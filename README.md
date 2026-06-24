@@ -30,7 +30,7 @@ Add the products your target needs:
 .product(name: "CodexUIKit", package: "CodexKit"),
 ```
 
-## CodexAppServerKit Quick Start
+## CodexAppServerKit
 
 Use `CodexAppServerKit` when you want direct control over the app-server connection and conversation APIs.
 
@@ -61,7 +61,7 @@ let response = try await stream.collect()
 
 For thread management, streaming, review sessions, model/account APIs, login flows, and testing utilities, see [Sources/CodexAppServerKit/README.md](Sources/CodexAppServerKit/README.md).
 
-## CodexUIKit Quick Start
+## CodexUIKit
 
 Use `CodexUIKit` when you want UI-ready observable state for thread lists and conversations.
 
