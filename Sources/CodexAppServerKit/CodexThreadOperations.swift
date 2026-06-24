@@ -51,7 +51,7 @@ extension CodexThread {
     /// Sends a prompt to the thread and waits for the final response.
     ///
     /// Use `streamResponse(to:options:)` when the caller needs incremental
-    /// progress, transcript updates, steering, or interruption.
+    /// progress, transcript updates, steering, or cancellation.
     ///
     /// - Parameters:
     ///   - prompt: The structured prompt to send.
@@ -83,8 +83,7 @@ extension CodexThread {
     /// Sends a prompt and returns a live response stream.
     ///
     /// The returned stream exposes events, progress, transcript updates, the
-    /// collected result, and Codex-specific controls such as steer and
-    /// interrupt.
+    /// collected result, and Codex-specific controls such as steer and cancel.
     ///
     /// - Parameters:
     ///   - prompt: The structured prompt to send.
@@ -165,16 +164,29 @@ extension CodexThread {
         )
     }
 
+    /// Cancels the currently active turn for this thread.
+    ///
+    /// Use this when the caller has a resumed `CodexThread` handle but no
+    /// in-memory response or review session object, such as after restoring a
+    /// persisted running operation.
+    ///
+    /// - Parameters:
+    ///   - expectedTurnID: The turn the caller expects to cancel. When the
+    ///     app-server reports a newer active turn, the returned cancellation
+    ///     identifies the actual cancelled turn.
+    ///   - willCancelActiveTurn: Optional hook invoked before retrying an
+    ///     cancellation for a newer active turn reported by app-server.
+    /// - Returns: The turn that app-server cancelled.
     @discardableResult
-    package func interruptActiveTurn(
+    public func cancelActiveTurn(
         expectedTurnID: CodexTurnID? = nil,
-        willInterruptActiveTurn: (@Sendable (CodexTurnInterruption) async -> Void)? = nil
-    ) async throws -> CodexTurnInterruption {
+        willCancelActiveTurn: (@Sendable (CodexTurnCancellation) async -> Void)? = nil
+    ) async throws -> CodexTurnCancellation {
         try await interruptCodexTurn(
             threadID: id,
             turnID: expectedTurnID,
             client: client,
-            willInterruptActiveTurn: willInterruptActiveTurn
+            willCancelActiveTurn: willCancelActiveTurn
         )
     }
 
@@ -352,19 +364,19 @@ extension CodexTurn {
     }
 
     @discardableResult
-    package func interrupt() async throws -> CodexTurnInterruption {
+    package func interrupt() async throws -> CodexTurnCancellation {
         try await interruptCodexTurn(threadID: threadID, turnID: id, client: client)
     }
 
     @discardableResult
     package func interrupt(
-        willInterruptActiveTurn: (@Sendable (CodexTurnInterruption) async -> Void)?
-    ) async throws -> CodexTurnInterruption {
+        willCancelActiveTurn: (@Sendable (CodexTurnCancellation) async -> Void)?
+    ) async throws -> CodexTurnCancellation {
         try await interruptCodexTurn(
             threadID: threadID,
             turnID: id,
             client: client,
-            willInterruptActiveTurn: willInterruptActiveTurn
+            willCancelActiveTurn: willCancelActiveTurn
         )
     }
 }
@@ -374,8 +386,8 @@ package func interruptCodexTurn(
     threadID: CodexThreadID,
     turnID: CodexTurnID?,
     client: AppServerClient,
-    willInterruptActiveTurn: (@Sendable (CodexTurnInterruption) async -> Void)? = nil
-) async throws -> CodexTurnInterruption {
+    willCancelActiveTurn: (@Sendable (CodexTurnCancellation) async -> Void)? = nil
+) async throws -> CodexTurnCancellation {
     do {
         try await sendInterrupt(threadID: threadID, turnID: turnID, client: client)
         return .init(threadID: threadID, turnID: turnID)
@@ -386,12 +398,12 @@ package func interruptCodexTurn(
             throw error
         }
         let activeTurn = CodexTurnID(rawValue: activeTurnID)
-        let interruption = CodexTurnInterruption(threadID: threadID, turnID: activeTurn)
-        if let willInterruptActiveTurn {
-            await willInterruptActiveTurn(interruption)
+        let cancellation = CodexTurnCancellation(threadID: threadID, turnID: activeTurn)
+        if let willCancelActiveTurn {
+            await willCancelActiveTurn(cancellation)
         }
         try await sendInterrupt(threadID: threadID, turnID: activeTurn, client: client)
-        return interruption
+        return cancellation
     }
 }
 

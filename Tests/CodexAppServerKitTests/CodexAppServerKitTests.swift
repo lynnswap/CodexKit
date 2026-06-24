@@ -1534,7 +1534,7 @@ struct CodexAppServerKitTests {
         ])
     }
 
-    @Test func responseStreamInterruptSendsTurnInterrupt() async throws {
+    @Test func responseStreamCancelSendsTurnInterrupt() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueue(
             AppServerAPI.Turn.Start.Response(turn: .init(id: "turn-1", status: "running")),
@@ -1550,7 +1550,7 @@ struct CodexAppServerKitTests {
         )
 
         let stream = try await thread.streamResponse(to: "Run the slow checks.")
-        try await stream.interrupt()
+        try await stream.cancel()
 
         #expect(
             await transport.recordedRequests().map(\.method) == [
@@ -1564,7 +1564,7 @@ struct CodexAppServerKitTests {
         #expect(params.turnID == "turn-1")
     }
 
-    @Test func threadInterruptActiveTurnSendsExpectedTurnID() async throws {
+    @Test func threadCancelActiveTurnSendsExpectedTurnID() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueue(EmptyResponse(), for: "turn/interrupt")
         let client = AppServerClient(transport: transport)
@@ -1575,10 +1575,10 @@ struct CodexAppServerKitTests {
             router: router
         )
 
-        let interruption = try await thread.interruptActiveTurn(expectedTurnID: "turn-1")
+        let cancellation = try await thread.cancelActiveTurn(expectedTurnID: "turn-1")
 
-        #expect(interruption.threadID == "thread-1")
-        #expect(interruption.turnID == "turn-1")
+        #expect(cancellation.threadID == "thread-1")
+        #expect(cancellation.turnID == "turn-1")
         let request = try #require(await transport.recordedRequests().first)
         #expect(request.method == "turn/interrupt")
         let params = try request.decodeParams(AppServerAPI.Turn.Interrupt.Params.self)
@@ -1586,7 +1586,7 @@ struct CodexAppServerKitTests {
         #expect(params.turnID == "turn-1")
     }
 
-    @Test func responseStreamInterruptRetriesWithCurrentActiveTurnID() async throws {
+    @Test func responseStreamCancelRetriesWithCurrentActiveTurnID() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueue(
             AppServerAPI.Turn.Start.Response(turn: .init(id: "turn-old", status: "running")),
@@ -1607,14 +1607,14 @@ struct CodexAppServerKitTests {
         )
 
         let stream = try await thread.streamResponse(to: "Run the slow checks.")
-        let interruption = try await stream.interrupt()
+        let cancellation = try await stream.cancel()
 
-        #expect(interruption.threadID == "thread-1")
-        #expect(interruption.turnID == "turn-new")
-        let interruptRequests = await transport.recordedRequests().filter {
+        #expect(cancellation.threadID == "thread-1")
+        #expect(cancellation.turnID == "turn-new")
+        let cancelRequests = await transport.recordedRequests().filter {
             $0.method == "turn/interrupt"
         }
-        let turnIDs = try interruptRequests.map { request in
+        let turnIDs = try cancelRequests.map { request in
             try request.decodeParams(AppServerAPI.Turn.Interrupt.Params.self).turnID
         }
         #expect(turnIDs == ["turn-old", "turn-new"])
@@ -1699,7 +1699,7 @@ struct CodexAppServerKitTests {
         #expect(params.model == "gpt-5")
     }
 
-    @Test func responseStreamInterruptStartsFollowUpAfterServerTerminalEvent() async throws {
+    @Test func responseStreamCancelStartsFollowUpAfterServerTerminalEvent() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueue(
             AppServerAPI.Turn.Start.Response(turn: .init(id: "turn-1", status: "running")),
@@ -1724,7 +1724,7 @@ struct CodexAppServerKitTests {
         let followUpTask = Task {
             try await stream.submit(
                 "Use the shorter path.",
-                mode: .interruptCurrentResponse
+                mode: .cancelCurrentResponse
             )
         }
         await transport.waitForRequestCount(2)
@@ -1753,7 +1753,7 @@ struct CodexAppServerKitTests {
         #expect(followUpParams.input == [.text("Use the shorter path.")])
     }
 
-    @Test func responseStreamInterruptFollowUpWaitsForRetriedActiveTurn() async throws {
+    @Test func responseStreamCancelFollowUpWaitsForRetriedActiveTurn() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueue(
             AppServerAPI.Turn.Start.Response(turn: .init(id: "turn-old", status: "running")),
@@ -1779,7 +1779,7 @@ struct CodexAppServerKitTests {
         let followUpTask = Task {
             try await stream.submit(
                 "Continue after the active turn stops.",
-                mode: .interruptCurrentResponse
+                mode: .cancelCurrentResponse
             )
         }
         defer {

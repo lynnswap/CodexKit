@@ -854,20 +854,20 @@ public struct CodexReviewSession: Identifiable, Sendable {
         try await response.collect()
     }
 
-    /// Interrupts the running review turn.
+    /// Cancels the running review turn.
     ///
-    /// - Returns: The turn that the app-server actually interrupted. This can
+    /// - Returns: The turn that the app-server actually cancelled. This can
     ///   differ from `turnID` when the app-server reports a newer active turn.
     @discardableResult
-    public func interrupt() async throws -> CodexTurnInterruption {
-        try await response.interrupt()
+    public func cancel() async throws -> CodexTurnCancellation {
+        try await response.cancel()
     }
 
     @discardableResult
-    package func interrupt(
-        willInterruptActiveTurn: (@Sendable (CodexTurnInterruption) async -> Void)?
-    ) async throws -> CodexTurnInterruption {
-        try await response.interrupt(willInterruptActiveTurn: willInterruptActiveTurn)
+    package func cancel(
+        willCancelActiveTurn: (@Sendable (CodexTurnCancellation) async -> Void)?
+    ) async throws -> CodexTurnCancellation {
+        try await response.cancel(willCancelActiveTurn: willCancelActiveTurn)
     }
 
     /// Sends additional input to the running review turn.
@@ -1511,12 +1511,12 @@ public struct CodexResponse: Identifiable, Equatable, Sendable {
     }
 }
 
-/// The turn interrupted by an app-server control request.
-public struct CodexTurnInterruption: Equatable, Sendable {
-    /// The thread that owns the interrupted turn.
+/// The turn cancelled by an app-server control request.
+public struct CodexTurnCancellation: Equatable, Sendable {
+    /// The thread that owns the cancelled turn.
     public var threadID: CodexThreadID
 
-    /// The interrupted turn, when the app-server reported one.
+    /// The cancelled turn, when the app-server reported one.
     public var turnID: CodexTurnID?
 
     public init(threadID: CodexThreadID, turnID: CodexTurnID?) {
@@ -1535,7 +1535,7 @@ public struct CodexTurnInterruption: Equatable, Sendable {
 public struct CodexResponseStream: AsyncSequence, Sendable {
     public enum SubmissionMode: Equatable, Sendable {
         case queueAfterCurrentResponse
-        case interruptCurrentResponse
+        case cancelCurrentResponse
     }
 
     public struct Snapshot: Equatable, Sendable {
@@ -1595,21 +1595,21 @@ public struct CodexResponseStream: AsyncSequence, Sendable {
         }
     }
 
-    /// Interrupts the running response.
+    /// Cancels the running response.
     ///
-    /// - Returns: The turn that the app-server actually interrupted. This can
+    /// - Returns: The turn that the app-server actually cancelled. This can
     ///   differ from the stream's original turn when the app-server reports a
     ///   newer active turn.
     @discardableResult
-    public func interrupt() async throws -> CodexTurnInterruption {
+    public func cancel() async throws -> CodexTurnCancellation {
         try await turn.interrupt()
     }
 
     @discardableResult
-    package func interrupt(
-        willInterruptActiveTurn: (@Sendable (CodexTurnInterruption) async -> Void)?
-    ) async throws -> CodexTurnInterruption {
-        try await turn.interrupt(willInterruptActiveTurn: willInterruptActiveTurn)
+    package func cancel(
+        willCancelActiveTurn: (@Sendable (CodexTurnCancellation) async -> Void)?
+    ) async throws -> CodexTurnCancellation {
+        try await turn.interrupt(willCancelActiveTurn: willCancelActiveTurn)
     }
 
     public func steer(with prompt: CodexPrompt) async throws {
@@ -1633,9 +1633,9 @@ public struct CodexResponseStream: AsyncSequence, Sendable {
         case .queueAfterCurrentResponse:
             _ = try await collect()
             return try await startFollowUp(to: prompt, options: options)
-        case .interruptCurrentResponse:
-            let interruption = try await interrupt()
-            try await waitForInterruptedResponse(interruption)
+        case .cancelCurrentResponse:
+            let cancellation = try await cancel()
+            try await waitForCancelledResponse(cancellation)
             return try await startFollowUp(to: prompt, options: options)
         }
     }
@@ -1673,9 +1673,9 @@ public struct CodexResponseStream: AsyncSequence, Sendable {
         )
     }
 
-    private func waitForInterruptedResponse(_ interruption: CodexTurnInterruption) async throws {
-        let interruptedTurn = interruptedTurn(for: interruption)
-        for try await event in interruptedTurn.events {
+    private func waitForCancelledResponse(_ cancellation: CodexTurnCancellation) async throws {
+        let cancelledTurn = cancelledTurn(for: cancellation)
+        for try await event in cancelledTurn.events {
             switch event {
             case .completed(let response):
                 if let message = response.errorMessage {
@@ -1699,14 +1699,14 @@ public struct CodexResponseStream: AsyncSequence, Sendable {
         throw CodexAppServerError.transportClosed
     }
 
-    private func interruptedTurn(for interruption: CodexTurnInterruption) -> CodexTurn {
-        let interruptedTurnID = interruption.turnID ?? turn.id
-        if interruptedTurnID == turn.id {
+    private func cancelledTurn(for cancellation: CodexTurnCancellation) -> CodexTurn {
+        let cancelledTurnID = cancellation.turnID ?? turn.id
+        if cancelledTurnID == turn.id {
             return turn
         }
         return CodexTurn(
-            id: interruptedTurnID,
-            threadID: interruption.threadID,
+            id: cancelledTurnID,
+            threadID: cancellation.threadID,
             client: turn.client,
             router: turn.router
         )
