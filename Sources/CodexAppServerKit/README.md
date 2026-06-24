@@ -89,16 +89,18 @@ for try await snapshot in stream {
 let response = try await stream.collect()
 ```
 
-Codex also supports explicit interruption for an in-flight response. App-server has real `turn/steer` and `turn/interrupt` control paths, so `CodexResponseStream` exposes them directly:
+Codex also supports explicit cancellation for an in-flight response. App-server
+has real `turn/steer` and `turn/interrupt` control paths, so
+`CodexResponseStream` exposes them directly:
 
 ```swift
 let stream = try await thread.streamResponse(to: "Run the slow checks.")
 try await stream.steer(with: "Prefer the smallest fix.")
-try await stream.interrupt()
+try await stream.cancel()
 ```
 
 If the task awaiting `stream.collect()` is cancelled, the stream also sends the
-same interrupt request to app-server.
+same cancellation request to app-server.
 
 When a UI needs to accept another prompt while a response is in flight, submit
 it with an explicit follow-up mode:
@@ -111,13 +113,13 @@ let next = try await stream.submit(
 
 let urgent = try await stream.submit(
     "Stop and try the shorter path.",
-    mode: .interruptCurrentResponse
+    mode: .cancelCurrentResponse
 )
 ```
 
 Use `steer(with:)` when the new input should modify the current turn.
 `.queueAfterCurrentResponse` waits for the current response to finish before
-starting the next turn. `.interruptCurrentResponse` sends `turn/interrupt`,
+starting the next turn. `.cancelCurrentResponse` sends `turn/interrupt`,
 waits for app-server's terminal event, and then starts the next turn in the
 same thread.
 
@@ -410,13 +412,13 @@ let stream = try await thread.streamResponse(to: "Run checks.")
 let gate = CodexAppServerTestGate()
 await runtime.transport.holdNext(method: "turn/interrupt", gate: gate)
 
-let interruptTask = Task {
-    try await stream.interrupt()
+let cancelTask = Task {
+    try await stream.cancel()
 }
 
 await runtime.transport.waitForRequest(method: "turn/interrupt")
 await gate.open()
-try await interruptTask.value
+try await cancelTask.value
 ```
 
 ## Boundary
