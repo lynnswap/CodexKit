@@ -39,7 +39,7 @@ public final class CodexThreadLibrary {
     }
 
     public func refresh() async {
-        await load(cursor: nil, appending: false)
+        await reload()
     }
 
     public func loadNextPage() async {
@@ -120,7 +120,7 @@ public final class CodexThreadLibrary {
                 removeThread(threadID)
                 phase = .loaded
             } else {
-                await load(cursor: nil, appending: false)
+                await reload()
             }
         } catch {
             fail(with: error)
@@ -149,7 +149,7 @@ public final class CodexThreadLibrary {
                     removeThread(thread.id)
                 }
             } else {
-                await load(cursor: nil, appending: false)
+                await reload()
             }
             markLoadedIfNeeded()
         } catch {
@@ -167,7 +167,7 @@ public final class CodexThreadLibrary {
                 removeThread(threadID)
                 phase = .loaded
             } else {
-                await load(cursor: nil, appending: false)
+                await reload()
             }
         } catch {
             fail(with: error)
@@ -189,6 +189,10 @@ public final class CodexThreadLibrary {
         } catch {
             fail(with: error)
         }
+    }
+
+    private func reload() async {
+        await load(cursor: configuration.query.cursor, appending: false)
     }
 
     private func replaceThreads(with records: [CodexThreadSnapshot], appending: Bool) {
@@ -226,7 +230,7 @@ public final class CodexThreadLibrary {
         preferFront: Bool
     ) async -> Bool {
         guard canEvaluateMutatedThreadVisibilityLocally else {
-            await load(cursor: nil, appending: false)
+            await reload()
             return sections.contains { section in
                 section.threads.contains { $0.id == id }
             }

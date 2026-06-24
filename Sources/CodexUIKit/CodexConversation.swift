@@ -102,7 +102,8 @@ public final class CodexConversation {
             phase = .loaded
             return response
         } catch {
-            if let response = (error as? CodexAppServerError)?.response {
+            if options.transcriptErrorHandlingPolicy != .revertTranscript,
+               let response = (error as? CodexAppServerError)?.response {
                 apply(response)
             }
             fail(with: error)

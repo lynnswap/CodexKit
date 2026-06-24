@@ -243,6 +243,25 @@ struct CodexThreadLibraryTests {
         let methods = await runtime.transport.recordedRequests().map(\.method)
         #expect(methods.filter { $0 == "thread/list" }.count == 2)
     }
+
+    @Test("refresh preserves configured thread-list cursor")
+    func refreshPreservesConfiguredCursor() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-cursor", name: "Cursor page")
+        ]))
+
+        let library = CodexThreadLibrary(
+            server: runtime.server,
+            configuration: .init(query: .init(cursor: "configured-cursor", limit: 1))
+        )
+        await library.refresh()
+
+        let request = try #require(await runtime.transport.recordedRequests(method: "thread/list").first)
+        let params = try request.decodeParams(ThreadListParams.self)
+        #expect(params.cursor == "configured-cursor")
+        #expect(params.limit == 1)
+    }
 }
 
 @MainActor
@@ -448,6 +467,44 @@ struct CodexConversationTests {
         #expect(item.text == "Partial failure")
         #expect(conversation.transcript.finalAnswer == "Partial failure")
     }
+
+    @Test("send skips failed response transcript after rollback policy")
+    func sendSkipsFailedResponseTranscriptAfterRollbackPolicy() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-revert"))
+        try await runtime.transport.enqueueTurnStart(turnID: "turn-revert", status: "running")
+        try await runtime.transport.enqueueEmpty(for: "thread/rollback")
+
+        let conversation = try await CodexConversation.resume("thread-revert", server: runtime.server)
+        let sendTask = Task {
+            try await conversation.send(
+                "fail",
+                options: .init(transcriptErrorHandlingPolicy: .revertTranscript)
+            )
+        }
+
+        await runtime.transport.waitForRequest(method: "turn/start")
+        try await runtime.transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(turnID: "turn-revert", delta: "Rolled back")
+        )
+        try await runtime.transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(id: "turn-revert", status: "failed"))
+        )
+
+        do {
+            _ = try await sendTask.value
+            Issue.record("Expected a failed turn to throw.")
+        } catch let error as CodexAppServerError {
+            #expect(error.response?.turnID == "turn-revert")
+        }
+
+        #expect(conversation.turns.isEmpty)
+        #expect(conversation.items.isEmpty)
+        let methods = await runtime.transport.recordedRequests().map(\.method)
+        #expect(methods.contains("thread/rollback"))
+    }
 }
 
 private struct TurnCompletedParams: Encodable, Sendable {
@@ -477,6 +534,11 @@ private struct ThreadReadParams: Decodable, Sendable {
         case threadID = "threadId"
         case includeTurns
     }
+}
+
+private struct ThreadListParams: Decodable, Sendable {
+    var cursor: String?
+    var limit: Int?
 }
 
 private struct ThreadItemParams: Encodable, Sendable {
