@@ -91,7 +91,7 @@ public final class CodexThreadLibrary {
                 instructions: instructions,
                 options: options
             )
-            upsertThread(
+            let isVisible = await reflectThreadMutation(
                 id: thread.id,
                 workspace: thread.workspace,
                 name: nil,
@@ -100,10 +100,10 @@ public final class CodexThreadLibrary {
                 archived: false,
                 preferFront: true
             )
-            if isThreadVisible(workspace: thread.workspace, archived: false) {
+            if isVisible {
                 selectedThreadID = thread.id
             }
-            phase = .loaded
+            markLoadedIfNeeded()
             return CodexConversation(thread: thread, configuration: configuration)
         } catch {
             fail(with: error)
@@ -129,16 +129,25 @@ public final class CodexThreadLibrary {
         lastErrorDescription = nil
         do {
             let thread = try await server.unarchiveThread(threadID)
-            upsertThread(
-                id: thread.id,
-                workspace: thread.workspace,
-                name: nil,
-                preview: nil,
-                turns: [],
-                archived: false,
-                preferFront: true
-            )
-            phase = .loaded
+            if canEvaluateMutatedThreadVisibilityLocally {
+                if isThreadVisible(workspace: thread.workspace, archived: false) {
+                    let record = try await thread.read()
+                    upsertThread(
+                        id: record.id,
+                        workspace: record.workspace,
+                        name: record.name,
+                        preview: record.preview,
+                        turns: record.turns,
+                        archived: false,
+                        preferFront: true
+                    )
+                } else {
+                    removeThread(thread.id)
+                }
+            } else {
+                await load(cursor: nil, appending: false)
+            }
+            markLoadedIfNeeded()
         } catch {
             fail(with: error)
             throw error
@@ -198,6 +207,35 @@ public final class CodexThreadLibrary {
         clearSelectionIfNeeded(in: section.threads)
     }
 
+    @discardableResult
+    private func reflectThreadMutation(
+        id: CodexThreadID,
+        workspace: URL?,
+        name: String?,
+        preview: String?,
+        turns: [CodexTurnSnapshot],
+        archived: Bool,
+        preferFront: Bool
+    ) async -> Bool {
+        guard canEvaluateMutatedThreadVisibilityLocally else {
+            await load(cursor: nil, appending: false)
+            return sections.contains { section in
+                section.threads.contains { $0.id == id }
+            }
+        }
+
+        upsertThread(
+            id: id,
+            workspace: workspace,
+            name: name,
+            preview: preview,
+            turns: turns,
+            archived: archived,
+            preferFront: preferFront
+        )
+        return isThreadVisible(workspace: workspace, archived: archived)
+    }
+
     private func upsertThread(
         id: CodexThreadID,
         workspace: URL?,
@@ -224,6 +262,18 @@ public final class CodexThreadLibrary {
         } else {
             section.threads.append(thread)
         }
+    }
+
+    private var canEvaluateMutatedThreadVisibilityLocally: Bool {
+        let query = configuration.query
+        return query.cursor == nil
+            && query.limit == nil
+            && query.searchTerm == nil
+            && query.modelProviders == nil
+            && query.sortDirection == nil
+            && query.sortKey == nil
+            && query.sourceKinds == nil
+            && query.useStateDBOnly == nil
     }
 
     private func isThreadVisible(workspace: URL?, archived: Bool) -> Bool {
@@ -272,6 +322,13 @@ public final class CodexThreadLibrary {
         let message = error.localizedDescription
         lastErrorDescription = message
         phase = .failed(message)
+    }
+
+    private func markLoadedIfNeeded() {
+        if case .failed = phase {
+            return
+        }
+        phase = .loaded
     }
 
     @MainActor

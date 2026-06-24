@@ -110,6 +110,33 @@ struct CodexThreadLibraryTests {
         #expect(library.selectedThreadID == nil)
     }
 
+    @Test("unarchive preserves metadata for a visible restored thread")
+    func unarchivePreservesVisibleThreadMetadata() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        try await runtime.transport.enqueueThreadList(.init(threads: []))
+        let restored = CodexThreadSnapshot(
+            id: "thread-restored",
+            workspace: URL(fileURLWithPath: "/tmp/restored", isDirectory: true),
+            name: "Restored",
+            preview: "Preview",
+            turns: [.init(id: "turn-restored", status: .completed)]
+        )
+        try await runtime.transport.enqueueThreadUnarchive(restored)
+        try await runtime.transport.enqueueThreadRead(restored)
+
+        let library = CodexThreadLibrary(server: runtime.server)
+        await library.refresh()
+
+        try await library.unarchive("thread-restored")
+
+        let thread = try #require(library.sections.first?.threads.first)
+        #expect(thread.id == "thread-restored")
+        #expect(thread.title == "Restored")
+        #expect(thread.preview == "Preview")
+        #expect(thread.turnCount == 1)
+        #expect(thread.latestTurnStatus == .completed)
+    }
+
     @Test("startConversation does not insert threads outside the workspace query")
     func startConversationHonorsWorkspaceQuery() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -129,6 +156,29 @@ struct CodexThreadLibraryTests {
         #expect(conversation.id == "thread-other")
         #expect(library.sections.first?.threads.isEmpty == true)
         #expect(library.selectedThreadID == nil)
+    }
+
+    @Test("startConversation refreshes instead of inserting into server-filtered queries")
+    func startConversationRefreshesServerFilteredQuery() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        try await runtime.transport.enqueueThreadList(.init(threads: []))
+        try await runtime.transport.enqueueThreadStart(threadID: "thread-filtered")
+        try await runtime.transport.enqueueThreadList(.init(threads: []))
+
+        let workspace = URL(fileURLWithPath: "/tmp/query", isDirectory: true)
+        let library = CodexThreadLibrary(
+            server: runtime.server,
+            configuration: .init(query: .init(searchTerm: "needle"))
+        )
+        await library.refresh()
+
+        let conversation = try await library.startConversation(in: workspace)
+
+        #expect(conversation.id == "thread-filtered")
+        #expect(library.sections.first?.threads.isEmpty == true)
+        #expect(library.selectedThreadID == nil)
+        let methods = await runtime.transport.recordedRequests().map(\.method)
+        #expect(methods.filter { $0 == "thread/list" }.count == 2)
     }
 }
 
