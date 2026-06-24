@@ -137,8 +137,7 @@ public final class CodexThreadLibrary {
         phase = .loading
         lastErrorDescription = nil
         do {
-            let thread = try await server.resumeThread(threadID)
-            try await thread.archive()
+            try await server.archiveThread(threadID)
             remove(threadID)
             phase = .loaded
         } catch {

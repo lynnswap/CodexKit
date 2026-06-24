@@ -318,8 +318,19 @@ public actor CodexAppServer {
         let response = try await client.send(
             AppServerAPI.Thread.Unarchive.Request(
                 params: .init(threadID: id.rawValue)
-            ))
+        ))
         return thread(from: response.thread)
+    }
+
+    /// Archives a Codex thread.
+    ///
+    /// - Parameter id: The thread identifier to archive.
+    /// - Throws: A transport, JSON-RPC, or app-server request error.
+    public func archiveThread(_ id: CodexThreadID) async throws {
+        let _: EmptyResponse = try await client.send(
+            AppServerAPI.Thread.Archive.Request(
+                params: .init(threadID: id.rawValue)
+            ))
     }
 
     /// Permanently deletes a Codex thread.

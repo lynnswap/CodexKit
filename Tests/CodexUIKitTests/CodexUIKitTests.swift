@@ -70,7 +70,7 @@ struct CodexThreadLibraryTests {
 
         try await runtime.transport.enqueueThreadStart(threadID: "thread-created", model: "gpt-5")
         try await runtime.transport.enqueueThreadResume(.init(id: "thread-selected"))
-        try await runtime.transport.enqueueThreadResume(.init(id: "thread-created"))
+        try await runtime.transport.enqueueEmpty(for: "thread/archive")
         try await runtime.transport.enqueueThreadUnarchive(.init(id: "thread-selected"))
         try await runtime.transport.enqueueEmpty(for: "thread/delete")
 
@@ -86,7 +86,7 @@ struct CodexThreadLibraryTests {
 
         let methods = await runtime.transport.recordedRequests().map(\.method)
         #expect(methods.contains("thread/start"))
-        #expect(methods.filter { $0 == "thread/resume" }.count == 2)
+        #expect(methods.filter { $0 == "thread/resume" }.count == 1)
         #expect(methods.contains("thread/archive"))
         #expect(methods.contains("thread/unarchive"))
         #expect(methods.contains("thread/delete"))
