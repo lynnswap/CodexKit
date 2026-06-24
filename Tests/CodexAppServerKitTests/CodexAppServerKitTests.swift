@@ -671,6 +671,43 @@ struct CodexAppServerKitTests {
         #expect(await transport.recordedRequests().map(\.method) == ["ping", "ping"])
     }
 
+    @Test func scopedRequestCancelledWhileQueuedDoesNotSend() async throws {
+        let transport = CodexAppServerTestTransport()
+        let gate = CodexAppServerTestGate()
+        await transport.holdNextIgnoringCancellation(method: "turn/start", gate: gate)
+        try await transport.enqueueTurnStart(turnID: "turn-1", status: "running")
+        let client = AppServerClient(transport: transport)
+
+        let first = Task {
+            try await client.send(AppServerAPI.Turn.Start.Request(
+                params: .init(threadID: "thread-1", input: [.text("first")])
+            ))
+        }
+        await transport.waitForRequest(method: "turn/start")
+
+        let second = Task {
+            try await client.send(AppServerAPI.Turn.Start.Request(
+                params: .init(threadID: "thread-1", input: [.text("second")])
+            ))
+        }
+        try await Task.sleep(for: .milliseconds(20))
+        second.cancel()
+
+        await gate.open()
+        _ = try await first.value
+        do {
+            _ = try await withTimeout {
+                try await second.value
+            }
+            Issue.record("Expected the queued scoped request to throw CancellationError.")
+        } catch is CancellationError {
+        } catch {
+            Issue.record("Expected CancellationError, got \(error).")
+        }
+
+        #expect(await transport.recordedRequests(method: "turn/start").count == 1)
+    }
+
     @Test func turnResultReplaysEarlyNotificationsAndKeepsUnknownEvents() async throws {
         let transport = CodexAppServerTestTransport()
         let client = AppServerClient(transport: transport)
@@ -1067,6 +1104,84 @@ struct CodexAppServerKitTests {
         #expect(logs.compactMap(\.messageDelta).map(\.text) == ["First", "Second"])
     }
 
+    @Test func threadLogEntriesIncludeProgressDeltaNotifications() async throws {
+        let transport = CodexAppServerTestTransport()
+        let client = AppServerClient(transport: transport)
+        let router = CodexAppServerNotificationRouter(client: client)
+        await router.start()
+        await transport.waitForNotificationStreamCount(1)
+
+        try await transport.emitServerNotification(
+            method: "item/commandExecution/outputDelta",
+            params: ItemOutputDeltaParams(
+                threadID: "thread-1",
+                turnID: "turn-1",
+                itemID: "command-1",
+                delta: "Compiling"
+            )
+        )
+        try await transport.emitServerNotification(
+            method: "item/fileChange/outputDelta",
+            params: ItemOutputDeltaParams(
+                threadID: "thread-1",
+                turnID: "turn-1",
+                itemID: "file-1",
+                delta: "diff --git"
+            )
+        )
+        try await transport.emitServerNotification(
+            method: "item/fileChange/patchUpdated",
+            params: ItemPatchUpdatedParams(
+                threadID: "thread-1",
+                turnID: "turn-1",
+                itemID: "patch-1",
+                changes: .array([
+                    .object([
+                        "kind": .string("update"),
+                        "path": .string("Sources/File.swift"),
+                    ]),
+                ])
+            )
+        )
+        try await transport.emitServerNotification(
+            method: "item/mcpToolCall/progress",
+            params: ItemProgressParams(
+                threadID: "thread-1",
+                turnID: "turn-1",
+                itemID: "tool-1",
+                message: "Reviewing"
+            )
+        )
+        try await transport.emitServerNotification(
+            method: "thread/closed",
+            params: ThreadIDParams(threadID: "thread-1")
+        )
+
+        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let logs = try await collect(thread.logEntries)
+
+        #expect(logs.count == 4)
+        #expect(logs.allSatisfy { $0.phase == .updated && $0.turnID == "turn-1" })
+        #expect(logs.contains { $0.item?.kind == .commandExecution && $0.item?.text == "Compiling" })
+        #expect(logs.contains { $0.item?.kind == .fileChange && $0.item?.text == "diff --git" })
+        #expect(
+            logs.contains {
+                if case .fileChange(let fileChange) = $0.item?.content {
+                    fileChange.output?.contains("File.swift") == true
+                } else {
+                    false
+                }
+            })
+        #expect(
+            logs.contains {
+                if case .toolCall(let toolCall) = $0.item?.content {
+                    toolCall.result == "Reviewing"
+                } else {
+                    false
+                }
+            })
+    }
+
     @Test func reasoningNotificationsRouteAsTypedEventsLogsAndTranscript() async throws {
         let transport = CodexAppServerTestTransport()
         let client = AppServerClient(transport: transport)
@@ -1248,6 +1363,35 @@ struct CodexAppServerKitTests {
                 resetsAt: resetDate
             ),
         ])
+    }
+
+    @Test func accountReadAcceptsChatGPTAccountWithoutEmail() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueJSON(
+            """
+            {
+              "account": {
+                "type": "chatgpt",
+                "email": null,
+                "planType": "plus"
+              },
+              "requiresOpenaiAuth": false
+            }
+            """,
+            for: "account/read"
+        )
+        let client = AppServerClient(transport: transport)
+        let server = CodexAppServer(
+            client: client,
+            router: CodexAppServerNotificationRouter(client: client)
+        )
+
+        let account = try #require(try await server.account())
+
+        #expect(account.kind == .chatGPT)
+        #expect(account.id == "chatgpt")
+        #expect(account.label == "ChatGPT")
+        #expect(account.planType == "plus")
     }
 
     @Test func loginFlowUsesSupportedRequestsAndCompletionNotification() async throws {
@@ -1629,6 +1773,48 @@ private struct TurnDeltaParams: Encodable, Sendable {
         case threadID = "threadId"
         case turnID = "turnId"
         case delta
+    }
+}
+
+private struct ItemOutputDeltaParams: Encodable, Sendable {
+    var threadID: String
+    var turnID: String
+    var itemID: String
+    var delta: String
+
+    enum CodingKeys: String, CodingKey {
+        case threadID = "threadId"
+        case turnID = "turnId"
+        case itemID = "itemId"
+        case delta
+    }
+}
+
+private struct ItemPatchUpdatedParams: Encodable, Sendable {
+    var threadID: String
+    var turnID: String
+    var itemID: String
+    var changes: AppServerJSONValue
+
+    enum CodingKeys: String, CodingKey {
+        case threadID = "threadId"
+        case turnID = "turnId"
+        case itemID = "itemId"
+        case changes
+    }
+}
+
+private struct ItemProgressParams: Encodable, Sendable {
+    var threadID: String
+    var turnID: String
+    var itemID: String
+    var message: String
+
+    enum CodingKeys: String, CodingKey {
+        case threadID = "threadId"
+        case turnID = "turnId"
+        case itemID = "itemId"
+        case message
     }
 }
 

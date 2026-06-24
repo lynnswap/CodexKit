@@ -189,11 +189,13 @@ package actor RequestSerializer {
         operation: @Sendable () async throws -> Output
     ) async throws -> Output {
         guard let scope else {
+            try Task.checkCancellation()
             return try await operation()
         }
         let lane = lane(for: scope)
-        await lane.enter()
+        try await lane.enter()
         do {
+            try Task.checkCancellation()
             let output = try await operation()
             await lane.leave()
             return output
@@ -214,17 +216,35 @@ package actor RequestSerializer {
 }
 
 private actor SerialLane {
-    private var isOccupied = false
-    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private struct Waiter {
+        var id: UUID
+        var continuation: CheckedContinuation<Void, Never>
+    }
 
-    func enter() async {
+    private var isOccupied = false
+    private var waiters: [Waiter] = []
+
+    func enter() async throws {
+        try Task.checkCancellation()
         if isOccupied == false {
             isOccupied = true
             return
         }
-        await withCheckedContinuation { continuation in
-            waiters.append(continuation)
+        let waiterID = UUID()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if Task.isCancelled {
+                    continuation.resume()
+                } else {
+                    waiters.append(.init(id: waiterID, continuation: continuation))
+                }
+            }
+        } onCancel: {
+            Task {
+                await self.cancelWaiter(id: waiterID)
+            }
         }
+        try Task.checkCancellation()
     }
 
     func leave() {
@@ -232,7 +252,15 @@ private actor SerialLane {
             isOccupied = false
         } else {
             let next = waiters.removeFirst()
-            next.resume()
+            next.continuation.resume()
         }
+    }
+
+    private func cancelWaiter(id: UUID) {
+        guard let index = waiters.firstIndex(where: { $0.id == id }) else {
+            return
+        }
+        let waiter = waiters.remove(at: index)
+        waiter.continuation.resume()
     }
 }

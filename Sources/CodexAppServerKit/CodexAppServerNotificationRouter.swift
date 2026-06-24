@@ -296,6 +296,21 @@ package actor CodexAppServerNotificationRouter {
                 return .itemCompleted(item)
             }
             return .unknown(raw)
+        case "item/commandExecution/outputDelta":
+            if let item = itemUpdate(from: notification.params, kind: .commandExecution) {
+                return .itemUpdated(item)
+            }
+            return .unknown(raw)
+        case "item/fileChange/outputDelta", "item/fileChange/patchUpdated":
+            if let item = itemUpdate(from: notification.params, kind: .fileChange) {
+                return .itemUpdated(item)
+            }
+            return .unknown(raw)
+        case "item/mcpToolCall/progress":
+            if let item = itemUpdate(from: notification.params, kind: .mcpToolCall) {
+                return .itemUpdated(item)
+            }
+            return .unknown(raw)
         case "item/agentMessage/delta":
             if let delta = messageDelta(from: notification.params) {
                 return .messageDelta(delta)
@@ -359,6 +374,21 @@ package actor CodexAppServerNotificationRouter {
         case "item/completed":
             if let item = item(from: notification.params) {
                 return .itemCompleted(item, turnID: context.turnID)
+            }
+            return .unknown(raw)
+        case "item/commandExecution/outputDelta":
+            if let item = itemUpdate(from: notification.params, kind: .commandExecution) {
+                return .itemUpdated(item, turnID: context.turnID)
+            }
+            return .unknown(raw)
+        case "item/fileChange/outputDelta", "item/fileChange/patchUpdated":
+            if let item = itemUpdate(from: notification.params, kind: .fileChange) {
+                return .itemUpdated(item, turnID: context.turnID)
+            }
+            return .unknown(raw)
+        case "item/mcpToolCall/progress":
+            if let item = itemUpdate(from: notification.params, kind: .mcpToolCall) {
+                return .itemUpdated(item, turnID: context.turnID)
             }
             return .unknown(raw)
         case "item/agentMessage/delta":
@@ -450,6 +480,26 @@ package actor CodexAppServerNotificationRouter {
             return nil
         }
         return payload.item.threadItem
+    }
+
+    private func itemUpdate(from data: Data, kind: CodexThreadItem.Kind) -> CodexThreadItem? {
+        guard let payload = try? decoder.decode(ItemProgressPayload.self, from: data) else {
+            return nil
+        }
+        let output = payload.delta ?? payload.message ?? payload.changes?.displayText
+        let itemID = payload.itemID ?? UUID().uuidString
+        let content: CodexThreadItem.Content
+        switch kind {
+        case .commandExecution:
+            content = .command(.init(command: "", output: output))
+        case .fileChange:
+            content = .fileChange(.init(output: output))
+        case .mcpToolCall:
+            content = .toolCall(.init(result: output))
+        case let kind:
+            content = .unknown(.init(rawType: kind.rawValue, text: output, payload: data))
+        }
+        return .init(id: itemID, kind: kind, content: content, rawPayload: data)
     }
 
     private func messageDelta(from data: Data) -> CodexMessageDelta? {
@@ -648,6 +698,20 @@ private struct ReasoningTextDeltaPayload: Decodable {
 
 private struct ItemPayload: Decodable {
     var item: RawThreadItem
+}
+
+private struct ItemProgressPayload: Decodable {
+    var itemID: String?
+    var delta: String?
+    var message: String?
+    var changes: AppServerJSONValue?
+
+    enum CodingKeys: String, CodingKey {
+        case itemID = "itemId"
+        case delta
+        case message
+        case changes
+    }
 }
 
 private struct ThreadStatusPayload: Decodable {

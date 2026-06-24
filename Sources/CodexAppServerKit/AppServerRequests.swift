@@ -1740,19 +1740,14 @@ extension AppServerAPI.Account {
             case .apiKey:
                 self.init(kind: .apiKey, id: "api-key", label: "API Key")
             case .chatGPT:
-                let email = try container.decode(String.self, forKey: .email)
-                let normalizedEmail = Self.normalizedAccountID(email)
-                guard normalizedEmail.isEmpty == false else {
-                    throw DecodingError.dataCorruptedError(
-                        forKey: .email,
-                        in: container,
-                        debugDescription: "ChatGPT account email must not be empty."
-                    )
-                }
+                let email = try container.decodeIfPresent(String.self, forKey: .email)
+                let normalizedEmail = email.map(Self.normalizedAccountID) ?? ""
+                let label = email?.trimmingCharacters(in: .whitespacesAndNewlines)
+                let displayLabel = label.flatMap { $0.isEmpty ? nil : $0 } ?? "ChatGPT"
                 self.init(
                     kind: .chatGPT,
-                    id: normalizedEmail,
-                    label: email,
+                    id: normalizedEmail.isEmpty ? "chatgpt" : normalizedEmail,
+                    label: displayLabel,
                     planType: try container.decodeIfPresent(String.self, forKey: .planType)
                 )
             case .amazonBedrock:
