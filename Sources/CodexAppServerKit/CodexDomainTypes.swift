@@ -1634,8 +1634,8 @@ public struct CodexResponseStream: AsyncSequence, Sendable {
             _ = try await collect()
             return try await startFollowUp(to: prompt, options: options)
         case .interruptCurrentResponse:
-            try await interrupt()
-            try await waitForInterruptedResponse()
+            let interruption = try await interrupt()
+            try await waitForInterruptedResponse(interruption)
             return try await startFollowUp(to: prompt, options: options)
         }
     }
@@ -1673,8 +1673,9 @@ public struct CodexResponseStream: AsyncSequence, Sendable {
         )
     }
 
-    private func waitForInterruptedResponse() async throws {
-        for try await event in turn.events {
+    private func waitForInterruptedResponse(_ interruption: CodexTurnInterruption) async throws {
+        let interruptedTurn = interruptedTurn(for: interruption)
+        for try await event in interruptedTurn.events {
             switch event {
             case .completed(let response):
                 if let message = response.errorMessage {
@@ -1696,6 +1697,19 @@ public struct CodexResponseStream: AsyncSequence, Sendable {
             }
         }
         throw CodexAppServerError.transportClosed
+    }
+
+    private func interruptedTurn(for interruption: CodexTurnInterruption) -> CodexTurn {
+        let interruptedTurnID = interruption.turnID ?? turn.id
+        if interruptedTurnID == turn.id {
+            return turn
+        }
+        return CodexTurn(
+            id: interruptedTurnID,
+            threadID: interruption.threadID,
+            client: turn.client,
+            router: turn.router
+        )
     }
 
     private func handleFailure() async throws {
@@ -1746,11 +1760,12 @@ public struct CodexResponseStream: AsyncSequence, Sendable {
                 }
                 throw error
             }
+            let usage = progress.result?.usage ?? progress.usage
             return Snapshot(
                 turnID: turn.id,
                 content: progress.result?.finalAnswer ?? progress.transcript.responseText,
                 transcript: progress.transcript,
-                usage: progress.result?.usage,
+                usage: usage,
                 response: progress.result
             )
         }
@@ -1990,15 +2005,18 @@ package struct CodexTurnProgress: Equatable, Sendable {
 
     package var phase: Phase
     package var transcript: CodexTranscript
+    package var usage: CodexTokenUsage?
     package var result: CodexResponse?
 
     package init(
         phase: Phase,
         transcript: CodexTranscript = .init(),
+        usage: CodexTokenUsage? = nil,
         result: CodexResponse? = nil
     ) {
         self.phase = phase
         self.transcript = transcript
+        self.usage = usage
         self.result = result
     }
 }

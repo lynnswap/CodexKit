@@ -461,20 +461,21 @@ package struct CodexTurnProgressSequence: AsyncSequence, Sendable {
             }
             switch event {
             case .started, .unknown:
-                return .init(phase: .running, transcript: accumulator.transcript)
+                return .init(phase: .running, transcript: accumulator.transcript, usage: usage)
             case .itemStarted, .itemUpdated, .itemCompleted, .messageDelta,
                 .reasoningSummaryPartAdded, .reasoningDelta:
                 _ = accumulator.apply(event)
-                return .init(phase: .running, transcript: accumulator.transcript)
+                return .init(phase: .running, transcript: accumulator.transcript, usage: usage)
             case .tokenUsageUpdated(let newUsage):
                 usage = newUsage
-                return .init(phase: .running, transcript: accumulator.transcript)
+                return .init(phase: .running, transcript: accumulator.transcript, usage: usage)
             case .completed(var result):
                 result = finalizedResult(result)
                 if result.errorMessage != nil {
                     return .init(
                         phase: .failed(.turnFailedWithResponse(result)),
                         transcript: result.transcript,
+                        usage: result.usage,
                         result: result
                     )
                 }
@@ -482,14 +483,21 @@ package struct CodexTurnProgressSequence: AsyncSequence, Sendable {
                     return .init(
                         phase: .failed(.turnFailedWithResponse(result)),
                         transcript: result.transcript,
+                        usage: result.usage,
                         result: result
                     )
                 }
-                return .init(phase: .completed, transcript: result.transcript, result: result)
+                return .init(
+                    phase: .completed,
+                    transcript: result.transcript,
+                    usage: result.usage,
+                    result: result
+                )
             case .failed(let message):
                 return .init(
                     phase: .failed(.turnFailed(message)),
-                    transcript: accumulator.transcript
+                    transcript: accumulator.transcript,
+                    usage: usage
                 )
             }
         }

@@ -914,6 +914,40 @@ struct CodexAppServerKitTests {
             ])
     }
 
+    @Test func responseStreamSnapshotsIncludeIncrementalTokenUsage() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueue(
+            AppServerAPI.Turn.Start.Response(turn: .init(id: "turn-1", status: "running")),
+            for: "turn/start"
+        )
+        let client = AppServerClient(transport: transport)
+        let router = CodexAppServerNotificationRouter(client: client)
+        await router.start()
+        await transport.waitForNotificationStreamCount(1)
+        let thread = CodexThread(id: "thread-1", client: client, router: router)
+
+        let stream = try await thread.streamResponse(to: "Summarize usage.")
+        try await transport.emitServerNotification(
+            method: "thread/tokenUsage/updated",
+            params: TokenUsageParams(
+                threadID: "thread-1",
+                turnID: "turn-1",
+                tokenUsage: .init(
+                    total: .init(inputTokens: 5, outputTokens: 8, totalTokens: 13)
+                )
+            )
+        )
+
+        var iterator = stream.makeAsyncIterator()
+        let snapshot = try await iterator.next()
+
+        #expect(snapshot?.turnID == "turn-1")
+        #expect(snapshot?.usage?.inputTokens == 5)
+        #expect(snapshot?.usage?.outputTokens == 8)
+        #expect(snapshot?.usage?.totalTokens == 13)
+        #expect(snapshot?.response == nil)
+    }
+
     @Test func responseStreamFailureCarriesPartialResponse() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueue(
@@ -1411,6 +1445,66 @@ struct CodexAppServerKitTests {
             AppServerAPI.Turn.Start.Params.self, from: followUpRequest.params)
         #expect(followUpParams.threadID == "thread-1")
         #expect(followUpParams.input == [.text("Use the shorter path.")])
+    }
+
+    @Test func responseStreamInterruptFollowUpWaitsForRetriedActiveTurn() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueue(
+            AppServerAPI.Turn.Start.Response(turn: .init(id: "turn-old", status: "running")),
+            for: "turn/start"
+        )
+        await transport.enqueueFailure(
+            code: -32602,
+            message: "expected active turn id turn-old but found turn-new",
+            for: "turn/interrupt"
+        )
+        try await transport.enqueue(EmptyResponse(), for: "turn/interrupt")
+        try await transport.enqueue(
+            AppServerAPI.Turn.Start.Response(turn: .init(id: "turn-follow-up", status: "running")),
+            for: "turn/start"
+        )
+        let client = AppServerClient(transport: transport)
+        let router = CodexAppServerNotificationRouter(client: client)
+        await router.start()
+        await transport.waitForNotificationStreamCount(1)
+        let thread = CodexThread(id: "thread-1", client: client, router: router)
+
+        let stream = try await thread.streamResponse(to: "Long request.")
+        let followUpTask = Task {
+            try await stream.submit(
+                "Continue after the active turn stops.",
+                mode: .interruptCurrentResponse
+            )
+        }
+        defer {
+            followUpTask.cancel()
+        }
+        await transport.waitForRequestCount(3)
+        #expect(await transport.recordedRequests().map(\.method) == [
+            "turn/start",
+            "turn/interrupt",
+            "turn/interrupt",
+        ])
+        try await transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(id: "turn-new", status: "interrupted"))
+        )
+        _ = try await withTimeout {
+            try await followUpTask.value
+        }
+
+        let requests = await transport.recordedRequests()
+        #expect(requests.map(\.method) == [
+            "turn/start",
+            "turn/interrupt",
+            "turn/interrupt",
+            "turn/start",
+        ])
+        let followUpParams = try #require(
+            try requests.last?.decodeParams(AppServerAPI.Turn.Start.Params.self)
+        )
+        #expect(followUpParams.threadID == "thread-1")
+        #expect(followUpParams.input == [.text("Continue after the active turn stops.")])
     }
 }
 
