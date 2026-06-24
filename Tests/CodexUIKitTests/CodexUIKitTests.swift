@@ -115,6 +115,28 @@ struct CodexThreadLibraryTests {
         #expect(methods.filter { $0 == "thread/list" }.count == 2)
     }
 
+    @Test("archive refreshes archived-only libraries")
+    func archiveRefreshesArchivedOnlyLibrary() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        try await runtime.transport.enqueueThreadList(.init(threads: []))
+        try await runtime.transport.enqueueEmpty(for: "thread/archive")
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-archive", name: "Archived")
+        ]))
+
+        let library = CodexThreadLibrary(
+            server: runtime.server,
+            configuration: .init(query: .init(archived: true))
+        )
+        await library.refresh()
+
+        try await library.archive("thread-archive")
+
+        #expect(library.sections.first?.threads.map(\.id) == ["thread-archive"])
+        let methods = await runtime.transport.recordedRequests().map(\.method)
+        #expect(methods.filter { $0 == "thread/list" }.count == 2)
+    }
+
     @Test("unarchive removes a thread from an archived-only library")
     func unarchiveRemovesThreadFromArchivedQuery() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()

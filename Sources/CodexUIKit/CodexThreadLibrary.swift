@@ -116,7 +116,8 @@ public final class CodexThreadLibrary {
         lastErrorDescription = nil
         do {
             try await server.archiveThread(threadID)
-            if canEvaluateMutatedThreadVisibilityLocally {
+            if canEvaluateMutatedThreadVisibilityLocally,
+               configuration.query.archived != true {
                 removeThread(threadID)
                 phase = .loaded
             } else {
