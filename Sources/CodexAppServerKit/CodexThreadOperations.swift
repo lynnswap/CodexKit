@@ -283,8 +283,10 @@ package func startCodexTurn(
                 summary: options.summary?.rawValue
             )
         ))
+    let turnID = CodexTurnID(rawValue: response.turn.id)
+    await router.seedTurn(turnID, threadID: threadID)
     return CodexTurn(
-        id: .init(rawValue: response.turn.id),
+        id: turnID,
         threadID: threadID,
         client: client,
         router: router

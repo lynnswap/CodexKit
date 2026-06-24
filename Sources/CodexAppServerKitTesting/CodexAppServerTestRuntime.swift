@@ -531,7 +531,7 @@ public actor CodexAppServerTestTransport {
         .init(
             usedPercent: window.usedPercent,
             windowDurationMins: window.windowDurationMinutes,
-            resetsAt: window.resetsAt.map { Int64($0.timeIntervalSince1970 * 1000) }
+            resetsAt: window.resetsAt.map { Int64($0.timeIntervalSince1970) }
         )
     }
 }

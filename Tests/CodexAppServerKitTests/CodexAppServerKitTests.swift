@@ -34,6 +34,36 @@ struct CodexAppServerKitTests {
         #expect(homeFallback.path == "/tmp/home/Library/Application Support/Codex")
     }
 
+    @Test func localProcessConfigurationResolvesExplicitExecutableCommandNames() throws {
+        let rootURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let binURL = rootURL.appendingPathComponent("bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: binURL, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: rootURL)
+        }
+
+        let executableURL = binURL.appendingPathComponent("codex")
+        try """
+            #!/bin/sh
+            echo "--session-source"
+            """
+            .write(to: executableURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: executableURL.path
+        )
+
+        let configuration = AppServerProcessTransport.Configuration(
+            executable: "codex",
+            environment: ["PATH": binURL.path],
+            codexHomeURL: rootURL.appendingPathComponent("codex-home", isDirectory: true)
+        )
+
+        #expect(configuration.executable == executableURL.path)
+        #expect(configuration.arguments.contains("--session-source"))
+    }
+
     @Test func testRuntimeStartsAppServerWithoutLaunchingProcess() async throws {
         let runtime = try await CodexAppServerTestRuntime.start(codexHome: "/tmp/codex")
         try await runtime.transport.enqueueThreadStart(threadID: "thread-test", model: "gpt-5")
@@ -89,6 +119,18 @@ struct CodexAppServerKitTests {
         let decoded = try JSONDecoder().decode(AppServerAPI.Initialize.Params.self, from: params)
         #expect(decoded.clientInfo.name == "TestClient")
         #expect(decoded.clientInfo.version == "1")
+    }
+
+    @Test func appServerClosesTransportWhenInitializationFails() async throws {
+        let transport = CodexAppServerTestTransport()
+        await transport.enqueueFailure(code: -32000, message: "initialize failed", for: "initialize")
+
+        do {
+            _ = try await CodexAppServer.testing(transport: transport)
+            Issue.record("Expected initialization failure.")
+        } catch {
+            #expect(await transport.isClosedForTesting())
+        }
     }
 
     @Test func appServerStartThreadSerializesDomainOptions() async throws {
@@ -435,6 +477,44 @@ struct CodexAppServerKitTests {
         #expect(progress.phase == .completed)
         #expect(progress.result?.turnID == "turn-review")
         #expect(try await progressIterator.next() == nil)
+    }
+
+    @Test func normalTurnSeedsThreadRoutingForTurnOnlyTerminalNotifications() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueue(
+            AppServerAPI.Turn.Start.Response(turn: .init(id: "turn-1", status: "running")),
+            for: "turn/start"
+        )
+        let client = AppServerClient(transport: transport)
+        let router = CodexAppServerNotificationRouter(client: client)
+        await router.start()
+        await transport.waitForNotificationStreamCount(1)
+        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let eventTask = Task { () -> CodexThreadEvent? in
+            var iterator = thread.events.makeAsyncIterator()
+            return try await iterator.next()
+        }
+        defer {
+            eventTask.cancel()
+        }
+        #expect(await eventually {
+            await router.threadSubscriberCountForTesting(for: "thread-1") == 1
+        })
+
+        _ = try await thread.streamResponse(to: "Run checks.")
+        try await transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(id: "turn-1", status: "completed"))
+        )
+
+        let event = try await withTimeout {
+            try await eventTask.value
+        }
+        if case .turnCompleted(let response) = event {
+            #expect(response.turnID == "turn-1")
+        } else {
+            Issue.record("Expected thread.events to receive turn-only completion.")
+        }
     }
 
     @Test func reviewEventsPreserveUnknownNotificationsAsRawDomainEvents() async throws {
@@ -1105,6 +1185,37 @@ struct CodexAppServerKitTests {
         #expect(configuration.reasoningEffort == .high)
     }
 
+    @Test func testRuntimeEnqueuesRateLimitResetTimesInAppServerSeconds() async throws {
+        let transport = CodexAppServerTestTransport()
+        let resetDate = Date(timeIntervalSince1970: 1_700_000_000)
+        try await transport.enqueueRateLimits(.init(
+            planType: "pro",
+            windows: [
+                .init(
+                    windowDurationMinutes: 300,
+                    usedPercent: 42,
+                    resetsAt: resetDate
+                ),
+            ]
+        ))
+        let client = AppServerClient(transport: transport)
+        let server = CodexAppServer(
+            client: client,
+            router: CodexAppServerNotificationRouter(client: client)
+        )
+
+        let rateLimits = try await server.rateLimits()
+
+        #expect(rateLimits.planType == "pro")
+        #expect(rateLimits.windows == [
+            .init(
+                windowDurationMinutes: 300,
+                usedPercent: 42,
+                resetsAt: resetDate
+            ),
+        ])
+    }
+
     @Test func responseStreamInterruptSendsTurnInterrupt() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueue(
@@ -1493,4 +1604,26 @@ private func eventually(
         try? await Task.sleep(for: .milliseconds(10))
     }
     return await condition()
+}
+
+private enum TestTimeoutError: Error {
+    case timedOut
+}
+
+private func withTimeout<Value: Sendable>(
+    _ timeout: Duration = .seconds(1),
+    operation: @escaping @Sendable () async throws -> Value
+) async throws -> Value {
+    try await withThrowingTaskGroup(of: Value.self) { group in
+        group.addTask {
+            try await operation()
+        }
+        group.addTask {
+            try await Task.sleep(for: timeout)
+            throw TestTimeoutError.timedOut
+        }
+        let value = try await group.next()!
+        group.cancelAll()
+        return value
+    }
 }

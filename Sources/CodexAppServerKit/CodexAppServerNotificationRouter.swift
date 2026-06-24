@@ -69,9 +69,23 @@ package actor CodexAppServerNotificationRouter {
         }
     }
 
+    package func seedTurn(_ turnID: CodexTurnID, threadID: CodexThreadID) {
+        seedTurn(turnID, threadID: threadID, isReviewThread: false)
+    }
+
     package func seedReviewTurn(_ turnID: CodexTurnID, reviewThreadID: CodexThreadID) {
-        threadIDByTurnID[turnID] = reviewThreadID
-        reviewThreadIDs.insert(reviewThreadID)
+        seedTurn(turnID, threadID: reviewThreadID, isReviewThread: true)
+    }
+
+    private func seedTurn(
+        _ turnID: CodexTurnID,
+        threadID: CodexThreadID,
+        isReviewThread: Bool
+    ) {
+        threadIDByTurnID[turnID] = threadID
+        if isReviewThread {
+            reviewThreadIDs.insert(threadID)
+        }
         guard let turnHistory = turnHistoryByTurnID[turnID] else {
             return
         }
@@ -79,12 +93,12 @@ package actor CodexAppServerNotificationRouter {
             let threadEvent = Self.threadEvent(
                 from: turnEvent,
                 turnID: turnID,
-                threadID: reviewThreadID
+                threadID: threadID
             )
-            if (threadHistoryByThreadID[reviewThreadID] ?? []).contains(threadEvent) {
+            if (threadHistoryByThreadID[threadID] ?? []).contains(threadEvent) {
                 continue
             }
-            appendThreadEvent(threadEvent, threadID: reviewThreadID)
+            appendThreadEvent(threadEvent, threadID: threadID)
         }
     }
 

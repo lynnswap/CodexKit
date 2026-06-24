@@ -138,12 +138,17 @@ public actor CodexAppServer {
             environment: configuration.localProcess.environment,
             codexHomeURL: configuration.localProcess.codexHomeURL
         )
-        let client = AppServerClient(
-            transport: try AppServerProcessTransport(configuration: transportConfiguration))
-        _ = try await client.initialize(
-            clientName: configuration.clientName,
-            clientVersion: configuration.clientVersion
-        )
+        let transport = try AppServerProcessTransport(configuration: transportConfiguration)
+        let client = AppServerClient(transport: transport)
+        do {
+            _ = try await client.initialize(
+                clientName: configuration.clientName,
+                clientVersion: configuration.clientVersion
+            )
+        } catch {
+            await client.close()
+            throw error
+        }
         let router = CodexAppServerNotificationRouter(client: client)
         await router.start()
         self.client = client
@@ -167,10 +172,15 @@ public actor CodexAppServer {
     ) async throws {
         let client = AppServerClient(transport: transport)
         let configuration = Configuration()
-        _ = try await client.initialize(
-            clientName: configuration.clientName,
-            clientVersion: configuration.clientVersion
-        )
+        do {
+            _ = try await client.initialize(
+                clientName: configuration.clientName,
+                clientVersion: configuration.clientVersion
+            )
+        } catch {
+            await client.close()
+            throw error
+        }
         let router = CodexAppServerNotificationRouter(client: client)
         await router.start()
         self.client = client

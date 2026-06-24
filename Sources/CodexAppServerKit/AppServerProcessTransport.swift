@@ -18,11 +18,11 @@ package actor AppServerProcessTransport: JSONRPC.Transport {
             environment: [String: String] = ProcessInfo.processInfo.environment,
             codexHomeURL: URL
         ) {
-            let resolvedExecutable =
-                executable
-                ?? CodexAppServerExecutable.resolveExecutable(
-                    environment: environment
-                )
+            let resolvedExecutable = executable.map {
+                CodexAppServerExecutable.resolveExecutable($0, environment: environment)
+            } ?? CodexAppServerExecutable.resolveExecutable(
+                environment: environment
+            )
             let supportsSessionSource: Bool
             if let arguments {
                 supportsSessionSource = arguments.contains("--session-source")
@@ -897,6 +897,13 @@ package enum CodexAppServerExecutable {
                 environment["CODEX_EXECUTABLE"],
             ].compactMap(\.self).first ?? "codex"
 
+        return resolveExecutable(requestedCommand, environment: environment)
+    }
+
+    package static func resolveExecutable(
+        _ requestedCommand: String,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> String {
         if let candidate = findExecutable(
             requestedCommand,
             environment: environment
