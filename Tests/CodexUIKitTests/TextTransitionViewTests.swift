@@ -123,6 +123,18 @@ struct TextTransitionViewTests {
         #expect(view.activeTransitionCountForTesting > 0)
     }
 
+    @Test func numericRunInsertedBeforeExistingRunDoesNotReuseOldDigits() {
+        let view = TextTransitionView(
+            text: attributed("59s"),
+            contentTransition: .numericText(),
+            motionPolicy: .enabled
+        )
+
+        view.setText(attributed("1m 0s"))
+
+        #expect(view.activeTransitionGlyphPairsForTesting == ["9->0"])
+    }
+
     @Test func disabledMotionPolicySuppressesNumericTransitions() {
         let view = TextTransitionView(
             text: attributed("1"),

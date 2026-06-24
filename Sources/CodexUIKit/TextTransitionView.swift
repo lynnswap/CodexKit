@@ -85,6 +85,12 @@ public final class TextTransitionView: NSView {
         var range: Range<Int>
     }
 
+    private struct NumericRunContext {
+        var run: GlyphRun
+        var previousLiteral: String?
+        var nextLiteral: String?
+    }
+
     private struct RenderedSlot {
         var index: Int
         var layer: CALayer
@@ -100,6 +106,8 @@ public final class TextTransitionView: NSView {
     private struct ActiveTransitionOverlay {
         var layer: CALayer
         var direction: NumericTransitionDirection?
+        var oldGlyphString: String?
+        var newGlyphString: String?
     }
 
     public private(set) var text: NSAttributedString
@@ -309,27 +317,132 @@ public final class TextTransitionView: NSView {
 
         switch contentTransition.kind {
         case .numericText, .numericTextValue:
-            let oldRuns = numericRuns(in: oldGlyphs)
-            let newRuns = numericRuns(in: newGlyphs)
-            for index in 0..<min(oldRuns.count, newRuns.count) {
-                mapTrailingDigits(
-                    oldRun: oldRuns[index],
-                    newRun: newRuns[index],
-                    mapping: &mapping
-                )
-            }
+            mapNumericRuns(
+                oldGlyphs: oldGlyphs,
+                newGlyphs: newGlyphs,
+                mapping: &mapping
+            )
         case .identity, .opacity:
             break
         }
 
         var usedOldIndices = Set(mapping.compactMap(\.self))
         for newIndex in newGlyphs.indices where mapping[newIndex] == nil {
+            if shouldReserveNumericGlyphMapping, newGlyphs[newIndex].isNumeric {
+                continue
+            }
             if oldGlyphs.indices.contains(newIndex), usedOldIndices.contains(newIndex) == false {
                 mapping[newIndex] = newIndex
                 usedOldIndices.insert(newIndex)
             }
         }
         return mapping
+    }
+
+    private var shouldReserveNumericGlyphMapping: Bool {
+        switch contentTransition.kind {
+        case .numericText, .numericTextValue:
+            return true
+        case .identity, .opacity:
+            return false
+        }
+    }
+
+    private func mapNumericRuns(
+        oldGlyphs: [Glyph],
+        newGlyphs: [Glyph],
+        mapping: inout [Int?]
+    ) {
+        // Roll digits only within the same formatted field. Literal neighbors
+        // keep added fields like minutes from reusing digits from seconds.
+        let oldContexts = numericRunContexts(in: oldGlyphs)
+        let newContexts = numericRunContexts(in: newGlyphs)
+        var usedOldContextIndices = Set<Int>()
+        var usedNewContextIndices = Set<Int>()
+
+        for newIndex in newContexts.indices {
+            guard let oldIndex = bestContextualOldRunIndex(
+                for: newContexts[newIndex],
+                oldContexts: oldContexts,
+                usedOldContextIndices: usedOldContextIndices
+            ) else {
+                continue
+            }
+            mapTrailingDigits(
+                oldRun: oldContexts[oldIndex].run,
+                newRun: newContexts[newIndex].run,
+                mapping: &mapping
+            )
+            usedOldContextIndices.insert(oldIndex)
+            usedNewContextIndices.insert(newIndex)
+        }
+
+        guard oldContexts.count == newContexts.count else {
+            return
+        }
+
+        for index in newContexts.indices
+            where usedNewContextIndices.contains(index) == false &&
+            usedOldContextIndices.contains(index) == false {
+            mapTrailingDigits(
+                oldRun: oldContexts[index].run,
+                newRun: newContexts[index].run,
+                mapping: &mapping
+            )
+            usedOldContextIndices.insert(index)
+            usedNewContextIndices.insert(index)
+        }
+    }
+
+    private func bestContextualOldRunIndex(
+        for newContext: NumericRunContext,
+        oldContexts: [NumericRunContext],
+        usedOldContextIndices: Set<Int>
+    ) -> Int? {
+        var bestMatch: (index: Int, score: Int)?
+        var isAmbiguous = false
+
+        for oldIndex in oldContexts.indices where usedOldContextIndices.contains(oldIndex) == false {
+            let score = contextMatchScore(
+                oldContext: oldContexts[oldIndex],
+                newContext: newContext
+            )
+            guard score > 0 else {
+                continue
+            }
+            if let currentBestMatch = bestMatch {
+                if score > currentBestMatch.score {
+                    bestMatch = (oldIndex, score)
+                    isAmbiguous = false
+                } else if score == currentBestMatch.score {
+                    isAmbiguous = true
+                }
+            } else {
+                bestMatch = (oldIndex, score)
+                isAmbiguous = false
+            }
+        }
+
+        guard let bestMatch, isAmbiguous == false else {
+            return nil
+        }
+        return bestMatch.index
+    }
+
+    private func contextMatchScore(
+        oldContext: NumericRunContext,
+        newContext: NumericRunContext
+    ) -> Int {
+        var score = 0
+        if let oldPrevious = oldContext.previousLiteral,
+           oldPrevious == newContext.previousLiteral {
+            score += 1
+        }
+        if let oldNext = oldContext.nextLiteral,
+           oldNext == newContext.nextLiteral {
+            score += 1
+        }
+        return score
     }
 
     private func mapTrailingDigits(
@@ -368,6 +481,40 @@ public final class TextTransitionView: NSView {
             runs.append(.init(range: start..<glyphs.count))
         }
         return runs
+    }
+
+    private func numericRunContexts(in glyphs: [Glyph]) -> [NumericRunContext] {
+        numericRuns(in: glyphs).map { run in
+            NumericRunContext(
+                run: run,
+                previousLiteral: nearestNonNumericGlyph(before: run.range.lowerBound, in: glyphs),
+                nextLiteral: nearestNonNumericGlyph(after: run.range.upperBound, in: glyphs)
+            )
+        }
+    }
+
+    private func nearestNonNumericGlyph(before index: Int, in glyphs: [Glyph]) -> String? {
+        guard index > glyphs.startIndex else {
+            return nil
+        }
+        for glyphIndex in stride(from: index - 1, through: glyphs.startIndex, by: -1) {
+            if glyphs[glyphIndex].isNumeric == false {
+                return glyphs[glyphIndex].string
+            }
+        }
+        return nil
+    }
+
+    private func nearestNonNumericGlyph(after index: Int, in glyphs: [Glyph]) -> String? {
+        guard index < glyphs.endIndex else {
+            return nil
+        }
+        for glyphIndex in index..<glyphs.endIndex {
+            if glyphs[glyphIndex].isNumeric == false {
+                return glyphs[glyphIndex].string
+            }
+        }
+        return nil
     }
 
     private func characterLayout(for glyphs: [Glyph]) -> [(glyph: Glyph, frame: CGRect)] {
@@ -525,7 +672,12 @@ public final class TextTransitionView: NSView {
         let newLayer = textLayer(for: newGlyph)
         performWithoutImplicitLayerActions {
             hideFinalSlotLayer(finalSlotLayer)
-            addOverlayLayer(overlayLayer, direction: direction)
+            addOverlayLayer(
+                overlayLayer,
+                direction: direction,
+                oldGlyph: oldGlyph,
+                newGlyph: newGlyph
+            )
             configureTextLayer(oldLayer, glyph: oldGlyph)
             configureTextLayer(newLayer, glyph: newGlyph)
             renderTextLayer(oldLayer, in: overlayLayer.bounds)
@@ -628,9 +780,19 @@ public final class TextTransitionView: NSView {
         return overlayLayer
     }
 
-    private func addOverlayLayer(_ overlayLayer: CALayer, direction: NumericTransitionDirection) {
+    private func addOverlayLayer(
+        _ overlayLayer: CALayer,
+        direction: NumericTransitionDirection,
+        oldGlyph: Glyph,
+        newGlyph: Glyph
+    ) {
         layer?.addSublayer(overlayLayer)
-        activeTransitionOverlays.append(.init(layer: overlayLayer, direction: direction))
+        activeTransitionOverlays.append(.init(
+            layer: overlayLayer,
+            direction: direction,
+            oldGlyphString: oldGlyph.string,
+            newGlyphString: newGlyph.string
+        ))
     }
 
     private func hideFinalSlotLayer(_ finalSlotLayer: CALayer) {
@@ -763,6 +925,16 @@ extension TextTransitionView {
     var activeTransitionOldLayerOpacitiesForTesting: [Float] {
         activeTransitionOverlays.compactMap { overlay in
             overlay.layer.sublayers?.first?.opacity
+        }
+    }
+
+    var activeTransitionGlyphPairsForTesting: [String] {
+        activeTransitionOverlays.compactMap { overlay in
+            guard let oldGlyphString = overlay.oldGlyphString,
+                  let newGlyphString = overlay.newGlyphString else {
+                return nil
+            }
+            return "\(oldGlyphString)->\(newGlyphString)"
         }
     }
 
