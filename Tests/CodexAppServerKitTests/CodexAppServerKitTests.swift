@@ -1353,14 +1353,11 @@ struct CodexAppServerKitTests {
             router: CodexAppServerNotificationRouter(client: client)
         )
 
-        try await server.updateConfiguration(.init(
-            reviewModel: "gpt-5-codex-review",
-            reasoningEffort: .high,
-            serviceTier: "flex",
-            updatesReviewModel: true,
-            updatesReasoningEffort: true,
-            updatesServiceTier: true
-        ))
+        var patch = CodexConfigurationPatch()
+        patch.setReviewModel("gpt-5-codex-review")
+        patch.setReasoningEffort(.high)
+        patch.setServiceTier("flex")
+        try await server.updateConfiguration(patch)
 
         let request = try #require(await transport.recordedRequests().first)
         #expect(request.method == "config/batchWrite")
@@ -1454,6 +1451,10 @@ struct CodexAppServerKitTests {
             callbackURLScheme: "codexkit"
         )
         try await transport.enqueue(
+            AppServerAPI.Account.Login.Complete.Response(),
+            for: "account/login/complete"
+        )
+        try await transport.enqueue(
             AppServerAPI.Account.Login.Cancel.Response(),
             for: "account/login/cancel"
         )
@@ -1477,6 +1478,18 @@ struct CodexAppServerKitTests {
         #expect(loginParams.type == "chatgpt")
         #expect(loginParams.nativeWebAuthentication?.callbackURLScheme == "codexkit")
 
+        try await server.completeLogin(
+            handle,
+            callbackURL: URL(string: "codexkit://auth/callback?code=abc")!
+        )
+        let completeRequest = try #require(await transport.recordedRequests().last)
+        #expect(completeRequest.method == "account/login/complete")
+        let completeParams = try completeRequest.decodeParams(
+            AppServerAPI.Account.Login.Complete.Params.self
+        )
+        #expect(completeParams.loginID == "login-1")
+        #expect(completeParams.callbackURL == "codexkit://auth/callback?code=abc")
+
         try await server.cancelLogin(handle)
         let cancelRequest = try #require(await transport.recordedRequests().last)
         #expect(cancelRequest.method == "account/login/cancel")
@@ -1496,6 +1509,7 @@ struct CodexAppServerKitTests {
         )))
         #expect(await transport.recordedRequests().map(\.method) == [
             "account/login/start",
+            "account/login/complete",
             "account/login/cancel",
         ])
     }

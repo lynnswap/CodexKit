@@ -2059,13 +2059,37 @@ public struct CodexConfiguration: Equatable, Sendable {
     }
 }
 
-package struct CodexConfigurationPatch: Equatable, Sendable {
-    package var reviewModel: String?
-    package var reasoningEffort: CodexReasoningEffort?
-    package var serviceTier: String?
-    package var updatesReviewModel: Bool
-    package var updatesReasoningEffort: Bool
-    package var updatesServiceTier: Bool
+public struct CodexConfigurationPatch: Equatable, Sendable {
+    public private(set) var reviewModel: String?
+    public private(set) var reasoningEffort: CodexReasoningEffort?
+    public private(set) var serviceTier: String?
+    public private(set) var updatesReviewModel: Bool
+    public private(set) var updatesReasoningEffort: Bool
+    public private(set) var updatesServiceTier: Bool
+
+    public init() {
+        self.reviewModel = nil
+        self.reasoningEffort = nil
+        self.serviceTier = nil
+        self.updatesReviewModel = false
+        self.updatesReasoningEffort = false
+        self.updatesServiceTier = false
+    }
+
+    public mutating func setReviewModel(_ reviewModel: String?) {
+        self.reviewModel = reviewModel
+        self.updatesReviewModel = true
+    }
+
+    public mutating func setReasoningEffort(_ reasoningEffort: CodexReasoningEffort?) {
+        self.reasoningEffort = reasoningEffort
+        self.updatesReasoningEffort = true
+    }
+
+    public mutating func setServiceTier(_ serviceTier: String?) {
+        self.serviceTier = serviceTier
+        self.updatesServiceTier = true
+    }
 
     package init(
         reviewModel: String? = nil,

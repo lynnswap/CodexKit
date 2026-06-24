@@ -408,7 +408,14 @@ public actor CodexAppServer {
         )
     }
 
-    package func updateConfiguration(_ patch: CodexConfigurationPatch) async throws {
+    /// Applies a partial update to the app-server configuration.
+    ///
+    /// Fields left unchanged in the patch are not sent. Fields explicitly set
+    /// to `nil` are cleared in the app-server configuration.
+    ///
+    /// - Parameter patch: The configuration fields to update.
+    /// - Throws: A transport, JSON-RPC, or app-server configuration error.
+    public func updateConfiguration(_ patch: CodexConfigurationPatch) async throws {
         var edits: [AppServerAPI.Config.Edit] = []
         if patch.updatesReviewModel {
             edits.append(.init(
@@ -509,6 +516,37 @@ public actor CodexAppServer {
     public func cancelLogin(id: CodexLoginHandle.ID) async throws {
         let _: AppServerAPI.Account.Login.Cancel.Response = try await client.send(
             AppServerAPI.Account.Login.Cancel.Request(params: .init(loginID: id.rawValue))
+        )
+    }
+
+    /// Completes a native ChatGPT browser login flow.
+    ///
+    /// Handles without an app-server login identifier are treated as already complete.
+    ///
+    /// - Parameters:
+    ///   - handle: The login handle returned from `loginChatGPT(callbackURLScheme:)`.
+    ///   - callbackURL: The callback URL received by the client application.
+    /// - Throws: A transport, JSON-RPC, or app-server login error.
+    public func completeLogin(_ handle: CodexLoginHandle, callbackURL: URL) async throws {
+        guard let id = handle.id else {
+            return
+        }
+        try await completeLogin(id: id, callbackURL: callbackURL)
+    }
+
+    /// Completes a native ChatGPT browser login flow by identifier.
+    ///
+    /// - Parameters:
+    ///   - id: The app-server login identifier.
+    ///   - callbackURL: The callback URL received by the client application.
+    /// - Throws: A transport, JSON-RPC, or app-server login error.
+    public func completeLogin(id: CodexLoginHandle.ID, callbackURL: URL) async throws {
+        let _: AppServerAPI.Account.Login.Complete.Response = try await client.send(
+            AppServerAPI.Account.Login.Complete.Request(
+                params: .init(
+                    loginID: id.rawValue,
+                    callbackURL: callbackURL.absoluteString
+                ))
         )
     }
 

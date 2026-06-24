@@ -341,11 +341,24 @@ let configuration = try await appServer.configuration()
 let rateLimits = try await appServer.rateLimits()
 ```
 
+Update configuration through a patch so `nil` can mean "clear this setting"
+without making every field optional update state visible in call sites:
+
+```swift
+var patch = CodexConfigurationPatch()
+patch.setReviewModel("gpt-5-codex-review")
+patch.setReasoningEffort(.high)
+patch.setServiceTier(nil)
+try await appServer.updateConfiguration(patch)
+```
+
 Login flows return typed handles:
 
 ```swift
 let handle = try await appServer.loginChatGPT(callbackURLScheme: "myapp")
 let accountEvents = await appServer.accountEvents()
+
+try await appServer.completeLogin(handle, callbackURL: callbackURL)
 
 for try await event in accountEvents {
     if case .loginCompleted(let completion) = event, completion.loginID == handle.id {
