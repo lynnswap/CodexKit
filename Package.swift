@@ -53,6 +53,7 @@ let package = Package(
             dependencies: [
                 "CodexAppServerKit",
             ],
+            exclude: ["README.md"],
             swiftSettings: [
                 .swiftLanguageMode(.v6),
             ],

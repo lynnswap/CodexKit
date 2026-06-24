@@ -48,9 +48,7 @@ let appServer = try await CodexAppServer(configuration: configuration)
 
 ## Threads
 
-`CodexThread` is the long-lived session handle for a Codex conversation in a
-workspace. It mirrors the Foundation Models session style: use `respond` for a
-single final response, or `streamResponse` when the UI needs partial snapshots.
+`CodexThread` is the long-lived session handle for a Codex conversation in a workspace. Use `respond` for a single final response, or `streamResponse` when the UI needs partial snapshots.
 
 ```swift
 let thread = try await appServer.startThread(
@@ -79,9 +77,7 @@ try await thread.delete()
 
 ## Streaming
 
-Use `streamResponse` for the Foundation Models-style streaming surface. The
-stream yields snapshots of the accumulated response state and can be collected
-into the final `CodexResponse`.
+Use `streamResponse` when callers need partial response state before the final `CodexResponse`. The stream yields snapshots of the accumulated response state and can be collected into the final result.
 
 ```swift
 let stream = try await thread.streamResponse(to: "Summarize the changes.")
@@ -93,10 +89,7 @@ for try await snapshot in stream {
 let response = try await stream.collect()
 ```
 
-Codex also supports explicit interruption for an in-flight response. Foundation
-Models normally relies on task cancellation, but app-server has real
-`turn/steer` and `turn/interrupt` control paths, so `CodexResponseStream`
-exposes them directly:
+Codex also supports explicit interruption for an in-flight response. App-server has real `turn/steer` and `turn/interrupt` control paths, so `CodexResponseStream` exposes them directly:
 
 ```swift
 let stream = try await thread.streamResponse(to: "Run the slow checks.")
@@ -128,8 +121,7 @@ starting the next turn. `.interruptCurrentResponse` sends `turn/interrupt`,
 waits for app-server's terminal event, and then starts the next turn in the
 same thread.
 
-`CodexGenerationOptions` includes `transcriptErrorHandlingPolicy`, matching the
-Foundation Models policy shape:
+`CodexGenerationOptions` includes `transcriptErrorHandlingPolicy` for controlling transcript handling after failed turns:
 
 ```swift
 let stream = try await thread.streamResponse(
