@@ -6,8 +6,20 @@ public final class TextTransitionAttachment: NSTextAttachment {
     public private(set) var widthReservation: TextTransition.WidthReservation
     public private(set) var motionPolicy: TextTransition.MotionPolicy
     public var reuseIdentifier: String?
-    private let activeViews = NSHashTable<TextTransitionView>.weakObjects()
-    private var inheritedAttributes: [NSAttributedString.Key: Any] = [:]
+    private var activeViews: [ObjectIdentifier: ActiveTextTransitionView] = [:]
+
+    private final class ActiveTextTransitionView {
+        weak var view: TextTransitionView?
+        var inheritedAttributes: [NSAttributedString.Key: Any]
+
+        init(
+            view: TextTransitionView,
+            inheritedAttributes: [NSAttributedString.Key: Any]
+        ) {
+            self.view = view
+            self.inheritedAttributes = inheritedAttributes
+        }
+    }
 
     public init(
         text: NSAttributedString,
@@ -96,28 +108,23 @@ public final class TextTransitionAttachment: NSTextAttachment {
     }
 
     private func updateBounds() {
-        bounds = resolvedBounds(for: inheritedAttributes)
+        bounds = resolvedBounds(for: [:])
     }
 
-    @discardableResult
-    fileprivate func updateInheritedAttributes(
-        _ attributes: [NSAttributedString.Key: Any]
-    ) -> CGRect {
-        inheritedAttributes = attributes.textTransitionRenderableAttributes
-        updateBounds()
-        return bounds
+    fileprivate func resolvedText(
+        for attributes: [NSAttributedString.Key: Any]
+    ) -> NSAttributedString {
+        text.resolvingMissingAttributes(from: attributes)
     }
 
-    fileprivate func resolvedTextForView() -> NSAttributedString {
-        text.resolvingMissingAttributes(from: inheritedAttributes)
-    }
-
-    fileprivate func resolvedWidthReservationForView() -> TextTransition.WidthReservation {
-        widthReservation.resolvingMissingAttributes(from: inheritedAttributes)
+    fileprivate func resolvedWidthReservation(
+        for attributes: [NSAttributedString.Key: Any]
+    ) -> TextTransition.WidthReservation {
+        widthReservation.resolvingMissingAttributes(from: attributes)
     }
 
     fileprivate func bounds(for attributes: [NSAttributedString.Key: Any]) -> CGRect {
-        updateInheritedAttributes(attributes)
+        resolvedBounds(for: attributes)
     }
 
     private func resolvedBounds(for attributes: [NSAttributedString.Key: Any]) -> CGRect {
@@ -153,20 +160,38 @@ public final class TextTransitionAttachment: NSTextAttachment {
     }
 
     @MainActor
-    fileprivate func registerActiveView(_ transitionView: TextTransitionView) {
-        activeViews.add(transitionView)
+    fileprivate func registerActiveView(
+        _ transitionView: TextTransitionView,
+        inheritedAttributes: [NSAttributedString.Key: Any]
+    ) {
+        pruneInactiveViews()
+        activeViews[ObjectIdentifier(transitionView)] = ActiveTextTransitionView(
+            view: transitionView,
+            inheritedAttributes: inheritedAttributes.textTransitionRenderableAttributes
+        )
     }
 
     @MainActor
     private func updateActiveViews(animated: Bool) {
-        for transitionView in activeViews.allObjects {
+        pruneInactiveViews()
+        for activeView in activeViews.values {
+            guard let transitionView = activeView.view else {
+                continue
+            }
             transitionView.configure(
-                text: resolvedTextForView(),
+                text: resolvedText(for: activeView.inheritedAttributes),
                 contentTransition: contentTransition,
-                widthReservation: resolvedWidthReservationForView(),
+                widthReservation: resolvedWidthReservation(for: activeView.inheritedAttributes),
                 motionPolicy: motionPolicy,
                 animated: animated
             )
+        }
+    }
+
+    @MainActor
+    private func pruneInactiveViews() {
+        activeViews = activeViews.filter { _, activeView in
+            activeView.view != nil
         }
     }
 
@@ -222,6 +247,7 @@ private extension TextTransition.WidthReservation {
 @MainActor
 public final class TextTransitionAttachmentViewProvider: NSTextAttachmentViewProvider {
     private var transitionView: TextTransitionView?
+    private nonisolated(unsafe) var inheritedAttributes: [NSAttributedString.Key: Any] = [:]
 
     override public init(
         textAttachment: NSTextAttachment,
@@ -250,17 +276,17 @@ public final class TextTransitionAttachmentViewProvider: NSTextAttachmentViewPro
         guard let attachment = textAttachment as? TextTransitionAttachment else {
             return nil
         }
-        let renderingAttributes = renderingAttributes()
-        if renderingAttributes.textTransitionRenderableAttributes.isEmpty == false {
-            attachment.updateInheritedAttributes(renderingAttributes)
-        }
+        updateInheritedAttributes(renderingAttributes())
 
         if let transitionView {
-            attachment.registerActiveView(transitionView)
+            attachment.registerActiveView(
+                transitionView,
+                inheritedAttributes: inheritedAttributes
+            )
             transitionView.configure(
-                text: attachment.resolvedTextForView(),
+                text: attachment.resolvedText(for: inheritedAttributes),
                 contentTransition: attachment.contentTransition,
-                widthReservation: attachment.resolvedWidthReservationForView(),
+                widthReservation: attachment.resolvedWidthReservation(for: inheritedAttributes),
                 motionPolicy: attachment.motionPolicy,
                 animated: animated
             )
@@ -268,13 +294,16 @@ public final class TextTransitionAttachmentViewProvider: NSTextAttachmentViewPro
         }
 
         let transitionView = TextTransitionView(
-            text: attachment.resolvedTextForView(),
+            text: attachment.resolvedText(for: inheritedAttributes),
             contentTransition: attachment.contentTransition,
-            widthReservation: attachment.resolvedWidthReservationForView(),
+            widthReservation: attachment.resolvedWidthReservation(for: inheritedAttributes),
             motionPolicy: attachment.motionPolicy
         )
         self.transitionView = transitionView
-        attachment.registerActiveView(transitionView)
+        attachment.registerActiveView(
+            transitionView,
+            inheritedAttributes: inheritedAttributes
+        )
         return transitionView
     }
 
@@ -294,7 +323,8 @@ public final class TextTransitionAttachmentViewProvider: NSTextAttachmentViewPro
                 position: position
             )
         }
-        return attachment.bounds(for: attributes)
+        updateInheritedAttributes(attributes)
+        return attachment.bounds(for: inheritedAttributes)
     }
 
     private func renderingAttributes() -> [NSAttributedString.Key: Any] {
@@ -307,5 +337,12 @@ public final class TextTransitionAttachmentViewProvider: NSTextAttachmentViewPro
             return false
         }
         return result ?? [:]
+    }
+
+    private nonisolated func updateInheritedAttributes(_ attributes: [NSAttributedString.Key: Any]) {
+        let renderableAttributes = attributes.textTransitionRenderableAttributes
+        if renderableAttributes.isEmpty == false {
+            inheritedAttributes = renderableAttributes
+        }
     }
 }

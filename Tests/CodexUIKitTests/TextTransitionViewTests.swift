@@ -252,18 +252,18 @@ struct TextTransitionViewTests {
             contentTransition: .numericText(),
             motionPolicy: .enabled
         )
-        _ = attachment.attachmentBounds(
-            for: [.font: font],
-            location: TestTextLocation(0),
-            textContainer: nil,
-            proposedLineFragment: .zero,
-            position: .zero
-        )
         let provider = TextTransitionAttachmentViewProvider(
             textAttachment: attachment,
             parentView: nil,
             textLayoutManager: nil,
             location: TestTextLocation(0)
+        )
+        let bounds = provider.attachmentBounds(
+            for: [.font: font],
+            location: TestTextLocation(0),
+            textContainer: nil,
+            proposedLineFragment: .zero,
+            position: .zero
         )
 
         provider.loadView()
@@ -271,7 +271,55 @@ struct TextTransitionViewTests {
         let view = provider.view as? TextTransitionView
         let resolvedFont = view?.text.attribute(.font, at: 0, effectiveRange: nil) as? NSFont
         #expect(resolvedFont == font)
-        #expect(view?.intrinsicContentSize == attachment.bounds.size)
+        #expect(view?.intrinsicContentSize == bounds.size)
+    }
+
+    @Test func attachmentUpdatesActiveViewsWithTheirOwnContextFonts() {
+        let smallFont = NSFont.systemFont(ofSize: 13)
+        let largeFont = NSFont.systemFont(ofSize: 30)
+        let attachment = TextTransitionAttachment(
+            text: NSAttributedString(string: "1"),
+            contentTransition: .numericText(),
+            motionPolicy: .enabled
+        )
+        let smallProvider = TextTransitionAttachmentViewProvider(
+            textAttachment: attachment,
+            parentView: nil,
+            textLayoutManager: nil,
+            location: TestTextLocation(0)
+        )
+        _ = smallProvider.attachmentBounds(
+            for: [.font: smallFont],
+            location: TestTextLocation(0),
+            textContainer: nil,
+            proposedLineFragment: .zero,
+            position: .zero
+        )
+        smallProvider.loadView()
+        let smallView = smallProvider.view as? TextTransitionView
+
+        let largeProvider = TextTransitionAttachmentViewProvider(
+            textAttachment: attachment,
+            parentView: nil,
+            textLayoutManager: nil,
+            location: TestTextLocation(1)
+        )
+        _ = largeProvider.attachmentBounds(
+            for: [.font: largeFont],
+            location: TestTextLocation(1),
+            textContainer: nil,
+            proposedLineFragment: .zero,
+            position: .zero
+        )
+        largeProvider.loadView()
+        let largeView = largeProvider.view as? TextTransitionView
+
+        attachment.setText(NSAttributedString(string: "2"), animated: false)
+
+        let resolvedSmallFont = smallView?.text.attribute(.font, at: 0, effectiveRange: nil) as? NSFont
+        let resolvedLargeFont = largeView?.text.attribute(.font, at: 0, effectiveRange: nil) as? NSFont
+        #expect(resolvedSmallFont == smallFont)
+        #expect(resolvedLargeFont == largeFont)
     }
 
     @Test func attachmentSetTextUpdatesLoadedTransitionView() {
