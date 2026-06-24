@@ -236,6 +236,26 @@ struct CodexAppServerKitTests {
         #expect(params.useStateDbOnly == true)
     }
 
+    @Test func appServerArchiveThreadSerializesThreadID() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueEmpty(for: "thread/archive")
+        let client = AppServerClient(transport: transport)
+        let server = CodexAppServer(
+            client: client,
+            router: CodexAppServerNotificationRouter(client: client)
+        )
+
+        try await server.archiveThread("thread-archive")
+
+        let request = try #require(await transport.recordedRequests().first)
+        #expect(request.method == "thread/archive")
+        let params = try JSONDecoder().decode(
+            AppServerAPI.Thread.Archive.Params.self,
+            from: request.params
+        )
+        #expect(params.threadID == "thread-archive")
+    }
+
     @Test func reviewNotificationMethodsClassifyReviewEvents() {
         #expect(AppServerReviewNotification.Method(rawValue: "turn/started").isReviewNotificationMethod)
         #expect(AppServerReviewNotification.Method(rawValue: "item/started").isReviewNotificationMethod)

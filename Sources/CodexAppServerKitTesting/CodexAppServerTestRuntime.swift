@@ -228,6 +228,42 @@ public actor CodexAppServerTestTransport {
         )
     }
 
+    /// Enqueues a thread-resume response.
+    public func enqueueThreadResume(_ thread: CodexThreadSnapshot) throws {
+        try enqueue(
+            AppServerAPI.Thread.Resume.Response(thread: Self.apiSnapshot(from: thread)),
+            for: "thread/resume"
+        )
+    }
+
+    /// Enqueues a thread-list response.
+    public func enqueueThreadList(_ page: CodexThreadPage) throws {
+        try enqueue(
+            AppServerAPI.Thread.List.Response(
+                data: page.threads.map(Self.apiSnapshot(from:)),
+                nextCursor: page.nextCursor,
+                backwardsCursor: page.backwardsCursor
+            ),
+            for: "thread/list"
+        )
+    }
+
+    /// Enqueues a thread-read response.
+    public func enqueueThreadRead(_ thread: CodexThreadSnapshot) throws {
+        try enqueue(
+            AppServerAPI.Thread.Read.Response(thread: Self.apiSnapshot(from: thread)),
+            for: "thread/read"
+        )
+    }
+
+    /// Enqueues a thread-unarchive response.
+    public func enqueueThreadUnarchive(_ thread: CodexThreadSnapshot) throws {
+        try enqueue(
+            AppServerAPI.Thread.Unarchive.Response(thread: Self.apiSnapshot(from: thread)),
+            for: "thread/unarchive"
+        )
+    }
+
     /// Enqueues a turn-start response.
     public func enqueueTurnStart(turnID: String, status: String? = nil) throws {
         try enqueue(
@@ -297,6 +333,24 @@ public actor CodexAppServerTestTransport {
                 planType: rateLimits.planType
             )),
             for: "account/rateLimits/read"
+        )
+    }
+
+    private static func apiSnapshot(from snapshot: CodexThreadSnapshot) -> AppServerAPI.Thread.Snapshot {
+        .init(
+            id: snapshot.id.rawValue,
+            cwd: snapshot.workspace?.path,
+            name: snapshot.name,
+            preview: snapshot.preview,
+            turns: snapshot.turns.map(Self.apiTurn(from:))
+        )
+    }
+
+    private static func apiTurn(from snapshot: CodexTurnSnapshot) -> AppServerAPI.Turn.Payload {
+        .init(
+            id: snapshot.id.rawValue,
+            status: snapshot.status?.rawValue,
+            error: snapshot.errorMessage.map { .init(message: $0) }
         )
     }
 

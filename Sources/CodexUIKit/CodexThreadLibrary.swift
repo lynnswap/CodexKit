@@ -1,0 +1,319 @@
+import CodexAppServerKit
+import Foundation
+import Observation
+
+@MainActor
+@Observable
+public final class CodexThreadLibrary {
+    public struct Configuration: Sendable {
+        public var query: CodexThreadQuery
+        public var sectionTitle: String
+
+        public init(
+            query: CodexThreadQuery = .init(),
+            sectionTitle: String = "Threads"
+        ) {
+            self.query = query
+            self.sectionTitle = sectionTitle
+        }
+    }
+
+    public var phase: CodexUIPhase = .idle
+    public var sections: [Section] = []
+    public var selectedThreadID: CodexThreadID?
+    public var nextCursor: String?
+    public var backwardsCursor: String?
+    public var lastErrorDescription: String?
+
+    public let configuration: Configuration
+
+    @ObservationIgnored
+    private let server: CodexAppServer
+
+    public init(
+        server: CodexAppServer,
+        configuration: Configuration = .init()
+    ) {
+        self.server = server
+        self.configuration = configuration
+    }
+
+    public func refresh() async {
+        await load(cursor: nil, appending: false)
+    }
+
+    public func loadNextPage() async {
+        guard let nextCursor else {
+            return
+        }
+        await load(cursor: nextCursor, appending: true)
+    }
+
+    public func selectThread(_ threadID: CodexThreadID?) {
+        selectedThreadID = threadID
+    }
+
+    public func conversation(
+        for threadID: CodexThreadID,
+        options: CodexThread.ResumeOptions = .init(),
+        configuration: CodexConversation.Configuration = .init()
+    ) async throws -> CodexConversation {
+        let thread = try await server.resumeThread(threadID, options: options)
+        return CodexConversation(thread: thread, configuration: configuration)
+    }
+
+    public func selectedConversation(
+        options: CodexThread.ResumeOptions = .init(),
+        configuration: CodexConversation.Configuration = .init()
+    ) async throws -> CodexConversation {
+        guard let selectedThreadID else {
+            throw CodexThreadLibraryError.noSelection
+        }
+        return try await conversation(
+            for: selectedThreadID,
+            options: options,
+            configuration: configuration
+        )
+    }
+
+    @discardableResult
+    public func startConversation(
+        in workspace: URL,
+        instructions: CodexInstructions? = nil,
+        options: CodexThread.Options = .init(),
+        configuration: CodexConversation.Configuration = .init()
+    ) async throws -> CodexConversation {
+        phase = .loading
+        lastErrorDescription = nil
+        do {
+            let thread = try await server.startThread(
+                in: workspace,
+                instructions: instructions,
+                options: options
+            )
+            upsertThread(
+                id: thread.id,
+                workspace: thread.workspace,
+                name: nil,
+                preview: nil,
+                turns: [],
+                preferFront: true
+            )
+            selectedThreadID = thread.id
+            phase = .loaded
+            return CodexConversation(thread: thread, configuration: configuration)
+        } catch {
+            fail(with: error)
+            throw error
+        }
+    }
+
+    public func archive(_ threadID: CodexThreadID) async throws {
+        phase = .loading
+        lastErrorDescription = nil
+        do {
+            try await server.archiveThread(threadID)
+            removeThread(threadID)
+            phase = .loaded
+        } catch {
+            fail(with: error)
+            throw error
+        }
+    }
+
+    public func unarchive(_ threadID: CodexThreadID) async throws {
+        phase = .loading
+        lastErrorDescription = nil
+        do {
+            let thread = try await server.unarchiveThread(threadID)
+            upsertThread(
+                id: thread.id,
+                workspace: thread.workspace,
+                name: nil,
+                preview: nil,
+                turns: [],
+                preferFront: true
+            )
+            phase = .loaded
+        } catch {
+            fail(with: error)
+            throw error
+        }
+    }
+
+    public func delete(_ threadID: CodexThreadID) async throws {
+        phase = .loading
+        lastErrorDescription = nil
+        do {
+            try await server.deleteThread(threadID)
+            removeThread(threadID)
+            phase = .loaded
+        } catch {
+            fail(with: error)
+            throw error
+        }
+    }
+
+    private func load(cursor: String?, appending: Bool) async {
+        phase = .loading
+        lastErrorDescription = nil
+        do {
+            var query = configuration.query
+            query.cursor = cursor
+            let page = try await server.listThreads(query)
+            replaceThreads(with: page.threads, appending: appending)
+            nextCursor = page.nextCursor
+            backwardsCursor = page.backwardsCursor
+            phase = .loaded
+        } catch {
+            fail(with: error)
+        }
+    }
+
+    private func replaceThreads(with records: [CodexThreadSnapshot], appending: Bool) {
+        let section = defaultSection()
+        let existingByID = Dictionary(uniqueKeysWithValues: section.threads.map { ($0.id, $0) })
+        let updated = records.map { record in
+            let thread = existingByID[record.id] ?? ThreadSummary(id: record.id)
+            thread.update(
+                workspace: record.workspace,
+                name: record.name,
+                preview: record.preview,
+                turns: record.turns
+            )
+            return thread
+        }
+
+        if appending {
+            let updatedIDs = Set(updated.map(\.id))
+            section.threads = section.threads.filter { updatedIDs.contains($0.id) == false } + updated
+        } else {
+            section.threads = updated
+        }
+
+        clearSelectionIfNeeded(in: section.threads)
+    }
+
+    private func upsertThread(
+        id: CodexThreadID,
+        workspace: URL?,
+        name: String?,
+        preview: String?,
+        turns: [CodexTurnSnapshot],
+        preferFront: Bool
+    ) {
+        let section = defaultSection()
+        let thread = section.threads.first { $0.id == id } ?? ThreadSummary(id: id)
+        thread.update(workspace: workspace, name: name, preview: preview, turns: turns)
+        section.threads.removeAll { $0.id == id }
+        if preferFront {
+            section.threads.insert(thread, at: 0)
+        } else {
+            section.threads.append(thread)
+        }
+    }
+
+    private func removeThread(_ threadID: CodexThreadID) {
+        let section = defaultSection()
+        section.threads.removeAll { $0.id == threadID }
+        if selectedThreadID == threadID {
+            selectedThreadID = nil
+        }
+    }
+
+    private func defaultSection() -> Section {
+        if let section = sections.first(where: { $0.id == Section.defaultID }) {
+            section.title = configuration.sectionTitle
+            return section
+        }
+        let section = Section(id: Section.defaultID, title: configuration.sectionTitle)
+        sections.append(section)
+        return section
+    }
+
+    private func clearSelectionIfNeeded(in threads: [ThreadSummary]) {
+        if let selectedThreadID,
+           threads.contains(where: { $0.id == selectedThreadID }) == false {
+            self.selectedThreadID = nil
+        }
+    }
+
+    private func fail(with error: any Error) {
+        let message = error.localizedDescription
+        lastErrorDescription = message
+        phase = .failed(message)
+    }
+
+    @MainActor
+    @Observable
+    public final class Section {
+        public static let defaultID = "threads"
+
+        public let id: String
+        public var title: String
+        public var threads: [ThreadSummary]
+
+        public init(id: String, title: String, threads: [ThreadSummary] = []) {
+            self.id = id
+            self.title = title
+            self.threads = threads
+        }
+    }
+
+    @MainActor
+    @Observable
+    public final class ThreadSummary {
+        public let id: CodexThreadID
+        public var workspace: URL?
+        public var name: String?
+        public var preview: String?
+        public var turnCount: Int = 0
+        public var latestTurnID: CodexTurnID?
+        public var latestTurnStatus: CodexTurnStatus?
+        public var latestErrorDescription: String?
+
+        public var title: String {
+            if let name, name.isEmpty == false {
+                return name
+            }
+            if let preview, preview.isEmpty == false {
+                return preview
+            }
+            if let workspace {
+                return workspace.lastPathComponent
+            }
+            return id.rawValue
+        }
+
+        public init(
+            id: CodexThreadID,
+            workspace: URL? = nil,
+            name: String? = nil,
+            preview: String? = nil
+        ) {
+            self.id = id
+            self.workspace = workspace
+            self.name = name
+            self.preview = preview
+        }
+
+        fileprivate func update(
+            workspace: URL?,
+            name: String?,
+            preview: String?,
+            turns: [CodexTurnSnapshot]
+        ) {
+            self.workspace = workspace
+            self.name = name
+            self.preview = preview
+            turnCount = turns.count
+            latestTurnID = turns.last?.id
+            latestTurnStatus = turns.last?.status
+            latestErrorDescription = turns.last?.errorMessage
+        }
+    }
+}
+
+public enum CodexThreadLibraryError: Error {
+    case noSelection
+}
