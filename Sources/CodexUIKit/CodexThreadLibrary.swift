@@ -280,6 +280,8 @@ public final class CodexThreadLibrary {
     private var canEvaluateMutatedThreadVisibilityLocally: Bool {
         let query = configuration.query
         return query.cursor == nil
+            && nextCursor == nil
+            && backwardsCursor == nil
             && query.limit == nil
             && query.searchTerm == nil
             && query.modelProviders == nil

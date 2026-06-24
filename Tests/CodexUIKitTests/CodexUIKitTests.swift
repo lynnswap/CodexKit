@@ -115,6 +115,30 @@ struct CodexThreadLibraryTests {
         #expect(methods.filter { $0 == "thread/list" }.count == 2)
     }
 
+    @Test("archive refreshes when the loaded list is paginated")
+    func archiveRefreshesPaginatedLoadedLibrary() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        try await runtime.transport.enqueueThreadList(.init(
+            threads: [.init(id: "thread-archive", name: "Archive me")],
+            nextCursor: "old-next"
+        ))
+        try await runtime.transport.enqueueEmpty(for: "thread/archive")
+        try await runtime.transport.enqueueThreadList(.init(
+            threads: [.init(id: "thread-replacement", name: "Replacement")],
+            nextCursor: "new-next"
+        ))
+
+        let library = CodexThreadLibrary(server: runtime.server)
+        await library.refresh()
+
+        try await library.archive("thread-archive")
+
+        #expect(library.sections.first?.threads.map(\.id) == ["thread-replacement"])
+        #expect(library.nextCursor == "new-next")
+        let methods = await runtime.transport.recordedRequests().map(\.method)
+        #expect(methods.filter { $0 == "thread/list" }.count == 2)
+    }
+
     @Test("archive refreshes archived-only libraries")
     func archiveRefreshesArchivedOnlyLibrary() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
