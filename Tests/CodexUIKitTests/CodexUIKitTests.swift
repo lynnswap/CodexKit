@@ -85,6 +85,51 @@ struct CodexThreadLibraryTests {
         #expect(methods.contains("thread/archive"))
         #expect(methods.contains("thread/resume") == false)
     }
+
+    @Test("unarchive removes a thread from an archived-only library")
+    func unarchiveRemovesThreadFromArchivedQuery() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-archived", name: "Archived")
+        ]))
+        try await runtime.transport.enqueueThreadUnarchive(.init(
+            id: "thread-archived",
+            name: "Restored"
+        ))
+
+        let library = CodexThreadLibrary(
+            server: runtime.server,
+            configuration: .init(query: .init(archived: true))
+        )
+        await library.refresh()
+        library.selectThread("thread-archived")
+
+        try await library.unarchive("thread-archived")
+
+        #expect(library.sections.first?.threads.isEmpty == true)
+        #expect(library.selectedThreadID == nil)
+    }
+
+    @Test("startConversation does not insert threads outside the workspace query")
+    func startConversationHonorsWorkspaceQuery() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        try await runtime.transport.enqueueThreadList(.init(threads: []))
+        try await runtime.transport.enqueueThreadStart(threadID: "thread-other")
+
+        let queryWorkspace = URL(fileURLWithPath: "/tmp/query", isDirectory: true)
+        let otherWorkspace = URL(fileURLWithPath: "/tmp/other", isDirectory: true)
+        let library = CodexThreadLibrary(
+            server: runtime.server,
+            configuration: .init(query: .init(workspace: queryWorkspace))
+        )
+        await library.refresh()
+
+        let conversation = try await library.startConversation(in: otherWorkspace)
+
+        #expect(conversation.id == "thread-other")
+        #expect(library.sections.first?.threads.isEmpty == true)
+        #expect(library.selectedThreadID == nil)
+    }
 }
 
 @MainActor

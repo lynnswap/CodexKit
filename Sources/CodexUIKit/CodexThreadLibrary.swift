@@ -97,9 +97,12 @@ public final class CodexThreadLibrary {
                 name: nil,
                 preview: nil,
                 turns: [],
+                archived: false,
                 preferFront: true
             )
-            selectedThreadID = thread.id
+            if isThreadVisible(workspace: thread.workspace, archived: false) {
+                selectedThreadID = thread.id
+            }
             phase = .loaded
             return CodexConversation(thread: thread, configuration: configuration)
         } catch {
@@ -132,6 +135,7 @@ public final class CodexThreadLibrary {
                 name: nil,
                 preview: nil,
                 turns: [],
+                archived: false,
                 preferFront: true
             )
             phase = .loaded
@@ -200,9 +204,18 @@ public final class CodexThreadLibrary {
         name: String?,
         preview: String?,
         turns: [CodexTurnSnapshot],
+        archived: Bool,
         preferFront: Bool
     ) {
         let section = defaultSection()
+        guard isThreadVisible(workspace: workspace, archived: archived) else {
+            section.threads.removeAll { $0.id == id }
+            if selectedThreadID == id {
+                selectedThreadID = nil
+            }
+            return
+        }
+
         let thread = section.threads.first { $0.id == id } ?? ThreadSummary(id: id)
         thread.update(workspace: workspace, name: name, preview: preview, turns: turns)
         section.threads.removeAll { $0.id == id }
@@ -211,6 +224,23 @@ public final class CodexThreadLibrary {
         } else {
             section.threads.append(thread)
         }
+    }
+
+    private func isThreadVisible(workspace: URL?, archived: Bool) -> Bool {
+        if let queryArchived = configuration.query.archived,
+           queryArchived != archived {
+            return false
+        }
+
+        guard let queryWorkspace = configuration.query.workspace else {
+            return true
+        }
+
+        guard let workspace else {
+            return false
+        }
+
+        return queryWorkspace.standardizedFileURL.path == workspace.standardizedFileURL.path
     }
 
     private func removeThread(_ threadID: CodexThreadID) {
