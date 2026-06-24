@@ -345,7 +345,13 @@ Login flows return typed handles:
 
 ```swift
 let handle = try await appServer.loginChatGPT(callbackURLScheme: "myapp")
-try await appServer.completeLogin(handle, callbackURL: callbackURL)
+let accountEvents = await appServer.accountEvents()
+
+for try await event in accountEvents {
+    if case .loginCompleted(let completion) = event, completion.loginID == handle.id {
+        break
+    }
+}
 ```
 
 API key and device-code login are also available:
@@ -437,6 +443,8 @@ The public boundary is:
 - `CodexThreadEvent`
 - `CodexModel`
 - `CodexAccount`
+- `CodexAccountEvent`
+- `CodexLoginCompletion`
 - `CodexLoginHandle`
 
 Unknown notifications and unknown item kinds are preserved so clients can keep

@@ -1250,6 +1250,60 @@ struct CodexAppServerKitTests {
         ])
     }
 
+    @Test func loginFlowUsesSupportedRequestsAndCompletionNotification() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueChatGPTLogin(
+            loginID: "login-1",
+            authenticationURL: URL(string: "https://chatgpt.com/auth")!,
+            callbackURLScheme: "codexkit"
+        )
+        try await transport.enqueue(
+            AppServerAPI.Account.Login.Cancel.Response(),
+            for: "account/login/cancel"
+        )
+        let client = AppServerClient(transport: transport)
+        let server = CodexAppServer(
+            client: client,
+            router: CodexAppServerNotificationRouter(client: client)
+        )
+        let accountEvents = await server.accountEvents()
+        await transport.waitForNotificationStreamCount(1)
+
+        let handle = try await server.loginChatGPT(callbackURLScheme: "codexkit")
+
+        #expect(handle == .chatGPT(
+            id: "login-1",
+            authenticationURL: URL(string: "https://chatgpt.com/auth")!
+        ))
+        let loginRequest = try #require(await transport.recordedRequests().first)
+        #expect(loginRequest.method == "account/login/start")
+        let loginParams = try loginRequest.decodeParams(AppServerAPI.Account.Login.Params.self)
+        #expect(loginParams.type == "chatgpt")
+        #expect(loginParams.nativeWebAuthentication?.callbackURLScheme == "codexkit")
+
+        try await server.cancelLogin(handle)
+        let cancelRequest = try #require(await transport.recordedRequests().last)
+        #expect(cancelRequest.method == "account/login/cancel")
+        let cancelParams = try cancelRequest.decodeParams(
+            AppServerAPI.Account.Login.Cancel.Params.self
+        )
+        #expect(cancelParams.loginID == "login-1")
+
+        try await transport.emitServerNotification(
+            method: "account/login/completed",
+            params: LoginCompletedParams(loginID: "login-1", success: true)
+        )
+        var iterator = accountEvents.makeAsyncIterator()
+        #expect(try await iterator.next() == .loginCompleted(.init(
+            loginID: "login-1",
+            success: true
+        )))
+        #expect(await transport.recordedRequests().map(\.method) == [
+            "account/login/start",
+            "account/login/cancel",
+        ])
+    }
+
     @Test func responseStreamInterruptSendsTurnInterrupt() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueue(
@@ -1531,6 +1585,24 @@ private struct ThreadIDParams: Encodable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case threadID = "threadId"
+    }
+}
+
+private struct LoginCompletedParams: Encodable, Sendable {
+    var loginID: String?
+    var success: Bool
+    var error: String?
+
+    enum CodingKeys: String, CodingKey {
+        case loginID = "loginId"
+        case success
+        case error
+    }
+
+    init(loginID: String? = nil, success: Bool, error: String? = nil) {
+        self.loginID = loginID
+        self.success = success
+        self.error = error
     }
 }
 

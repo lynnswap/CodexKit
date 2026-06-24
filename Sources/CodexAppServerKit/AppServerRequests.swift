@@ -49,7 +49,6 @@ package enum AppServerAPI {
         }
         package enum Login {
             package enum Start {}
-            package enum Complete {}
             package enum Cancel {}
         }
     }
@@ -1897,42 +1896,6 @@ extension AppServerAPI.Account.Login.Start {
         package var params: AppServerAPI.Account.Login.Params
 
         package init(params: AppServerAPI.Account.Login.Params) {
-            self.params = params
-        }
-    }
-}
-
-extension AppServerAPI.Account.Login.Complete {
-    package struct Params: Codable, Equatable, Sendable {
-        package var loginID: String
-        package var callbackURL: String
-
-        enum CodingKeys: String, CodingKey {
-            case loginID = "loginId"
-            case callbackURL = "callbackUrl"
-        }
-
-        package init(loginID: String, callbackURL: String) {
-            self.loginID = loginID
-            self.callbackURL = callbackURL
-        }
-    }
-}
-
-extension AppServerAPI.Account.Login.Complete {
-    package struct Response: Codable, Equatable, Sendable {
-        package init() {}
-    }
-}
-
-extension AppServerAPI.Account.Login.Complete {
-    package struct Request: AppServerAPI.Request {
-        package typealias Response = AppServerAPI.Account.Login.Complete.Response
-
-        package static let method = "account/login/complete"
-        package var params: AppServerAPI.Account.Login.Complete.Params
-
-        package init(params: AppServerAPI.Account.Login.Complete.Params) {
             self.params = params
         }
     }

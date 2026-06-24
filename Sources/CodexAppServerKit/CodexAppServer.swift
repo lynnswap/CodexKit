@@ -498,37 +498,6 @@ public actor CodexAppServer {
         )
     }
 
-    /// Completes a native ChatGPT browser login flow.
-    ///
-    /// Handles without an app-server login identifier are treated as already complete.
-    ///
-    /// - Parameters:
-    ///   - handle: The login handle returned from `loginChatGPT(callbackURLScheme:)`.
-    ///   - callbackURL: The callback URL received by the client application.
-    /// - Throws: A transport, JSON-RPC, or app-server login error.
-    public func completeLogin(_ handle: CodexLoginHandle, callbackURL: URL) async throws {
-        guard let id = handle.id else {
-            return
-        }
-        try await completeLogin(id: id, callbackURL: callbackURL)
-    }
-
-    /// Completes a native ChatGPT browser login flow by identifier.
-    ///
-    /// - Parameters:
-    ///   - id: The app-server login identifier.
-    ///   - callbackURL: The callback URL received by the client application.
-    /// - Throws: A transport, JSON-RPC, or app-server login error.
-    public func completeLogin(id: CodexLoginHandle.ID, callbackURL: URL) async throws {
-        let _: AppServerAPI.Account.Login.Complete.Response = try await client.send(
-            AppServerAPI.Account.Login.Complete.Request(
-                params: .init(
-                    loginID: id.rawValue,
-                    callbackURL: callbackURL.absoluteString
-                ))
-        )
-    }
-
     /// Logs out of the active Codex account.
     ///
     /// - Throws: A transport, JSON-RPC, or app-server request error.
