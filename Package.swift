@@ -5,7 +5,7 @@ import PackageDescription
 let package = Package(
     name: "CodexKit",
     platforms: [
-        .macOS(.v15),
+        .macOS("15.4"),
     ],
     products: [
         .library(
