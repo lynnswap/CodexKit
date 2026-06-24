@@ -10,6 +10,7 @@ CodexKit packages Swift SDK surfaces for building native Codex integrations.
   login flows.
 - `CodexAppServerKitTesting`: deterministic in-memory app-server test runtime
   for exercising `CodexAppServerKit` without launching a real process.
+- `CodexUIKit`: reusable AppKit UI components for Codex-native interfaces.
 
 `CodexAppServerKit` keeps JSON-RPC framing and app-server request DTOs as
 package implementation details. Public clients should use `CodexAppServer`,
