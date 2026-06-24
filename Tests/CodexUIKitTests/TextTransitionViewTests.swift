@@ -217,10 +217,10 @@ struct TextTransitionViewTests {
         #expect(rect.origin.y == floor(font.descender))
     }
 
-    @Test func attachmentBoundsUseContextFontDescenderWhenTextHasNoFont() {
-        let font = NSFont.systemFont(ofSize: 17)
+    @Test func attachmentBoundsUseContextFontWhenTextHasNoFont() {
+        let font = NSFont.systemFont(ofSize: 30)
         let attachment = TextTransitionAttachment(
-            text: NSAttributedString(string: "1"),
+            text: NSAttributedString(string: "99"),
             contentTransition: .numericText(),
             motionPolicy: .enabled
         )
@@ -232,8 +232,17 @@ struct TextTransitionViewTests {
             proposedLineFragment: .zero,
             position: .zero
         )
+        let expectedText = NSAttributedString(
+            string: "99",
+            attributes: [.font: font]
+        )
+        let expectedSize = textTransitionPreferredSize(
+            for: expectedText,
+            widthReservation: .natural
+        )
 
         #expect(rect.origin.y == floor(font.descender))
+        #expect(rect.size == expectedSize)
     }
 
     @Test func attachmentSetTextUpdatesLoadedTransitionView() {

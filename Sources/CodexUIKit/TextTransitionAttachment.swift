@@ -105,15 +105,32 @@ public final class TextTransitionAttachment: NSTextAttachment {
     }
 
     private func bounds(for attributes: [NSAttributedString.Key: Any]) -> CGRect {
-        var rect = bounds
-        if textTransitionFontDescender(in: text) == nil {
-            rect.origin.y = baselineOffset(attributes: attributes)
-        }
-        return rect
+        let resolvedText = text.resolvingMissingFont(from: attributes)
+        let resolvedWidthReservation = widthReservation.resolvingMissingFont(from: attributes)
+        let size = textTransitionPreferredSize(
+            for: resolvedText,
+            widthReservation: resolvedWidthReservation
+        )
+        return CGRect(
+            x: bounds.origin.x,
+            y: baselineOffset(for: resolvedText, attributes: attributes),
+            width: size.width,
+            height: size.height
+        )
     }
 
     private func baselineOffset(attributes: [NSAttributedString.Key: Any] = [:]) -> CGFloat {
-        let descender = textTransitionFontDescender(in: text) ??
+        baselineOffset(
+            for: text.resolvingMissingFont(from: attributes),
+            attributes: attributes
+        )
+    }
+
+    private func baselineOffset(
+        for resolvedText: NSAttributedString,
+        attributes: [NSAttributedString.Key: Any]
+    ) -> CGFloat {
+        let descender = textTransitionFontDescender(in: resolvedText) ??
             (attributes[.font] as? NSFont)?.descender ??
             0
         return floor(descender)
@@ -145,6 +162,36 @@ public final class TextTransitionAttachment: NSTextAttachment {
         image.unlockFocus()
         return image
     }()
+}
+
+private extension NSAttributedString {
+    func resolvingMissingFont(from attributes: [NSAttributedString.Key: Any]) -> NSAttributedString {
+        guard let font = attributes[.font] as? NSFont, length > 0 else {
+            return self
+        }
+
+        let resolvedText = NSMutableAttributedString(attributedString: self)
+        let fullRange = NSRange(location: 0, length: length)
+        resolvedText.enumerateAttribute(.font, in: fullRange) { value, range, _ in
+            if value == nil {
+                resolvedText.addAttribute(.font, value: font, range: range)
+            }
+        }
+        return resolvedText
+    }
+}
+
+private extension TextTransition.WidthReservation {
+    func resolvingMissingFont(
+        from attributes: [NSAttributedString.Key: Any]
+    ) -> TextTransition.WidthReservation {
+        switch self {
+        case .natural, .fixed:
+            return self
+        case .sample(let sample):
+            return .sample(sample.resolvingMissingFont(from: attributes))
+        }
+    }
 }
 
 @MainActor
