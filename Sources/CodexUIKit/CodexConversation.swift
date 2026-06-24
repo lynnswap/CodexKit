@@ -64,13 +64,16 @@ public final class CodexConversation {
         phase = .loading
         lastErrorDescription = nil
         do {
+            let shouldIncludeTurns = includeTurns ?? configuration.includeTurnsInRefresh
             let record = try await thread.read(
-                includeTurns: includeTurns ?? configuration.includeTurnsInRefresh
+                includeTurns: shouldIncludeTurns
             )
             workspace = record.workspace
             name = record.name
             preview = record.preview
-            replaceTurns(with: record.turns)
+            if shouldIncludeTurns {
+                replaceTurns(with: record.turns)
+            }
             phase = .loaded
         } catch {
             fail(with: error)
@@ -95,15 +98,13 @@ public final class CodexConversation {
         lastErrorDescription = nil
         do {
             let response = try await thread.respond(to: prompt, options: options)
-            upsertTurn(
-                id: response.turnID,
-                status: response.status,
-                errorDescription: response.errorMessage
-            )
-            mergeItems(response.transcript.items, turnID: response.turnID)
+            apply(response)
             phase = .loaded
             return response
         } catch {
+            if let response = (error as? CodexAppServerError)?.response {
+                apply(response)
+            }
             fail(with: error)
             throw error
         }
@@ -138,6 +139,15 @@ public final class CodexConversation {
         } else {
             turns.append(Turn(id: id, status: status, errorDescription: errorDescription))
         }
+    }
+
+    private func apply(_ response: CodexResponse) {
+        upsertTurn(
+            id: response.turnID,
+            status: response.status,
+            errorDescription: response.errorMessage
+        )
+        mergeItems(response.transcript.items, turnID: response.turnID)
     }
 
     private func mergeItems(_ incomingItems: [CodexThreadItem], turnID: CodexTurnID?) {

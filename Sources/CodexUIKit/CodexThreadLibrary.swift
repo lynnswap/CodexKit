@@ -116,8 +116,12 @@ public final class CodexThreadLibrary {
         lastErrorDescription = nil
         do {
             try await server.archiveThread(threadID)
-            removeThread(threadID)
-            phase = .loaded
+            if canEvaluateMutatedThreadVisibilityLocally {
+                removeThread(threadID)
+                phase = .loaded
+            } else {
+                await load(cursor: nil, appending: false)
+            }
         } catch {
             fail(with: error)
             throw error
@@ -159,8 +163,12 @@ public final class CodexThreadLibrary {
         lastErrorDescription = nil
         do {
             try await server.deleteThread(threadID)
-            removeThread(threadID)
-            phase = .loaded
+            if canEvaluateMutatedThreadVisibilityLocally {
+                removeThread(threadID)
+                phase = .loaded
+            } else {
+                await load(cursor: nil, appending: false)
+            }
         } catch {
             fail(with: error)
             throw error

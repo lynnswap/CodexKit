@@ -86,6 +86,35 @@ struct CodexThreadLibraryTests {
         #expect(methods.contains("thread/resume") == false)
     }
 
+    @Test("archive refreshes server-filtered libraries")
+    func archiveRefreshesServerFilteredLibrary() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        try await runtime.transport.enqueueThreadList(.init(
+            threads: [.init(id: "thread-archive", name: "Archive me")],
+            nextCursor: "old-next"
+        ))
+        try await runtime.transport.enqueueEmpty(for: "thread/archive")
+        try await runtime.transport.enqueueThreadList(.init(
+            threads: [.init(id: "thread-replacement", name: "Replacement")],
+            nextCursor: "new-next"
+        ))
+
+        let library = CodexThreadLibrary(
+            server: runtime.server,
+            configuration: .init(query: .init(limit: 1))
+        )
+        await library.refresh()
+        library.selectThread("thread-archive")
+
+        try await library.archive("thread-archive")
+
+        #expect(library.sections.first?.threads.map(\.id) == ["thread-replacement"])
+        #expect(library.selectedThreadID == nil)
+        #expect(library.nextCursor == "new-next")
+        let methods = await runtime.transport.recordedRequests().map(\.method)
+        #expect(methods.filter { $0 == "thread/list" }.count == 2)
+    }
+
     @Test("unarchive removes a thread from an archived-only library")
     func unarchiveRemovesThreadFromArchivedQuery() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -185,6 +214,35 @@ struct CodexThreadLibraryTests {
         let methods = await runtime.transport.recordedRequests().map(\.method)
         #expect(methods.filter { $0 == "thread/list" }.count == 2)
     }
+
+    @Test("delete refreshes server-filtered libraries")
+    func deleteRefreshesServerFilteredLibrary() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        try await runtime.transport.enqueueThreadList(.init(
+            threads: [.init(id: "thread-delete", name: "Delete me")],
+            nextCursor: "old-next"
+        ))
+        try await runtime.transport.enqueueEmpty(for: "thread/delete")
+        try await runtime.transport.enqueueThreadList(.init(
+            threads: [.init(id: "thread-replacement", name: "Replacement")],
+            nextCursor: "new-next"
+        ))
+
+        let library = CodexThreadLibrary(
+            server: runtime.server,
+            configuration: .init(query: .init(limit: 1))
+        )
+        await library.refresh()
+        library.selectThread("thread-delete")
+
+        try await library.delete("thread-delete")
+
+        #expect(library.sections.first?.threads.map(\.id) == ["thread-replacement"])
+        #expect(library.selectedThreadID == nil)
+        #expect(library.nextCursor == "new-next")
+        let methods = await runtime.transport.recordedRequests().map(\.method)
+        #expect(methods.filter { $0 == "thread/list" }.count == 2)
+    }
 }
 
 @MainActor
@@ -235,6 +293,34 @@ struct CodexConversationTests {
 
         #expect(conversation.turns.first === firstTurn)
         #expect(firstTurn.status == .completed)
+    }
+
+    @Test("metadata-only refresh preserves existing turns")
+    func metadataOnlyRefreshPreservesExistingTurns() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-1"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-1",
+            name: "Conversation",
+            turns: [.init(id: "turn-1", status: .running)]
+        ))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-1",
+            name: "Conversation renamed",
+            turns: []
+        ))
+
+        let conversation = try await CodexConversation.resume("thread-1", server: runtime.server)
+        try await conversation.refresh()
+        let firstTurn = try #require(conversation.turns.first)
+        try await conversation.refresh(includeTurns: false)
+
+        #expect(conversation.title == "Conversation renamed")
+        #expect(conversation.turns.first === firstTurn)
+        #expect(firstTurn.status == .running)
+        let requests = await runtime.transport.recordedRequests(method: "thread/read")
+        let params = try requests.map { try $0.decodeParams(ThreadReadParams.self) }
+        #expect(params.map(\.includeTurns) == [true, false])
     }
 
     @Test("send merges transcript items into observable item objects")
@@ -324,6 +410,43 @@ struct CodexConversationTests {
         #expect(conversation.items[1].turnID == "turn-2")
         #expect(conversation.items[1].text == "Second")
         #expect(conversation.transcript.messages.map(\.text) == ["First", "Second"])
+    }
+
+    @Test("send preserves failed response transcript before rethrowing")
+    func sendPreservesFailedResponseTranscript() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-failed"))
+        try await runtime.transport.enqueueTurnStart(turnID: "turn-failed", status: "running")
+
+        let conversation = try await CodexConversation.resume("thread-failed", server: runtime.server)
+        let sendTask = Task {
+            try await conversation.send("fail")
+        }
+
+        await runtime.transport.waitForRequest(method: "turn/start")
+        try await runtime.transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(turnID: "turn-failed", delta: "Partial failure")
+        )
+        try await runtime.transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(id: "turn-failed", status: "failed"))
+        )
+
+        do {
+            _ = try await sendTask.value
+            Issue.record("Expected a failed turn to throw.")
+        } catch let error as CodexAppServerError {
+            #expect(error.response?.turnID == "turn-failed")
+        }
+
+        let turn = try #require(conversation.turns.first)
+        let item = try #require(conversation.items.first)
+        #expect(turn.id == "turn-failed")
+        #expect(turn.status == .failed)
+        #expect(item.turnID == "turn-failed")
+        #expect(item.text == "Partial failure")
+        #expect(conversation.transcript.finalAnswer == "Partial failure")
     }
 }
 
