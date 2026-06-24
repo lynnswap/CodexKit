@@ -46,7 +46,7 @@ struct CodexAppServerKitTests {
         let executableURL = binURL.appendingPathComponent("codex")
         try """
             #!/bin/sh
-            echo "--session-source"
+            exit 0
             """
             .write(to: executableURL, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes(
@@ -61,7 +61,15 @@ struct CodexAppServerKitTests {
         )
 
         #expect(configuration.executable == executableURL.path)
-        #expect(configuration.arguments.contains("--session-source"))
+        #expect(configuration.arguments == [
+            "-c",
+            CodexAppServerExecutable.fileBackedAuthConfiguration,
+            "app-server",
+            "--listen",
+            "stdio://",
+            "--session-source",
+            "app-server",
+        ])
     }
 
     @Test func testRuntimeStartsAppServerWithoutLaunchingProcess() async throws {
@@ -152,6 +160,7 @@ struct CodexAppServerKitTests {
             options: .init(
                 model: "gpt-5",
                 sandbox: .workspaceWrite,
+                permissions: .profile(id: "codex-default"),
                 ephemeral: true,
                 config: ["experimental": .bool(true)],
                 personality: .pragmatic,
@@ -174,6 +183,7 @@ struct CodexAppServerKitTests {
         #expect(params.approvalPolicy == "on-request")
         #expect(params.approvalsReviewer == "auto_review")
         #expect(params.sandbox == "workspace-write")
+        #expect(params.permissions == .profileID("codex-default"))
         #expect(params.config == ["experimental": .bool(true)])
         #expect(params.personality == "pragmatic")
         #expect(params.serviceName == "app-server-kit-test")

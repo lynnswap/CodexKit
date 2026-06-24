@@ -1,5 +1,3 @@
-// The Swift Programming Language
-// https://docs.swift.org/swift-book
-public func hello() {
-    print("Hello, world!")
+public enum CodexKit {
+    public static let productName = "CodexKit"
 }
