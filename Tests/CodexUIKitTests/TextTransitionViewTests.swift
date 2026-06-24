@@ -245,6 +245,35 @@ struct TextTransitionViewTests {
         #expect(rect.size == expectedSize)
     }
 
+    @Test func attachmentViewProviderUsesContextFontResolvedByBounds() {
+        let font = NSFont.systemFont(ofSize: 30)
+        let attachment = TextTransitionAttachment(
+            text: NSAttributedString(string: "99"),
+            contentTransition: .numericText(),
+            motionPolicy: .enabled
+        )
+        _ = attachment.attachmentBounds(
+            for: [.font: font],
+            location: TestTextLocation(0),
+            textContainer: nil,
+            proposedLineFragment: .zero,
+            position: .zero
+        )
+        let provider = TextTransitionAttachmentViewProvider(
+            textAttachment: attachment,
+            parentView: nil,
+            textLayoutManager: nil,
+            location: TestTextLocation(0)
+        )
+
+        provider.loadView()
+
+        let view = provider.view as? TextTransitionView
+        let resolvedFont = view?.text.attribute(.font, at: 0, effectiveRange: nil) as? NSFont
+        #expect(resolvedFont == font)
+        #expect(view?.intrinsicContentSize == attachment.bounds.size)
+    }
+
     @Test func attachmentSetTextUpdatesLoadedTransitionView() {
         let attachment = TextTransitionAttachment(
             text: attributed("1"),

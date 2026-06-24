@@ -7,6 +7,7 @@ public final class TextTransitionAttachment: NSTextAttachment {
     public private(set) var motionPolicy: TextTransition.MotionPolicy
     public var reuseIdentifier: String?
     private let activeViews = NSHashTable<TextTransitionView>.weakObjects()
+    private var inheritedAttributes: [NSAttributedString.Key: Any] = [:]
 
     public init(
         text: NSAttributedString,
@@ -80,7 +81,7 @@ public final class TextTransitionAttachment: NSTextAttachment {
         TextTransitionAttachmentViewProvider(
             textAttachment: self,
             parentView: parentView,
-            textLayoutManager: nil,
+            textLayoutManager: textContainer?.textLayoutManager,
             location: location
         )
     }
@@ -95,18 +96,33 @@ public final class TextTransitionAttachment: NSTextAttachment {
     }
 
     private func updateBounds() {
-        let size = textTransitionPreferredSize(for: text, widthReservation: widthReservation)
-        bounds = CGRect(
-            x: 0,
-            y: baselineOffset(),
-            width: size.width,
-            height: size.height
-        )
+        bounds = resolvedBounds(for: inheritedAttributes)
     }
 
-    private func bounds(for attributes: [NSAttributedString.Key: Any]) -> CGRect {
-        let resolvedText = text.resolvingMissingFont(from: attributes)
-        let resolvedWidthReservation = widthReservation.resolvingMissingFont(from: attributes)
+    @discardableResult
+    fileprivate func updateInheritedAttributes(
+        _ attributes: [NSAttributedString.Key: Any]
+    ) -> CGRect {
+        inheritedAttributes = attributes.textTransitionRenderableAttributes
+        updateBounds()
+        return bounds
+    }
+
+    fileprivate func resolvedTextForView() -> NSAttributedString {
+        text.resolvingMissingAttributes(from: inheritedAttributes)
+    }
+
+    fileprivate func resolvedWidthReservationForView() -> TextTransition.WidthReservation {
+        widthReservation.resolvingMissingAttributes(from: inheritedAttributes)
+    }
+
+    fileprivate func bounds(for attributes: [NSAttributedString.Key: Any]) -> CGRect {
+        updateInheritedAttributes(attributes)
+    }
+
+    private func resolvedBounds(for attributes: [NSAttributedString.Key: Any]) -> CGRect {
+        let resolvedText = text.resolvingMissingAttributes(from: attributes)
+        let resolvedWidthReservation = widthReservation.resolvingMissingAttributes(from: attributes)
         let size = textTransitionPreferredSize(
             for: resolvedText,
             widthReservation: resolvedWidthReservation
@@ -121,7 +137,7 @@ public final class TextTransitionAttachment: NSTextAttachment {
 
     private func baselineOffset(attributes: [NSAttributedString.Key: Any] = [:]) -> CGFloat {
         baselineOffset(
-            for: text.resolvingMissingFont(from: attributes),
+            for: text.resolvingMissingAttributes(from: attributes),
             attributes: attributes
         )
     }
@@ -145,9 +161,9 @@ public final class TextTransitionAttachment: NSTextAttachment {
     private func updateActiveViews(animated: Bool) {
         for transitionView in activeViews.allObjects {
             transitionView.configure(
-                text: text,
+                text: resolvedTextForView(),
                 contentTransition: contentTransition,
-                widthReservation: widthReservation,
+                widthReservation: resolvedWidthReservationForView(),
                 motionPolicy: motionPolicy,
                 animated: animated
             )
@@ -164,17 +180,26 @@ public final class TextTransitionAttachment: NSTextAttachment {
     }()
 }
 
+private extension Dictionary where Key == NSAttributedString.Key, Value == Any {
+    var textTransitionRenderableAttributes: [NSAttributedString.Key: Any] {
+        filter { key, _ in key != .attachment }
+    }
+}
+
 private extension NSAttributedString {
-    func resolvingMissingFont(from attributes: [NSAttributedString.Key: Any]) -> NSAttributedString {
-        guard let font = attributes[.font] as? NSFont, length > 0 else {
+    func resolvingMissingAttributes(from attributes: [NSAttributedString.Key: Any]) -> NSAttributedString {
+        let inheritedAttributes = attributes.textTransitionRenderableAttributes
+        guard inheritedAttributes.isEmpty == false, length > 0 else {
             return self
         }
 
         let resolvedText = NSMutableAttributedString(attributedString: self)
         let fullRange = NSRange(location: 0, length: length)
-        resolvedText.enumerateAttribute(.font, in: fullRange) { value, range, _ in
-            if value == nil {
-                resolvedText.addAttribute(.font, value: font, range: range)
+        for (key, value) in inheritedAttributes {
+            resolvedText.enumerateAttribute(key, in: fullRange) { existingValue, range, _ in
+                if existingValue == nil {
+                    resolvedText.addAttribute(key, value: value, range: range)
+                }
             }
         }
         return resolvedText
@@ -182,14 +207,14 @@ private extension NSAttributedString {
 }
 
 private extension TextTransition.WidthReservation {
-    func resolvingMissingFont(
+    func resolvingMissingAttributes(
         from attributes: [NSAttributedString.Key: Any]
     ) -> TextTransition.WidthReservation {
         switch self {
         case .natural, .fixed:
             return self
         case .sample(let sample):
-            return .sample(sample.resolvingMissingFont(from: attributes))
+            return .sample(sample.resolvingMissingAttributes(from: attributes))
         }
     }
 }
@@ -225,13 +250,17 @@ public final class TextTransitionAttachmentViewProvider: NSTextAttachmentViewPro
         guard let attachment = textAttachment as? TextTransitionAttachment else {
             return nil
         }
+        let renderingAttributes = renderingAttributes()
+        if renderingAttributes.textTransitionRenderableAttributes.isEmpty == false {
+            attachment.updateInheritedAttributes(renderingAttributes)
+        }
 
         if let transitionView {
             attachment.registerActiveView(transitionView)
             transitionView.configure(
-                text: attachment.text,
+                text: attachment.resolvedTextForView(),
                 contentTransition: attachment.contentTransition,
-                widthReservation: attachment.widthReservation,
+                widthReservation: attachment.resolvedWidthReservationForView(),
                 motionPolicy: attachment.motionPolicy,
                 animated: animated
             )
@@ -239,13 +268,44 @@ public final class TextTransitionAttachmentViewProvider: NSTextAttachmentViewPro
         }
 
         let transitionView = TextTransitionView(
-            text: attachment.text,
+            text: attachment.resolvedTextForView(),
             contentTransition: attachment.contentTransition,
-            widthReservation: attachment.widthReservation,
+            widthReservation: attachment.resolvedWidthReservationForView(),
             motionPolicy: attachment.motionPolicy
         )
         self.transitionView = transitionView
         attachment.registerActiveView(transitionView)
         return transitionView
+    }
+
+    override public func attachmentBounds(
+        for attributes: [NSAttributedString.Key: Any],
+        location: any NSTextLocation,
+        textContainer: NSTextContainer?,
+        proposedLineFragment lineFrag: CGRect,
+        position: CGPoint
+    ) -> CGRect {
+        guard let attachment = textAttachment as? TextTransitionAttachment else {
+            return super.attachmentBounds(
+                for: attributes,
+                location: location,
+                textContainer: textContainer,
+                proposedLineFragment: lineFrag,
+                position: position
+            )
+        }
+        return attachment.bounds(for: attributes)
+    }
+
+    private func renderingAttributes() -> [NSAttributedString.Key: Any] {
+        var result: [NSAttributedString.Key: Any]?
+        textLayoutManager?.enumerateRenderingAttributes(
+            from: location,
+            reverse: false
+        ) { _, attributes, _ in
+            result = attributes
+            return false
+        }
+        return result ?? [:]
     }
 }
