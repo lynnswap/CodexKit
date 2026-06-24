@@ -1344,6 +1344,48 @@ struct CodexAppServerKitTests {
         #expect(configuration.reasoningEffort == .high)
     }
 
+    @Test func updateConfigurationSendsBatchWriteEdits() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueJSON(#"{"status":"ok"}"#, for: "config/batchWrite")
+        let client = AppServerClient(transport: transport)
+        let server = CodexAppServer(
+            client: client,
+            router: CodexAppServerNotificationRouter(client: client)
+        )
+
+        try await server.updateConfiguration(.init(
+            reviewModel: "gpt-5-codex-review",
+            reasoningEffort: .high,
+            serviceTier: "flex",
+            updatesReviewModel: true,
+            updatesReasoningEffort: true,
+            updatesServiceTier: true
+        ))
+
+        let request = try #require(await transport.recordedRequests().first)
+        #expect(request.method == "config/batchWrite")
+        let params = try request.decodeParams(ConfigBatchWriteParams.self)
+        #expect(params.reloadUserConfig == true)
+        #expect(params.edits == [
+            .init(keyPath: "review_model", value: .string("gpt-5-codex-review")),
+            .init(keyPath: "model_reasoning_effort", value: .string("high")),
+            .init(keyPath: "service_tier", value: .string("flex")),
+        ])
+    }
+
+    @Test func updateConfigurationSkipsEmptyPatch() async throws {
+        let transport = CodexAppServerTestTransport()
+        let client = AppServerClient(transport: transport)
+        let server = CodexAppServer(
+            client: client,
+            router: CodexAppServerNotificationRouter(client: client)
+        )
+
+        try await server.updateConfiguration(.init())
+
+        #expect(await transport.recordedRequests().isEmpty)
+    }
+
     @Test func testRuntimeEnqueuesRateLimitResetTimesInAppServerSeconds() async throws {
         let transport = CodexAppServerTestTransport()
         let resetDate = Date(timeIntervalSince1970: 1_700_000_000)
@@ -1484,6 +1526,28 @@ struct CodexAppServerKitTests {
         let request = try #require(await transport.recordedRequests().last)
         let params = try JSONDecoder().decode(
             AppServerAPI.Turn.Interrupt.Params.self, from: request.params)
+        #expect(params.threadID == "thread-1")
+        #expect(params.turnID == "turn-1")
+    }
+
+    @Test func threadInterruptActiveTurnSendsExpectedTurnID() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueue(EmptyResponse(), for: "turn/interrupt")
+        let client = AppServerClient(transport: transport)
+        let router = CodexAppServerNotificationRouter(client: client)
+        let thread = CodexThread(
+            id: "thread-1",
+            client: client,
+            router: router
+        )
+
+        let interruption = try await thread.interruptActiveTurn(expectedTurnID: "turn-1")
+
+        #expect(interruption.threadID == "thread-1")
+        #expect(interruption.turnID == "turn-1")
+        let request = try #require(await transport.recordedRequests().first)
+        #expect(request.method == "turn/interrupt")
+        let params = try request.decodeParams(AppServerAPI.Turn.Interrupt.Params.self)
         #expect(params.threadID == "thread-1")
         #expect(params.turnID == "turn-1")
     }
@@ -1724,6 +1788,27 @@ private func collect<Sequence: AsyncSequence>(
         elements.append(element)
     }
     return elements
+}
+
+private struct ConfigBatchWriteParams: Decodable, Equatable {
+    var edits: [Edit]
+    var reloadUserConfig: Bool
+
+    struct Edit: Decodable, Equatable {
+        var keyPath: String
+        var value: AppServerJSONValue
+        var mergeStrategy: String
+
+        init(
+            keyPath: String,
+            value: AppServerJSONValue,
+            mergeStrategy: String = "replace"
+        ) {
+            self.keyPath = keyPath
+            self.value = value
+            self.mergeStrategy = mergeStrategy
+        }
+    }
 }
 
 private struct TurnIDParams: Encodable, Sendable {

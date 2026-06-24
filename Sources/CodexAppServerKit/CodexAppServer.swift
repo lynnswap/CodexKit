@@ -408,6 +408,34 @@ public actor CodexAppServer {
         )
     }
 
+    package func updateConfiguration(_ patch: CodexConfigurationPatch) async throws {
+        var edits: [AppServerAPI.Config.Edit] = []
+        if patch.updatesReviewModel {
+            edits.append(.init(
+                keyPath: "review_model",
+                value: patch.reviewModel.map(AppServerAPI.Config.Value.string) ?? .null
+            ))
+        }
+        if patch.updatesReasoningEffort {
+            edits.append(.init(
+                keyPath: "model_reasoning_effort",
+                value: patch.reasoningEffort.map { .string($0.rawValue) } ?? .null
+            ))
+        }
+        if patch.updatesServiceTier {
+            edits.append(.init(
+                keyPath: "service_tier",
+                value: patch.serviceTier.map(AppServerAPI.Config.Value.string) ?? .null
+            ))
+        }
+        guard edits.isEmpty == false else {
+            return
+        }
+        let _: AppServerAPI.Config.BatchWrite.Response = try await client.send(
+            AppServerAPI.Config.BatchWrite.Request(params: .init(edits: edits))
+        )
+    }
+
     /// Reads Codex account rate-limit information.
     ///
     /// - Returns: Current plan type and rate-limit windows reported by the app-server.
