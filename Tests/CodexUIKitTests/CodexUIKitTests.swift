@@ -135,6 +135,11 @@ struct CodexThreadLibraryTests {
         #expect(thread.preview == "Preview")
         #expect(thread.turnCount == 1)
         #expect(thread.latestTurnStatus == .completed)
+
+        let request = try #require(await runtime.transport.recordedRequests(method: "thread/read").first)
+        let params = try request.decodeParams(ThreadReadParams.self)
+        #expect(params.threadID == "thread-restored")
+        #expect(params.includeTurns == true)
     }
 
     @Test("startConversation does not insert threads outside the workspace query")
@@ -270,6 +275,56 @@ struct CodexConversationTests {
         #expect(item.turnID == "turn-send")
         #expect(conversation.transcript.finalAnswer == "Done")
     }
+
+    @Test("send scopes generated transcript item IDs by turn")
+    func sendScopesGeneratedTranscriptItemsByTurn() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-send"))
+        try await runtime.transport.enqueueTurnStart(turnID: "turn-1", status: "running")
+        try await runtime.transport.enqueueTurnStart(turnID: "turn-2", status: "running")
+
+        let conversation = try await CodexConversation.resume("thread-send", server: runtime.server)
+        let firstSend = Task {
+            try await conversation.send("first")
+        }
+
+        await runtime.transport.waitForRequest(method: "turn/start")
+        try await runtime.transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(turnID: "turn-1", delta: "First")
+        )
+        try await runtime.transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(id: "turn-1", status: "completed"))
+        )
+        _ = try await firstSend.value
+
+        let firstItem = try #require(conversation.items.first)
+        let secondSend = Task {
+            try await conversation.send("second")
+        }
+
+        await runtime.transport.waitForRequest(method: "turn/start", count: 2)
+        try await runtime.transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(turnID: "turn-2", delta: "Second")
+        )
+        try await runtime.transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(id: "turn-2", status: "completed"))
+        )
+        _ = try await secondSend.value
+
+        #expect(conversation.items.count == 2)
+        #expect(conversation.items[0] === firstItem)
+        #expect(conversation.items[0].id == "agent-message-delta")
+        #expect(conversation.items[0].turnID == "turn-1")
+        #expect(conversation.items[0].text == "First")
+        #expect(conversation.items[1].id == "agent-message-delta")
+        #expect(conversation.items[1].turnID == "turn-2")
+        #expect(conversation.items[1].text == "Second")
+        #expect(conversation.transcript.messages.map(\.text) == ["First", "Second"])
+    }
 }
 
 private struct TurnCompletedParams: Encodable, Sendable {
@@ -278,6 +333,26 @@ private struct TurnCompletedParams: Encodable, Sendable {
     struct Turn: Encodable, Sendable {
         var id: String
         var status: String?
+    }
+}
+
+private struct TurnDeltaParams: Encodable, Sendable {
+    var turnID: String
+    var delta: String
+
+    enum CodingKeys: String, CodingKey {
+        case turnID = "turnId"
+        case delta
+    }
+}
+
+private struct ThreadReadParams: Decodable, Sendable {
+    var threadID: String
+    var includeTurns: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case threadID = "threadId"
+        case includeTurns
     }
 }
 

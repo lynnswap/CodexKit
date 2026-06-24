@@ -131,7 +131,7 @@ public final class CodexThreadLibrary {
             let thread = try await server.unarchiveThread(threadID)
             if canEvaluateMutatedThreadVisibilityLocally {
                 if isThreadVisible(workspace: thread.workspace, archived: false) {
-                    let record = try await thread.read()
+                    let record = try await thread.read(includeTurns: true)
                     upsertThread(
                         id: record.id,
                         workspace: record.workspace,

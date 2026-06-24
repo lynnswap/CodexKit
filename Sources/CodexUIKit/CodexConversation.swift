@@ -144,10 +144,11 @@ public final class CodexConversation {
         guard incomingItems.isEmpty == false else {
             return
         }
-        let existingByID = Dictionary(uniqueKeysWithValues: items.map { ($0.id, $0) })
+        let existingByKey = Dictionary(uniqueKeysWithValues: items.map { ($0.mergeKey, $0) })
         var merged = items
         for incomingItem in incomingItems {
-            if let existing = existingByID[incomingItem.id] {
+            let incomingKey = ItemKey(id: incomingItem.id, turnID: turnID)
+            if let existing = existingByKey[incomingKey] {
                 existing.update(from: incomingItem, turnID: turnID)
             } else {
                 merged.append(Item(threadItem: incomingItem, turnID: turnID))
@@ -160,6 +161,11 @@ public final class CodexConversation {
         let message = error.localizedDescription
         lastErrorDescription = message
         phase = .failed(message)
+    }
+
+    fileprivate struct ItemKey: Hashable {
+        var id: String
+        var turnID: CodexTurnID?
     }
 
     @MainActor
@@ -199,6 +205,10 @@ public final class CodexConversation {
 
         fileprivate var threadItem: CodexThreadItem {
             CodexThreadItem(id: id, kind: kind, content: content, rawPayload: rawPayload)
+        }
+
+        fileprivate var mergeKey: ItemKey {
+            .init(id: id, turnID: turnID)
         }
 
         fileprivate init(threadItem: CodexThreadItem, turnID: CodexTurnID?) {
