@@ -876,8 +876,54 @@ struct CodexAppServerKitTests {
         let turnIDs = try await runtime.transport.recordedRequests(method: "turn/interrupt")
             .map { request in
                 try request.decodeParams(AppServerAPI.Turn.Interrupt.Params.self).turnID
-            }
+        }
         #expect(turnIDs == ["turn-review", "turn-new"])
+    }
+
+    @Test func reviewSequencesFilterEventsOutsideTerminalTurn() async throws {
+        let oldMessage = CodexMessage(
+            id: "old-message",
+            role: .assistant,
+            text: "Old review"
+        )
+        let currentMessage = CodexMessage(
+            id: "current-message",
+            role: .assistant,
+            text: "Current review"
+        )
+        let events = [
+            CodexThreadEvent.message(oldMessage, turnID: "turn-old"),
+            .message(currentMessage, turnID: "turn-current"),
+            .turnCompleted(.init(turnID: "turn-old", status: .completed)),
+            .turnCompleted(.init(turnID: "turn-current", status: .completed)),
+        ]
+        let eventSequence = CodexThreadEventSequence {
+            AsyncThrowingStream { continuation in
+                for event in events {
+                    continuation.yield(event)
+                }
+                continuation.finish()
+            }
+        }
+
+        let reviewEvents = try await collect(CodexReviewEventSequence(
+            events: eventSequence,
+            terminalTurnID: "turn-current"
+        ))
+        let logs = try await collect(CodexReviewLogSequence(
+            events: eventSequence,
+            terminalTurnID: "turn-current"
+        ))
+        let progress = try await collect(CodexReviewProgressSequence(
+            events: eventSequence,
+            terminalTurnID: "turn-current"
+        ))
+
+        #expect(reviewEvents.count == 2)
+        #expect(logs.map(\.turnID) == ["turn-current"])
+        #expect(logs.first?.item?.text == "Current review")
+        #expect(progress.last?.result?.turnID == "turn-current")
+        #expect(progress.last?.transcript.responseText == "Current review")
     }
 
     @Test func appServerPrepareAndRestartReviewUsesLifecycleControlSequence() async throws {
@@ -2272,6 +2318,41 @@ struct CodexAppServerKitTests {
             })
     }
 
+    @Test func completedFileChangeItemsPreserveChangesOutput() async throws {
+        let transport = CodexAppServerTestTransport()
+        let client = AppServerClient(transport: transport)
+        let router = CodexAppServerNotificationRouter(client: client)
+        await router.start()
+        await transport.waitForNotificationStreamCount(1)
+        try await transport.emitServerNotification(
+            method: "item/completed",
+            params: ThreadItemParams(
+                threadID: "thread-1",
+                turnID: "turn-1",
+                item: .init(
+                    id: "file-1",
+                    type: "fileChange",
+                    changes: .array([
+                        .object([
+                            "kind": .string("update"),
+                            "path": .string("Sources/File.swift"),
+                        ]),
+                    ])
+                )
+            )
+        )
+        try await transport.emitServerNotification(
+            method: "thread/closed",
+            params: ThreadIDParams(threadID: "thread-1")
+        )
+        let thread = CodexThread(id: "thread-1", client: client, router: router)
+
+        let logs = try await collect(thread.logEntries)
+
+        #expect(logs.first?.item?.kind == .fileChange)
+        #expect(logs.first?.item?.text?.contains("File.swift") == true)
+    }
+
     @Test func reasoningNotificationsRouteAsTypedEventsLogsAndTranscript() async throws {
         let transport = CodexAppServerTestTransport()
         let client = AppServerClient(transport: transport)
@@ -3090,6 +3171,7 @@ private struct ThreadItemParams: Encodable, Sendable {
         var summary: [String]?
         var content: [String]?
         var contentItems: [TextContent]?
+        var changes: AppServerJSONValue?
 
         init(
             id: String,
@@ -3103,7 +3185,8 @@ private struct ThreadItemParams: Encodable, Sendable {
             tool: String? = nil,
             summary: [String]? = nil,
             content: [String]? = nil,
-            contentItems: [TextContent]? = nil
+            contentItems: [TextContent]? = nil,
+            changes: AppServerJSONValue? = nil
         ) {
             self.id = id
             self.type = type
@@ -3117,6 +3200,7 @@ private struct ThreadItemParams: Encodable, Sendable {
             self.summary = summary
             self.content = content
             self.contentItems = contentItems
+            self.changes = changes
         }
 
         enum CodingKeys: String, CodingKey {
@@ -3131,6 +3215,7 @@ private struct ThreadItemParams: Encodable, Sendable {
             case tool
             case summary
             case content
+            case changes
         }
 
         func encode(to encoder: Encoder) throws {
@@ -3145,6 +3230,7 @@ private struct ThreadItemParams: Encodable, Sendable {
             try container.encodeIfPresent(path, forKey: .path)
             try container.encodeIfPresent(tool, forKey: .tool)
             try container.encodeIfPresent(summary, forKey: .summary)
+            try container.encodeIfPresent(changes, forKey: .changes)
             if let contentItems {
                 try container.encode(contentItems, forKey: .content)
             } else {

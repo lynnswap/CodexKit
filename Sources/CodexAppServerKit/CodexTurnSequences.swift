@@ -182,13 +182,17 @@ public struct CodexReviewEventSequence: AsyncSequence, Sendable {
             guard finished == false else {
                 return nil
             }
-            guard let event = try await events.next() else {
-                return nil
+            while let event = try await events.next() {
+                guard reviewEventMatches(event, terminalTurnID: terminalTurnID) else {
+                    continue
+                }
+                if isTerminal(event) {
+                    finished = true
+                }
+                return CodexReviewEvent(event)
             }
-            if isTerminal(event) {
-                finished = true
-            }
-            return CodexReviewEvent(event)
+            finished = true
+            return nil
         }
 
         private func isTerminal(_ event: CodexThreadEvent) -> Bool {
@@ -243,6 +247,9 @@ public struct CodexReviewLogSequence: AsyncSequence, Sendable {
                 return nil
             }
             while let event = try await events.next() {
+                guard reviewEventMatches(event, terminalTurnID: terminalTurnID) else {
+                    continue
+                }
                 switch event {
                 case .itemStarted(let item, let turnID):
                     return .itemStarted(item, turnID: turnID)
@@ -337,6 +344,9 @@ public struct CodexReviewProgressSequence: AsyncSequence, Sendable {
                 return nil
             }
             while let event = try await events.next() {
+                guard reviewEventMatches(event, terminalTurnID: terminalTurnID) else {
+                    continue
+                }
                 switch event {
                 case .turnStarted, .unknown:
                     return .init(phase: .running, transcript: accumulator.transcript, usage: usage)
@@ -416,6 +426,32 @@ public struct CodexReviewProgressSequence: AsyncSequence, Sendable {
                 false
             }
         }
+    }
+}
+
+private func reviewEventMatches(
+    _ event: CodexThreadEvent,
+    terminalTurnID: CodexTurnID?
+) -> Bool {
+    guard let terminalTurnID else {
+        return true
+    }
+    switch event {
+    case .turnStarted(let turnID):
+        return turnID == terminalTurnID
+    case .turnCompleted(let response):
+        return response.turnID == terminalTurnID
+    case .turnFailed(let turnID, _), .itemStarted(_, let turnID), .itemUpdated(_, let turnID),
+         .itemCompleted(_, let turnID), .message(_, let turnID), .messageDelta(_, let turnID),
+         .reasoningSummaryPartAdded(_, let turnID), .reasoningDelta(_, let turnID),
+         .tokenUsageUpdated(_, let turnID):
+        return turnID == terminalTurnID
+    case .unknown(let raw):
+        return raw.turnID.map { $0 == terminalTurnID } ?? true
+    case .statusChanged:
+        return false
+    case .closed:
+        return true
     }
 }
 

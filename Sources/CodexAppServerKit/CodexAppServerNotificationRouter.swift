@@ -796,6 +796,7 @@ private struct RawThreadItem: Decodable {
     var input: AppServerJSONValue?
     var result: AppServerJSONValue?
     var error: AppServerJSONValue?
+    var changes: AppServerJSONValue?
     var rawValue: AppServerJSONValue?
 
     enum CodingKeys: String, CodingKey {
@@ -824,6 +825,7 @@ private struct RawThreadItem: Decodable {
         case input
         case result
         case error
+        case changes
     }
 
     init(from decoder: Decoder) throws {
@@ -854,6 +856,7 @@ private struct RawThreadItem: Decodable {
         input = try? container.decodeIfPresent(AppServerJSONValue.self, forKey: .input)
         result = try? container.decodeIfPresent(AppServerJSONValue.self, forKey: .result)
         error = try? container.decodeIfPresent(AppServerJSONValue.self, forKey: .error)
+        changes = try? container.decodeIfPresent(AppServerJSONValue.self, forKey: .changes)
     }
 
     var threadItem: CodexThreadItem {
@@ -906,7 +909,7 @@ private struct RawThreadItem: Decodable {
             return .fileChange(
                 .init(
                     path: path,
-                    output: aggregatedOutput ?? output ?? text,
+                    output: aggregatedOutput ?? output ?? changes?.displayText ?? text,
                     status: status.map(CodexTurnStatus.init(rawValue:))
                 ))
         case .mcpToolCall, .dynamicToolCall, .collabAgentToolCall, .subAgentActivity,
