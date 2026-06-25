@@ -675,6 +675,22 @@ public struct CodexReviewIdentity: Codable, Equatable, Identifiable, Sendable {
     }
 }
 
+/// Transient token for a review restart prepared by ``CodexAppServer``.
+public struct CodexReviewRestartToken: Equatable, Identifiable, Sendable {
+    public typealias ID = String
+
+    /// The app-server-local restart token identity.
+    public var id: ID
+
+    /// The review identity that was interrupted while preparing the restart.
+    public var interruptedIdentity: CodexReviewIdentity
+
+    public init(id: ID, interruptedIdentity: CodexReviewIdentity) {
+        self.id = id
+        self.interruptedIdentity = interruptedIdentity
+    }
+}
+
 /// Options for restoring a persisted review run as a live session handle.
 public struct CodexReviewResumeOptions: Equatable, Sendable {
     /// How collection should treat transcript errors for the restored response.
@@ -1785,7 +1801,7 @@ public struct CodexResponseStream: AsyncSequence, Sendable {
         )
     }
 
-    private func waitForCancelledResponse(_ cancellation: CodexTurnCancellation) async throws {
+    package func waitForCancelledResponse(_ cancellation: CodexTurnCancellation) async throws {
         let cancelledTurn = cancelledTurn(for: cancellation)
         for try await event in cancelledTurn.events {
             switch event {
@@ -2439,6 +2455,7 @@ public enum CodexAppServerError: Error, Equatable, LocalizedError, Sendable {
     case malformedNotification(String)
     case turnFailed(String)
     case turnFailedWithResponse(CodexResponse)
+    case reviewRestartUnavailable(CodexReviewRestartToken.ID)
 
     public var errorDescription: String? {
         switch self {
@@ -2456,6 +2473,8 @@ public enum CodexAppServerError: Error, Equatable, LocalizedError, Sendable {
             message
         case .turnFailedWithResponse(let response):
             response.errorMessage ?? response.status?.rawValue ?? "Turn failed."
+        case .reviewRestartUnavailable(let tokenID):
+            "Prepared review restart is no longer available for token \(tokenID)."
         }
     }
 

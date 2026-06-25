@@ -306,6 +306,21 @@ identity: source thread, review turn, optional detached review thread, and
 active review thread model when known. It is intended for persisted app-server
 review runs and does not depend on any higher-level review domain model.
 
+`CodexAppServer` also owns app-server review restart and cleanup lifecycle
+state. A host that needs to interrupt and restart a review can prepare a
+transient token, restart from it, then perform best-effort cleanup without
+tracking detached review thread IDs itself:
+
+```swift
+let token = try await appServer.prepareReviewRestart(identity)
+let restarted = try await appServer.restartPreparedReview(
+    token,
+    target: .baseBranch("main"),
+    delivery: .detached
+)
+await appServer.cleanupReview(restarted.identity)
+```
+
 ## Responses
 
 `CodexResponse` is the final result from `respond` or `ResponseStream.collect()`.
@@ -455,6 +470,7 @@ The public boundary is:
 - `CodexReviewTarget`
 - `CodexReviewSession`
 - `CodexReviewIdentity`
+- `CodexReviewRestartToken`
 - `CodexReviewResumeOptions`
 - `CodexReviewEvent`
 - `CodexReviewLogEntry`
