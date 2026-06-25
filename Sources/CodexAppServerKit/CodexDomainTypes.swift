@@ -1067,15 +1067,18 @@ public struct CodexTurnSnapshot: Identifiable, Equatable, Sendable {
     public var id: CodexTurnID
     public var status: CodexTurnStatus?
     public var errorMessage: String?
+    public var items: [CodexThreadItem]
 
     public init(
         id: CodexTurnID,
         status: CodexTurnStatus? = nil,
-        errorMessage: String? = nil
+        errorMessage: String? = nil,
+        items: [CodexThreadItem] = []
     ) {
         self.id = id
         self.status = status
         self.errorMessage = errorMessage
+        self.items = items
     }
 }
 

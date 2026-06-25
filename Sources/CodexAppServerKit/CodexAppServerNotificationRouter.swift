@@ -590,14 +590,7 @@ package actor CodexAppServerNotificationRouter {
     }
 
     private func threadItems(from values: [AppServerJSONValue]?) -> [CodexThreadItem] {
-        values?.compactMap { value in
-            guard let data = try? JSONEncoder().encode(value),
-                  let item = try? decoder.decode(RawThreadItem.self, from: data)
-            else {
-                return nil
-            }
-            return item.threadItem
-        } ?? []
+        AppServerThreadItemMapping.threadItems(from: values)
     }
 
     private func turnFailureMessage(from data: Data) -> String? {
@@ -736,6 +729,21 @@ private struct ThreadStatusPayload: Decodable {
 
 private struct TokenUsagePayload: Decodable {
     var tokenUsage: RawTokenUsage
+}
+
+package enum AppServerThreadItemMapping {
+    package static func threadItems(from values: [AppServerJSONValue]?) -> [CodexThreadItem] {
+        values?.compactMap(threadItem(from:)) ?? []
+    }
+
+    package static func threadItem(from value: AppServerJSONValue) -> CodexThreadItem? {
+        guard let data = try? JSONEncoder().encode(value),
+              let item = try? JSONDecoder().decode(RawThreadItem.self, from: data)
+        else {
+            return nil
+        }
+        return item.threadItem
+    }
 }
 
 private struct RawTokenUsage: Decodable {

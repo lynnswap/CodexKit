@@ -350,8 +350,24 @@ public actor CodexAppServerTestTransport {
         .init(
             id: snapshot.id.rawValue,
             status: snapshot.status?.rawValue,
-            error: snapshot.errorMessage.map { .init(message: $0) }
+            error: snapshot.errorMessage.map { .init(message: $0) },
+            items: snapshot.items.map(Self.apiItem(from:))
         )
+    }
+
+    private static func apiItem(from item: CodexThreadItem) -> AppServerJSONValue {
+        var object: [String: AppServerJSONValue] = [
+            "id": .string(item.id),
+            "type": .string(item.kind.rawValue),
+        ]
+        if let text = item.text {
+            object["text"] = .string(text)
+        }
+        if let message = item.message,
+           let phase = message.phase?.rawValue {
+            object["phase"] = .string(phase)
+        }
+        return .object(object)
     }
 
     /// Enqueues a ChatGPT browser login response.

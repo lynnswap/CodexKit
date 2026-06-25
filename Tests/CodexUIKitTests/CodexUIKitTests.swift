@@ -360,6 +360,43 @@ struct CodexConversationTests {
         #expect(firstTurn.status == .completed)
     }
 
+    @Test("refresh populates transcript items from turn history")
+    func refreshPopulatesTranscriptItemsFromTurnHistory() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-1"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-1",
+            turns: [
+                .init(
+                    id: "turn-1",
+                    status: .completed,
+                    items: [
+                        .init(
+                            id: "message-1",
+                            kind: .agentMessage,
+                            content: .message(.init(
+                                id: "message-1",
+                                role: .assistant,
+                                phase: .finalAnswer,
+                                text: "Done"
+                            ))
+                        ),
+                    ]
+                ),
+            ]
+        ))
+
+        let conversation = try await CodexConversation.resume("thread-1", server: runtime.server)
+        try await conversation.refresh()
+
+        let item = try #require(conversation.items.first)
+        #expect(conversation.items.count == 1)
+        #expect(item.id == "message-1")
+        #expect(item.turnID == "turn-1")
+        #expect(item.text == "Done")
+        #expect(conversation.transcript.finalAnswer == "Done")
+    }
+
     @Test("metadata-only refresh preserves existing turns")
     func metadataOnlyRefreshPreservesExistingTurns() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()

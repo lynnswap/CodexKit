@@ -242,7 +242,8 @@ extension CodexThread {
                 CodexTurnSnapshot(
                     id: .init(rawValue: $0.id),
                     status: $0.status.map(CodexTurnStatus.init(rawValue:)),
-                    errorMessage: $0.error?.message
+                    errorMessage: $0.error?.message,
+                    items: AppServerThreadItemMapping.threadItems(from: $0.items)
                 )
             }
         )

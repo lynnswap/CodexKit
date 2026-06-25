@@ -73,6 +73,7 @@ public final class CodexConversation {
             preview = record.preview
             if shouldIncludeTurns {
                 replaceTurns(with: record.turns)
+                replaceItems(with: record.turns)
             }
             phase = .loaded
         } catch {
@@ -126,6 +127,20 @@ public final class CodexConversation {
             turn.status = record.status
             turn.errorDescription = record.errorMessage
             return turn
+        }
+    }
+
+    private func replaceItems(with records: [CodexTurnSnapshot]) {
+        let existingByKey = Dictionary(uniqueKeysWithValues: items.map { ($0.mergeKey, $0) })
+        items = records.flatMap { record in
+            record.items.map { incomingItem in
+                let incomingKey = ItemKey(id: incomingItem.id, turnID: record.id)
+                if let existing = existingByKey[incomingKey] {
+                    existing.update(from: incomingItem, turnID: record.id)
+                    return existing
+                }
+                return Item(threadItem: incomingItem, turnID: record.id)
+            }
         }
     }
 
