@@ -273,6 +273,64 @@ public actor CodexAppServer {
         )
     }
 
+    /// Starts a Codex code review in a workspace.
+    ///
+    /// This creates a source thread for `workspace` and starts the app-server
+    /// review lifecycle from that thread, so callers do not need to manually
+    /// sequence `startThread` and `CodexThread.startReview`.
+    ///
+    /// - Parameters:
+    ///   - workspace: The workspace directory to review.
+    ///   - target: The repository changes or custom instructions to review.
+    ///   - instructions: Optional base and developer instructions for the source thread.
+    ///   - options: Thread creation options, including model, approval, and sandbox settings.
+    ///   - delivery: Whether the app-server should run the review inline or in a detached review thread.
+    ///   - transcriptErrorHandlingPolicy: How collection should treat transcript errors.
+    /// - Returns: A live review session.
+    /// - Throws: A transport, JSON-RPC, or app-server request error.
+    public func startReview(
+        in workspace: URL,
+        target: CodexReviewTarget,
+        instructions: CodexInstructions? = nil,
+        options: CodexThread.Options = .init(),
+        delivery: CodexReviewDelivery = .inline,
+        transcriptErrorHandlingPolicy: CodexTranscriptErrorHandlingPolicy = .preserveTranscript
+    ) async throws -> CodexReviewSession {
+        try Task.checkCancellation()
+        let thread = try await startThreadIgnoringCallerCancellation(
+            in: workspace,
+            instructions: instructions,
+            options: options
+        )
+        do {
+            try Task.checkCancellation()
+        } catch {
+            await deleteThreadIgnoringCallerCancellation(thread.id)
+            throw error
+        }
+
+        let review: CodexReviewSession
+        do {
+            review = try await startReviewIgnoringCallerCancellation(
+                thread: thread,
+                target: target,
+                delivery: delivery,
+                transcriptErrorHandlingPolicy: transcriptErrorHandlingPolicy
+            )
+        } catch {
+            await deleteThreadIgnoringCallerCancellation(thread.id)
+            throw error
+        }
+
+        do {
+            try Task.checkCancellation()
+            return review
+        } catch {
+            await cleanupReviewIgnoringCallerCancellation(review.identity)
+            throw error
+        }
+    }
+
     /// Resumes an existing Codex thread.
     ///
     /// - Parameters:
@@ -802,6 +860,47 @@ public actor CodexAppServer {
         reviewRestartContextsByTokenID = reviewRestartContextsByTokenID.filter { _, context in
             context.interruptedIdentity.sourceThreadID != sourceThreadID
         }
+    }
+
+    private func startThreadIgnoringCallerCancellation(
+        in workspace: URL,
+        instructions: CodexInstructions?,
+        options: CodexThread.Options
+    ) async throws -> CodexThread {
+        try await Task.detached { [self] in
+            try await startThread(
+                in: workspace,
+                instructions: instructions,
+                options: options
+            )
+        }.value
+    }
+
+    private func startReviewIgnoringCallerCancellation(
+        thread: CodexThread,
+        target: CodexReviewTarget,
+        delivery: CodexReviewDelivery,
+        transcriptErrorHandlingPolicy: CodexTranscriptErrorHandlingPolicy
+    ) async throws -> CodexReviewSession {
+        try await Task.detached {
+            try await thread.startReview(
+                target: target,
+                delivery: delivery,
+                transcriptErrorHandlingPolicy: transcriptErrorHandlingPolicy
+            )
+        }.value
+    }
+
+    private func deleteThreadIgnoringCallerCancellation(_ id: CodexThreadID) async {
+        await Task.detached { [self] in
+            try? await deleteThread(id)
+        }.value
+    }
+
+    private func cleanupReviewIgnoringCallerCancellation(_ identity: CodexReviewIdentity) async {
+        await Task.detached { [self] in
+            await cleanupReview(identity)
+        }.value
     }
 
     private nonisolated static func reviewCleanupIdentity(

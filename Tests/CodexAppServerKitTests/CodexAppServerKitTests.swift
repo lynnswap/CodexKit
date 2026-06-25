@@ -191,6 +191,211 @@ struct CodexAppServerKitTests {
         #expect(params.threadSource?.rawValue == "automation")
     }
 
+    @Test func appServerStartReviewStartsThreadThenReview() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        try await runtime.transport.enqueueThreadStart(threadID: "thread-source", model: "gpt-5")
+        try await runtime.transport.enqueueReviewStart(turnID: "turn-review")
+        let workspace = URL(fileURLWithPath: "/tmp/project", isDirectory: true)
+
+        let review = try await runtime.server.startReview(
+            in: workspace,
+            target: .baseBranch("main"),
+            instructions: .init(base: "Base", developer: "Developer"),
+            options: .init(model: "gpt-5"),
+            transcriptErrorHandlingPolicy: .revertTranscript
+        )
+
+        #expect(review.threadID == "thread-source")
+        #expect(review.turnID == "turn-review")
+        #expect(review.reviewThreadID == "thread-source")
+        #expect(review.identity == CodexReviewIdentity(
+            threadID: "thread-source",
+            turnID: "turn-review",
+            model: "gpt-5"
+        ))
+
+        let requests = await runtime.transport.recordedRequests()
+        #expect(requests.map(\.method) == [
+            "initialize",
+            "thread/start",
+            "review/start",
+        ])
+        let threadStart = try requests[1].decodeParams(AppServerAPI.Thread.Start.Params.self)
+        #expect(threadStart.cwd == workspace.path)
+        #expect(threadStart.model == "gpt-5")
+        #expect(threadStart.baseInstructions == "Base")
+        #expect(threadStart.developerInstructions == "Developer")
+
+        let reviewStart = try requests[2].decodeParams(AppServerAPI.Review.Start.Params.self)
+        #expect(reviewStart.threadID == "thread-source")
+        #expect(reviewStart.target == .baseBranch("main"))
+        #expect(reviewStart.delivery == .inline)
+    }
+
+    @Test func appServerStartReviewDeletesSourceThreadWhenReviewStartFails() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        try await runtime.transport.enqueueThreadStart(threadID: "thread-source", model: "gpt-5")
+        await runtime.transport.enqueueFailure(
+            code: -32602,
+            message: "invalid review target",
+            for: "review/start"
+        )
+        try await runtime.transport.enqueueEmpty(for: "thread/delete")
+        let workspace = URL(fileURLWithPath: "/tmp/project", isDirectory: true)
+
+        do {
+            _ = try await runtime.server.startReview(
+                in: workspace,
+                target: .baseBranch("missing")
+            )
+            Issue.record("Expected review start failure.")
+        } catch {
+            let requests = await runtime.transport.recordedRequests()
+            #expect(requests.map(\.method) == [
+                "initialize",
+                "thread/start",
+                "review/start",
+                "thread/delete",
+            ])
+            let delete = try requests[3].decodeParams(AppServerAPI.Thread.Delete.Params.self)
+            #expect(delete.threadID == "thread-source")
+        }
+    }
+
+    @Test func appServerStartReviewDeletesSourceThreadWhenCancelledDuringThreadStart() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let threadStartGate = CodexAppServerTestGate()
+        try await runtime.transport.enqueueThreadStart(threadID: "thread-source", model: "gpt-5")
+        try await runtime.transport.enqueueEmpty(for: "thread/delete")
+        await runtime.transport.holdNextIgnoringCancellation(
+            method: "thread/start",
+            gate: threadStartGate
+        )
+        let workspace = URL(fileURLWithPath: "/tmp/project", isDirectory: true)
+
+        let task = Task {
+            try await runtime.server.startReview(
+                in: workspace,
+                target: .baseBranch("main")
+            )
+        }
+        await runtime.transport.waitForRequest(method: "thread/start")
+        task.cancel()
+        await threadStartGate.open()
+
+        do {
+            _ = try await withTimeout {
+                try await task.value
+            }
+            Issue.record("Expected cancelled thread start failure.")
+        } catch is CancellationError {
+            let requests = await runtime.transport.recordedRequests()
+            #expect(requests.map(\.method) == [
+                "initialize",
+                "thread/start",
+                "thread/delete",
+            ])
+            let delete = try requests[2].decodeParams(AppServerAPI.Thread.Delete.Params.self)
+            #expect(delete.threadID == "thread-source")
+        } catch {
+            Issue.record("Expected CancellationError, got \(error).")
+        }
+    }
+
+    @Test func appServerStartReviewDeletesSourceThreadWhenCancelledAfterThreadStart() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let reviewStartGate = CodexAppServerTestGate()
+        try await runtime.transport.enqueueThreadStart(threadID: "thread-source", model: "gpt-5")
+        await runtime.transport.enqueueFailure(
+            code: -32602,
+            message: "cancelled review start",
+            for: "review/start"
+        )
+        try await runtime.transport.enqueueEmpty(for: "thread/delete")
+        await runtime.transport.holdNextIgnoringCancellation(
+            method: "review/start",
+            gate: reviewStartGate
+        )
+        let workspace = URL(fileURLWithPath: "/tmp/project", isDirectory: true)
+
+        let task = Task {
+            try await runtime.server.startReview(
+                in: workspace,
+                target: .baseBranch("main")
+            )
+        }
+        await runtime.transport.waitForRequest(method: "review/start")
+        task.cancel()
+        await reviewStartGate.open()
+
+        do {
+            _ = try await withTimeout {
+                try await task.value
+            }
+            Issue.record("Expected cancelled review start failure.")
+        } catch {
+            let requests = await runtime.transport.recordedRequests()
+            #expect(requests.map(\.method) == [
+                "initialize",
+                "thread/start",
+                "review/start",
+                "thread/delete",
+            ])
+            let delete = try requests[3].decodeParams(AppServerAPI.Thread.Delete.Params.self)
+            #expect(delete.threadID == "thread-source")
+        }
+    }
+
+    @Test func appServerStartReviewCleansDetachedReviewWhenCancelledAfterReviewStart() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let reviewStartGate = CodexAppServerTestGate()
+        try await runtime.transport.enqueueThreadStart(threadID: "thread-source", model: "gpt-5")
+        try await runtime.transport.enqueueReviewStart(
+            turnID: "turn-review",
+            reviewThreadID: "thread-review"
+        )
+        try await runtime.transport.enqueueEmpty(for: "thread/delete")
+        try await runtime.transport.enqueueEmpty(for: "thread/delete")
+        await runtime.transport.holdNextIgnoringCancellation(
+            method: "review/start",
+            gate: reviewStartGate
+        )
+        let workspace = URL(fileURLWithPath: "/tmp/project", isDirectory: true)
+
+        let task = Task {
+            try await runtime.server.startReview(
+                in: workspace,
+                target: .baseBranch("main"),
+                delivery: .detached
+            )
+        }
+        await runtime.transport.waitForRequest(method: "review/start")
+        task.cancel()
+        await reviewStartGate.open()
+
+        do {
+            _ = try await withTimeout {
+                try await task.value
+            }
+            Issue.record("Expected cancelled detached review start failure.")
+        } catch is CancellationError {
+            let requests = await runtime.transport.recordedRequests()
+            #expect(requests.map(\.method) == [
+                "initialize",
+                "thread/start",
+                "review/start",
+                "thread/delete",
+                "thread/delete",
+            ])
+            let deletedThreadIDs = try requests.suffix(2).map {
+                try $0.decodeParams(AppServerAPI.Thread.Delete.Params.self).threadID
+            }
+            #expect(deletedThreadIDs == ["thread-review", "thread-source"])
+        } catch {
+            Issue.record("Expected CancellationError, got \(error).")
+        }
+    }
+
     @Test func appServerListThreadsSerializesQueryOptions() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueue(

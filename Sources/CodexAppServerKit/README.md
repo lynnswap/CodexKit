@@ -238,15 +238,20 @@ not yet model directly.
 ## Reviews
 
 `review/start` is part of the app-server surface, so CodexAppServerKit exposes
-it as a thread operation. A review session provides the review turn response and
-review-domain streams. If app-server detaches the review into a separate
-thread, `events`, `logEntries`, `progress`, and `transcriptUpdates` are bound to
-that review thread automatically. Detached review notification routing is owned
-by CodexAppServerKit, so callers do not need to parse JSON-RPC notifications or
-track app-server thread event details.
+it as a high-level `CodexAppServer` operation and as a lower-level thread
+operation for callers that already own a thread. A review session provides the
+review turn response and review-domain streams. If app-server detaches the
+review into a separate thread, `events`, `logEntries`, `progress`, and
+`transcriptUpdates` are bound to that review thread automatically. Detached
+review notification routing is owned by CodexAppServerKit, so callers do not
+need to parse JSON-RPC notifications or track app-server thread event details.
 
 ```swift
-let review = try await thread.startReview(target: .baseBranch("main"))
+let review = try await appServer.startReview(
+    in: workspaceURL,
+    target: .baseBranch("main"),
+    options: .init(model: "gpt-5")
+)
 
 for try await entry in review.logEntries {
     switch entry {
@@ -270,12 +275,19 @@ let response = try await review.collect()
 print(response.finalAnswer ?? "")
 ```
 
+Use `CodexThread.startReview` when a thread owner is already explicit:
+
+```swift
+let thread = try await appServer.startThread(in: workspaceURL)
+let review = try await thread.startReview(target: .uncommittedChanges)
+```
+
 Review targets are Swift domain values:
 
 ```swift
-try await thread.startReview(target: .uncommittedChanges)
-try await thread.startReview(target: .commit(sha: sha, title: title))
-try await thread.startReview(target: .custom(instructions: instructions))
+try await appServer.startReview(in: workspaceURL, target: .uncommittedChanges)
+try await appServer.startReview(in: workspaceURL, target: .commit(sha: sha, title: title))
+try await appServer.startReview(in: workspaceURL, target: .custom(instructions: instructions))
 ```
 
 `CodexReviewSession.events` yields `CodexReviewEvent`, preserving unknown
