@@ -598,8 +598,8 @@ private struct CodexTranscriptAccumulator {
                     content: .message(message)
                 ))
             return true
-        case .messageDelta(let delta, _):
-            append(delta)
+        case .messageDelta(let delta, let turnID):
+            append(delta, fallbackItemID: scopedFallbackMessageID(turnID: turnID))
             return true
         case .reasoningSummaryPartAdded(let part, _):
             start(part)
@@ -627,8 +627,11 @@ private struct CodexTranscriptAccumulator {
         }
     }
 
-    private mutating func append(_ delta: CodexMessageDelta) {
-        let itemID = delta.itemID ?? "agent-message-delta"
+    private mutating func append(
+        _ delta: CodexMessageDelta,
+        fallbackItemID: String = "agent-message-delta"
+    ) {
+        let itemID = delta.itemID ?? fallbackItemID
         let text = (messageDeltaTextByItemID[itemID] ?? "") + delta.text
         messageDeltaTextByItemID[itemID] = text
         let message = CodexMessage(
@@ -638,6 +641,10 @@ private struct CodexTranscriptAccumulator {
             text: text
         )
         upsert(.init(id: itemID, kind: .agentMessage, content: .message(message)))
+    }
+
+    private func scopedFallbackMessageID(turnID: CodexTurnID?) -> String {
+        turnID.map { "agent-message-delta:\($0.rawValue)" } ?? "agent-message-delta"
     }
 
     private mutating func start(_ part: CodexReasoningPart) {

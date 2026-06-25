@@ -1842,6 +1842,47 @@ struct CodexAppServerKitTests {
         #expect(transcripts.last?.items.first?.text == "hello\nworld")
     }
 
+    @Test func threadTranscriptScopesFallbackMessageDeltaIDsByTurn() async throws {
+        let transport = CodexAppServerTestTransport()
+        let client = AppServerClient(transport: transport)
+        let router = CodexAppServerNotificationRouter(client: client)
+        await router.start()
+        await transport.waitForNotificationStreamCount(1)
+        try await transport.emitServerNotification(
+            method: "turn/started",
+            params: TurnStartedParams(threadID: "thread-1", turnID: "turn-1")
+        )
+        try await transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(turnID: "turn-1", delta: "First")
+        )
+        try await transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(id: "turn-1", status: "completed"))
+        )
+        try await transport.emitServerNotification(
+            method: "turn/started",
+            params: TurnStartedParams(threadID: "thread-1", turnID: "turn-2")
+        )
+        try await transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(turnID: "turn-2", delta: "Second")
+        )
+        try await transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(id: "turn-2", status: "completed"))
+        )
+        try await transport.emitServerNotification(
+            method: "thread/closed",
+            params: ThreadIDParams(threadID: "thread-1")
+        )
+        let thread = CodexThread(id: "thread-1", client: client, router: router)
+
+        let transcripts = try await collect(thread.transcriptUpdates)
+
+        #expect(transcripts.last?.items.compactMap(\.text) == ["First", "Second"])
+    }
+
     @Test func responseStreamYieldsSnapshotsAndCollectsFinalResponse() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueue(
@@ -2856,6 +2897,16 @@ private struct TurnDeltaParams: Encodable, Sendable {
         case threadID = "threadId"
         case turnID = "turnId"
         case delta
+    }
+}
+
+private struct TurnStartedParams: Encodable, Sendable {
+    var threadID: String
+    var turnID: String
+
+    enum CodingKeys: String, CodingKey {
+        case threadID = "threadId"
+        case turnID = "turnId"
     }
 }
 
