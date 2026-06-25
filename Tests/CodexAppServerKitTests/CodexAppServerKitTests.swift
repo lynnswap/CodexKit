@@ -466,6 +466,123 @@ struct CodexAppServerKitTests {
         })
     }
 
+    @Test func reviewSessionExposesPersistableLifecycleIdentity() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        try await runtime.transport.enqueueThreadStart(threadID: "thread-source", model: "gpt-5")
+        try await runtime.transport.enqueueReviewStart(
+            turnID: "turn-review",
+            reviewThreadID: "thread-review"
+        )
+
+        let thread = try await runtime.server.startThread(
+            in: URL(fileURLWithPath: "/tmp/project", isDirectory: true),
+            options: .init(model: "gpt-5")
+        )
+        let review = try await thread.startReview(
+            target: .baseBranch("main"),
+            delivery: .detached
+        )
+
+        let identity = CodexReviewIdentity(
+            threadID: "thread-source",
+            turnID: "turn-review",
+            reviewThreadID: "thread-review",
+            model: "gpt-5"
+        )
+        #expect(review.identity == identity)
+        #expect(review.sourceThreadID == "thread-source")
+        #expect(review.activeTurnThreadID == "thread-review")
+        #expect(review.associatedThreadIDs == ["thread-source", "thread-review"])
+        #expect(review.cleanupThreadIDs == ["thread-review", "thread-source"])
+        #expect(identity.associatedThreadIDs == ["thread-source", "thread-review"])
+        #expect(identity.cleanupThreadIDs == ["thread-review", "thread-source"])
+
+        let encoded = try JSONEncoder().encode(identity)
+        let decoded = try JSONDecoder().decode(CodexReviewIdentity.self, from: encoded)
+        #expect(decoded == identity)
+    }
+
+    @Test func appServerResumeReviewRestoresEventsAndCancellationFromIdentity() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        try await runtime.transport.enqueueThreadResume(.init(
+            id: "thread-review",
+            workspace: URL(fileURLWithPath: "/tmp/project", isDirectory: true)
+        ))
+        try await runtime.transport.enqueueEmpty(for: "turn/interrupt")
+        let identity = CodexReviewIdentity(
+            threadID: "thread-source",
+            turnID: "turn-review",
+            reviewThreadID: "thread-review",
+            model: "gpt-5"
+        )
+
+        let review = try await runtime.server.resumeReview(identity)
+        let cancellation = try await review.cancel()
+        try await runtime.transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(id: "turn-review", status: "completed"))
+        )
+
+        #expect(review.identity == identity)
+        #expect(cancellation.threadID == "thread-review")
+        #expect(cancellation.turnID == "turn-review")
+        let requests = await runtime.transport.recordedRequests()
+        #expect(requests.map(\.method) == [
+            "initialize",
+            "thread/resume",
+            "turn/interrupt",
+        ])
+        let resumeParams = try requests[1].decodeParams(AppServerAPI.Thread.Resume.Params.self)
+        #expect(resumeParams.threadID == "thread-review")
+        #expect(resumeParams.model == "gpt-5")
+        let interruptParams = try requests[2].decodeParams(AppServerAPI.Turn.Interrupt.Params.self)
+        #expect(interruptParams.threadID == "thread-review")
+        #expect(interruptParams.turnID == "turn-review")
+
+        var iterator = review.events.makeAsyncIterator()
+        let event = try await iterator.next()
+        if case .turnCompleted(let response) = event {
+            #expect(response.turnID == "turn-review")
+        } else {
+            Issue.record("Expected resumed review.events to receive turn-only completion.")
+        }
+        #expect(try await iterator.next() == nil)
+    }
+
+    @Test func reviewSessionCancelHookReceivesCurrentActiveTurn() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-review"))
+        await runtime.transport.enqueueFailure(
+            code: -32602,
+            message: "expected active turn id turn-review but found turn-new",
+            for: "turn/interrupt"
+        )
+        try await runtime.transport.enqueueEmpty(for: "turn/interrupt")
+        let identity = CodexReviewIdentity(
+            threadID: "thread-source",
+            turnID: "turn-review",
+            reviewThreadID: "thread-review",
+            model: "gpt-5"
+        )
+        let recorder = CancellationRecorder()
+
+        let review = try await runtime.server.resumeReview(identity)
+        let cancellation = try await review.cancel { cancellation in
+            await recorder.append(cancellation)
+        }
+
+        #expect(cancellation.threadID == "thread-review")
+        #expect(cancellation.turnID == "turn-new")
+        #expect(await recorder.values() == [
+            CodexTurnCancellation(threadID: "thread-review", turnID: "turn-new")
+        ])
+        let turnIDs = try await runtime.transport.recordedRequests(method: "turn/interrupt")
+            .map { request in
+                try request.decodeParams(AppServerAPI.Turn.Interrupt.Params.self).turnID
+            }
+        #expect(turnIDs == ["turn-review", "turn-new"])
+    }
+
     @Test func reviewStartSeedsDetachedTurnRoutingForTurnOnlyTerminalNotifications() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueue(
@@ -2071,6 +2188,18 @@ private struct TokenUsageParams: Encodable, Sendable {
         var outputTokens: Int
         var reasoningOutputTokens: Int = 0
         var totalTokens: Int
+    }
+}
+
+private actor CancellationRecorder {
+    private var cancellations: [CodexTurnCancellation] = []
+
+    func append(_ cancellation: CodexTurnCancellation) {
+        cancellations.append(cancellation)
+    }
+
+    func values() -> [CodexTurnCancellation] {
+        cancellations
     }
 }
 

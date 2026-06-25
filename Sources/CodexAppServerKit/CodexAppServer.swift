@@ -287,7 +287,36 @@ public actor CodexAppServer {
                 threadID: id.rawValue,
                 params: threadStartParams(options: options)
             ))
-        return thread(from: response.thread)
+        return thread(from: response.thread, model: options.model)
+    }
+
+    /// Restores a persisted app-server review run as a live review session handle.
+    ///
+    /// The restored session can consume review events and cancel the active
+    /// review turn. The active turn thread is resumed first so app-server has
+    /// the stored thread context loaded before the review handle is rebuilt.
+    ///
+    /// - Parameters:
+    ///   - identity: Persisted review run identity.
+    ///   - options: Options for the restored review response stream.
+    ///   - threadOptions: Resume options for the active turn thread. When `model` is
+    ///     `nil`, `identity.model` is used.
+    /// - Returns: A live review session handle for the persisted run.
+    /// - Throws: A transport, JSON-RPC, or app-server request error.
+    public func resumeReview(
+        _ identity: CodexReviewIdentity,
+        options: CodexReviewResumeOptions = .init(),
+        threadOptions: CodexThread.ResumeOptions = .init()
+    ) async throws -> CodexReviewSession {
+        var threadOptions = threadOptions
+        if threadOptions.model == nil {
+            threadOptions.model = identity.model
+        }
+        let activeThread = try await resumeThread(identity.activeTurnThreadID, options: threadOptions)
+        return await activeThread.reviewSession(
+            identity,
+            transcriptErrorHandlingPolicy: options.transcriptErrorHandlingPolicy
+        )
     }
 
     /// Forks an existing Codex thread into a new thread.
@@ -586,10 +615,11 @@ public actor CodexAppServer {
         )
     }
 
-    private func thread(from snapshot: AppServerAPI.Thread.Snapshot) -> CodexThread {
+    private func thread(from snapshot: AppServerAPI.Thread.Snapshot, model: String? = nil) -> CodexThread {
         CodexThread(
             id: .init(rawValue: snapshot.id),
             workspace: snapshot.cwd.map { URL(fileURLWithPath: $0, isDirectory: true) },
+            model: model,
             client: client,
             router: router
         )

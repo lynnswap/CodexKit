@@ -617,6 +617,76 @@ public enum CodexReviewDelivery: String, Codable, Equatable, Sendable {
     case detached
 }
 
+/// Persistable app-server identity for a Codex review run.
+public struct CodexReviewIdentity: Codable, Equatable, Identifiable, Sendable {
+    /// The source thread where the review was started.
+    public var threadID: CodexThreadID
+
+    /// The app-server turn producing the review response.
+    public var turnID: CodexTurnID
+
+    /// The detached review thread, when app-server created one.
+    public var reviewThreadID: CodexThreadID?
+
+    /// The model used when restoring app-server thread handles.
+    public var model: String?
+
+    public var id: CodexTurnID {
+        turnID
+    }
+
+    /// Alias for `threadID` that makes review lifecycle ownership explicit.
+    public var sourceThreadID: CodexThreadID {
+        threadID
+    }
+
+    /// The thread that owns the currently active review turn.
+    public var activeTurnThreadID: CodexThreadID {
+        reviewThreadID ?? sourceThreadID
+    }
+
+    /// Source and review thread identities in source-first order.
+    public var associatedThreadIDs: [CodexThreadID] {
+        if activeTurnThreadID == sourceThreadID {
+            return [sourceThreadID]
+        }
+        return [sourceThreadID, activeTurnThreadID]
+    }
+
+    /// Thread identities to clean up after a review, with detached review
+    /// threads before the source thread.
+    public var cleanupThreadIDs: [CodexThreadID] {
+        if activeTurnThreadID == sourceThreadID {
+            return [sourceThreadID]
+        }
+        return [activeTurnThreadID, sourceThreadID]
+    }
+
+    public init(
+        threadID: CodexThreadID,
+        turnID: CodexTurnID,
+        reviewThreadID: CodexThreadID? = nil,
+        model: String? = nil
+    ) {
+        self.threadID = threadID
+        self.turnID = turnID
+        self.reviewThreadID = reviewThreadID
+        self.model = model
+    }
+}
+
+/// Options for restoring a persisted review run as a live session handle.
+public struct CodexReviewResumeOptions: Equatable, Sendable {
+    /// How collection should treat transcript errors for the restored response.
+    public var transcriptErrorHandlingPolicy: CodexTranscriptErrorHandlingPolicy
+
+    public init(
+        transcriptErrorHandlingPolicy: CodexTranscriptErrorHandlingPolicy = .preserveTranscript
+    ) {
+        self.transcriptErrorHandlingPolicy = transcriptErrorHandlingPolicy
+    }
+}
+
 /// Review-scoped events emitted for a `CodexReviewSession`.
 public enum CodexReviewEvent: Equatable, Sendable {
     case turnStarted(CodexTurnID)
@@ -802,6 +872,9 @@ public struct CodexReviewSession: Identifiable, Sendable {
     /// reviews.
     public let reviewThreadID: CodexThreadID
 
+    /// The model used for the review thread, when known.
+    public let model: String?
+
     /// The live response stream for the review turn.
     public let response: CodexResponseStream
 
@@ -811,14 +884,53 @@ public struct CodexReviewSession: Identifiable, Sendable {
         threadID: CodexThreadID,
         turnID: CodexTurnID,
         reviewThreadID: CodexThreadID,
+        model: String?,
         response: CodexResponseStream,
         eventThread: CodexThread
     ) {
         self.threadID = threadID
         self.turnID = turnID
         self.reviewThreadID = reviewThreadID
+        self.model = model
         self.response = response
         self.eventThread = eventThread
+    }
+
+    /// Persistable identity for this review run.
+    public var identity: CodexReviewIdentity {
+        .init(
+            threadID: sourceThreadID,
+            turnID: turnID,
+            reviewThreadID: reviewThreadID,
+            model: model
+        )
+    }
+
+    /// Alias for `threadID` that makes the source/review split explicit.
+    public var sourceThreadID: CodexThreadID {
+        threadID
+    }
+
+    /// The thread that owns the currently active review turn.
+    public var activeTurnThreadID: CodexThreadID {
+        reviewThreadID
+    }
+
+    /// Source and review thread identities in source-first order.
+    public var associatedThreadIDs: [CodexThreadID] {
+        if activeTurnThreadID == sourceThreadID {
+            return [sourceThreadID]
+        }
+        return [sourceThreadID, activeTurnThreadID]
+    }
+
+    /// Thread identities to clean up after this review, with detached review
+    /// threads before the source thread.
+    public var cleanupThreadIDs: [CodexThreadID] {
+        if activeTurnThreadID == sourceThreadID {
+            return [sourceThreadID]
+        }
+        return [activeTurnThreadID, sourceThreadID]
     }
 
     /// Review-scoped events emitted by the review thread.
@@ -864,7 +976,7 @@ public struct CodexReviewSession: Identifiable, Sendable {
     }
 
     @discardableResult
-    package func cancel(
+    public func cancel(
         willCancelActiveTurn: (@Sendable (CodexTurnCancellation) async -> Void)?
     ) async throws -> CodexTurnCancellation {
         try await response.cancel(willCancelActiveTurn: willCancelActiveTurn)

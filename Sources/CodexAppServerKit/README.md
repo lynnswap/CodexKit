@@ -286,6 +286,26 @@ review turn completes or fails. `transcriptUpdates` remains the transcript
 sequence for the review thread itself, which is useful when a UI wants
 thread-bound transcript snapshots rather than review progress phases.
 
+`CodexReviewSession` also owns the app-server lifecycle identity for a review.
+Use `sourceThreadID`, `activeTurnThreadID`, `associatedThreadIDs`, and
+`cleanupThreadIDs` when a host app needs to track source, detached review, and
+cleanup ownership without keeping its own app-server dictionaries.
+
+```swift
+let identity = review.identity
+persist(identity)
+
+let restored = try await appServer.resumeReview(identity)
+try await restored.cancel { cancellation in
+    noteRollbackThread(cancellation.threadID)
+}
+```
+
+`CodexReviewIdentity` is a `Codable` Swift value containing only CodexKit
+identity: source thread, review turn, optional detached review thread, and
+model. It is intended for persisted app-server review runs and does not depend
+on any higher-level review domain model.
+
 ## Responses
 
 `CodexResponse` is the final result from `respond` or `ResponseStream.collect()`.
@@ -434,6 +454,8 @@ The public boundary is:
 - `CodexThread`
 - `CodexReviewTarget`
 - `CodexReviewSession`
+- `CodexReviewIdentity`
+- `CodexReviewResumeOptions`
 - `CodexReviewEvent`
 - `CodexReviewLogEntry`
 - `CodexReviewProgress`

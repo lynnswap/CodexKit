@@ -138,9 +138,27 @@ extension CodexThread {
         ))
         let reviewThreadID = response.reviewThreadID.map(CodexThreadID.init(rawValue:)) ?? id
         let turnID = CodexTurnID(rawValue: response.turnID)
-        await router.seedReviewTurn(turnID, reviewThreadID: reviewThreadID)
+        let identity = CodexReviewIdentity(
+            threadID: id,
+            turnID: turnID,
+            reviewThreadID: reviewThreadID,
+            model: model
+        )
+        return await reviewSession(
+            identity,
+            transcriptErrorHandlingPolicy: transcriptErrorHandlingPolicy
+        )
+    }
+
+    package func reviewSession(
+        _ identity: CodexReviewIdentity,
+        transcriptErrorHandlingPolicy: CodexTranscriptErrorHandlingPolicy = .preserveTranscript
+    ) async -> CodexReviewSession {
+        let reviewThreadID = identity.activeTurnThreadID
+        await router.seedReviewTurn(identity.turnID, reviewThreadID: reviewThreadID)
+        let model = identity.model ?? self.model
         let turn = CodexTurn(
-            id: turnID,
+            id: identity.turnID,
             threadID: reviewThreadID,
             client: client,
             router: router
@@ -153,9 +171,10 @@ extension CodexThread {
             router: router
         )
         return .init(
-            threadID: id,
+            threadID: identity.sourceThreadID,
             turnID: turn.id,
             reviewThreadID: reviewThreadID,
+            model: model,
             response: .init(
                 turn: turn,
                 transcriptErrorHandlingPolicy: transcriptErrorHandlingPolicy
