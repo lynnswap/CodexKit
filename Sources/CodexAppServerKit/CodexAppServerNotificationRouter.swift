@@ -828,8 +828,8 @@ private struct RawThreadItem: Decodable {
         name = try container.decodeStringIfPresent(forKey: .name)
         query = try container.decodeStringIfPresent(forKey: .query)
         prompt = try container.decodeStringIfPresent(forKey: .prompt)
-        summary = try? container.decodeIfPresent([String].self, forKey: .summary)
-        content = try? container.decodeIfPresent([String].self, forKey: .content)
+        summary = try container.decodeTextListIfPresent(forKey: .summary)
+        content = try container.decodeTextListIfPresent(forKey: .content)
         arguments = try? container.decodeIfPresent(AppServerJSONValue.self, forKey: .arguments)
         input = try? container.decodeIfPresent(AppServerJSONValue.self, forKey: .input)
         result = try? container.decodeIfPresent(AppServerJSONValue.self, forKey: .result)
@@ -920,6 +920,19 @@ private struct RawThreadItem: Decodable {
 }
 
 extension KeyedDecodingContainer {
+    fileprivate func decodeTextListIfPresent(forKey key: Key) throws -> [String]? {
+        if let values = try? decodeIfPresent([String].self, forKey: key) {
+            return values.nonEmpty
+        }
+        if let value = try? decodeStringIfPresent(forKey: key) {
+            return [value]
+        }
+        if let fragments = try? decodeIfPresent([AppServerTextFragment].self, forKey: key) {
+            return fragments.compactMap(\.text).nonEmpty
+        }
+        return nil
+    }
+
     fileprivate func decodeStringIfPresent(forKey key: Key) throws -> String? {
         if let string = try? decode(String.self, forKey: key) {
             return string
@@ -934,6 +947,34 @@ extension KeyedDecodingContainer {
             return bool ? "true" : "false"
         }
         return nil
+    }
+}
+
+private struct AppServerTextFragment: Decodable {
+    var text: String?
+
+    enum CodingKeys: String, CodingKey {
+        case text
+    }
+
+    init(from decoder: Decoder) throws {
+        let singleValue = try decoder.singleValueContainer()
+        if singleValue.decodeNil() {
+            text = nil
+            return
+        }
+        if let text = try? singleValue.decode(String.self) {
+            self.text = text
+            return
+        }
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        text = try container.decodeStringIfPresent(forKey: .text)
+    }
+}
+
+private extension Array where Element == String {
+    var nonEmpty: [String]? {
+        isEmpty ? nil : self
     }
 }
 

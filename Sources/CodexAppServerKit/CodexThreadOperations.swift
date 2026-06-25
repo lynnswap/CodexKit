@@ -136,7 +136,8 @@ extension CodexThread {
         let response = try await client.send(AppServerAPI.Review.Start.Request(
             params: .init(threadID: id.rawValue, target: target, delivery: delivery)
         ))
-        let detachedReviewThreadID = response.reviewThreadID.map(CodexThreadID.init(rawValue:))
+        let responseReviewThreadID = response.reviewThreadID.map(CodexThreadID.init(rawValue:))
+        let detachedReviewThreadID = responseReviewThreadID == id ? nil : responseReviewThreadID
         let turnID = CodexTurnID(rawValue: response.turnID)
         let identity = CodexReviewIdentity(
             threadID: id,
@@ -408,24 +409,35 @@ package func interruptCodexTurn(
     client: AppServerClient,
     willCancelActiveTurn: (@Sendable (CodexTurnCancellation) async -> Void)? = nil
 ) async throws -> CodexTurnCancellation {
-    do {
-        try await sendInterrupt(threadID: threadID, turnID: turnID, client: client)
-        return .init(threadID: threadID, turnID: turnID)
-    } catch {
-        guard let activeTurnID = activeTurnID(from: error),
-              activeTurnID != turnID?.rawValue
-        else {
-            throw error
+    for attempt in 0...interruptActivationRetryLimit {
+        do {
+            try await sendInterrupt(threadID: threadID, turnID: turnID, client: client)
+            return .init(threadID: threadID, turnID: turnID)
+        } catch {
+            if attempt < interruptActivationRetryLimit,
+               isExpectedTurnNotActive(error, turnID: turnID) {
+                try await Task.sleep(nanoseconds: interruptActivationRetryDelayNanoseconds)
+                continue
+            }
+            guard let activeTurnID = activeTurnID(from: error),
+                  activeTurnID != turnID?.rawValue
+            else {
+                throw error
+            }
+            let activeTurn = CodexTurnID(rawValue: activeTurnID)
+            let cancellation = CodexTurnCancellation(threadID: threadID, turnID: activeTurn)
+            if let willCancelActiveTurn {
+                await willCancelActiveTurn(cancellation)
+            }
+            try await sendInterrupt(threadID: threadID, turnID: activeTurn, client: client)
+            return cancellation
         }
-        let activeTurn = CodexTurnID(rawValue: activeTurnID)
-        let cancellation = CodexTurnCancellation(threadID: threadID, turnID: activeTurn)
-        if let willCancelActiveTurn {
-            await willCancelActiveTurn(cancellation)
-        }
-        try await sendInterrupt(threadID: threadID, turnID: activeTurn, client: client)
-        return cancellation
     }
+    throw CancellationError()
 }
+
+private let interruptActivationRetryLimit = 5
+private let interruptActivationRetryDelayNanoseconds: UInt64 = 50_000_000
 
 private func sendInterrupt(
     threadID: CodexThreadID,
@@ -447,6 +459,16 @@ private func activeTurnID(from error: Error) -> String? {
     return String(message[range.upperBound...])
         .trimmingCharacters(in: CharacterSet(charactersIn: "` ").union(.whitespacesAndNewlines))
         .nonEmpty
+}
+
+private func isExpectedTurnNotActive(_ error: Error, turnID: CodexTurnID?) -> Bool {
+    guard turnID != nil,
+          case JSONRPC.Error.responseError(_, let message) = error
+    else {
+        return false
+    }
+    let normalized = message.lowercased()
+    return normalized.contains("no active turn") && normalized.contains("interrupt")
 }
 
 private extension String {

@@ -250,6 +250,28 @@ struct CodexAppServerKitTests {
         #expect(reviewStart.delivery == .inline)
     }
 
+    @Test func threadStartReviewTreatsReturnedSourceThreadIDAsInline() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueue(
+            AppServerAPI.Review.Start.Response(
+                turnID: "turn-review",
+                reviewThreadID: "thread-1"
+            ),
+            for: "review/start"
+        )
+        let client = AppServerClient(transport: transport)
+        let router = CodexAppServerNotificationRouter(client: client)
+        let thread = CodexThread(id: "thread-1", model: "gpt-5", client: client, router: router)
+
+        let review = try await thread.startReview(target: .baseBranch("main"))
+
+        #expect(review.threadID == "thread-1")
+        #expect(review.reviewThreadID == "thread-1")
+        #expect(review.model == "gpt-5")
+        #expect(review.identity.reviewThreadID == nil)
+        #expect(review.identity.model == "gpt-5")
+    }
+
     @Test func appServerStartReviewDeletesSourceThreadWhenReviewStartFails() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         try await runtime.transport.enqueueThreadStart(threadID: "thread-source", model: "gpt-5")
@@ -1777,6 +1799,42 @@ struct CodexAppServerKitTests {
             })
     }
 
+    @Test func threadItemDecodeReadsTextObjectContentFragments() async throws {
+        let transport = CodexAppServerTestTransport()
+        let client = AppServerClient(transport: transport)
+        let router = CodexAppServerNotificationRouter(client: client)
+        await router.start()
+        await transport.waitForNotificationStreamCount(1)
+        try await transport.emitServerNotification(
+            method: "item/completed",
+            params: ThreadItemParams(
+                threadID: "thread-1",
+                turnID: "turn-1",
+                item: .init(
+                    id: "message-1",
+                    type: "userMessage",
+                    contentItems: [
+                        .init(text: "hello"),
+                        .init(text: "world"),
+                    ]
+                )
+            )
+        )
+        try await transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(id: "turn-1", status: "completed"))
+        )
+        try await transport.emitServerNotification(
+            method: "thread/closed",
+            params: ThreadIDParams(threadID: "thread-1")
+        )
+        let thread = CodexThread(id: "thread-1", client: client, router: router)
+
+        let transcripts = try await collect(thread.transcriptUpdates)
+
+        #expect(transcripts.last?.items.first?.text == "hello\nworld")
+    }
+
     @Test func responseStreamYieldsSnapshotsAndCollectsFinalResponse() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueue(
@@ -2447,6 +2505,33 @@ struct CodexAppServerKitTests {
         #expect(turnIDs == ["turn-old", "turn-new"])
     }
 
+    @Test func responseStreamCancelRetriesUntilExpectedTurnIsActive() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueue(
+            AppServerAPI.Turn.Start.Response(turn: .init(id: "turn-1", status: "running")),
+            for: "turn/start"
+        )
+        await transport.enqueueFailure(
+            code: -32602,
+            message: "no active turn to interrupt",
+            for: "turn/interrupt"
+        )
+        try await transport.enqueue(EmptyResponse(), for: "turn/interrupt")
+        let client = AppServerClient(transport: transport)
+        let router = CodexAppServerNotificationRouter(client: client)
+        let thread = CodexThread(id: "thread-1", client: client, router: router)
+
+        let stream = try await thread.streamResponse(to: "Run the slow checks.")
+        let cancellation = try await stream.cancel()
+
+        #expect(cancellation.threadID == "thread-1")
+        #expect(cancellation.turnID == "turn-1")
+        let turnIDs = try await transport.recordedRequests(method: "turn/interrupt").map {
+            try $0.decodeParams(AppServerAPI.Turn.Interrupt.Params.self).turnID
+        }
+        #expect(turnIDs == ["turn-1", "turn-1"])
+    }
+
     @Test func responseStreamSteerSubmitsInputToCurrentTurn() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueue(
@@ -2801,6 +2886,7 @@ private struct ThreadItemParams: Encodable, Sendable {
         var tool: String?
         var summary: [String]?
         var content: [String]?
+        var contentItems: [TextContent]?
 
         init(
             id: String,
@@ -2813,7 +2899,8 @@ private struct ThreadItemParams: Encodable, Sendable {
             path: String? = nil,
             tool: String? = nil,
             summary: [String]? = nil,
-            content: [String]? = nil
+            content: [String]? = nil,
+            contentItems: [TextContent]? = nil
         ) {
             self.id = id
             self.type = type
@@ -2826,6 +2913,45 @@ private struct ThreadItemParams: Encodable, Sendable {
             self.tool = tool
             self.summary = summary
             self.content = content
+            self.contentItems = contentItems
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case id
+            case type
+            case text
+            case phase
+            case command
+            case aggregatedOutput
+            case status
+            case path
+            case tool
+            case summary
+            case content
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(id, forKey: .id)
+            try container.encode(type, forKey: .type)
+            try container.encodeIfPresent(text, forKey: .text)
+            try container.encodeIfPresent(phase, forKey: .phase)
+            try container.encodeIfPresent(command, forKey: .command)
+            try container.encodeIfPresent(aggregatedOutput, forKey: .aggregatedOutput)
+            try container.encodeIfPresent(status, forKey: .status)
+            try container.encodeIfPresent(path, forKey: .path)
+            try container.encodeIfPresent(tool, forKey: .tool)
+            try container.encodeIfPresent(summary, forKey: .summary)
+            if let contentItems {
+                try container.encode(contentItems, forKey: .content)
+            } else {
+                try container.encodeIfPresent(content, forKey: .content)
+            }
+        }
+
+        struct TextContent: Encodable, Sendable {
+            var type = "text"
+            var text: String
         }
     }
 }
