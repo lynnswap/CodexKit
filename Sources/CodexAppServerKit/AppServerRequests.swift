@@ -581,6 +581,7 @@ extension AppServerAPI.Turn {
         package var startedAt: Int?
         package var completedAt: Int?
         package var durationMS: Int?
+        package var items: [AppServerJSONValue]?
 
         enum CodingKeys: String, CodingKey {
             case id
@@ -589,6 +590,7 @@ extension AppServerAPI.Turn {
             case startedAt
             case completedAt
             case durationMS = "durationMs"
+            case items
         }
 
         package init(
@@ -597,7 +599,8 @@ extension AppServerAPI.Turn {
             error: AppServerAPI.Turn.Error? = nil,
             startedAt: Int? = nil,
             completedAt: Int? = nil,
-            durationMS: Int? = nil
+            durationMS: Int? = nil,
+            items: [AppServerJSONValue]? = nil
         ) {
             self.id = id
             self.status = status
@@ -605,6 +608,7 @@ extension AppServerAPI.Turn {
             self.startedAt = startedAt
             self.completedAt = completedAt
             self.durationMS = durationMS
+            self.items = items
         }
     }
 }

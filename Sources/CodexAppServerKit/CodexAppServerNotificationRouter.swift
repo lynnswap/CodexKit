@@ -578,14 +578,28 @@ package actor CodexAppServerNotificationRouter {
         let payload = try? decoder.decode(TurnCompletedPayload.self, from: data)
         let turn = payload?.turn
         let status = turn?.status.map(CodexTurnStatus.init(rawValue:))
+        let transcript = CodexTranscript(items: threadItems(from: turn?.items))
         return .init(
             turnID: turn.map { .init(rawValue: $0.id) } ?? context.turnID ?? .init(rawValue: ""),
             status: status,
             errorMessage: turn?.error?.message,
+            finalAnswer: transcript.finalAnswer,
+            transcript: transcript,
             startedAt: turn?.startedAt.map { Date(timeIntervalSince1970: TimeInterval($0)) },
             completedAt: turn?.completedAt.map { Date(timeIntervalSince1970: TimeInterval($0)) },
             duration: turn?.durationMS.map { .milliseconds(Int64($0)) }
         )
+    }
+
+    private func threadItems(from values: [AppServerJSONValue]?) -> [CodexThreadItem] {
+        values?.compactMap { value in
+            guard let data = try? JSONEncoder().encode(value),
+                  let item = try? decoder.decode(RawThreadItem.self, from: data)
+            else {
+                return nil
+            }
+            return item.threadItem
+        } ?? []
     }
 
     private func turnFailureMessage(from data: Data) -> String? {

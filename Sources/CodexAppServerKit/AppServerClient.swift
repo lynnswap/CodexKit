@@ -218,7 +218,7 @@ package actor RequestSerializer {
 private actor SerialLane {
     private struct Waiter {
         var id: UUID
-        var continuation: CheckedContinuation<Void, Never>
+        var continuation: CheckedContinuation<Bool, Never>
     }
 
     private var isOccupied = false
@@ -231,10 +231,10 @@ private actor SerialLane {
             return
         }
         let waiterID = UUID()
-        await withTaskCancellationHandler {
+        let acquired = await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
                 if Task.isCancelled {
-                    continuation.resume()
+                    continuation.resume(returning: false)
                 } else {
                     waiters.append(.init(id: waiterID, continuation: continuation))
                 }
@@ -244,7 +244,15 @@ private actor SerialLane {
                 await self.cancelWaiter(id: waiterID)
             }
         }
-        try Task.checkCancellation()
+        if Task.isCancelled {
+            if acquired {
+                leave()
+            }
+            throw CancellationError()
+        }
+        guard acquired else {
+            throw CancellationError()
+        }
     }
 
     func leave() {
@@ -252,7 +260,7 @@ private actor SerialLane {
             isOccupied = false
         } else {
             let next = waiters.removeFirst()
-            next.continuation.resume()
+            next.continuation.resume(returning: true)
         }
     }
 
@@ -261,6 +269,6 @@ private actor SerialLane {
             return
         }
         let waiter = waiters.remove(at: index)
-        waiter.continuation.resume()
+        waiter.continuation.resume(returning: false)
     }
 }

@@ -1884,6 +1884,41 @@ struct CodexAppServerKitTests {
             ])
     }
 
+    @Test func responseStreamCollectsTranscriptFromCompletedTurnItems() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueue(
+            AppServerAPI.Turn.Start.Response(turn: .init(id: "turn-1", status: "running")),
+            for: "turn/start"
+        )
+        let client = AppServerClient(transport: transport)
+        let router = CodexAppServerNotificationRouter(client: client)
+        await router.start()
+        await transport.waitForNotificationStreamCount(1)
+        let thread = CodexThread(id: "thread-1", client: client, router: router)
+
+        let stream = try await thread.streamResponse(to: "Summarize this.")
+        try await transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(
+                id: "turn-1",
+                status: "completed",
+                items: [
+                    .object([
+                        "id": .string("message-1"),
+                        "type": .string("agentMessage"),
+                        "text": .string("Final from payload"),
+                        "phase": .string("final_answer"),
+                    ]),
+                ]
+            ))
+        )
+
+        let response = try await stream.collect()
+
+        #expect(response.finalAnswer == "Final from payload")
+        #expect(response.transcript.items.first?.text == "Final from payload")
+    }
+
     @Test func responseStreamSnapshotsIncludeIncrementalTokenUsage() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueue(
