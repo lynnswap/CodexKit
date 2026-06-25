@@ -273,6 +273,41 @@ public actor CodexAppServer {
         )
     }
 
+    /// Starts a Codex code review in a workspace.
+    ///
+    /// This creates a source thread for `workspace` and starts the app-server
+    /// review lifecycle from that thread, so callers do not need to manually
+    /// sequence `startThread` and `CodexThread.startReview`.
+    ///
+    /// - Parameters:
+    ///   - workspace: The workspace directory to review.
+    ///   - target: The repository changes or custom instructions to review.
+    ///   - instructions: Optional base and developer instructions for the source thread.
+    ///   - options: Thread creation options, including model, approval, and sandbox settings.
+    ///   - delivery: Whether the app-server should run the review inline or in a detached review thread.
+    ///   - transcriptErrorHandlingPolicy: How collection should treat transcript errors.
+    /// - Returns: A live review session.
+    /// - Throws: A transport, JSON-RPC, or app-server request error.
+    public func startReview(
+        in workspace: URL,
+        target: CodexReviewTarget,
+        instructions: CodexInstructions? = nil,
+        options: CodexThread.Options = .init(),
+        delivery: CodexReviewDelivery = .inline,
+        transcriptErrorHandlingPolicy: CodexTranscriptErrorHandlingPolicy = .preserveTranscript
+    ) async throws -> CodexReviewSession {
+        let thread = try await startThread(
+            in: workspace,
+            instructions: instructions,
+            options: options
+        )
+        return try await thread.startReview(
+            target: target,
+            delivery: delivery,
+            transcriptErrorHandlingPolicy: transcriptErrorHandlingPolicy
+        )
+    }
+
     /// Resumes an existing Codex thread.
     ///
     /// - Parameters:
