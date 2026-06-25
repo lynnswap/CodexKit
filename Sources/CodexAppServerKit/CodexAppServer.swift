@@ -606,7 +606,7 @@ public actor CodexAppServer {
                 params: .init(
                     archived: query.archived,
                     cursor: query.cursor,
-                    cwd: query.workspace.map { .path($0.path) },
+                    cwd: query.workspace.map { .paths([$0.path]) },
                     limit: query.limit,
                     modelProviders: query.modelProviders,
                     searchTerm: query.searchTerm,

@@ -652,23 +652,16 @@ extension AppServerAPI.Thread.List {
     }
 
     package enum CWDFilter: Codable, Equatable, Sendable {
-        case path(String)
         case paths([String])
 
         package init(from decoder: Decoder) throws {
             let container = try decoder.singleValueContainer()
-            if let path = try? container.decode(String.self) {
-                self = .path(path)
-            } else {
-                self = .paths(try container.decode([String].self))
-            }
+            self = .paths(try container.decode([String].self))
         }
 
         package func encode(to encoder: Encoder) throws {
             var container = encoder.singleValueContainer()
             switch self {
-            case .path(let path):
-                try container.encode(path)
             case .paths(let paths):
                 try container.encode(paths)
             }

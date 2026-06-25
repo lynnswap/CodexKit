@@ -478,7 +478,7 @@ struct CodexAppServerKitTests {
         )
         #expect(params.archived == false)
         #expect(params.cursor == "cursor")
-        #expect(params.cwd == .path(workspace.path))
+        #expect(params.cwd == .paths([workspace.path]))
         #expect(params.limit == 10)
         #expect(params.searchTerm == "review")
         #expect(params.modelProviders == ["openai"])
