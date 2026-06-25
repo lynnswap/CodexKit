@@ -301,11 +301,16 @@ public actor CodexAppServer {
             instructions: instructions,
             options: options
         )
-        return try await thread.startReview(
-            target: target,
-            delivery: delivery,
-            transcriptErrorHandlingPolicy: transcriptErrorHandlingPolicy
-        )
+        do {
+            return try await thread.startReview(
+                target: target,
+                delivery: delivery,
+                transcriptErrorHandlingPolicy: transcriptErrorHandlingPolicy
+            )
+        } catch {
+            try? await deleteThread(thread.id)
+            throw error
+        }
     }
 
     /// Resumes an existing Codex thread.

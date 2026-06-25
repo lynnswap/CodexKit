@@ -232,6 +232,36 @@ struct CodexAppServerKitTests {
         #expect(reviewStart.delivery == .inline)
     }
 
+    @Test func appServerStartReviewDeletesSourceThreadWhenReviewStartFails() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        try await runtime.transport.enqueueThreadStart(threadID: "thread-source", model: "gpt-5")
+        await runtime.transport.enqueueFailure(
+            code: -32602,
+            message: "invalid review target",
+            for: "review/start"
+        )
+        try await runtime.transport.enqueueEmpty(for: "thread/delete")
+        let workspace = URL(fileURLWithPath: "/tmp/project", isDirectory: true)
+
+        do {
+            _ = try await runtime.server.startReview(
+                in: workspace,
+                target: .baseBranch("missing")
+            )
+            Issue.record("Expected review start failure.")
+        } catch {
+            let requests = await runtime.transport.recordedRequests()
+            #expect(requests.map(\.method) == [
+                "initialize",
+                "thread/start",
+                "review/start",
+                "thread/delete",
+            ])
+            let delete = try requests[3].decodeParams(AppServerAPI.Thread.Delete.Params.self)
+            #expect(delete.threadID == "thread-source")
+        }
+    }
+
     @Test func appServerListThreadsSerializesQueryOptions() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueue(
