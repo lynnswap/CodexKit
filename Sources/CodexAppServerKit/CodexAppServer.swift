@@ -296,19 +296,37 @@ public actor CodexAppServer {
         delivery: CodexReviewDelivery = .inline,
         transcriptErrorHandlingPolicy: CodexTranscriptErrorHandlingPolicy = .preserveTranscript
     ) async throws -> CodexReviewSession {
-        let thread = try await startThread(
+        try Task.checkCancellation()
+        let thread = try await startThreadIgnoringCallerCancellation(
             in: workspace,
             instructions: instructions,
             options: options
         )
         do {
-            return try await thread.startReview(
+            try Task.checkCancellation()
+        } catch {
+            await deleteThreadIgnoringCallerCancellation(thread.id)
+            throw error
+        }
+
+        let review: CodexReviewSession
+        do {
+            review = try await startReviewIgnoringCallerCancellation(
+                thread: thread,
                 target: target,
                 delivery: delivery,
                 transcriptErrorHandlingPolicy: transcriptErrorHandlingPolicy
             )
         } catch {
             await deleteThreadIgnoringCallerCancellation(thread.id)
+            throw error
+        }
+
+        do {
+            try Task.checkCancellation()
+            return review
+        } catch {
+            await cleanupReviewIgnoringCallerCancellation(review.identity)
             throw error
         }
     }
@@ -844,9 +862,44 @@ public actor CodexAppServer {
         }
     }
 
+    private func startThreadIgnoringCallerCancellation(
+        in workspace: URL,
+        instructions: CodexInstructions?,
+        options: CodexThread.Options
+    ) async throws -> CodexThread {
+        try await Task.detached { [self] in
+            try await startThread(
+                in: workspace,
+                instructions: instructions,
+                options: options
+            )
+        }.value
+    }
+
+    private func startReviewIgnoringCallerCancellation(
+        thread: CodexThread,
+        target: CodexReviewTarget,
+        delivery: CodexReviewDelivery,
+        transcriptErrorHandlingPolicy: CodexTranscriptErrorHandlingPolicy
+    ) async throws -> CodexReviewSession {
+        try await Task.detached {
+            try await thread.startReview(
+                target: target,
+                delivery: delivery,
+                transcriptErrorHandlingPolicy: transcriptErrorHandlingPolicy
+            )
+        }.value
+    }
+
     private func deleteThreadIgnoringCallerCancellation(_ id: CodexThreadID) async {
         await Task.detached { [self] in
             try? await deleteThread(id)
+        }.value
+    }
+
+    private func cleanupReviewIgnoringCallerCancellation(_ identity: CodexReviewIdentity) async {
+        await Task.detached { [self] in
+            await cleanupReview(identity)
         }.value
     }
 
