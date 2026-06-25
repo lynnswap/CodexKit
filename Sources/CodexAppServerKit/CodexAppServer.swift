@@ -454,6 +454,7 @@ public actor CodexAppServer {
         threadOptions: CodexThread.ResumeOptions = .init(),
         transcriptErrorHandlingPolicy: CodexTranscriptErrorHandlingPolicy = .preserveTranscript
     ) async throws -> CodexReviewSession {
+        try Task.checkCancellation()
         guard var context = reviewRestartContextsByTokenID[token.id],
               context.isRestarting == false else {
             throw CodexAppServerError.reviewRestartUnavailable(token.id)
@@ -472,6 +473,7 @@ public actor CodexAppServer {
                 reviewRestartContextsByTokenID[token.id] = context
             }
 
+            try Task.checkCancellation()
             var sourceThreadOptions = threadOptions
             if sourceThreadOptions.model == nil,
                context.interruptedIdentity.activeTurnThreadID == context.interruptedIdentity.sourceThreadID {
@@ -481,11 +483,21 @@ public actor CodexAppServer {
                 context.interruptedIdentity.sourceThreadID,
                 options: sourceThreadOptions
             )
-            let review = try await sourceThread.startReview(
+            try Task.checkCancellation()
+
+            let review = try await startReviewIgnoringCallerCancellation(
+                thread: sourceThread,
                 target: target,
                 delivery: delivery,
                 transcriptErrorHandlingPolicy: transcriptErrorHandlingPolicy
             )
+            do {
+                try Task.checkCancellation()
+            } catch {
+                await cleanupReviewIgnoringCallerCancellation(review.identity)
+                throw error
+            }
+
             reviewRestartContextsByTokenID.removeValue(forKey: token.id)
             return review
         } catch {

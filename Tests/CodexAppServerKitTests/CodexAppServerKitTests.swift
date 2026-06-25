@@ -1080,6 +1080,156 @@ struct CodexAppServerKitTests {
         ])
     }
 
+    @Test func restartPreparedReviewKeepsTokenWhenCancelledAfterSourceResume() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let identity = CodexReviewIdentity(
+            threadID: "thread-source",
+            turnID: "turn-review",
+            reviewThreadID: "thread-review",
+            model: "gpt-5"
+        )
+        let token = try await prepareRestartToken(runtime: runtime, identity: identity)
+
+        let rollbackGate = CodexAppServerTestGate()
+        let sourceResumeGate = CodexAppServerTestGate()
+        await runtime.transport.holdNextIgnoringCancellation(
+            method: "thread/rollback",
+            gate: rollbackGate
+        )
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-review"))
+        try await runtime.transport.enqueueEmpty(for: "thread/rollback")
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-source"))
+        let restart = Task {
+            try await runtime.server.restartPreparedReview(token, target: .baseBranch("main"))
+        }
+        defer {
+            restart.cancel()
+        }
+
+        await runtime.transport.waitForRequest(method: "thread/rollback")
+        await runtime.transport.holdNextIgnoringCancellation(
+            method: "thread/resume",
+            gate: sourceResumeGate
+        )
+        await rollbackGate.open()
+        await runtime.transport.waitForRequest(method: "thread/resume", count: 3)
+        restart.cancel()
+        await sourceResumeGate.open()
+
+        do {
+            _ = try await withTimeout {
+                try await restart.value
+            }
+            Issue.record("Expected cancelled source resume failure.")
+        } catch is CancellationError {
+            #expect(await runtime.transport.recordedRequests(method: "review/start").isEmpty)
+        } catch {
+            Issue.record("Expected CancellationError, got \(error).")
+        }
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-source"))
+        try await runtime.transport.enqueueReviewStart(turnID: "turn-restarted")
+        let review = try await runtime.server.restartPreparedReview(token, target: .baseBranch("main"))
+
+        #expect(review.identity == CodexReviewIdentity(
+            threadID: "thread-source",
+            turnID: "turn-restarted"
+        ))
+        let requests = await runtime.transport.recordedRequests()
+        #expect(requests.map(\.method) == [
+            "initialize",
+            "thread/resume",
+            "turn/interrupt",
+            "thread/resume",
+            "thread/rollback",
+            "thread/resume",
+            "thread/resume",
+            "review/start",
+        ])
+        #expect(requests.filter { $0.method == "thread/rollback" }.count == 1)
+    }
+
+    @Test func restartPreparedReviewCleansDetachedReviewWhenCancelledDuringReviewStart() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let identity = CodexReviewIdentity(
+            threadID: "thread-source",
+            turnID: "turn-review",
+            reviewThreadID: "thread-review",
+            model: "gpt-5"
+        )
+        let token = try await prepareRestartToken(runtime: runtime, identity: identity)
+        let reviewStartGate = CodexAppServerTestGate()
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-review"))
+        try await runtime.transport.enqueueEmpty(for: "thread/rollback")
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-source"))
+        try await runtime.transport.enqueueReviewStart(
+            turnID: "turn-restarted",
+            reviewThreadID: "thread-review-restarted"
+        )
+        try await runtime.transport.enqueueEmpty(for: "thread/delete")
+        try await runtime.transport.enqueueEmpty(for: "thread/delete")
+        try await runtime.transport.enqueueEmpty(for: "thread/delete")
+        await runtime.transport.holdNextIgnoringCancellation(
+            method: "review/start",
+            gate: reviewStartGate
+        )
+
+        let restart = Task {
+            try await runtime.server.restartPreparedReview(
+                token,
+                target: .baseBranch("main"),
+                delivery: .detached
+            )
+        }
+        defer {
+            restart.cancel()
+        }
+        await runtime.transport.waitForRequest(method: "review/start")
+        restart.cancel()
+        await reviewStartGate.open()
+
+        do {
+            _ = try await withTimeout {
+                try await restart.value
+            }
+            Issue.record("Expected cancelled review start failure.")
+        } catch is CancellationError {
+            let requests = await runtime.transport.recordedRequests()
+            #expect(requests.map(\.method) == [
+                "initialize",
+                "thread/resume",
+                "turn/interrupt",
+                "thread/resume",
+                "thread/rollback",
+                "thread/resume",
+                "review/start",
+                "thread/delete",
+                "thread/delete",
+                "thread/delete",
+            ])
+            let deletedThreadIDs = try requests.suffix(3).map {
+                try $0.decodeParams(AppServerAPI.Thread.Delete.Params.self).threadID
+            }
+            #expect(deletedThreadIDs == [
+                "thread-review",
+                "thread-review-restarted",
+                "thread-source",
+            ])
+        } catch {
+            Issue.record("Expected CancellationError, got \(error).")
+        }
+
+        do {
+            _ = try await runtime.server.restartPreparedReview(token, target: .baseBranch("main"))
+            Issue.record("Expected cleaned up restart token to throw.")
+        } catch let error as CodexAppServerError {
+            #expect(error == .reviewRestartUnavailable(token.id))
+        } catch {
+            Issue.record("Expected CodexAppServerError, got \(error).")
+        }
+    }
+
     @Test func restartPreparedReviewRejectsConcurrentTokenReuse() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         try await runtime.transport.enqueueThreadResume(.init(id: "thread-review"))
@@ -2778,6 +2928,28 @@ private func eventually(
 
 private enum TestTimeoutError: Error {
     case timedOut
+}
+
+private func prepareRestartToken(
+    runtime: CodexAppServerTestRuntime,
+    identity: CodexReviewIdentity
+) async throws -> CodexReviewRestartToken {
+    try await runtime.transport.enqueueThreadResume(.init(id: identity.activeTurnThreadID))
+    try await runtime.transport.enqueueEmpty(for: "turn/interrupt")
+    let prepareTask = Task {
+        try await runtime.server.prepareReviewRestart(identity)
+    }
+    defer {
+        prepareTask.cancel()
+    }
+    await runtime.transport.waitForRequest(method: "turn/interrupt")
+    try await runtime.transport.emitServerNotification(
+        method: "turn/completed",
+        params: TurnCompletedParams(turn: .init(id: identity.turnID.rawValue, status: "interrupted"))
+    )
+    return try await withTimeout {
+        try await prepareTask.value
+    }
 }
 
 private func withTimeout<Value: Sendable>(
