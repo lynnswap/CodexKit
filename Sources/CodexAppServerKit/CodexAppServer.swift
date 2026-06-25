@@ -308,7 +308,7 @@ public actor CodexAppServer {
                 transcriptErrorHandlingPolicy: transcriptErrorHandlingPolicy
             )
         } catch {
-            try? await deleteThread(thread.id)
+            await deleteThreadIgnoringCallerCancellation(thread.id)
             throw error
         }
     }
@@ -842,6 +842,12 @@ public actor CodexAppServer {
         reviewRestartContextsByTokenID = reviewRestartContextsByTokenID.filter { _, context in
             context.interruptedIdentity.sourceThreadID != sourceThreadID
         }
+    }
+
+    private func deleteThreadIgnoringCallerCancellation(_ id: CodexThreadID) async {
+        await Task.detached { [self] in
+            try? await deleteThread(id)
+        }.value
     }
 
     private nonisolated static func reviewCleanupIdentity(

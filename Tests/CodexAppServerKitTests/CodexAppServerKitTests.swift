@@ -262,6 +262,50 @@ struct CodexAppServerKitTests {
         }
     }
 
+    @Test func appServerStartReviewDeletesSourceThreadWhenCancelledAfterThreadStart() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let reviewStartGate = CodexAppServerTestGate()
+        try await runtime.transport.enqueueThreadStart(threadID: "thread-source", model: "gpt-5")
+        await runtime.transport.enqueueFailure(
+            code: -32602,
+            message: "cancelled review start",
+            for: "review/start"
+        )
+        try await runtime.transport.enqueueEmpty(for: "thread/delete")
+        await runtime.transport.holdNextIgnoringCancellation(
+            method: "review/start",
+            gate: reviewStartGate
+        )
+        let workspace = URL(fileURLWithPath: "/tmp/project", isDirectory: true)
+
+        let task = Task {
+            try await runtime.server.startReview(
+                in: workspace,
+                target: .baseBranch("main")
+            )
+        }
+        await runtime.transport.waitForRequest(method: "review/start")
+        task.cancel()
+        await reviewStartGate.open()
+
+        do {
+            _ = try await withTimeout {
+                try await task.value
+            }
+            Issue.record("Expected cancelled review start failure.")
+        } catch {
+            let requests = await runtime.transport.recordedRequests()
+            #expect(requests.map(\.method) == [
+                "initialize",
+                "thread/start",
+                "review/start",
+                "thread/delete",
+            ])
+            let delete = try requests[3].decodeParams(AppServerAPI.Thread.Delete.Params.self)
+            #expect(delete.threadID == "thread-source")
+        }
+    }
+
     @Test func appServerListThreadsSerializesQueryOptions() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueue(
