@@ -1625,6 +1625,16 @@ extension AppServerAPI.Account.RateLimits {
         package var windowDurationMins: Int?
         package var resetsAt: Int64?
 
+        private enum CodingKeys: String, CodingKey {
+            case usedPercent
+            case usedPercentSnake = "used_percent"
+            case windowDurationMins
+            case windowDurationMinsSnake = "window_duration_mins"
+            case windowMinutes = "window_minutes"
+            case resetsAt
+            case resetsAtSnake = "resets_at"
+        }
+
         package init(
             usedPercent: Int,
             windowDurationMins: Int? = nil,
@@ -1633,6 +1643,98 @@ extension AppServerAPI.Account.RateLimits {
             self.usedPercent = usedPercent
             self.windowDurationMins = windowDurationMins
             self.resetsAt = resetsAt
+        }
+
+        package init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            let usedPercent = try Self.decodeNumber(
+                for: [.usedPercent, .usedPercentSnake],
+                in: container
+            )
+            self.usedPercent = Int(usedPercent.rounded())
+            windowDurationMins = try Self.decodeOptionalInt(
+                for: [.windowDurationMins, .windowDurationMinsSnake, .windowMinutes],
+                in: container
+            )
+            resetsAt = try Self.decodeOptionalInt64(
+                for: [.resetsAt, .resetsAtSnake],
+                in: container
+            )
+        }
+
+        package func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(usedPercent, forKey: .usedPercent)
+            try container.encodeIfPresent(windowDurationMins, forKey: .windowDurationMins)
+            try container.encodeIfPresent(resetsAt, forKey: .resetsAt)
+        }
+
+        private static func decodeNumber(
+            for keys: [CodingKeys],
+            in container: KeyedDecodingContainer<CodingKeys>
+        ) throws -> Double {
+            for key in keys where container.contains(key) {
+                if let value = try? container.decode(Double.self, forKey: key) {
+                    return value
+                }
+                throw DecodingError.typeMismatch(
+                    Double.self,
+                    .init(
+                        codingPath: container.codingPath + [key],
+                        debugDescription: "Expected numeric rate-limit field."
+                    )
+                )
+            }
+            throw DecodingError.keyNotFound(
+                keys[0],
+                .init(
+                    codingPath: container.codingPath,
+                    debugDescription: "Missing rate-limit field \(keys[0].stringValue)."
+                )
+            )
+        }
+
+        private static func decodeOptionalInt(
+            for keys: [CodingKeys],
+            in container: KeyedDecodingContainer<CodingKeys>
+        ) throws -> Int? {
+            guard let value = try decodeOptionalInt64(for: keys, in: container) else {
+                return nil
+            }
+            guard let intValue = Int(exactly: value) else {
+                throw DecodingError.dataCorrupted(
+                    .init(
+                        codingPath: container.codingPath,
+                        debugDescription: "Rate-limit integer value exceeds platform Int range."
+                    )
+                )
+            }
+            return intValue
+        }
+
+        private static func decodeOptionalInt64(
+            for keys: [CodingKeys],
+            in container: KeyedDecodingContainer<CodingKeys>
+        ) throws -> Int64? {
+            for key in keys where container.contains(key) {
+                if try container.decodeNil(forKey: key) {
+                    return nil
+                }
+                if let value = try? container.decode(Int64.self, forKey: key) {
+                    return value
+                }
+                if let value = try? container.decode(Double.self, forKey: key) {
+                    return Int64(value.rounded())
+                }
+                throw DecodingError.typeMismatch(
+                    Int64.self,
+                    .init(
+                        codingPath: container.codingPath + [key],
+                        debugDescription: "Expected integer rate-limit field."
+                    )
+                )
+            }
+            return nil
         }
     }
 }

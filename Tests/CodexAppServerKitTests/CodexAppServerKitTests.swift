@@ -2095,6 +2095,35 @@ struct CodexAppServerKitTests {
         #expect(params.clientUserMessageID == "client-message-1")
     }
 
+    @Test func responseStreamSerializesSandboxPolicyWithAppServerSchema() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueue(
+            AppServerAPI.Turn.Start.Response(turn: .init(id: "turn-1", status: "running")),
+            for: "turn/start"
+        )
+        let client = AppServerClient(transport: transport)
+        let router = CodexAppServerNotificationRouter(client: client)
+        let thread = CodexThread(id: "thread-1", client: client, router: router)
+
+        _ = try await thread.streamResponse(
+            to: "Explain the patch.",
+            options: .init(sandbox: .workspaceWrite)
+        )
+
+        let request = try #require(await transport.recordedRequests().first)
+        let params = try #require(
+            JSONSerialization.jsonObject(with: request.params) as? [String: Any]
+        )
+        let sandboxPolicy = try #require(params["sandboxPolicy"] as? [String: Any])
+        #expect(sandboxPolicy["type"] as? String == "workspaceWrite")
+        #expect((sandboxPolicy["writableRoots"] as? [Any])?.isEmpty == true)
+        #expect(sandboxPolicy["networkAccess"] as? Bool == false)
+        #expect(sandboxPolicy["excludeTmpdirEnvVar"] as? Bool == false)
+        #expect(sandboxPolicy["excludeSlashTmp"] as? Bool == false)
+        #expect(sandboxPolicy.keys.contains("writable_roots") == false)
+        #expect(sandboxPolicy.keys.contains("network_access") == false)
+    }
+
     @Test func messageDeltaLogEntriesUseUniqueEntryIDs() async throws {
         let transport = CodexAppServerTestTransport()
         let client = AppServerClient(transport: transport)
@@ -2416,6 +2445,42 @@ struct CodexAppServerKitTests {
                 windowDurationMinutes: 300,
                 usedPercent: 42,
                 resetsAt: resetDate
+            ),
+        ])
+    }
+
+    @Test func rateLimitsDecodeCoreWindowWireShape() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueJSON(
+            """
+            {
+              "rateLimits": {
+                "limitId": "codex",
+                "planType": "pro",
+                "primary": {
+                  "used_percent": 87.5,
+                  "window_minutes": 60,
+                  "resets_at": 1700000000
+                }
+              }
+            }
+            """,
+            for: "account/rateLimits/read"
+        )
+        let client = AppServerClient(transport: transport)
+        let server = CodexAppServer(
+            client: client,
+            router: CodexAppServerNotificationRouter(client: client)
+        )
+
+        let rateLimits = try await server.rateLimits()
+
+        #expect(rateLimits.planType == "pro")
+        #expect(rateLimits.windows == [
+            .init(
+                windowDurationMinutes: 60,
+                usedPercent: 88,
+                resetsAt: Date(timeIntervalSince1970: 1_700_000_000)
             ),
         ])
     }
