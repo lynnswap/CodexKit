@@ -2103,7 +2103,7 @@ public enum CodexThreadStatus: Equatable, Sendable {
 
     public init(rawValue: String) {
         switch rawValue {
-        case "running", "loaded":
+        case "running", "loaded", "active", "idle":
             self = .running
         case "closed", "notLoaded":
             self = .closed

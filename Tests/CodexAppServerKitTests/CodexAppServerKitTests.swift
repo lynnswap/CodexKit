@@ -1549,6 +1549,13 @@ struct CodexAppServerKitTests {
             ])
     }
 
+    @Test func threadStatusNormalizesAppServerLiveStates() {
+        #expect(CodexThreadStatus(rawValue: "active") == .running)
+        #expect(CodexThreadStatus(rawValue: "idle") == .running)
+        #expect(CodexThreadStatus(rawValue: "notLoaded") == .closed)
+        #expect(CodexThreadStatus(rawValue: "systemError") == .unknown("systemError"))
+    }
+
     @Test func clientRetriesOverloadedRequestsThenSucceeds() async throws {
         let transport = CodexAppServerTestTransport()
         await transport.enqueueFailure(code: -32001, message: "server busy", for: "ping")
