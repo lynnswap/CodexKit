@@ -591,14 +591,14 @@ private final class AppServerSpawnedProcess: @unchecked Sendable {
                 stderr.fileHandleForWriting.fileDescriptor,
                 STDERR_FILENO
             ))
-        for fileDescriptor in [
+        for fileDescriptor in AppServerProcessFileDescriptorPlan.childPipeDescriptorsToClose([
             stdin.fileHandleForReading.fileDescriptor,
             stdin.fileHandleForWriting.fileDescriptor,
             stdout.fileHandleForReading.fileDescriptor,
             stdout.fileHandleForWriting.fileDescriptor,
             stderr.fileHandleForReading.fileDescriptor,
             stderr.fileHandleForWriting.fileDescriptor,
-        ] {
+        ]) {
             try check(posix_spawn_file_actions_addclose(&fileActions, fileDescriptor))
         }
         try check(posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETPGROUP)))
@@ -798,6 +798,16 @@ private final class AppServerSpawnedProcess: @unchecked Sendable {
         pointers.append(nil)
         return try pointers.withUnsafeMutableBufferPointer { buffer in
             try body(buffer.baseAddress)
+        }
+    }
+}
+
+package enum AppServerProcessFileDescriptorPlan {
+    package static func childPipeDescriptorsToClose(_ fileDescriptors: [Int32]) -> [Int32] {
+        fileDescriptors.filter { fileDescriptor in
+            fileDescriptor != STDIN_FILENO
+                && fileDescriptor != STDOUT_FILENO
+                && fileDescriptor != STDERR_FILENO
         }
     }
 }

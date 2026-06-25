@@ -70,6 +70,13 @@ struct CodexAppServerKitTests {
         ])
     }
 
+    @Test func processSpawnClosePlanPreservesStandardIOFileDescriptors() {
+        let closeDescriptors = AppServerProcessFileDescriptorPlan
+            .childPipeDescriptorsToClose([0, 1, 2, 3, 4, 5])
+
+        #expect(closeDescriptors == [3, 4, 5])
+    }
+
     @Test func testRuntimeStartsAppServerWithoutLaunchingProcess() async throws {
         let runtime = try await CodexAppServerTestRuntime.start(codexHome: "/tmp/codex")
         try await runtime.transport.enqueueThreadStart(threadID: "thread-test", model: "gpt-5")
@@ -1684,6 +1691,25 @@ struct CodexAppServerKitTests {
         }
     }
 
+    @Test func directThreadEventStreamCancellationRemovesRouterSubscriber() async throws {
+        let transport = CodexAppServerTestTransport()
+        let client = AppServerClient(transport: transport)
+        let router = CodexAppServerNotificationRouter(client: client)
+        let stream = await router.events(for: CodexThreadID(rawValue: "thread-1"))
+        #expect(await router.threadSubscriberCountForTesting(for: "thread-1") == 1)
+
+        let consumer = Task {
+            var iterator = stream.makeAsyncIterator()
+            _ = try await iterator.next()
+        }
+
+        consumer.cancel()
+        let removed = await eventually {
+            await router.threadSubscriberCountForTesting(for: "thread-1") == 0
+        }
+        #expect(removed)
+    }
+
     @Test func turnEventStreamCancellationRemovesRouterSubscriber() async throws {
         let transport = CodexAppServerTestTransport()
         let client = AppServerClient(transport: transport)
@@ -1711,6 +1737,25 @@ struct CodexAppServerKitTests {
         if removed {
             try await consumer.value
         }
+    }
+
+    @Test func directTurnEventStreamCancellationRemovesRouterSubscriber() async throws {
+        let transport = CodexAppServerTestTransport()
+        let client = AppServerClient(transport: transport)
+        let router = CodexAppServerNotificationRouter(client: client)
+        let stream = await router.events(for: CodexTurnID(rawValue: "turn-1"))
+        #expect(await router.turnSubscriberCountForTesting(for: "turn-1") == 1)
+
+        let consumer = Task {
+            var iterator = stream.makeAsyncIterator()
+            _ = try await iterator.next()
+        }
+
+        consumer.cancel()
+        let removed = await eventually {
+            await router.turnSubscriberCountForTesting(for: "turn-1") == 0
+        }
+        #expect(removed)
     }
 
     @Test func threadStreamsReplayMessagesTranscriptLogsAndUsage() async throws {

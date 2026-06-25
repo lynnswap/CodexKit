@@ -42,31 +42,29 @@ package actor CodexAppServerNotificationRouter {
     }
 
     package func events(for turnID: CodexTurnID) -> AsyncThrowingStream<CodexTurnEvent, Error> {
-        AsyncThrowingStream(bufferingPolicy: .unbounded) { continuation in
-            let subscriptionID = UUID()
-            Task {
-                self.addTurnSubscriber(
-                    subscriptionID, turnID: turnID, continuation: continuation)
-            }
-            continuation.onTermination = { _ in
-                Task { await self.removeTurnSubscriber(subscriptionID, turnID: turnID) }
-            }
+        let (stream, continuation) = AsyncThrowingStream<CodexTurnEvent, Error>.makeStream(
+            bufferingPolicy: .unbounded
+        )
+        let subscriptionID = UUID()
+        continuation.onTermination = { _ in
+            Task { await self.removeTurnSubscriber(subscriptionID, turnID: turnID) }
         }
+        addTurnSubscriber(subscriptionID, turnID: turnID, continuation: continuation)
+        return stream
     }
 
     package func events(for threadID: CodexThreadID) -> AsyncThrowingStream<
         CodexThreadEvent, Error
     > {
-        AsyncThrowingStream(bufferingPolicy: .unbounded) { continuation in
-            let subscriptionID = UUID()
-            Task {
-                self.addThreadSubscriber(
-                    subscriptionID, threadID: threadID, continuation: continuation)
-            }
-            continuation.onTermination = { _ in
-                Task { await self.removeThreadSubscriber(subscriptionID, threadID: threadID) }
-            }
+        let (stream, continuation) = AsyncThrowingStream<CodexThreadEvent, Error>.makeStream(
+            bufferingPolicy: .unbounded
+        )
+        let subscriptionID = UUID()
+        continuation.onTermination = { _ in
+            Task { await self.removeThreadSubscriber(subscriptionID, threadID: threadID) }
         }
+        addThreadSubscriber(subscriptionID, threadID: threadID, continuation: continuation)
+        return stream
     }
 
     package func seedTurn(_ turnID: CodexTurnID, threadID: CodexThreadID) {
