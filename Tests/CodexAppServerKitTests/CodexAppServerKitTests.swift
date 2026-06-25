@@ -893,6 +893,7 @@ struct CodexAppServerKitTests {
         )
         let events = [
             CodexThreadEvent.message(oldMessage, turnID: "turn-old"),
+            .statusChanged(.running),
             .message(currentMessage, turnID: "turn-current"),
             .turnCompleted(.init(turnID: "turn-old", status: .completed)),
             .turnCompleted(.init(turnID: "turn-current", status: .completed)),
@@ -919,9 +920,11 @@ struct CodexAppServerKitTests {
             terminalTurnID: "turn-current"
         ))
 
-        #expect(reviewEvents.count == 2)
+        #expect(reviewEvents.count == 3)
+        #expect(reviewEvents.contains(.statusChanged(.running)))
         #expect(logs.map(\.turnID) == ["turn-current"])
         #expect(logs.first?.item?.text == "Current review")
+        #expect(progress.count == 3)
         #expect(progress.last?.result?.turnID == "turn-current")
         #expect(progress.last?.transcript.responseText == "Current review")
     }

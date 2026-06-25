@@ -449,7 +449,7 @@ private func reviewEventMatches(
     case .unknown(let raw):
         return raw.turnID.map { $0 == terminalTurnID } ?? true
     case .statusChanged:
-        return false
+        return true
     case .closed:
         return true
     }
