@@ -297,7 +297,7 @@ persist(identity)
 
 let restored = try await appServer.resumeReview(identity)
 try await restored.cancel { cancellation in
-    noteRollbackThread(cancellation.threadID)
+    noteActiveTurnThread(cancellation.threadID)
 }
 ```
 
