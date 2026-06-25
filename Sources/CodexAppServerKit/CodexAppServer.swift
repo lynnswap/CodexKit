@@ -382,8 +382,10 @@ public actor CodexAppServer {
     ///   - token: Token returned by ``prepareReviewRestart(_:options:threadOptions:)``.
     ///   - target: The repository changes or custom instructions to review.
     ///   - delivery: Whether the app-server should run the review inline or in a detached review thread.
-    ///   - threadOptions: Resume options for the source thread. When `model` is
-    ///     `nil`, `token.interruptedIdentity.model` is used.
+    ///   - threadOptions: Resume options for the source thread. For inline
+    ///     reviews, `token.interruptedIdentity.model` is used when `model` is
+    ///     `nil`; detached review restarts leave source-thread model selection
+    ///     to app-server unless the caller supplies an explicit model.
     ///   - transcriptErrorHandlingPolicy: How collection should treat transcript errors for the new review.
     /// - Returns: A live review session for the restarted review.
     /// - Throws: ``CodexAppServerError/reviewRestartUnavailable(_:)`` when the token is stale.
