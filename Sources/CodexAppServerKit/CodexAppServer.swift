@@ -114,6 +114,8 @@ public actor CodexAppServer {
 
     private let client: AppServerClient
     private let router: CodexAppServerNotificationRouter
+    private var retainedReviewCleanupIdentitiesBySourceThreadID: [CodexThreadID: [CodexReviewIdentity]] = [:]
+    private var reviewRestartContextsByTokenID: [CodexReviewRestartToken.ID: CodexReviewRestartContext] = [:]
 
     package nonisolated var appServerClient: AppServerClient {
         client
@@ -318,6 +320,153 @@ public actor CodexAppServer {
             model: activeThread.model ?? identity.model,
             transcriptErrorHandlingPolicy: options.transcriptErrorHandlingPolicy
         )
+    }
+
+    /// Cancels a running review and prepares it for a later restart.
+    ///
+    /// The returned token is process-local to this ``CodexAppServer`` instance.
+    /// Cleanup ownership for the interrupted review is retained internally until
+    /// ``cleanupReview(_:additionalCleanupThreadIDs:)`` is called for the same
+    /// source thread.
+    ///
+    /// - Parameters:
+    ///   - identity: Persisted review run identity to interrupt.
+    ///   - options: Options for the restored review response stream used during cancellation.
+    ///   - threadOptions: Resume options for the active turn thread. When `model` is
+    ///     `nil`, `identity.model` is used.
+    /// - Returns: A token that can be passed to ``restartPreparedReview(_:target:delivery:threadOptions:transcriptErrorHandlingPolicy:)``.
+    /// - Throws: A transport, JSON-RPC, or app-server request error.
+    public func prepareReviewRestart(
+        _ identity: CodexReviewIdentity,
+        options: CodexReviewResumeOptions = .init(),
+        threadOptions: CodexThread.ResumeOptions = .init()
+    ) async throws -> CodexReviewRestartToken {
+        let review = try await resumeReview(identity, options: options, threadOptions: threadOptions)
+        let cancellation = try await review.cancel { retryCancellation in
+            if retryCancellation.turnID != Optional(identity.turnID) {
+                await self.rememberReviewCleanupIdentity(
+                    for: retryCancellation,
+                    sourceIdentity: identity,
+                    model: review.model
+                )
+            }
+        }
+        try await review.response.waitForCancelledResponse(cancellation)
+        rememberReviewCleanupIdentity(identity)
+        rememberReviewCleanupIdentity(
+            for: cancellation,
+            sourceIdentity: identity,
+            model: review.model
+        )
+        discardReviewRestartContexts(sourceThreadID: identity.sourceThreadID)
+
+        let token = CodexReviewRestartToken(
+            id: UUID().uuidString,
+            interruptedIdentity: identity
+        )
+        reviewRestartContextsByTokenID[token.id] = CodexReviewRestartContext(
+            interruptedIdentity: identity,
+            rollbackThreadID: cancellation.threadID,
+            rollbackModel: review.model
+        )
+        return token
+    }
+
+    /// Restarts a review that was previously prepared by ``prepareReviewRestart(_:options:threadOptions:)``.
+    ///
+    /// The restart first reloads and rolls back the thread that owned the
+    /// interrupted active turn, then reloads the source thread and starts a new
+    /// review from that source.
+    ///
+    /// - Parameters:
+    ///   - token: Token returned by ``prepareReviewRestart(_:options:threadOptions:)``.
+    ///   - target: The repository changes or custom instructions to review.
+    ///   - delivery: Whether the app-server should run the review inline or in a detached review thread.
+    ///   - threadOptions: Resume options for the source thread. When `model` is
+    ///     `nil`, `token.interruptedIdentity.model` is used.
+    ///   - transcriptErrorHandlingPolicy: How collection should treat transcript errors for the new review.
+    /// - Returns: A live review session for the restarted review.
+    /// - Throws: ``CodexAppServerError/reviewRestartUnavailable(_:)`` when the token is stale.
+    public func restartPreparedReview(
+        _ token: CodexReviewRestartToken,
+        target: CodexReviewTarget,
+        delivery: CodexReviewDelivery = .inline,
+        threadOptions: CodexThread.ResumeOptions = .init(),
+        transcriptErrorHandlingPolicy: CodexTranscriptErrorHandlingPolicy = .preserveTranscript
+    ) async throws -> CodexReviewSession {
+        guard var context = reviewRestartContextsByTokenID[token.id],
+              context.isRestarting == false else {
+            throw CodexAppServerError.reviewRestartUnavailable(token.id)
+        }
+        context.isRestarting = true
+        reviewRestartContextsByTokenID[token.id] = context
+
+        do {
+            if context.rollbackCompleted == false {
+                let rollbackThread = try await resumeThread(
+                    context.rollbackThreadID,
+                    options: .init(model: context.rollbackModel)
+                )
+                try await rollbackThread.rollback(turnCount: 1)
+                context.rollbackCompleted = true
+                reviewRestartContextsByTokenID[token.id] = context
+            }
+
+            var sourceThreadOptions = threadOptions
+            if sourceThreadOptions.model == nil,
+               context.interruptedIdentity.activeTurnThreadID == context.interruptedIdentity.sourceThreadID {
+                sourceThreadOptions.model = context.interruptedIdentity.model
+            }
+            let sourceThread = try await resumeThread(
+                context.interruptedIdentity.sourceThreadID,
+                options: sourceThreadOptions
+            )
+            let review = try await sourceThread.startReview(
+                target: target,
+                delivery: delivery,
+                transcriptErrorHandlingPolicy: transcriptErrorHandlingPolicy
+            )
+            reviewRestartContextsByTokenID.removeValue(forKey: token.id)
+            return review
+        } catch {
+            context.isRestarting = false
+            if reviewRestartContextsByTokenID[token.id]?.isRestarting == true {
+                reviewRestartContextsByTokenID[token.id] = context
+            }
+            throw error
+        }
+    }
+
+    /// Deletes all app-server threads owned by a review lifecycle.
+    ///
+    /// Retained cleanup identities from prepared restarts are included, duplicate
+    /// thread identifiers are removed, and the source thread is deleted last.
+    /// Delete failures are intentionally ignored to match best-effort cleanup
+    /// behavior.
+    ///
+    /// - Parameters:
+    ///   - identity: Review identity whose source thread owns the lifecycle.
+    ///   - additionalCleanupThreadIDs: Extra cleanup ID sequences, in preferred
+    ///     per-sequence order, to merge with retained review cleanup IDs.
+    public func cleanupReview(
+        _ identity: CodexReviewIdentity,
+        additionalCleanupThreadIDs: [[CodexThreadID]] = []
+    ) async {
+        let sourceThreadID = identity.sourceThreadID
+        let retainedIdentities = retainedReviewCleanupIdentitiesBySourceThreadID.removeValue(
+            forKey: sourceThreadID
+        ) ?? []
+        discardReviewRestartContexts(sourceThreadID: sourceThreadID)
+
+        let cleanupThreadIDs = Self.orderedReviewCleanupThreadIDs(
+            sourceThreadID: sourceThreadID,
+            sequences: retainedIdentities.map(\.cleanupThreadIDs)
+                + [identity.cleanupThreadIDs]
+                + additionalCleanupThreadIDs
+        )
+        for threadID in cleanupThreadIDs {
+            try? await deleteThread(threadID)
+        }
     }
 
     /// Forks an existing Codex thread into a new thread.
@@ -626,6 +775,63 @@ public actor CodexAppServer {
         )
     }
 
+    private func rememberReviewCleanupIdentity(_ identity: CodexReviewIdentity) {
+        let sourceThreadID = identity.sourceThreadID
+        if retainedReviewCleanupIdentitiesBySourceThreadID[sourceThreadID, default: []]
+            .contains(identity) == false {
+            retainedReviewCleanupIdentitiesBySourceThreadID[sourceThreadID, default: []].append(identity)
+        }
+    }
+
+    private func rememberReviewCleanupIdentity(
+        for cancellation: CodexTurnCancellation,
+        sourceIdentity: CodexReviewIdentity,
+        model: String?
+    ) {
+        let cancelledIdentity = Self.reviewCleanupIdentity(
+            for: cancellation,
+            sourceIdentity: sourceIdentity,
+            model: model
+        )
+        rememberReviewCleanupIdentity(cancelledIdentity)
+    }
+
+    private func discardReviewRestartContexts(sourceThreadID: CodexThreadID) {
+        reviewRestartContextsByTokenID = reviewRestartContextsByTokenID.filter { _, context in
+            context.interruptedIdentity.sourceThreadID != sourceThreadID
+        }
+    }
+
+    private nonisolated static func reviewCleanupIdentity(
+        for cancellation: CodexTurnCancellation,
+        sourceIdentity: CodexReviewIdentity,
+        model: String?
+    ) -> CodexReviewIdentity {
+        CodexReviewIdentity(
+            threadID: sourceIdentity.sourceThreadID,
+            turnID: cancellation.turnID ?? sourceIdentity.turnID,
+            reviewThreadID: cancellation.threadID == sourceIdentity.sourceThreadID ? nil : cancellation.threadID,
+            model: model ?? sourceIdentity.model
+        )
+    }
+
+    private nonisolated static func orderedReviewCleanupThreadIDs(
+        sourceThreadID: CodexThreadID,
+        sequences: [[CodexThreadID]]
+    ) -> [CodexThreadID] {
+        var seen: Set<CodexThreadID> = []
+        var threadIDs: [CodexThreadID] = []
+        for sequence in sequences {
+            for threadID in sequence where threadID != sourceThreadID && seen.insert(threadID).inserted {
+                threadIDs.append(threadID)
+            }
+        }
+        if seen.insert(sourceThreadID).inserted {
+            threadIDs.append(sourceThreadID)
+        }
+        return threadIDs
+    }
+
     package nonisolated static func threadSnapshot(
         from snapshot: AppServerAPI.Thread.Snapshot
     ) -> CodexThreadSnapshot {
@@ -724,6 +930,14 @@ public actor CodexAppServer {
         }
     }
 
+}
+
+private struct CodexReviewRestartContext: Sendable {
+    var interruptedIdentity: CodexReviewIdentity
+    var rollbackThreadID: CodexThreadID
+    var rollbackModel: String?
+    var rollbackCompleted: Bool = false
+    var isRestarting: Bool = false
 }
 
 private struct AppServerAccountLoginCompletedNotification: Decodable, Equatable, Sendable {
