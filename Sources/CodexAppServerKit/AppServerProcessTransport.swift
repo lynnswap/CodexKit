@@ -903,7 +903,6 @@ package enum CodexAppServerExecutable {
             "-c", fileBackedAuthConfiguration,
             "app-server",
             "--listen", "stdio://",
-            "--session-source", "app-server",
         ]
     }
 

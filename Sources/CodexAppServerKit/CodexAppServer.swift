@@ -347,7 +347,7 @@ public actor CodexAppServer {
                 threadID: id.rawValue,
                 params: threadStartParams(options: options)
             ))
-        return thread(from: response.thread, model: options.model)
+        return thread(from: response.thread, model: response.model ?? options.model)
     }
 
     /// Restores a persisted app-server review run as a live review session handle.
@@ -730,18 +730,12 @@ public actor CodexAppServer {
 
     /// Starts a ChatGPT browser login flow.
     ///
-    /// - Parameter callbackURLScheme: Optional native callback URL scheme for completing login.
-    /// - Returns: A login handle containing the next browser or callback step.
+    /// - Returns: A login handle containing the browser authentication URL.
     /// - Throws: A transport, JSON-RPC, or app-server login error.
-    public func loginChatGPT(callbackURLScheme: String? = nil) async throws -> CodexLoginHandle {
+    public func loginChatGPT() async throws -> CodexLoginHandle {
         let response = try await client.send(
             AppServerAPI.Account.Login.Start.Request(
-                params: .init(
-                    type: "chatgpt",
-                    nativeWebAuthentication: callbackURLScheme.map {
-                        .init(callbackURLScheme: $0)
-                    }
-                )
+                params: .init(type: "chatgpt")
             ))
         return try Self.loginHandle(from: response)
     }
@@ -778,37 +772,6 @@ public actor CodexAppServer {
     public func cancelLogin(id: CodexLoginHandle.ID) async throws {
         let _: AppServerAPI.Account.Login.Cancel.Response = try await client.send(
             AppServerAPI.Account.Login.Cancel.Request(params: .init(loginID: id.rawValue))
-        )
-    }
-
-    /// Completes a native ChatGPT browser login flow.
-    ///
-    /// Handles without an app-server login identifier are treated as already complete.
-    ///
-    /// - Parameters:
-    ///   - handle: The login handle returned from `loginChatGPT(callbackURLScheme:)`.
-    ///   - callbackURL: The callback URL received by the client application.
-    /// - Throws: A transport, JSON-RPC, or app-server login error.
-    public func completeLogin(_ handle: CodexLoginHandle, callbackURL: URL) async throws {
-        guard let id = handle.id else {
-            return
-        }
-        try await completeLogin(id: id, callbackURL: callbackURL)
-    }
-
-    /// Completes a native ChatGPT browser login flow by identifier.
-    ///
-    /// - Parameters:
-    ///   - id: The app-server login identifier.
-    ///   - callbackURL: The callback URL received by the client application.
-    /// - Throws: A transport, JSON-RPC, or app-server login error.
-    public func completeLogin(id: CodexLoginHandle.ID, callbackURL: URL) async throws {
-        let _: AppServerAPI.Account.Login.Complete.Response = try await client.send(
-            AppServerAPI.Account.Login.Complete.Request(
-                params: .init(
-                    loginID: id.rawValue,
-                    callbackURL: callbackURL.absoluteString
-                ))
         )
     }
 
@@ -978,7 +941,7 @@ public actor CodexAppServer {
         switch response {
         case .apiKey:
             return .apiKey
-        case .chatgpt(let loginID, let authURL, _):
+        case .chatgpt(let loginID, let authURL):
             guard let url = URL(string: authURL) else {
                 throw CodexAppServerError.jsonRPC(
                     code: -32602, message: "Invalid ChatGPT authentication URL.")

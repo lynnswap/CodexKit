@@ -229,9 +229,9 @@ public actor CodexAppServerTestTransport {
     }
 
     /// Enqueues a thread-resume response.
-    public func enqueueThreadResume(_ thread: CodexThreadSnapshot) throws {
+    public func enqueueThreadResume(_ thread: CodexThreadSnapshot, model: String? = nil) throws {
         try enqueue(
-            AppServerAPI.Thread.Resume.Response(thread: Self.apiSnapshot(from: thread)),
+            AppServerAPI.Thread.Resume.Response(thread: Self.apiSnapshot(from: thread), model: model),
             for: "thread/resume"
         )
     }
@@ -357,16 +357,12 @@ public actor CodexAppServerTestTransport {
     /// Enqueues a ChatGPT browser login response.
     public func enqueueChatGPTLogin(
         loginID: String,
-        authenticationURL: URL,
-        callbackURLScheme: String? = nil
+        authenticationURL: URL
     ) throws {
         try enqueue(
             AppServerAPI.Account.Login.Response.chatgpt(
                 loginID: loginID,
-                authURL: authenticationURL.absoluteString,
-                nativeWebAuthentication: callbackURLScheme.map {
-                    .init(callbackURLScheme: $0)
-                }
+                authURL: authenticationURL.absoluteString
             ),
             for: "account/login/start"
         )

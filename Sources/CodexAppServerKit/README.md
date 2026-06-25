@@ -396,10 +396,8 @@ try await appServer.updateConfiguration(patch)
 Login flows return typed handles:
 
 ```swift
-let handle = try await appServer.loginChatGPT(callbackURLScheme: "myapp")
 let accountEvents = await appServer.accountEvents()
-
-try await appServer.completeLogin(handle, callbackURL: callbackURL)
+let handle = try await appServer.loginChatGPT()
 
 for try await event in accountEvents {
     if case .loginCompleted(let completion) = event, completion.loginID == handle.id {

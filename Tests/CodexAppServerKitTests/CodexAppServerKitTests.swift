@@ -67,8 +67,6 @@ struct CodexAppServerKitTests {
             "app-server",
             "--listen",
             "stdio://",
-            "--session-source",
-            "app-server",
         ])
     }
 
@@ -189,6 +187,26 @@ struct CodexAppServerKitTests {
         #expect(params.serviceName == "app-server-kit-test")
         #expect(params.sessionStartSource == .startup)
         #expect(params.threadSource?.rawValue == "automation")
+    }
+
+    @Test func appServerResumeThreadPreservesServerReturnedModel() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        try await runtime.transport.enqueueThreadResume(
+            .init(
+                id: "thread-1",
+                workspace: URL(fileURLWithPath: "/tmp/project", isDirectory: true)
+            ),
+            model: "gpt-5"
+        )
+
+        let thread = try await runtime.server.resumeThread("thread-1")
+
+        #expect(thread.id == "thread-1")
+        #expect(thread.model == "gpt-5")
+        let request = try #require(await runtime.transport.recordedRequests().last)
+        let params = try request.decodeParams(AppServerAPI.Thread.Resume.Params.self)
+        #expect(params.threadID == "thread-1")
+        #expect(params.model == nil)
     }
 
     @Test func appServerStartReviewStartsThreadThenReview() async throws {
@@ -2294,12 +2312,7 @@ struct CodexAppServerKitTests {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueueChatGPTLogin(
             loginID: "login-1",
-            authenticationURL: URL(string: "https://chatgpt.com/auth")!,
-            callbackURLScheme: "codexkit"
-        )
-        try await transport.enqueue(
-            AppServerAPI.Account.Login.Complete.Response(),
-            for: "account/login/complete"
+            authenticationURL: URL(string: "https://chatgpt.com/auth")!
         )
         try await transport.enqueue(
             AppServerAPI.Account.Login.Cancel.Response(),
@@ -2313,7 +2326,7 @@ struct CodexAppServerKitTests {
         let accountEvents = await server.accountEvents()
         await transport.waitForNotificationStreamCount(1)
 
-        let handle = try await server.loginChatGPT(callbackURLScheme: "codexkit")
+        let handle = try await server.loginChatGPT()
 
         #expect(handle == .chatGPT(
             id: "login-1",
@@ -2323,19 +2336,7 @@ struct CodexAppServerKitTests {
         #expect(loginRequest.method == "account/login/start")
         let loginParams = try loginRequest.decodeParams(AppServerAPI.Account.Login.Params.self)
         #expect(loginParams.type == "chatgpt")
-        #expect(loginParams.nativeWebAuthentication?.callbackURLScheme == "codexkit")
-
-        try await server.completeLogin(
-            handle,
-            callbackURL: URL(string: "codexkit://auth/callback?code=abc")!
-        )
-        let completeRequest = try #require(await transport.recordedRequests().last)
-        #expect(completeRequest.method == "account/login/complete")
-        let completeParams = try completeRequest.decodeParams(
-            AppServerAPI.Account.Login.Complete.Params.self
-        )
-        #expect(completeParams.loginID == "login-1")
-        #expect(completeParams.callbackURL == "codexkit://auth/callback?code=abc")
+        #expect(loginParams.codexStreamlinedLogin == true)
 
         try await server.cancelLogin(handle)
         let cancelRequest = try #require(await transport.recordedRequests().last)
@@ -2356,7 +2357,6 @@ struct CodexAppServerKitTests {
         )))
         #expect(await transport.recordedRequests().map(\.method) == [
             "account/login/start",
-            "account/login/complete",
             "account/login/cancel",
         ])
     }
