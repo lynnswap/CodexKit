@@ -502,6 +502,28 @@ struct CodexAppServerKitTests {
         #expect(decoded == identity)
     }
 
+    @Test func inlineReviewIdentityKeepsDetachedReviewThreadNil() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        try await runtime.transport.enqueueThreadStart(threadID: "thread-source", model: "gpt-5")
+        try await runtime.transport.enqueueReviewStart(turnID: "turn-review")
+
+        let thread = try await runtime.server.startThread(
+            in: URL(fileURLWithPath: "/tmp/project", isDirectory: true),
+            options: .init(model: "gpt-5")
+        )
+        let review = try await thread.startReview(target: .baseBranch("main"))
+
+        #expect(review.reviewThreadID == "thread-source")
+        #expect(review.identity == CodexReviewIdentity(
+            threadID: "thread-source",
+            turnID: "turn-review",
+            model: "gpt-5"
+        ))
+        #expect(review.identity.reviewThreadID == nil)
+        #expect(review.identity.activeTurnThreadID == "thread-source")
+        #expect(review.identity.cleanupThreadIDs == ["thread-source"])
+    }
+
     @Test func appServerResumeReviewRestoresEventsAndCancellationFromIdentity() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         try await runtime.transport.enqueueThreadResume(.init(
@@ -547,6 +569,29 @@ struct CodexAppServerKitTests {
             Issue.record("Expected resumed review.events to receive turn-only completion.")
         }
         #expect(try await iterator.next() == nil)
+    }
+
+    @Test func appServerResumeReviewUsesThreadOptionModelOverride() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-review"))
+        let identity = CodexReviewIdentity(
+            threadID: "thread-source",
+            turnID: "turn-review",
+            reviewThreadID: "thread-review",
+            model: "gpt-5"
+        )
+
+        let review = try await runtime.server.resumeReview(
+            identity,
+            threadOptions: .init(model: "gpt-5.1")
+        )
+
+        #expect(review.model == "gpt-5.1")
+        #expect(review.identity.model == "gpt-5.1")
+        let request = try #require(await runtime.transport.recordedRequests().last)
+        let params = try request.decodeParams(AppServerAPI.Thread.Resume.Params.self)
+        #expect(params.threadID == "thread-review")
+        #expect(params.model == "gpt-5.1")
     }
 
     @Test func reviewSessionCancelHookReceivesCurrentActiveTurn() async throws {

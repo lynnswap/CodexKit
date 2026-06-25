@@ -901,7 +901,7 @@ public struct CodexReviewSession: Identifiable, Sendable {
         .init(
             threadID: sourceThreadID,
             turnID: turnID,
-            reviewThreadID: reviewThreadID,
+            reviewThreadID: reviewThreadID == sourceThreadID ? nil : reviewThreadID,
             model: model
         )
     }
