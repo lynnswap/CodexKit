@@ -303,8 +303,8 @@ try await restored.cancel { cancellation in
 
 `CodexReviewIdentity` is a `Codable` Swift value containing only CodexKit
 identity: source thread, review turn, optional detached review thread, and
-model. It is intended for persisted app-server review runs and does not depend
-on any higher-level review domain model.
+active review thread model when known. It is intended for persisted app-server
+review runs and does not depend on any higher-level review domain model.
 
 ## Responses
 

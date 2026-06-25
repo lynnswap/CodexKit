@@ -486,10 +486,10 @@ struct CodexAppServerKitTests {
         let identity = CodexReviewIdentity(
             threadID: "thread-source",
             turnID: "turn-review",
-            reviewThreadID: "thread-review",
-            model: "gpt-5"
+            reviewThreadID: "thread-review"
         )
         #expect(review.identity == identity)
+        #expect(review.model == nil)
         #expect(review.sourceThreadID == "thread-source")
         #expect(review.activeTurnThreadID == "thread-review")
         #expect(review.associatedThreadIDs == ["thread-source", "thread-review"])

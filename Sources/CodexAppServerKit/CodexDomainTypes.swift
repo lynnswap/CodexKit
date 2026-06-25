@@ -628,7 +628,7 @@ public struct CodexReviewIdentity: Codable, Equatable, Identifiable, Sendable {
     /// The detached review thread, when app-server created one.
     public var reviewThreadID: CodexThreadID?
 
-    /// The model used when restoring app-server thread handles.
+    /// The active review thread model, when known.
     public var model: String?
 
     public var id: CodexTurnID {
@@ -872,7 +872,7 @@ public struct CodexReviewSession: Identifiable, Sendable {
     /// reviews.
     public let reviewThreadID: CodexThreadID
 
-    /// The model used for the review thread, when known.
+    /// The active review thread model, when known.
     public let model: String?
 
     /// The live response stream for the review turn.

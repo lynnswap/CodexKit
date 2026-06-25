@@ -315,6 +315,7 @@ public actor CodexAppServer {
         let activeThread = try await resumeThread(identity.activeTurnThreadID, options: threadOptions)
         return await activeThread.reviewSession(
             identity,
+            model: activeThread.model ?? identity.model,
             transcriptErrorHandlingPolicy: options.transcriptErrorHandlingPolicy
         )
     }
