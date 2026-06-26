@@ -79,16 +79,13 @@ public final class CodexModelContext: @unchecked Sendable {
         )
         let previousWorkspaces = group.workspaces
         let previousChats = group.workspaces.flatMap(\.chats)
-        let snapshots = try await fetchAllThreadSnapshots(matching: request).filter {
-            $0.workspace.map { workspaceURL in
-                let standardizedURL = Self.standardizedDirectoryURL(workspaceURL)
-                return CodexWorkspaceGroupIdentity.identity(for: standardizedURL).id == group.id
-            } ?? false
-        }
-        let chats = await applyFetchedSnapshots(
+        let snapshots = try await fetchAllThreadSnapshots(matching: request)
+        let fetchedChats = await applyFetchedSnapshots(
             snapshots,
             archived: request.filter.archived == true
         )
+        let fetchedChatIDs = Set(fetchedChats.map(\.id))
+        let chats = fetchedChats.filter { $0.workspace?.workspaceGroup?.id == group.id }
         let workspaces = unique(chats.compactMap(\.workspace))
         for workspace in unique(previousWorkspaces + workspaces) {
             let previousWorkspaceChats = workspace.chats
@@ -118,6 +115,7 @@ public final class CodexModelContext: @unchecked Sendable {
         let currentChatIDs = Set(group.workspaces.flatMap(\.chats).map(\.id))
         let removedChats = previousChats.filter {
             currentChatIDs.contains($0.id) == false
+                && fetchedChatIDs.contains($0.id) == false
                 && isInRefreshedScope($0, archivedScope: request.filter.archived)
         }
         await refreshWorkspaceGroupInRegisteredResults(
@@ -436,7 +434,11 @@ public final class CodexModelContext: @unchecked Sendable {
             let previousWorkspace = existingChat?.workspace
             let previousGroup = previousWorkspace?.workspaceGroup
             let chat = apply(snapshot, archived: archived)
-            if let previousArchived, previousArchived != archived {
+            let membershipChanged = existingChat != nil
+                && (previousArchived != archived
+                    || previousWorkspace?.id != chat.workspace?.id
+                    || previousGroup?.id != chat.workspace?.workspaceGroup?.id)
+            if membershipChanged {
                 revalidations.append((chat, previousWorkspace, previousGroup))
             }
             return chat

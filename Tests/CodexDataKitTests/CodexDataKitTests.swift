@@ -581,6 +581,56 @@ struct CodexModelContextTests {
         #expect(allResults.items.first === chat)
     }
 
+    @Test("thread list fetch revalidates workspace scoped fetched results")
+    func threadListFetchRevalidatesWorkspaceScopedFetchedResults() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let oldWorkspaceURL = temporaryDirectory()
+        let newWorkspaceURL = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-move", workspace: oldWorkspaceURL, name: "Move")
+        ]))
+        let allResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>.recentChats)
+        try await allResults.performFetch()
+        let chat = try #require(allResults.items.first)
+        let oldWorkspace = try #require(chat.workspace)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-move", workspace: oldWorkspaceURL, name: "Move")
+        ]))
+        let oldWorkspaceResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>.chats(
+            in: oldWorkspace
+        ))
+        try await oldWorkspaceResults.performFetch()
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-move", workspace: oldWorkspaceURL, name: "Move")
+        ]))
+        let sectionedResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            sortDescriptors: [.name()],
+            sectionDescriptor: .workspace
+        ))
+        try await sectionedResults.performFetch()
+        let oldWorkspaceSectionID = oldWorkspaceURL.standardizedFileURL
+            .resolvingSymlinksInPath()
+            .path
+        #expect(sectionedResults.sections.first?.id == oldWorkspaceSectionID)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-move", workspace: newWorkspaceURL, name: "Move")
+        ]))
+        let fetchedChats = try await context.fetch(CodexFetchRequest<CodexChat>.recentChats)
+        let newWorkspaceSectionID = newWorkspaceURL.standardizedFileURL
+            .resolvingSymlinksInPath()
+            .path
+
+        #expect(fetchedChats.first === chat)
+        #expect(chat.workspace?.url == newWorkspaceURL)
+        #expect(oldWorkspaceResults.items.isEmpty)
+        #expect(sectionedResults.items.first === chat)
+        #expect(sectionedResults.sections.first?.id == newWorkspaceSectionID)
+    }
+
     @Test("chat refresh preserves archived fetched result membership")
     func chatRefreshPreservesArchivedFetchedResultMembership() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -1263,6 +1313,33 @@ struct CodexModelContextTests {
 
         #expect(chatResults.items.map(\.id.rawValue) == ["thread-app"])
         #expect(group.workspaces.map(\.url) == [app])
+    }
+
+    @Test("group refresh preserves chats that moved to another group")
+    func groupRefreshPreservesChatsThatMovedToAnotherGroup() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let appRepo = try gitRepository(named: "AppRepo")
+        let toolsRepo = try gitRepository(named: "ToolsRepo")
+        let app = try createDirectory("App", in: appRepo)
+        let tools = try createDirectory("Tools", in: toolsRepo)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-move", workspace: app, name: "Move")
+        ]))
+        let chatResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>.recentChats)
+        try await chatResults.performFetch()
+        let chat = try #require(chatResults.items.first)
+        let group = try #require(chat.workspace?.workspaceGroup)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-move", workspace: tools, name: "Move")
+        ]))
+        try await group.refresh()
+
+        #expect(chat.workspace?.url == tools)
+        #expect(chatResults.items.first === chat)
+        #expect(group.workspaces.isEmpty)
     }
 
     @Test("group refresh does not prune unrelated groups")
