@@ -280,6 +280,7 @@ public final class CodexFetchedResults<Model: CodexObservableModel> {
     private func load(_ request: CodexFetchRequest<Model>, appending: Bool) async throws {
         phase = .loading
         lastErrorDescription = nil
+        let previousBackwardsCursor = backwardsCursor
         do {
             let page = try await modelContext.fetchPage(request, excluding: self)
             let newItems = loadedItems(from: page, appending: appending)
@@ -293,7 +294,7 @@ public final class CodexFetchedResults<Model: CodexObservableModel> {
             )
             sections = modelContext.sections(for: newItems, descriptor: request.sectionDescriptor)
             nextCursor = page.nextCursor
-            backwardsCursor = page.backwardsCursor
+            backwardsCursor = appending ? previousBackwardsCursor : page.backwardsCursor
             phase = .loaded
         } catch {
             let message = error.localizedDescription

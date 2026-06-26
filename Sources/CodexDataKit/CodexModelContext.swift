@@ -229,7 +229,14 @@ public final class CodexModelContext: @unchecked Sendable {
     package func apply(_ response: CodexResponse, to chat: CodexChat) async {
         let previousWorkspace = chat.workspace
         let previousGroup = previousWorkspace?.workspaceGroup
+        let previousUpdatedAt = chat.updatedAt
         chat.apply(response)
+        if let workspace = chat.workspace,
+            let updatedAt = chat.updatedAt,
+            previousUpdatedAt.map({ updatedAt > $0 }) ?? true
+        {
+            workspace.moveChatToFront(chat)
+        }
         await revalidateChatInRegisteredResults(
             chat,
             previousWorkspace: previousWorkspace,

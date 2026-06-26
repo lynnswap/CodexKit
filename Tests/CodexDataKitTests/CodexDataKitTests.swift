@@ -279,6 +279,33 @@ struct CodexModelContextTests {
         #expect(results.nextCursor == nil)
     }
 
+    @Test("appended local pages preserve the loaded window backwards cursor")
+    func appendedLocalPagesPreserveLoadedWindowBackwardsCursor() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspace = temporaryDirectory()
+        let page = CodexThreadPage(threads: [
+            .init(id: "thread-alpha", workspace: workspace, name: "Alpha"),
+            .init(id: "thread-beta", workspace: workspace, name: "Beta"),
+            .init(id: "thread-zulu", workspace: workspace, name: "Zulu"),
+        ])
+
+        try await runtime.transport.enqueueThreadList(page)
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            sortDescriptors: [.name()],
+            fetchLimit: 1
+        ))
+        try await results.performFetch()
+        #expect(results.items.map(\.title) == ["Alpha"])
+        #expect(results.backwardsCursor == nil)
+
+        try await runtime.transport.enqueueThreadList(page)
+        try await results.loadNextPage()
+
+        #expect(results.items.map(\.title) == ["Alpha", "Beta"])
+        #expect(results.backwardsCursor == nil)
+    }
+
     @Test("local paged chat load reconciles stale loaded items")
     func localPagedChatLoadReconcilesStaleLoadedItems() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -3438,6 +3465,46 @@ struct CodexModelContextTests {
 
         #expect(alpha.updatedAt == completedAt)
         #expect(results.items.map(\.id.rawValue) == ["thread-alpha", "thread-beta"])
+    }
+
+    @Test("chat send moves the chat to the front of its workspace")
+    func chatSendMovesChatToFrontOfWorkspace() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+        let firstUpdate = Date(timeIntervalSince1970: 1_000)
+        let secondUpdate = Date(timeIntervalSince1970: 2_000)
+        let completedAt = Date(timeIntervalSince1970: 3_000)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-alpha", workspace: workspaceURL, name: "Alpha", updatedAt: firstUpdate),
+            .init(id: "thread-beta", workspace: workspaceURL, name: "Beta", updatedAt: secondUpdate),
+        ]))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>.recentChats)
+        try await results.performFetch()
+        let alpha = try #require(results.items.first { $0.id.rawValue == "thread-alpha" })
+        let workspace = try #require(alpha.workspace)
+        #expect(workspace.chats.map(\.id.rawValue) == ["thread-beta", "thread-alpha"])
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-alpha"))
+        try await runtime.transport.enqueueTurnStart(turnID: "turn-alpha", status: "running")
+        let sendTask = Task {
+            try await alpha.send("hello")
+        }
+
+        await runtime.transport.waitForRequest(method: "turn/start")
+        try await runtime.transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(
+                id: "turn-alpha",
+                status: "completed",
+                completedAt: Int(completedAt.timeIntervalSince1970)
+            ))
+        )
+
+        _ = try await sendTask.value
+
+        #expect(workspace.chats.map(\.id.rawValue) == ["thread-alpha", "thread-beta"])
     }
 
     @Test("chat send refreshes primary recency-sorted fetched results")
