@@ -109,7 +109,13 @@ public struct CodexFetchFilter<Model: CodexObservableModel>: Sendable, Hashable 
             }
         }
     }
-    public var sourceKinds: [CodexThreadSourceKind]?
+    public var sourceKinds: [CodexThreadSourceKind]? {
+        didSet {
+            if sourceKinds?.isEmpty == true {
+                sourceKinds = nil
+            }
+        }
+    }
     public var useStateDBOnly: Bool?
 
     public init(
@@ -124,7 +130,7 @@ public struct CodexFetchFilter<Model: CodexObservableModel>: Sendable, Hashable 
         self.workspace = workspace
         self.searchTerm = searchTerm?.isEmpty == true ? nil : searchTerm
         self.modelProviders = modelProviders?.isEmpty == true ? nil : modelProviders
-        self.sourceKinds = sourceKinds
+        self.sourceKinds = sourceKinds?.isEmpty == true ? nil : sourceKinds
         self.useStateDBOnly = useStateDBOnly
     }
 }
@@ -367,7 +373,10 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             await refreshAfterLocalRemovalIfNeeded(originalCount: originalCount)
             return
         }
-        upsert(model)
+        guard upsert(model) else {
+            await refreshAfterLocalRemovalIfNeeded(originalCount: originalCount)
+            return
+        }
     }
 
     package func remove(
@@ -453,18 +462,20 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         return nil
     }
 
-    private func upsert(_ model: Model) {
+    @discardableResult
+    private func upsert(_ model: Model) -> Bool {
         var nextItems = items
         if let index = nextItems.firstIndex(where: { $0.id == model.id }) {
             nextItems[index] = model
         } else {
             guard canInsertLiveModel else {
-                return
+                return false
             }
             nextItems.insert(model, at: 0)
         }
         items = modelContext.sortedItems(nextItems, for: request)
         sections = modelContext.sections(for: items, descriptor: request.sectionDescriptor)
+        return true
     }
 
     private var canInsertLiveModel: Bool {

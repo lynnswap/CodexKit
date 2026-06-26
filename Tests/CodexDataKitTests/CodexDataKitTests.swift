@@ -316,6 +316,34 @@ struct CodexModelContextTests {
         #expect(fetchedWorkspace.chats.map(\.id.rawValue) == ["thread-remaining"])
     }
 
+    @Test("empty source-kind filters behave like unfiltered chat fetches")
+    func emptySourceKindFiltersBehaveLikeUnfilteredChatFetches() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspace = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-stale", workspace: workspace, name: "Stale"),
+            .init(id: "thread-remaining", workspace: workspace, name: "Remaining"),
+        ]))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            filter: .init(sourceKinds: [])
+        ))
+        try await results.performFetch()
+        let fetchedWorkspace = try #require(results.items.first?.workspace)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-remaining", workspace: workspace, name: "Remaining")
+        ]))
+        try await results.refresh()
+
+        let requests = await runtime.transport.recordedRequests(method: "thread/list")
+        let firstParams = try #require(requests.first).decodeParams(ThreadListParams.self)
+        #expect(firstParams.sourceKinds == nil)
+        #expect(results.items.map(\.id.rawValue) == ["thread-remaining"])
+        #expect(fetchedWorkspace.chats.map(\.id.rawValue) == ["thread-remaining"])
+    }
+
     @Test("filtered workspace fetches keep previously loaded workspace chats")
     func filteredWorkspaceFetchesKeepPreviouslyLoadedWorkspaceChats() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -815,6 +843,42 @@ struct CodexModelContextTests {
         try await results.refresh()
 
         #expect(fetchedWorkspace.chats.map(\.id.rawValue) == ["thread-remaining"])
+    }
+
+    @Test("paged workspace revalidation backfills when new parent cannot be inserted")
+    func pagedWorkspaceRevalidationBackfillsWhenNewParentCannotBeInserted() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let repo = try gitRepository()
+        let app = try createDirectory("App", in: repo)
+        let backfill = try createDirectory("Backfill", in: repo)
+        let tools = try createDirectory("Tools", in: repo)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-move", workspace: app, name: "Move"),
+            .init(id: "thread-backfill", workspace: backfill, name: "Backfill"),
+        ]))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexWorkspace>(
+            sortDescriptors: [.name()],
+            fetchLimit: 1
+        ))
+        try await results.performFetch()
+        let chat = try #require(results.items.first?.chats.first)
+        #expect(results.items.map(\.url) == [app])
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-move"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-move",
+            workspace: tools,
+            name: "Move"
+        ))
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-backfill", workspace: backfill, name: "Backfill"),
+            .init(id: "thread-move", workspace: tools, name: "Move"),
+        ]))
+        try await chat.refresh(includeTurns: false)
+
+        #expect(results.items.map(\.url) == [backfill])
     }
 
     @Test("server paginated chat fetches preserve existing workspace relationships")
