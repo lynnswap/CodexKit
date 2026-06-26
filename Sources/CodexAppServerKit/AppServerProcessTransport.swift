@@ -10,12 +10,15 @@ package actor AppServerProcessTransport: JSONRPC.Transport {
         package var arguments: [String]
         package var environment: [String: String]
         package var codexHomeURL: URL
+        package var serverRequestHandler: CodexAppServerRequestHandler
 
         package init(
             executable: String? = nil,
             arguments: [String]? = nil,
             environment: [String: String] = ProcessInfo.processInfo.environment,
-            codexHomeURL: URL
+            codexHomeURL: URL,
+            serverRequestHandler: @escaping CodexAppServerRequestHandler =
+                CodexAppServer.Configuration.defaultServerRequestHandler
         ) {
             let resolvedExecutable = executable.map {
                 CodexAppServerExecutable.resolveExecutable($0, environment: environment)
@@ -31,6 +34,7 @@ package actor AppServerProcessTransport: JSONRPC.Transport {
                 codexHomeURL: codexHomeURL
             )
             self.codexHomeURL = codexHomeURL
+            self.serverRequestHandler = serverRequestHandler
         }
     }
 
@@ -44,6 +48,7 @@ package actor AppServerProcessTransport: JSONRPC.Transport {
     private let stderr: Pipe
     private let stdoutEvents: AppServerPipeReadEventSource
     private let stderrEvents: AppServerPipeReadEventSource
+    private let serverRequestHandler: CodexAppServerRequestHandler
     private var framer = JSONRPC.Framer()
     private var pending: [Int: PendingResponse] = [:]
     private var notificationContinuations:
@@ -72,6 +77,7 @@ package actor AppServerProcessTransport: JSONRPC.Transport {
         self.stdin = stdin
         self.stdout = stdout
         self.stderr = stderr
+        self.serverRequestHandler = configuration.serverRequestHandler
         let stdoutEvents = AppServerPipeReadEventSource(
             fileHandle: stdout.fileHandleForReading,
             label: "com.lynnpd.CodexAppServerKit.app-server.stdout"
@@ -226,14 +232,13 @@ package actor AppServerProcessTransport: JSONRPC.Transport {
 
     private func processServerRequest(method: String, object: [String: Any]) {
         do {
-            let response = try Self.unsupportedServerRequestPayload(
-                id: object["id"] ?? NSNull(),
-                method: method
-            )
-            try stdin.fileHandleForWriting.write(contentsOf: response)
+            let request = try Self.serverRequest(method: method, object: object)
+            Task {
+                await self.respond(to: request)
+            }
         } catch {
             logger.error(
-                "Failed to reject unsupported app-server request \(method, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                "Failed to decode app-server request \(method, privacy: .public): \(error.localizedDescription, privacy: .public)"
             )
         }
     }
@@ -268,15 +273,68 @@ package actor AppServerProcessTransport: JSONRPC.Transport {
         return try JSONSerialization.data(withJSONObject: result, options: [.fragmentsAllowed])
     }
 
-    package static func unsupportedServerRequestPayload(id: Any, method: String) throws -> Data {
-        var data = try JSONSerialization.data(
-            withJSONObject: [
-                "id": id,
+    private static func serverRequest(
+        method: String,
+        object: [String: Any]
+    ) throws -> CodexAppServerRequest {
+        guard let id = CodexAppServerRequest.ID(jsonObject: object["id"]) else {
+            throw JSONRPC.Error.invalidMessage("Server request has an invalid id.")
+        }
+        let params = object["params"] ?? [:]
+        let data = try responsePayloadData(from: params)
+        return CodexAppServerRequest(id: id, method: method, params: data)
+    }
+
+    private func respond(to request: CodexAppServerRequest) async {
+        do {
+            let response = try await serverRequestHandler(request)
+            let payload = try Self.serverRequestResponsePayload(
+                id: request.id,
+                response: response
+            )
+            try stdin.fileHandleForWriting.write(contentsOf: payload)
+        } catch {
+            do {
+                let payload = try Self.serverRequestResponsePayload(
+                    id: request.id,
+                    response: .error(
+                        code: -32000,
+                        message: "App-server request failed: \(error.localizedDescription)"
+                    )
+                )
+                try stdin.fileHandleForWriting.write(contentsOf: payload)
+            } catch {
+                logger.error(
+                    "Failed to respond to app-server request \(request.method, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                )
+            }
+        }
+    }
+
+    package static func serverRequestResponsePayload(
+        id: CodexAppServerRequest.ID,
+        response: CodexAppServerResponse
+    ) throws -> Data {
+        let payload: [String: Any]
+        switch response.payload {
+        case .result(let result):
+            payload = [
+                "id": id.jsonObject,
+                "result": try JSONSerialization.jsonObject(
+                    with: result,
+                    options: [.fragmentsAllowed]
+                ),
+            ]
+        case .error(let code, let message):
+            payload = [
+                "id": id.jsonObject,
                 "error": [
-                    "code": -32601,
-                    "message": "Unsupported app-server request: \(method)",
+                    "code": code,
+                    "message": message,
                 ],
-            ] as [String: Any])
+            ]
+        }
+        var data = try JSONSerialization.data(withJSONObject: payload)
         data.append(0x0A)
         return data
     }

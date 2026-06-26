@@ -207,11 +207,11 @@ public enum CodexSandbox: String, Codable, Equatable, Sendable {
     package var threadSandboxValue: String {
         switch self {
         case .readOnly:
-            "read-only"
+            "readOnly"
         case .workspaceWrite:
-            "workspace-write"
+            "workspaceWrite"
         case .fullAccess:
-            "danger-full-access"
+            "dangerFullAccess"
         }
     }
 
@@ -270,7 +270,7 @@ public enum CodexApprovalMode: String, Codable, Equatable, Sendable {
     package var approvalPolicy: String {
         switch self {
         case .autoReview:
-            "on-request"
+            "onRequest"
         case .denyAll:
             "never"
         }

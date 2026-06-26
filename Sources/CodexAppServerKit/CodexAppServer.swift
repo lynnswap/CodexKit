@@ -95,20 +95,46 @@ public actor CodexAppServer {
         /// The client version sent in the app-server `initialize` request.
         public var clientVersion: String
 
+        /// Handles JSON-RPC requests initiated by the app-server.
+        ///
+        /// App-server uses these requests for host-side decisions such as
+        /// command approvals, file-change approvals, and user-input prompts.
+        public var serverRequestHandler: CodexAppServerRequestHandler
+
         /// Creates a configuration for a Codex app-server container.
         ///
         /// - Parameters:
         ///   - localProcess: Local process launch settings.
         ///   - clientName: Client name sent during app-server initialization.
         ///   - clientVersion: Client version sent during app-server initialization.
+        ///   - serverRequestHandler: Handler for app-server-initiated JSON-RPC requests.
         public init(
             localProcess: LocalProcess = .init(),
             clientName: String = "CodexAppServerKit",
-            clientVersion: String = "1"
+            clientVersion: String = "1",
+            serverRequestHandler: @escaping CodexAppServerRequestHandler =
+                Self.defaultServerRequestHandler
         ) {
             self.localProcess = localProcess
             self.clientName = clientName
             self.clientVersion = clientVersion
+            self.serverRequestHandler = serverRequestHandler
+        }
+
+        private struct ApprovalDeclineResponse: Encodable {
+            var decision: String
+        }
+
+        public static func defaultServerRequestHandler(
+            request: CodexAppServerRequest
+        ) async throws -> CodexAppServerResponse {
+            switch request.method {
+            case "item/commandExecution/requestApproval",
+                 "item/fileChange/requestApproval":
+                try .result(ApprovalDeclineResponse(decision: "decline"))
+            default:
+                try .emptyResult()
+            }
         }
     }
 
@@ -133,7 +159,8 @@ public actor CodexAppServer {
             executable: configuration.localProcess.executable,
             arguments: configuration.localProcess.arguments,
             environment: configuration.localProcess.environment,
-            codexHomeURL: configuration.localProcess.codexHomeURL
+            codexHomeURL: configuration.localProcess.codexHomeURL,
+            serverRequestHandler: configuration.serverRequestHandler
         )
         let transport = try AppServerProcessTransport(configuration: transportConfiguration)
         let client = AppServerClient(transport: transport)

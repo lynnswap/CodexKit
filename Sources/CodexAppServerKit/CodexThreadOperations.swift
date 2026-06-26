@@ -491,8 +491,14 @@ extension CodexPrompt {
             case .skill(let name, let path):
                 .skill(name: name, path: path.path)
             case .mention(let name, let path):
-                .mention(name: name, path: path.path)
+                .mention(name: name, path: path.appServerMentionPath)
             }
         }
+    }
+}
+
+private extension URL {
+    var appServerMentionPath: String {
+        isFileURL ? path : absoluteString
     }
 }

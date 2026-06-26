@@ -70,6 +70,69 @@ struct CodexAppServerKitTests {
         ])
     }
 
+    @Test func processTransportAnswersServerInitiatedRequestsThroughConfiguredHandler() async throws {
+        let rootURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let responseURL = rootURL.appendingPathComponent("response.json")
+        let executableURL = rootURL.appendingPathComponent("fake-app-server")
+        try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: rootURL)
+        }
+
+        try """
+            #!/bin/sh
+            printf '%s\\n' '{"id":"approval-1","method":"item/commandExecution/requestApproval","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"item-1"}}'
+            IFS= read -r line
+            printf '%s\\n' "$line" > "$RESPONSE_PATH"
+            """
+            .write(to: executableURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: executableURL.path
+        )
+
+        let recorder = ServerRequestRecorder()
+        let transport = try AppServerProcessTransport(
+            configuration: .init(
+                executable: executableURL.path,
+                arguments: [],
+                environment: ["RESPONSE_PATH": responseURL.path],
+                codexHomeURL: rootURL.appendingPathComponent("codex-home", isDirectory: true),
+                serverRequestHandler: { request in
+                    await recorder.append(request)
+                    return try .result(["decision": "accept"])
+                }
+            )
+        )
+        defer {
+            Task {
+                await transport.close()
+            }
+        }
+
+        let wroteResponse = await eventually(attempts: 100) {
+            FileManager.default.fileExists(atPath: responseURL.path)
+        }
+        #expect(wroteResponse)
+
+        let request = try #require(await recorder.requests().first)
+        #expect(request.id == .string("approval-1"))
+        #expect(request.method == "item/commandExecution/requestApproval")
+        let requestParams = try #require(
+            JSONSerialization.jsonObject(with: request.params) as? [String: Any]
+        )
+        #expect(requestParams["threadId"] as? String == "thread-1")
+
+        let responseData = try Data(contentsOf: responseURL)
+        let response = try #require(
+            JSONSerialization.jsonObject(with: responseData) as? [String: Any]
+        )
+        #expect(response["id"] as? String == "approval-1")
+        let result = try #require(response["result"] as? [String: Any])
+        #expect(result["decision"] as? String == "accept")
+    }
+
     @Test func processSpawnClosePlanPreservesStandardIOFileDescriptors() {
         let closeDescriptors = AppServerProcessFileDescriptorPlan
             .childPipeDescriptorsToClose([0, 1, 2, 3, 4, 5])
@@ -185,9 +248,9 @@ struct CodexAppServerKitTests {
         #expect(params.ephemeral == true)
         #expect(params.baseInstructions == "Base")
         #expect(params.developerInstructions == "Developer")
-        #expect(params.approvalPolicy == "on-request")
+        #expect(params.approvalPolicy == "onRequest")
         #expect(params.approvalsReviewer == "auto_review")
-        #expect(params.sandbox == "workspace-write")
+        #expect(params.sandbox == "workspaceWrite")
         #expect(params.permissions == .profileID("codex-default"))
         #expect(params.config == ["experimental": .bool(true)])
         #expect(params.personality == "pragmatic")
@@ -1593,6 +1656,8 @@ struct CodexAppServerKitTests {
             .localImage(URL(fileURLWithPath: "/tmp/screenshot.png")),
             .skill(name: "checks", path: URL(fileURLWithPath: "/tmp/skills/checks")),
             .mention(name: "repo", path: URL(fileURLWithPath: "/tmp/repo")),
+            .mention(name: "app", path: URL(string: "app://demo-app")!),
+            .mention(name: "plugin", path: URL(string: "plugin://sample@test")!),
         ])
 
         #expect(
@@ -1602,6 +1667,8 @@ struct CodexAppServerKitTests {
                 .localImage(path: "/tmp/screenshot.png"),
                 .skill(name: "checks", path: "/tmp/skills/checks"),
                 .mention(name: "repo", path: "/tmp/repo"),
+                .mention(name: "app", path: "app://demo-app"),
+                .mention(name: "plugin", path: "plugin://sample@test"),
             ])
     }
 
@@ -2216,6 +2283,29 @@ struct CodexAppServerKitTests {
         #expect(sandboxPolicy["excludeSlashTmp"] as? Bool == false)
         #expect(sandboxPolicy.keys.contains("writable_roots") == false)
         #expect(sandboxPolicy.keys.contains("network_access") == false)
+    }
+
+    @Test func responseStreamSerializesApprovalPolicyWithAppServerSchema() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueue(
+            AppServerAPI.Turn.Start.Response(turn: .init(id: "turn-1", status: "running")),
+            for: "turn/start"
+        )
+        let client = AppServerClient(transport: transport)
+        let router = CodexAppServerNotificationRouter(client: client)
+        let thread = CodexThread(id: "thread-1", client: client, router: router)
+
+        _ = try await thread.streamResponse(
+            to: "Explain the patch.",
+            options: .init(approvalMode: .autoReview)
+        )
+
+        let request = try #require(await transport.recordedRequests().first)
+        let params = try #require(
+            JSONSerialization.jsonObject(with: request.params) as? [String: Any]
+        )
+        #expect(params["approvalPolicy"] as? String == "onRequest")
+        #expect(params["approvalPolicy"] as? String != "on-request")
     }
 
     @Test func messageDeltaLogEntriesUseUniqueEntryIDs() async throws {
@@ -3328,6 +3418,18 @@ private actor CancellationRecorder {
 
     func values() -> [CodexTurnCancellation] {
         cancellations
+    }
+}
+
+private actor ServerRequestRecorder {
+    private var recordedRequests: [CodexAppServerRequest] = []
+
+    func append(_ request: CodexAppServerRequest) {
+        recordedRequests.append(request)
+    }
+
+    func requests() -> [CodexAppServerRequest] {
+        recordedRequests
     }
 }
 
