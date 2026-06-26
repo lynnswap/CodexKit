@@ -44,13 +44,13 @@ public final class CodexModelContext: @unchecked Sendable {
         self.container = container
     }
 
-    public func fetch<Model: CodexModel>(
+    public func fetch<Model: CodexObservableModel>(
         _ request: CodexFetchRequest<Model>
     ) async throws -> [Model] {
         try await fetchPage(request).items
     }
 
-    public func fetchedResults<Model: CodexModel>(
+    public func fetchedResults<Model: CodexObservableModel>(
         for request: CodexFetchRequest<Model>
     ) -> CodexFetchedResults<Model> {
         CodexFetchedResults(modelContext: self, request: request)
@@ -106,7 +106,7 @@ public final class CodexModelContext: @unchecked Sendable {
             workspace: thread.workspace
         )
         let chat = apply(snapshot, shouldReplaceTurns: false)
-        workspace.addChatIfNeeded(chat)
+        workspace.moveChatToFront(chat)
         return chat
     }
 
@@ -134,7 +134,7 @@ public final class CodexModelContext: @unchecked Sendable {
         remove(chat)
     }
 
-    package func fetchPage<Model: CodexModel>(
+    package func fetchPage<Model: CodexObservableModel>(
         _ request: CodexFetchRequest<Model>
     ) async throws -> CodexFetchPage<Model> {
         if Model.self == CodexChat.self {
@@ -165,7 +165,7 @@ public final class CodexModelContext: @unchecked Sendable {
         throw CodexModelContextError.unsupportedModelType(String(describing: Model.self))
     }
 
-    package func sections<Model: CodexModel>(
+    package func sections<Model: CodexObservableModel>(
         for items: [Model],
         descriptor: CodexSectionDescriptor<Model>?
     ) -> [CodexFetchSection<Model>] {
@@ -199,7 +199,9 @@ public final class CodexModelContext: @unchecked Sendable {
                     .map { apply($0, shouldReplaceTurns: $0.turns.isEmpty == false) },
                 using: request.sortDescriptors
             )
-            return localPage(chats, for: request)
+            let page = localPage(chats, for: request)
+            syncWorkspaceChats(page.items)
+            return page
         }
 
         let page = try await appServer.listThreads(threadQuery(from: request))
@@ -207,6 +209,7 @@ public final class CodexModelContext: @unchecked Sendable {
             page.threads.map { apply($0, shouldReplaceTurns: $0.turns.isEmpty == false) },
             using: request.sortDescriptors
         )
+        syncWorkspaceChats(chats)
         return CodexFetchPage(
             items: chats,
             nextCursor: page.nextCursor,
@@ -333,7 +336,14 @@ public final class CodexModelContext: @unchecked Sendable {
         }
     }
 
-    private func fetchAllThreadSnapshots<Model: CodexModel>(
+    private func syncWorkspaceChats(_ chats: [CodexChat]) {
+        let workspaces = unique(chats.compactMap(\.workspace))
+        for workspace in workspaces {
+            workspace.setChats(chats.filter { $0.workspace === workspace })
+        }
+    }
+
+    private func fetchAllThreadSnapshots<Model: CodexObservableModel>(
         matching request: CodexFetchRequest<Model>
     ) async throws -> [CodexThreadSnapshot] {
         var query = threadQuery(from: request, includePaging: false)
@@ -350,7 +360,7 @@ public final class CodexModelContext: @unchecked Sendable {
         return threads
     }
 
-    private func localPage<Model: CodexModel>(
+    private func localPage<Model: CodexObservableModel>(
         _ items: [Model],
         for request: CodexFetchRequest<Model>
     ) -> CodexFetchPage<Model> {
@@ -375,7 +385,7 @@ public final class CodexModelContext: @unchecked Sendable {
         )
     }
 
-    private func canUseServerOrderedPages<Model: CodexModel>(
+    private func canUseServerOrderedPages<Model: CodexObservableModel>(
         for request: CodexFetchRequest<Model>
     ) -> Bool {
         switch request.sortDescriptors.count {
@@ -406,7 +416,7 @@ public final class CodexModelContext: @unchecked Sendable {
         return offset
     }
 
-    private func threadQuery<Model: CodexModel>(
+    private func threadQuery<Model: CodexObservableModel>(
         from request: CodexFetchRequest<Model>,
         includePaging: Bool = true
     )
@@ -434,7 +444,7 @@ public final class CodexModelContext: @unchecked Sendable {
         )
     }
 
-    private func sectionIdentity<Model: CodexModel>(
+    private func sectionIdentity<Model: CodexObservableModel>(
         for item: Model,
         descriptor: CodexSectionDescriptor<Model>
     ) -> (id: String, title: String) {
@@ -457,14 +467,19 @@ public final class CodexModelContext: @unchecked Sendable {
     private func sort(_ chats: [CodexChat], using descriptors: [CodexSortDescriptor<CodexChat>])
         -> [CodexChat]
     {
-        sortModels(chats, using: descriptors) { descriptor, lhs, rhs in
+        guard descriptors.contains(where: { $0.key == .recencyAt }) == false else {
+            return chats
+        }
+        return sortModels(chats, using: descriptors) { descriptor, lhs, rhs in
             switch descriptor.key {
             case .name:
                 compare(lhs.title, rhs.title, order: descriptor.order)
             case .createdAt:
                 compare(lhs.createdAt, rhs.createdAt, order: descriptor.order)
-            case .updatedAt, .recencyAt:
+            case .updatedAt:
                 compare(lhs.updatedAt, rhs.updatedAt, order: descriptor.order)
+            case .recencyAt:
+                .orderedSame
             }
         }
     }
@@ -530,15 +545,15 @@ public final class CodexModelContext: @unchecked Sendable {
             let result: ComparisonResult = lhs < rhs ? .orderedAscending : .orderedDescending
             return order == .forward ? result : result.reversed
         case (.some, .none):
-            return order == .forward ? .orderedAscending : .orderedDescending
+            return .orderedAscending
         case (.none, .some):
-            return order == .forward ? .orderedDescending : .orderedAscending
+            return .orderedDescending
         case (.none, .none):
             return .orderedSame
         }
     }
 
-    private func unique<Model: CodexModel>(_ models: [Model]) -> [Model] {
+    private func unique<Model: CodexObservableModel>(_ models: [Model]) -> [Model] {
         var seen: Set<Model.ID> = []
         var result: [Model] = []
         for model in models where seen.insert(model.id).inserted {

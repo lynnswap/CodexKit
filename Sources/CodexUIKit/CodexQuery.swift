@@ -21,7 +21,7 @@ extension View {
     }
 }
 
-public struct CodexQueryResults<Model: CodexModel>: RandomAccessCollection {
+public struct CodexQueryResults<Model: CodexObservableModel>: RandomAccessCollection {
     public typealias Index = Array<Model>.Index
     public typealias Element = Model
 
@@ -57,7 +57,7 @@ public struct CodexQueryResults<Model: CodexModel>: RandomAccessCollection {
 
 @MainActor
 @propertyWrapper
-public struct CodexQuery<Model: CodexModel>: @preconcurrency DynamicProperty {
+public struct CodexQuery<Model: CodexObservableModel>: @preconcurrency DynamicProperty {
     @Environment(\.codexModelContext) private var modelContext
     @State private var fetchedResults: CodexFetchedResults<Model>?
     private let request: CodexFetchRequest<Model>

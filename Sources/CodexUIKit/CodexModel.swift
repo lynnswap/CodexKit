@@ -3,7 +3,7 @@ import Foundation
 import Observation
 
 @MainActor
-public protocol CodexModel: AnyObject, Identifiable where ID: Sendable {
+public protocol CodexObservableModel: AnyObject, Identifiable where ID: Sendable {
     var id: ID { get }
     var modelContext: CodexModelContext? { get }
 }
@@ -82,7 +82,7 @@ public struct CodexChatMessageInput: Sendable {
 
 @MainActor
 @Observable
-public final class CodexWorkspaceGroup: CodexModel {
+public final class CodexWorkspaceGroup: CodexObservableModel {
     public let id: CodexWorkspaceGroupID
     public private(set) var name: String
     public private(set) var workspaces: [CodexWorkspace]
@@ -116,7 +116,7 @@ public final class CodexWorkspaceGroup: CodexModel {
 
 @MainActor
 @Observable
-public final class CodexWorkspace: CodexModel {
+public final class CodexWorkspace: CodexObservableModel {
     public let id: CodexWorkspaceID
     public private(set) var url: URL
     public private(set) var name: String
@@ -159,6 +159,11 @@ public final class CodexWorkspace: CodexModel {
         guard chats.contains(where: { $0 === chat }) == false else {
             return
         }
+        chats.append(chat)
+    }
+
+    package func moveChatToFront(_ chat: CodexChat) {
+        chats.removeAll { $0 === chat }
         chats.insert(chat, at: 0)
     }
 
@@ -177,7 +182,7 @@ public final class CodexWorkspace: CodexModel {
 
 @MainActor
 @Observable
-public final class CodexChat: CodexModel {
+public final class CodexChat: CodexObservableModel {
     public let id: CodexThreadID
     public private(set) var workspace: CodexWorkspace?
     public private(set) var name: String?

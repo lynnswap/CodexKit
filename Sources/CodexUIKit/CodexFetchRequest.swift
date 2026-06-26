@@ -23,7 +23,7 @@ package enum CodexSortKey: Sendable, Hashable {
     case recencyAt
 }
 
-public struct CodexSortDescriptor<Model: CodexModel>: Sendable, Hashable {
+public struct CodexSortDescriptor<Model: CodexObservableModel>: Sendable, Hashable {
     package var key: CodexSortKey
     public var order: CodexSortOrder
 
@@ -68,7 +68,7 @@ package enum CodexSectionKey: Sendable, Hashable {
     case workspace
 }
 
-public struct CodexSectionDescriptor<Model: CodexModel>: Sendable, Hashable {
+public struct CodexSectionDescriptor<Model: CodexObservableModel>: Sendable, Hashable {
     package var key: CodexSectionKey
 
     package init(key: CodexSectionKey) {
@@ -92,7 +92,7 @@ extension CodexSectionDescriptor where Model == CodexChat {
     }
 }
 
-public struct CodexFetchFilter<Model: CodexModel>: Sendable, Hashable {
+public struct CodexFetchFilter<Model: CodexObservableModel>: Sendable, Hashable {
     public var archived: Bool?
     public var workspace: URL?
     public var searchTerm: String?
@@ -117,7 +117,7 @@ public struct CodexFetchFilter<Model: CodexModel>: Sendable, Hashable {
     }
 }
 
-public struct CodexFetchRequest<Model: CodexModel>: Sendable, Hashable {
+public struct CodexFetchRequest<Model: CodexObservableModel>: Sendable, Hashable {
     public var filter: CodexFetchFilter<Model>
     public var sortDescriptors: [CodexSortDescriptor<Model>]
     public var sectionDescriptor: CodexSectionDescriptor<Model>?
@@ -179,7 +179,7 @@ extension CodexFetchRequest where Model == CodexChat {
     }
 }
 
-public struct CodexFetchSection<Model: CodexModel>: Identifiable {
+public struct CodexFetchSection<Model: CodexObservableModel>: Identifiable {
     public var id: String
     public var title: String?
     public var items: [Model]
@@ -191,7 +191,7 @@ public struct CodexFetchSection<Model: CodexModel>: Identifiable {
     }
 }
 
-package struct CodexFetchPage<Model: CodexModel> {
+package struct CodexFetchPage<Model: CodexObservableModel> {
     package var items: [Model]
     package var nextCursor: String?
     package var backwardsCursor: String?
@@ -199,7 +199,7 @@ package struct CodexFetchPage<Model: CodexModel> {
 
 @MainActor
 @Observable
-public final class CodexFetchedResults<Model: CodexModel> {
+public final class CodexFetchedResults<Model: CodexObservableModel> {
     public let modelContext: CodexModelContext
     public private(set) var request: CodexFetchRequest<Model>
     public private(set) var items: [Model] = []

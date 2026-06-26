@@ -164,6 +164,75 @@ struct CodexModelContextTests {
         #expect(results.nextCursor == nil)
     }
 
+    @Test("workspace chats preserve fetched chat order")
+    func workspaceChatsPreserveFetchedChatOrder() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspace = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-zulu", workspace: workspace, name: "Zulu"),
+            .init(id: "thread-alpha", workspace: workspace, name: "Alpha"),
+        ]))
+
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            sortDescriptors: [.name()]
+        ))
+        try await results.performFetch()
+
+        let fetchedWorkspace = try #require(results.items.first?.workspace)
+        #expect(results.items.map(\.title) == ["Alpha", "Zulu"])
+        #expect(fetchedWorkspace.chats.map(\.title) == ["Alpha", "Zulu"])
+    }
+
+    @Test("recency sort preserves app-server ordering")
+    func recencySortPreservesAppServerOrdering() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(
+                id: "thread-server-first",
+                name: "Server first",
+                updatedAt: Date(timeIntervalSince1970: 1_000)
+            ),
+            .init(
+                id: "thread-server-second",
+                name: "Server second",
+                updatedAt: Date(timeIntervalSince1970: 2_000)
+            ),
+        ]))
+
+        let results = context.fetchedResults(
+            for: CodexFetchRequest<CodexChat>(sortDescriptors: [.recencyAt(.reverse)])
+        )
+        try await results.performFetch()
+
+        #expect(results.items.map(\.id.rawValue) == ["thread-server-first", "thread-server-second"])
+    }
+
+    @Test("reverse date sorts keep missing dates behind dated chats")
+    func reverseDateSortsKeepMissingDatesBehindDatedChats() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-undated", name: "Undated"),
+            .init(
+                id: "thread-dated",
+                name: "Dated",
+                updatedAt: Date(timeIntervalSince1970: 1_000)
+            ),
+        ]))
+
+        let results = context.fetchedResults(
+            for: CodexFetchRequest<CodexChat>(sortDescriptors: [.updatedAt(.reverse)])
+        )
+        try await results.performFetch()
+
+        #expect(results.items.map(\.id.rawValue) == ["thread-dated", "thread-undated"])
+    }
+
     @Test("workspace and chat fetches can be sectioned by workspace group or workspace")
     func fetchesSupportWorkspaceSections() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
