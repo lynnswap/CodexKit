@@ -311,7 +311,12 @@ public final class CodexFetchedResults<Model: CodexObservableModel> {
             return page.items
         }
         if page.relationshipIsComplete == true, let authoritativeItems = page.relationshipItems {
-            return Array(authoritativeItems.prefix(items.count + page.items.count))
+            let start = min(
+                modelContext.localCursorOffset(from: request.cursor),
+                authoritativeItems.count
+            )
+            let end = min(start + items.count + page.items.count, authoritativeItems.count)
+            return Array(authoritativeItems[start..<end])
         }
         return append(page.items, to: items)
     }
@@ -564,8 +569,9 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         guard missingCount > 0, shouldRefreshAfterLocalRemoval else {
             return
         }
+        let backfillOffset = modelContext.localCursorOffset(from: request.cursor) + items.count
         var request = request
-        request.cursor = modelContext.backfillCursor(after: items.count, currentCursor: nextCursor)
+        request.cursor = modelContext.backfillCursor(after: backfillOffset, currentCursor: nextCursor)
         request.fetchLimit = missingCount
         do {
             try await load(request, appending: true)

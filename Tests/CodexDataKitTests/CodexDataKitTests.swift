@@ -2388,6 +2388,86 @@ struct CodexModelContextTests {
         #expect(results.items.map(\.id.rawValue) == ["thread-b", "thread-c"])
     }
 
+    @Test("local paged fetched results preserve starting cursor when loading next page")
+    func localPagedFetchedResultsPreserveStartingCursorWhenLoadingNextPage() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+        let threads = [
+            CodexThreadSnapshot(id: "thread-a", workspace: workspaceURL, name: "A"),
+            CodexThreadSnapshot(id: "thread-b", workspace: workspaceURL, name: "B"),
+            CodexThreadSnapshot(id: "thread-c", workspace: workspaceURL, name: "C"),
+            CodexThreadSnapshot(id: "thread-d", workspace: workspaceURL, name: "D"),
+        ]
+
+        try await runtime.transport.enqueueThreadList(.init(threads: threads))
+        let firstPage = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            sortDescriptors: [.name()],
+            fetchLimit: 2
+        ))
+        try await firstPage.performFetch()
+        let cursor = try #require(firstPage.nextCursor)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: threads))
+        let offsetPage = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            sortDescriptors: [.name()],
+            fetchLimit: 1,
+            cursor: cursor
+        ))
+        try await offsetPage.performFetch()
+        #expect(offsetPage.items.map(\.title) == ["C"])
+
+        try await runtime.transport.enqueueThreadList(.init(threads: threads))
+        try await offsetPage.loadNextPage()
+
+        #expect(offsetPage.items.map(\.title) == ["C", "D"])
+        #expect(offsetPage.nextCursor == nil)
+    }
+
+    @Test("local paged fetched results backfill from starting cursor offset after removals")
+    func localPagedFetchedResultsBackfillFromStartingCursorOffsetAfterRemovals() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+        let initialThreads = [
+            CodexThreadSnapshot(id: "thread-a", workspace: workspaceURL, name: "A"),
+            CodexThreadSnapshot(id: "thread-b", workspace: workspaceURL, name: "B"),
+            CodexThreadSnapshot(id: "thread-c", workspace: workspaceURL, name: "C"),
+            CodexThreadSnapshot(id: "thread-d", workspace: workspaceURL, name: "D"),
+            CodexThreadSnapshot(id: "thread-e", workspace: workspaceURL, name: "E"),
+        ]
+
+        try await runtime.transport.enqueueThreadList(.init(threads: initialThreads))
+        let firstPage = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            sortDescriptors: [.name()],
+            fetchLimit: 2
+        ))
+        try await firstPage.performFetch()
+        let cursor = try #require(firstPage.nextCursor)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: initialThreads))
+        let offsetPage = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            sortDescriptors: [.name()],
+            fetchLimit: 2,
+            cursor: cursor
+        ))
+        try await offsetPage.performFetch()
+        let deletedChat = try #require(offsetPage.items.first)
+        #expect(offsetPage.items.map(\.title) == ["C", "D"])
+
+        try await runtime.transport.enqueueEmpty(for: "thread/delete")
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-a", workspace: workspaceURL, name: "A"),
+            .init(id: "thread-b", workspace: workspaceURL, name: "B"),
+            .init(id: "thread-d", workspace: workspaceURL, name: "D"),
+            .init(id: "thread-e", workspace: workspaceURL, name: "E"),
+        ]))
+        try await deletedChat.delete()
+
+        #expect(offsetPage.items.map(\.title) == ["D", "E"])
+        #expect(offsetPage.nextCursor == nil)
+    }
+
     @Test("starting a chat inserts it into active fetched results")
     func startingChatInsertsItIntoActiveFetchedResults() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()

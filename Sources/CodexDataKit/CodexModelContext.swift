@@ -991,7 +991,7 @@ public final class CodexModelContext: @unchecked Sendable {
         "\(Self.localCursorPrefix)\(offset)"
     }
 
-    private func localCursorOffset(from cursor: String?) -> Int {
+    package func localCursorOffset(from cursor: String?) -> Int {
         guard let cursor,
             cursor.hasPrefix(Self.localCursorPrefix)
         else {
