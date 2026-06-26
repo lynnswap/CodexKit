@@ -303,6 +303,63 @@ struct CodexModelContextTests {
             })
     }
 
+    @Test("workspace fetch pagination is applied after workspace deduplication")
+    func workspaceFetchPaginationIsAppliedAfterWorkspaceDeduplication() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let firstWorkspace = temporaryDirectory()
+        let secondWorkspace = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(
+            threads: [
+                .init(id: "thread-first-a", workspace: firstWorkspace, name: "First A"),
+                .init(id: "thread-first-b", workspace: firstWorkspace, name: "First B"),
+            ],
+            nextCursor: "server-next"
+        ))
+        try await runtime.transport.enqueueThreadList(.init(
+            threads: [
+                .init(id: "thread-second", workspace: secondWorkspace, name: "Second")
+            ]
+        ))
+
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexWorkspace>(
+            sortDescriptors: [.name()],
+            fetchLimit: 2
+        ))
+        try await results.performFetch()
+
+        #expect(Set(results.items.map(\.url)) == Set([firstWorkspace, secondWorkspace]))
+        #expect(results.nextCursor == nil)
+
+        let requests = await runtime.transport.recordedRequests(method: "thread/list")
+        #expect(requests.count == 2)
+    }
+
+    @Test("removing the last chat removes the workspace from its group")
+    func removingLastChatRemovesWorkspaceFromGroup() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let repo = try gitRepository()
+        let workspaceURL = try createDirectory("App", in: repo)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-delete", workspace: workspaceURL, name: "Delete")
+        ]))
+
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>.recentChats)
+        try await results.performFetch()
+        let chat = try #require(results.items.first)
+        let workspace = try #require(chat.workspace)
+        let group = try #require(workspace.workspaceGroup)
+
+        try await runtime.transport.enqueueEmpty(for: "thread/delete")
+        try await chat.delete()
+
+        #expect(workspace.chats.isEmpty)
+        #expect(group.workspaces.isEmpty)
+    }
+
     @Test("metadata-only chat refresh preserves existing turn objects")
     func metadataOnlyRefreshPreservesTurns() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()

@@ -219,55 +219,26 @@ public final class CodexModelContext: @unchecked Sendable {
     private func fetchWorkspacePage(
         _ request: CodexFetchRequest<CodexWorkspace>
     ) async throws -> CodexFetchPage<CodexWorkspace> {
-        if canUseServerOrderedPages(for: request) == false {
-            let chats = try await fetchAllThreadSnapshots(matching: request)
-                .map { apply($0, shouldReplaceTurns: $0.turns.isEmpty == false) }
-            let workspaces = unique(chats.compactMap(\.workspace))
-            for workspace in workspaces {
-                workspace.setChats(chats.filter { $0.workspace === workspace })
-            }
-            return localPage(sort(workspaces, using: request.sortDescriptors), for: request)
-        }
-
-        let page = try await appServer.listThreads(threadQuery(from: request))
-        let chats = page.threads.map { apply($0, shouldReplaceTurns: $0.turns.isEmpty == false) }
+        let chats = try await fetchAllThreadSnapshots(matching: request)
+            .map { apply($0, shouldReplaceTurns: $0.turns.isEmpty == false) }
         let workspaces = unique(chats.compactMap(\.workspace))
         for workspace in workspaces {
             workspace.setChats(chats.filter { $0.workspace === workspace })
         }
-        return CodexFetchPage(
-            items: sort(workspaces, using: request.sortDescriptors),
-            nextCursor: page.nextCursor,
-            backwardsCursor: page.backwardsCursor
-        )
+        return localPage(sort(workspaces, using: request.sortDescriptors), for: request)
     }
 
     private func fetchWorkspaceGroupPage(
         _ request: CodexFetchRequest<CodexWorkspaceGroup>
     ) async throws -> CodexFetchPage<CodexWorkspaceGroup> {
-        if canUseServerOrderedPages(for: request) == false {
-            let chats = try await fetchAllThreadSnapshots(matching: request)
-                .map { apply($0, shouldReplaceTurns: $0.turns.isEmpty == false) }
-            let workspaces = unique(chats.compactMap(\.workspace))
-            let groups = unique(workspaces.compactMap(\.workspaceGroup))
-            for group in groups {
-                group.setWorkspaces(workspaces.filter { $0.workspaceGroup === group })
-            }
-            return localPage(sort(groups, using: request.sortDescriptors), for: request)
-        }
-
-        let page = try await appServer.listThreads(threadQuery(from: request))
-        let chats = page.threads.map { apply($0, shouldReplaceTurns: $0.turns.isEmpty == false) }
+        let chats = try await fetchAllThreadSnapshots(matching: request)
+            .map { apply($0, shouldReplaceTurns: $0.turns.isEmpty == false) }
         let workspaces = unique(chats.compactMap(\.workspace))
         let groups = unique(workspaces.compactMap(\.workspaceGroup))
         for group in groups {
             group.setWorkspaces(workspaces.filter { $0.workspaceGroup === group })
         }
-        return CodexFetchPage(
-            items: sort(groups, using: request.sortDescriptors),
-            nextCursor: page.nextCursor,
-            backwardsCursor: page.backwardsCursor
-        )
+        return localPage(sort(groups, using: request.sortDescriptors), for: request)
     }
 
     @discardableResult
@@ -332,6 +303,9 @@ public final class CodexModelContext: @unchecked Sendable {
         chatsByID.removeValue(forKey: chat.id)
         if let workspace = chat.workspace {
             workspace.setChats(workspace.chats.filter { $0 !== chat })
+            if workspace.chats.isEmpty, let group = workspace.workspaceGroup {
+                group.setWorkspaces(group.workspaces.filter { $0 !== workspace })
+            }
         }
     }
 
