@@ -27,13 +27,13 @@ public struct CodexQueryResults<Model: CodexObservableModel>: RandomAccessCollec
 
     public var items: [Model]
     public var sections: [CodexFetchSection<Model>]
-    public var phase: CodexUIPhase
+    public var phase: CodexDataPhase
     public var lastErrorDescription: String?
 
     public init(
         items: [Model] = [],
         sections: [CodexFetchSection<Model>] = [],
-        phase: CodexUIPhase = .idle,
+        phase: CodexDataPhase = .idle,
         lastErrorDescription: String? = nil
     ) {
         self.items = items

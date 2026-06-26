@@ -1,8 +1,8 @@
-# CodexUIKit
+# CodexDataKit
 
-CodexUIKit provides `@Observable` model objects for building native Codex UIs on top of `CodexAppServerKit`.
+CodexDataKit provides SwiftData-style `@Observable` app-server backed models on top of `CodexAppServerKit`.
 
-Use this package when UI code needs app-server backed workspace group, workspace, and chat models without rendering directly from JSON-RPC payloads.
+Use this package when app or UI code needs workspace group, workspace, and chat models without rendering directly from JSON-RPC payloads.
 
 ## Main Types
 
@@ -12,12 +12,12 @@ Use this package when UI code needs app-server backed workspace group, workspace
 - `CodexFetchedResults`: Observable CoreData-style fetch results with items, sections, cursors, loading phase, and errors.
 - `CodexWorkspaceGroup`, `CodexWorkspace`, `CodexChat`: Observable model objects attached to a model context.
 - `CodexQuery`: A SwiftUI `DynamicProperty` wrapper around `CodexFetchedResults`.
-- `CodexUIPhase`: A small UI state enum with `idle`, `loading`, `loaded`, and `failed`.
+- `CodexDataPhase`: A small data-loading state enum with `idle`, `loading`, `loaded`, and `failed`.
 
 ## Quick Start
 
 ```swift
-import CodexUIKit
+import CodexDataKit
 
 let container = try await CodexModelContainer()
 let context = container.mainContext
@@ -50,7 +50,7 @@ let results = context.fetchedResults(for: request)
 try await results.performFetch()
 ```
 
-Fetches preserve object identity. If the same app-server thread appears in a later refresh, CodexUIKit mutates the existing `CodexChat` instance instead of replacing it.
+Fetches preserve object identity. If the same app-server thread appears in a later refresh, CodexDataKit mutates the existing `CodexChat` instance instead of replacing it.
 
 ```swift
 try await results.refresh()
@@ -95,7 +95,7 @@ if let server = chat?.modelContext?.appServer {
 }
 ```
 
-Keep review-specific state, parsed findings, and review timelines outside CodexUIKit. CodexUIKit owns generic Codex app-server UI models; higher-level packages can layer their own indices on top of `CodexChat.id`, workspace IDs, or sectioned fetch results.
+Keep review-specific state, parsed findings, and review timelines outside CodexDataKit. CodexDataKit owns generic Codex app-server data models; higher-level packages can layer their own indices on top of `CodexChat.id`, workspace IDs, or sectioned fetch results.
 
 ## SwiftUI
 
@@ -103,7 +103,7 @@ Install the container or context in the environment, then use `@CodexQuery` in v
 
 ```swift
 import SwiftUI
-import CodexUIKit
+import CodexDataKit
 
 struct Sidebar: View {
     @CodexQuery(CodexFetchRequest<CodexChat>(
@@ -131,11 +131,11 @@ Sidebar()
 
 ## Testing
 
-Use `CodexAppServerKitTesting` to test CodexUIKit owners without a real app-server process.
+Use `CodexAppServerKitTesting` to test CodexDataKit owners without a real app-server process.
 
 ```swift
 import CodexAppServerKitTesting
-import CodexUIKit
+import CodexDataKit
 import Testing
 
 @MainActor

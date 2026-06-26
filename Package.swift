@@ -21,8 +21,8 @@ let package = Package(
             targets: ["CodexAppServerKitTesting"]
         ),
         .library(
-            name: "CodexUIKit",
-            targets: ["CodexUIKit"]
+            name: "CodexDataKit",
+            targets: ["CodexDataKit"]
         ),
     ],
     targets: [
@@ -49,7 +49,7 @@ let package = Package(
             ],
         ),
         .target(
-            name: "CodexUIKit",
+            name: "CodexDataKit",
             dependencies: [
                 "CodexAppServerKit",
             ],
@@ -76,9 +76,9 @@ let package = Package(
             ],
         ),
         .testTarget(
-            name: "CodexUIKitTests",
+            name: "CodexDataKitTests",
             dependencies: [
-                "CodexUIKit",
+                "CodexDataKit",
                 "CodexAppServerKitTesting",
             ],
             swiftSettings: [

@@ -229,7 +229,7 @@ public final class CodexFetchedResults<Model: CodexObservableModel> {
     public private(set) var sections: [CodexFetchSection<Model>] = []
     public private(set) var nextCursor: String?
     public private(set) var backwardsCursor: String?
-    public var phase: CodexUIPhase = .idle
+    public var phase: CodexDataPhase = .idle
     public var lastErrorDescription: String?
 
     package init(

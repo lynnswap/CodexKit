@@ -1,6 +1,6 @@
 import CodexAppServerKit
 import CodexAppServerKitTesting
-import CodexUIKit
+import CodexDataKit
 import Foundation
 import Testing
 

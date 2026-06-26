@@ -194,7 +194,7 @@ public final class CodexChat: CodexObservableModel {
     public private(set) var ephemeral: Bool?
     public private(set) var turns: [Turn]
     public private(set) var items: [Item]
-    public var phase: CodexUIPhase = .idle
+    public var phase: CodexDataPhase = .idle
     public var lastErrorDescription: String?
 
     @ObservationIgnored
