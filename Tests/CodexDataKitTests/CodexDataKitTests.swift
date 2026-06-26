@@ -1160,6 +1160,39 @@ struct CodexModelContextTests {
         #expect(currentGroup.workspaces.contains { $0 === workspace })
     }
 
+    @Test("group refresh preserves workspace contents when it moves groups")
+    func groupRefreshPreservesWorkspaceContentsWhenItMovesGroups() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-regroup", workspace: workspaceURL, name: "Regroup")
+        ]))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexWorkspaceGroup>.workspaceGroups)
+        try await results.performFetch()
+        let previousGroup = try #require(results.items.first)
+        let workspace = try #require(previousGroup.workspaces.first)
+        let chat = try #require(workspace.chats.first)
+
+        try FileManager.default.createDirectory(
+            at: workspaceURL.appendingPathComponent(".git", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-regroup", workspace: workspaceURL, name: "Regroup")
+        ]))
+        try await previousGroup.refresh()
+
+        let currentGroup = try #require(workspace.workspaceGroup)
+        #expect(currentGroup !== previousGroup)
+        #expect(previousGroup.workspaces.isEmpty)
+        #expect(currentGroup.workspaces.contains { $0 === workspace })
+        #expect(workspace.chats.first === chat)
+        #expect(chat.workspace === workspace)
+        #expect(results.items.map(\.id) == [currentGroup.id])
+    }
+
     @Test("paged workspace fetches prune stale workspace chats")
     func pagedWorkspaceFetchesPruneStaleWorkspaceChats() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()

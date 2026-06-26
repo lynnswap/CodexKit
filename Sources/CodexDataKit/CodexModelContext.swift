@@ -99,7 +99,10 @@ public final class CodexModelContext: @unchecked Sendable {
         let fetchedChatIDs = Set(fetchedChats.map(\.id))
         let chats = fetchedChats.filter { $0.workspace?.workspaceGroup?.id == group.id }
         let workspaces = unique(chats.compactMap(\.workspace))
-        for workspace in unique(previousWorkspaces + workspaces) {
+        let previousWorkspacesStillInGroup = previousWorkspaces.filter {
+            $0.workspaceGroup?.id == group.id
+        }
+        for workspace in unique(previousWorkspacesStillInGroup + workspaces) {
             let previousWorkspaceChats = workspace.chats
             let fetchedChats = chats.filter { $0.workspace === workspace }
             let fetchedIDs = Set(fetchedChats.map(\.id))
@@ -119,7 +122,7 @@ public final class CodexModelContext: @unchecked Sendable {
         }
         let refreshedWorkspaces = workspaces.filter { $0.workspaceGroup?.id == group.id }
         let refreshedWorkspaceIDs = Set(refreshedWorkspaces.map(\.id))
-        let preservedWorkspaces = previousWorkspaces.filter {
+        let preservedWorkspaces = previousWorkspacesStillInGroup.filter {
             refreshedWorkspaceIDs.contains($0.id) == false
                 && containsOutOfScopeChat(in: $0, archivedScope: request.filter.archived)
         }
