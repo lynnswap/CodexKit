@@ -328,11 +328,6 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         previousGroup: CodexWorkspaceGroup?,
         archived: Bool
     ) async {
-        guard canEvaluateFilterLocally else {
-            items = modelContext.sortedItems(items, for: request)
-            sections = modelContext.sections(for: items, descriptor: request.sectionDescriptor)
-            return
-        }
         let originalCount = items.count
         let filteredItems = items.filter {
             shouldKeep(
@@ -343,9 +338,11 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
                 archived: archived
             )
         }
-        items = filteredItems
-        sections = modelContext.sections(for: filteredItems, descriptor: request.sectionDescriptor)
-        guard let model = insertionModel(for: chat, archived: archived) else {
+        items = modelContext.sortedItems(filteredItems, for: request)
+        sections = modelContext.sections(for: items, descriptor: request.sectionDescriptor)
+        guard canEvaluateFilterLocally,
+            let model = insertionModel(for: chat, archived: archived)
+        else {
             await refreshAfterLocalRemovalIfNeeded(originalCount: originalCount)
             return
         }
@@ -458,9 +455,9 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             return
         }
         do {
-            try await performFetch()
+            try await loadNextPage()
         } catch {
-            // performFetch records the failed phase; the server mutation has already succeeded.
+            // loadNextPage records the failed phase; the server mutation has already succeeded.
         }
     }
 

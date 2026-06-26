@@ -329,6 +329,11 @@ public final class CodexModelContext: @unchecked Sendable {
             .map { apply($0, archived: request.filter.archived == true) }
         let workspaces = unique(chats.compactMap(\.workspace))
         let groups = unique(workspaces.compactMap(\.workspaceGroup))
+        let preservingGroupWorkspaces = request.filter.workspace != nil
+            || shouldPreserveExistingWorkspaceChats(
+                for: request,
+                relationshipIsComplete: true
+            )
         syncWorkspaceChats(
             chats,
             preservingExisting: shouldPreserveExistingWorkspaceChats(
@@ -340,10 +345,7 @@ public final class CodexModelContext: @unchecked Sendable {
         )
         syncGroupWorkspaces(
             workspaces,
-            preservingExisting: shouldPreserveExistingWorkspaceChats(
-                for: request,
-                relationshipIsComplete: true
-            )
+            preservingExisting: preservingGroupWorkspaces
         )
         return localPage(sort(groups, using: request.sortDescriptors), for: request)
     }
