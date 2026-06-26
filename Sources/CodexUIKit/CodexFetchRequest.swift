@@ -199,6 +199,12 @@ package struct CodexFetchPage<Model: CodexObservableModel> {
 
 @MainActor
 package protocol CodexFetchedResultsRegistration: AnyObject {
+    func insert(_ chat: CodexChat, archived: Bool)
+    func archive(
+        _ chat: CodexChat,
+        workspace: CodexWorkspace?,
+        group: CodexWorkspaceGroup?
+    )
     func remove(
         _ chat: CodexChat,
         workspace: CodexWorkspace?,
@@ -277,6 +283,25 @@ public final class CodexFetchedResults<Model: CodexObservableModel> {
 }
 
 extension CodexFetchedResults: CodexFetchedResultsRegistration {
+    package func insert(_ chat: CodexChat, archived: Bool) {
+        guard let model = insertionModel(for: chat, archived: archived) else {
+            return
+        }
+        upsert(model)
+    }
+
+    package func archive(
+        _ chat: CodexChat,
+        workspace: CodexWorkspace?,
+        group: CodexWorkspaceGroup?
+    ) {
+        if let model = archivedChatModel(for: chat) {
+            upsert(model)
+        } else {
+            remove(chat, workspace: workspace, group: group)
+        }
+    }
+
     package func remove(
         _ chat: CodexChat,
         workspace: CodexWorkspace?,
@@ -290,6 +315,96 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         }
         items = filteredItems
         sections = modelContext.sections(for: filteredItems, descriptor: request.sectionDescriptor)
+    }
+
+    private func archivedChatModel(for chat: CodexChat) -> Model? {
+        guard Model.self == CodexChat.self,
+              shouldInclude(chat, archived: true)
+        else {
+            return nil
+        }
+        return chat as? Model
+    }
+
+    private func insertionModel(for chat: CodexChat, archived: Bool) -> Model? {
+        guard shouldInclude(chat, archived: archived) else {
+            return nil
+        }
+        if let chat = chat as? Model {
+            return chat
+        }
+        guard archived == false else {
+            return nil
+        }
+        if let workspace = chat.workspace as? Model {
+            return workspace
+        }
+        if let workspaceGroup = chat.workspace?.workspaceGroup,
+           let group = workspaceGroup as? Model
+        {
+            return group
+        }
+        return nil
+    }
+
+    private func upsert(_ model: Model) {
+        var nextItems = items
+        if let index = nextItems.firstIndex(where: { $0.id == model.id }) {
+            nextItems[index] = model
+        } else {
+            nextItems.insert(model, at: 0)
+        }
+        items = modelContext.sortedItems(nextItems, for: request)
+        sections = modelContext.sections(for: items, descriptor: request.sectionDescriptor)
+    }
+
+    private func shouldInclude(_ chat: CodexChat, archived: Bool) -> Bool {
+        switch request.filter.archived {
+        case .some(let expectedArchived):
+            guard expectedArchived == archived else {
+                return false
+            }
+        case .none:
+            guard archived == false else {
+                return false
+            }
+        }
+
+        if let workspace = request.filter.workspace {
+            guard let chatWorkspace = chat.workspace,
+                  Self.standardizedPath(chatWorkspace.url) == Self.standardizedPath(workspace)
+            else {
+                return false
+            }
+        }
+
+        if let searchTerm = request.filter.searchTerm, searchTerm.isEmpty == false {
+            let searchableText = [
+                chat.name,
+                chat.preview,
+                chat.workspace?.name,
+                chat.title,
+            ]
+            guard searchableText.contains(where: { text in
+                text?.localizedCaseInsensitiveContains(searchTerm) == true
+            }) else {
+                return false
+            }
+        }
+
+        if let modelProviders = request.filter.modelProviders {
+            guard let modelProvider = chat.modelProvider,
+                  modelProviders.contains(modelProvider)
+            else {
+                return false
+            }
+        }
+
+        if request.filter.sourceKinds != nil || request.filter.useStateDBOnly != nil {
+            return false
+        }
+
+        return true
     }
 
     private func shouldKeep(
@@ -308,5 +423,9 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             return item.id != group.id || group.workspaces.isEmpty == false
         }
         return true
+    }
+
+    private static func standardizedPath(_ url: URL) -> String {
+        url.standardizedFileURL.resolvingSymlinksInPath().path
     }
 }
