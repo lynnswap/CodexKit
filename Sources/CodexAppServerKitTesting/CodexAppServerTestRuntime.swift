@@ -346,7 +346,7 @@ public actor CodexAppServerTestTransport {
             createdAt: snapshot.createdAt.map { Int($0.timeIntervalSince1970) },
             updatedAt: snapshot.updatedAt.map { Int($0.timeIntervalSince1970) },
             ephemeral: snapshot.ephemeral,
-            turns: snapshot.turns.map(Self.apiTurn(from:))
+            turns: snapshot.turns?.map(Self.apiTurn(from:))
         )
     }
 

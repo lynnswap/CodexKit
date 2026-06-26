@@ -241,7 +241,7 @@ public final class CodexFetchedResults<Model: CodexObservableModel> {
             let page = try await modelContext.fetchPage(request)
             let newItems = appending ? append(page.items, to: items) : page.items
             items = newItems
-            modelContext.syncLoadedRelationships(newItems)
+            modelContext.syncLoadedRelationships(newItems, request: request)
             sections = modelContext.sections(for: newItems, descriptor: request.sectionDescriptor)
             nextCursor = page.nextCursor
             backwardsCursor = page.backwardsCursor

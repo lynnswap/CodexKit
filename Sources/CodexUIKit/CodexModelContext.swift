@@ -47,7 +47,7 @@ public final class CodexModelContext: @unchecked Sendable {
         _ request: CodexFetchRequest<Model>
     ) async throws -> [Model] {
         let items = try await fetchPage(request).items
-        syncLoadedRelationships(items)
+        syncLoadedRelationships(items, request: request)
         return items
     }
 
@@ -89,7 +89,7 @@ public final class CodexModelContext: @unchecked Sendable {
     public func refresh(_ chat: CodexChat, includeTurns: Bool = true) async throws {
         let thread = try await appServer.resumeThread(chat.id)
         let snapshot = try await thread.read(includeTurns: includeTurns)
-        apply(snapshot, shouldReplaceTurns: includeTurns)
+        apply(snapshot)
     }
 
     @discardableResult
@@ -106,7 +106,7 @@ public final class CodexModelContext: @unchecked Sendable {
             id: thread.id,
             workspace: thread.workspace
         )
-        let chat = apply(snapshot, shouldReplaceTurns: false)
+        let chat = apply(snapshot)
         workspace.moveChatToFront(chat)
         return chat
     }
@@ -197,7 +197,7 @@ public final class CodexModelContext: @unchecked Sendable {
         if canUseServerOrderedPages(for: request) == false {
             let chats = sort(
                 try await fetchAllThreadSnapshots(matching: request)
-                    .map { apply($0, shouldReplaceTurns: $0.turns.isEmpty == false) },
+                    .map(apply),
                 using: request.sortDescriptors
             )
             return localPage(chats, for: request)
@@ -205,7 +205,7 @@ public final class CodexModelContext: @unchecked Sendable {
 
         let page = try await appServer.listThreads(threadQuery(from: request))
         let chats = sort(
-            page.threads.map { apply($0, shouldReplaceTurns: $0.turns.isEmpty == false) },
+            page.threads.map(apply),
             using: request.sortDescriptors
         )
         return CodexFetchPage(
@@ -219,7 +219,7 @@ public final class CodexModelContext: @unchecked Sendable {
         _ request: CodexFetchRequest<CodexWorkspace>
     ) async throws -> CodexFetchPage<CodexWorkspace> {
         let chats = try await fetchAllThreadSnapshots(matching: request)
-            .map { apply($0, shouldReplaceTurns: $0.turns.isEmpty == false) }
+            .map(apply)
         let workspaces = unique(chats.compactMap(\.workspace))
         for workspace in workspaces {
             workspace.setChats(chats.filter { $0.workspace === workspace })
@@ -231,7 +231,7 @@ public final class CodexModelContext: @unchecked Sendable {
         _ request: CodexFetchRequest<CodexWorkspaceGroup>
     ) async throws -> CodexFetchPage<CodexWorkspaceGroup> {
         let chats = try await fetchAllThreadSnapshots(matching: request)
-            .map { apply($0, shouldReplaceTurns: $0.turns.isEmpty == false) }
+            .map(apply)
         let workspaces = unique(chats.compactMap(\.workspace))
         let groups = unique(workspaces.compactMap(\.workspaceGroup))
         for group in groups {
@@ -241,10 +241,16 @@ public final class CodexModelContext: @unchecked Sendable {
     }
 
     @discardableResult
-    private func apply(_ snapshot: CodexThreadSnapshot, shouldReplaceTurns: Bool) -> CodexChat {
+    private func apply(_ snapshot: CodexThreadSnapshot) -> CodexChat {
         let workspace = snapshot.workspace.map(workspace(for:))
         let chat = chat(for: snapshot.id)
-        chat.apply(snapshot, workspace: workspace, shouldReplaceTurns: shouldReplaceTurns)
+        if let previousWorkspace = chat.workspace {
+            let movedToDifferentWorkspace = workspace.map { $0 !== previousWorkspace } ?? true
+            if movedToDifferentWorkspace {
+                detach(chat, from: previousWorkspace)
+            }
+        }
+        chat.apply(snapshot, workspace: workspace)
         workspace?.addChatIfNeeded(chat)
         return chat
     }
@@ -301,27 +307,78 @@ public final class CodexModelContext: @unchecked Sendable {
     private func remove(_ chat: CodexChat) {
         chatsByID.removeValue(forKey: chat.id)
         if let workspace = chat.workspace {
-            workspace.setChats(workspace.chats.filter { $0 !== chat })
-            if workspace.chats.isEmpty, let group = workspace.workspaceGroup {
-                group.setWorkspaces(group.workspaces.filter { $0 !== workspace })
+            detach(chat, from: workspace)
+        }
+    }
+
+    package func syncLoadedRelationships<Model: CodexObservableModel>(
+        _ items: [Model],
+        request: CodexFetchRequest<Model>
+    ) {
+        if let chats = items as? [CodexChat] {
+            syncWorkspaceChats(
+                chats,
+                preservingExisting: shouldPreserveExistingWorkspaceChats(for: request),
+                workspaceFilter: request.filter.workspace
+            )
+        }
+    }
+
+    private func syncWorkspaceChats(
+        _ chats: [CodexChat],
+        preservingExisting: Bool,
+        workspaceFilter: URL?
+    ) {
+        let fetchedWorkspaces = unique(chats.compactMap(\.workspace))
+        let workspaces: [CodexWorkspace]
+        if preservingExisting {
+            workspaces = fetchedWorkspaces
+        } else if let workspaceFilter {
+            let filteredWorkspace = workspaceIfLoaded(for: workspaceFilter)
+            workspaces = unique((filteredWorkspace.map { [$0] } ?? []) + fetchedWorkspaces)
+        } else {
+            workspaces = Array(workspacesByID.values)
+        }
+        for workspace in workspaces {
+            let fetchedChats = chats.filter { $0.workspace === workspace }
+            if preservingExisting {
+                let fetchedIDs = Set(fetchedChats.map(\.id))
+                let remainingChats = workspace.chats.filter { fetchedIDs.contains($0.id) == false }
+                workspace.setChats(fetchedChats + remainingChats)
+            } else {
+                workspace.setChats(fetchedChats)
+                pruneWorkspaceIfEmpty(workspace)
             }
         }
     }
 
-    package func syncLoadedRelationships<Model: CodexObservableModel>(_ items: [Model]) {
-        if let chats = items as? [CodexChat] {
-            syncWorkspaceChats(chats)
-        }
+    private func detach(_ chat: CodexChat, from workspace: CodexWorkspace) {
+        workspace.setChats(workspace.chats.filter { $0 !== chat })
+        pruneWorkspaceIfEmpty(workspace)
     }
 
-    private func syncWorkspaceChats(_ chats: [CodexChat]) {
-        let workspaces = unique(chats.compactMap(\.workspace))
-        for workspace in workspaces {
-            let fetchedChats = chats.filter { $0.workspace === workspace }
-            let fetchedIDs = Set(fetchedChats.map(\.id))
-            let remainingChats = workspace.chats.filter { fetchedIDs.contains($0.id) == false }
-            workspace.setChats(fetchedChats + remainingChats)
+    private func pruneWorkspaceIfEmpty(_ workspace: CodexWorkspace) {
+        guard workspace.chats.isEmpty, let group = workspace.workspaceGroup else {
+            return
         }
+        group.setWorkspaces(group.workspaces.filter { $0 !== workspace })
+    }
+
+    private func shouldPreserveExistingWorkspaceChats<Model: CodexObservableModel>(
+        for request: CodexFetchRequest<Model>
+    ) -> Bool {
+        request.cursor != nil
+            || request.fetchLimit != nil
+            || request.filter.archived != nil
+            || request.filter.searchTerm != nil
+            || request.filter.modelProviders != nil
+            || request.filter.sourceKinds != nil
+            || request.filter.useStateDBOnly != nil
+    }
+
+    private func workspaceIfLoaded(for url: URL) -> CodexWorkspace? {
+        let id = CodexWorkspaceID(rawValue: Self.standardizedDirectoryURL(url).path)
+        return workspacesByID[id]
     }
 
     private func fetchAllThreadSnapshots<Model: CodexObservableModel>(

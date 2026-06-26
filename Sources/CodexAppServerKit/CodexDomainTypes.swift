@@ -1050,7 +1050,7 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
     public var createdAt: Date?
     public var updatedAt: Date?
     public var ephemeral: Bool?
-    public var turns: [CodexTurnSnapshot]
+    public var turns: [CodexTurnSnapshot]?
 
     public init(
         id: CodexThreadID,
@@ -1061,7 +1061,7 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
         createdAt: Date? = nil,
         updatedAt: Date? = nil,
         ephemeral: Bool? = nil,
-        turns: [CodexTurnSnapshot] = []
+        turns: [CodexTurnSnapshot]? = nil
     ) {
         self.id = id
         self.workspace = workspace

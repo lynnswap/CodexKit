@@ -226,9 +226,7 @@ public final class CodexChat: CodexObservableModel {
         self.modelContext = modelContext
     }
 
-    package func apply(
-        _ snapshot: CodexThreadSnapshot, workspace: CodexWorkspace?, shouldReplaceTurns: Bool
-    ) {
+    package func apply(_ snapshot: CodexThreadSnapshot, workspace: CodexWorkspace?) {
         self.workspace = workspace
         name = snapshot.name
         preview = snapshot.preview
@@ -236,9 +234,9 @@ public final class CodexChat: CodexObservableModel {
         createdAt = snapshot.createdAt
         updatedAt = snapshot.updatedAt
         ephemeral = snapshot.ephemeral
-        if shouldReplaceTurns {
-            replaceTurns(with: snapshot.turns)
-            replaceItems(with: snapshot.turns)
+        if let turns = snapshot.turns {
+            replaceTurns(with: turns)
+            replaceItems(with: turns)
         }
     }
 

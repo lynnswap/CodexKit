@@ -234,6 +234,56 @@ struct CodexModelContextTests {
         #expect(Set(fetchedWorkspace.chats.map(\.id.rawValue)) == ["thread-keep", "thread-match"])
     }
 
+    @Test("unfiltered chat refresh prunes stale workspace chats")
+    func unfilteredChatRefreshPrunesStaleWorkspaceChats() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspace = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-stale", workspace: workspace, name: "Stale"),
+            .init(id: "thread-remaining", workspace: workspace, name: "Remaining"),
+        ]))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>.recentChats)
+        try await results.performFetch()
+        let fetchedWorkspace = try #require(results.items.first?.workspace)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-remaining", workspace: workspace, name: "Remaining")
+        ]))
+        try await results.refresh()
+
+        #expect(fetchedWorkspace.chats.map(\.id.rawValue) == ["thread-remaining"])
+    }
+
+    @Test("chat refresh removes chat from previous workspace when reparented")
+    func chatRefreshRemovesChatFromPreviousWorkspaceWhenReparented() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let oldWorkspaceURL = temporaryDirectory()
+        let newWorkspaceURL = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-move", workspace: oldWorkspaceURL, name: "Move")
+        ]))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>.recentChats)
+        try await results.performFetch()
+        let chat = try #require(results.items.first)
+        let oldWorkspace = try #require(chat.workspace)
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-move"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-move",
+            workspace: newWorkspaceURL,
+            name: "Move"
+        ))
+        try await chat.refresh(includeTurns: false)
+
+        #expect(oldWorkspace.chats.isEmpty)
+        #expect(chat.workspace?.url == newWorkspaceURL)
+        #expect(chat.workspace?.chats.first === chat)
+    }
+
     @Test("recency sort preserves app-server ordering")
     func recencySortPreservesAppServerOrdering() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -440,8 +490,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadRead(
             .init(
                 id: "thread-refresh",
-                name: "After",
-                turns: []
+                name: "After"
             ))
 
         try await chat.refresh(includeTurns: false)
@@ -455,6 +504,50 @@ struct CodexModelContextTests {
         let params = try request.decodeParams(ThreadReadParams.self)
         #expect(params.threadID == "thread-refresh")
         #expect(params.includeTurns == false)
+    }
+
+    @Test("explicit empty turn lists clear cached turns and items")
+    func explicitEmptyTurnListsClearCachedTurnsAndItems() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(
+                id: "thread-clear",
+                name: "Before",
+                turns: [
+                    .init(
+                        id: "turn-clear",
+                        status: .completed,
+                        items: [
+                            .init(
+                                id: "message-clear",
+                                kind: .agentMessage,
+                                content: .message(.init(
+                                    id: "message-clear",
+                                    role: .assistant,
+                                    phase: .finalAnswer,
+                                    text: "Done"
+                                ))
+                            ),
+                        ]
+                    )
+                ]
+            )
+        ]))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>.recentChats)
+        try await results.performFetch()
+        let chat = try #require(results.items.first)
+        #expect(chat.turns.isEmpty == false)
+        #expect(chat.items.isEmpty == false)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-clear", name: "After", turns: [])
+        ]))
+        try await results.refresh()
+
+        #expect(chat.turns.isEmpty)
+        #expect(chat.items.isEmpty)
     }
 
     @Test("chat refresh populates transcript items from turn history")
