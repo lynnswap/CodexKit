@@ -218,8 +218,6 @@ public final class CodexFetchedResults<Model: CodexModel> {
     }
 
     public func performFetch() async throws {
-        var request = request
-        request.cursor = nil
         try await load(request, appending: false)
     }
 

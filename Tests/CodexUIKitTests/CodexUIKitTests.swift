@@ -104,6 +104,66 @@ struct CodexModelContextTests {
         #expect(params.useStateDbOnly == true)
     }
 
+    @Test("fetched results preserve configured cursor on initial fetch")
+    func fetchedResultsPreserveConfiguredCursorOnInitialFetch() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadList(.init(threads: []))
+
+        let request = CodexFetchRequest<CodexChat>(
+            sortDescriptors: [.updatedAt(.reverse)],
+            cursor: "cursor-1"
+        )
+        let results = context.fetchedResults(for: request)
+        try await results.performFetch()
+
+        let recorded = try #require(
+            await runtime.transport.recordedRequests(method: "thread/list").first)
+        let params = try recorded.decodeParams(ThreadListParams.self)
+        #expect(params.cursor == "cursor-1")
+    }
+
+    @Test("name-sorted chat pages are sliced after local sorting")
+    func nameSortedChatPagesAreSlicedAfterLocalSorting() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadList(
+            .init(threads: [.init(id: "thread-zulu", name: "Zulu")], nextCursor: "server-next"))
+        try await runtime.transport.enqueueThreadList(
+            .init(threads: [.init(id: "thread-alpha", name: "Alpha")]))
+
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            sortDescriptors: [.name()],
+            fetchLimit: 1
+        ))
+        try await results.performFetch()
+
+        #expect(results.items.map(\.title) == ["Alpha"])
+        #expect(results.nextCursor?.isEmpty == false)
+
+        let initialRequests = await runtime.transport.recordedRequests(method: "thread/list")
+        #expect(initialRequests.count == 2)
+        let firstParams = try #require(initialRequests.first).decodeParams(ThreadListParams.self)
+        let secondParams = try #require(initialRequests.dropFirst().first)
+            .decodeParams(ThreadListParams.self)
+        #expect(firstParams.cursor == nil)
+        #expect(firstParams.limit == nil)
+        #expect(secondParams.cursor == "server-next")
+        #expect(secondParams.limit == nil)
+
+        try await runtime.transport.enqueueThreadList(
+            .init(threads: [.init(id: "thread-zulu", name: "Zulu")], nextCursor: "server-next"))
+        try await runtime.transport.enqueueThreadList(
+            .init(threads: [.init(id: "thread-alpha", name: "Alpha")]))
+
+        try await results.loadNextPage()
+
+        #expect(results.items.map(\.title) == ["Alpha", "Zulu"])
+        #expect(results.nextCursor == nil)
+    }
+
     @Test("workspace and chat fetches can be sectioned by workspace group or workspace")
     func fetchesSupportWorkspaceSections() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()

@@ -29,6 +29,8 @@ public final class CodexModelContainer: @unchecked Sendable {
 
 @MainActor
 public final class CodexModelContext: @unchecked Sendable {
+    private static let localCursorPrefix = "codexkit-ui-offset:"
+
     public let container: CodexModelContainer
     public var appServer: CodexAppServer {
         container.appServer
@@ -191,6 +193,15 @@ public final class CodexModelContext: @unchecked Sendable {
     private func fetchChatPage(_ request: CodexFetchRequest<CodexChat>) async throws
         -> CodexFetchPage<CodexChat>
     {
+        if canUseServerOrderedPages(for: request) == false {
+            let chats = sort(
+                try await fetchAllThreadSnapshots(matching: request)
+                    .map { apply($0, shouldReplaceTurns: $0.turns.isEmpty == false) },
+                using: request.sortDescriptors
+            )
+            return localPage(chats, for: request)
+        }
+
         let page = try await appServer.listThreads(threadQuery(from: request))
         let chats = sort(
             page.threads.map { apply($0, shouldReplaceTurns: $0.turns.isEmpty == false) },
@@ -206,6 +217,16 @@ public final class CodexModelContext: @unchecked Sendable {
     private func fetchWorkspacePage(
         _ request: CodexFetchRequest<CodexWorkspace>
     ) async throws -> CodexFetchPage<CodexWorkspace> {
+        if canUseServerOrderedPages(for: request) == false {
+            let chats = try await fetchAllThreadSnapshots(matching: request)
+                .map { apply($0, shouldReplaceTurns: $0.turns.isEmpty == false) }
+            let workspaces = unique(chats.compactMap(\.workspace))
+            for workspace in workspaces {
+                workspace.setChats(chats.filter { $0.workspace === workspace })
+            }
+            return localPage(sort(workspaces, using: request.sortDescriptors), for: request)
+        }
+
         let page = try await appServer.listThreads(threadQuery(from: request))
         let chats = page.threads.map { apply($0, shouldReplaceTurns: $0.turns.isEmpty == false) }
         let workspaces = unique(chats.compactMap(\.workspace))
@@ -222,6 +243,17 @@ public final class CodexModelContext: @unchecked Sendable {
     private func fetchWorkspaceGroupPage(
         _ request: CodexFetchRequest<CodexWorkspaceGroup>
     ) async throws -> CodexFetchPage<CodexWorkspaceGroup> {
+        if canUseServerOrderedPages(for: request) == false {
+            let chats = try await fetchAllThreadSnapshots(matching: request)
+                .map { apply($0, shouldReplaceTurns: $0.turns.isEmpty == false) }
+            let workspaces = unique(chats.compactMap(\.workspace))
+            let groups = unique(workspaces.compactMap(\.workspaceGroup))
+            for group in groups {
+                group.setWorkspaces(workspaces.filter { $0.workspaceGroup === group })
+            }
+            return localPage(sort(groups, using: request.sortDescriptors), for: request)
+        }
+
         let page = try await appServer.listThreads(threadQuery(from: request))
         let chats = page.threads.map { apply($0, shouldReplaceTurns: $0.turns.isEmpty == false) }
         let workspaces = unique(chats.compactMap(\.workspace))
@@ -301,7 +333,83 @@ public final class CodexModelContext: @unchecked Sendable {
         }
     }
 
-    private func threadQuery<Model: CodexModel>(from request: CodexFetchRequest<Model>)
+    private func fetchAllThreadSnapshots<Model: CodexModel>(
+        matching request: CodexFetchRequest<Model>
+    ) async throws -> [CodexThreadSnapshot] {
+        var query = threadQuery(from: request, includePaging: false)
+        var threads: [CodexThreadSnapshot] = []
+        var cursor: String?
+
+        repeat {
+            query.cursor = cursor
+            let page = try await appServer.listThreads(query)
+            threads.append(contentsOf: page.threads)
+            cursor = page.nextCursor
+        } while cursor != nil
+
+        return threads
+    }
+
+    private func localPage<Model: CodexModel>(
+        _ items: [Model],
+        for request: CodexFetchRequest<Model>
+    ) -> CodexFetchPage<Model> {
+        let start = min(localCursorOffset(from: request.cursor), items.count)
+        guard let limit = request.fetchLimit else {
+            return CodexFetchPage(
+                items: Array(items[start..<items.endIndex]),
+                nextCursor: nil,
+                backwardsCursor: start > 0 ? localCursor(for: 0) : nil
+            )
+        }
+        guard limit > 0 else {
+            return CodexFetchPage(items: [], nextCursor: nil, backwardsCursor: nil)
+        }
+
+        let end = min(start + limit, items.count)
+        let previousStart = max(0, start - limit)
+        return CodexFetchPage(
+            items: Array(items[start..<end]),
+            nextCursor: end < items.count ? localCursor(for: end) : nil,
+            backwardsCursor: start > 0 ? localCursor(for: previousStart) : nil
+        )
+    }
+
+    private func canUseServerOrderedPages<Model: CodexModel>(
+        for request: CodexFetchRequest<Model>
+    ) -> Bool {
+        switch request.sortDescriptors.count {
+        case 0:
+            return true
+        case 1:
+            return request.sortDescriptors[0].threadSortKey != nil
+        default:
+            return false
+        }
+    }
+
+    private func localCursor(for offset: Int) -> String {
+        "\(Self.localCursorPrefix)\(offset)"
+    }
+
+    private func localCursorOffset(from cursor: String?) -> Int {
+        guard let cursor,
+              cursor.hasPrefix(Self.localCursorPrefix)
+        else {
+            return 0
+        }
+
+        let rawOffset = cursor.dropFirst(Self.localCursorPrefix.count)
+        guard let offset = Int(rawOffset), offset > 0 else {
+            return 0
+        }
+        return offset
+    }
+
+    private func threadQuery<Model: CodexModel>(
+        from request: CodexFetchRequest<Model>,
+        includePaging: Bool = true
+    )
         -> CodexThreadQuery
     {
         let serverSort = request.sortDescriptors.first { descriptor in
@@ -314,9 +422,9 @@ public final class CodexModelContext: @unchecked Sendable {
         }
         return CodexThreadQuery(
             archived: request.filter.archived,
-            cursor: request.cursor,
+            cursor: includePaging ? request.cursor : nil,
             workspace: request.filter.workspace,
-            limit: request.fetchLimit,
+            limit: includePaging ? request.fetchLimit : nil,
             searchTerm: request.filter.searchTerm,
             modelProviders: request.filter.modelProviders,
             sortDirection: serverSort?.order.threadSortDirection,

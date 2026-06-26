@@ -79,9 +79,17 @@ public struct CodexQuery<Model: CodexModel>: @preconcurrency DynamicProperty {
     }
 
     public mutating func update() {
-        guard fetchedResults == nil, let modelContext else {
+        guard let modelContext else {
+            fetchedResults = nil
             return
         }
+
+        if let fetchedResults,
+           fetchedResults.modelContext === modelContext,
+           fetchedResults.request == request {
+            return
+        }
+
         let results = modelContext.fetchedResults(for: request)
         fetchedResults = results
         Task {
