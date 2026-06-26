@@ -631,6 +631,67 @@ struct CodexModelContextTests {
         #expect(sectionedResults.sections.first?.id == newWorkspaceSectionID)
     }
 
+    @Test("thread list fetch revalidates metadata sorted fetched results")
+    func threadListFetchRevalidatesMetadataSortedFetchedResults() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+        let initialPage = CodexThreadPage(threads: [
+            .init(
+                id: "thread-alpha",
+                workspace: workspaceURL,
+                name: "Alpha",
+                updatedAt: Date(timeIntervalSince1970: 1_000)
+            ),
+            .init(
+                id: "thread-zulu",
+                workspace: workspaceURL,
+                name: "Zulu",
+                updatedAt: Date(timeIntervalSince1970: 2_000)
+            ),
+        ])
+
+        try await runtime.transport.enqueueThreadList(initialPage)
+        let nameResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            sortDescriptors: [.name()]
+        ))
+        try await nameResults.performFetch()
+
+        try await runtime.transport.enqueueThreadList(initialPage)
+        let updatedResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            sortDescriptors: [.updatedAt(.reverse)]
+        ))
+        try await updatedResults.performFetch()
+
+        try await runtime.transport.enqueueThreadList(initialPage)
+        let sectionedNameResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            sortDescriptors: [.name()],
+            sectionDescriptor: .workspace
+        ))
+        try await sectionedNameResults.performFetch()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(
+                id: "thread-alpha",
+                workspace: workspaceURL,
+                name: "Omega",
+                updatedAt: Date(timeIntervalSince1970: 3_000)
+            ),
+            .init(
+                id: "thread-zulu",
+                workspace: workspaceURL,
+                name: "Aardvark",
+                updatedAt: Date(timeIntervalSince1970: 1_000)
+            ),
+        ]))
+        _ = try await context.fetch(CodexFetchRequest<CodexChat>.recentChats)
+
+        #expect(nameResults.items.map(\.title) == ["Aardvark", "Omega"])
+        #expect(updatedResults.items.map(\.title) == ["Omega", "Aardvark"])
+        #expect(sectionedNameResults.items.map(\.title) == ["Aardvark", "Omega"])
+        #expect(sectionedNameResults.sections.first?.items.map(\.title) == ["Aardvark", "Omega"])
+    }
+
     @Test("chat refresh preserves archived fetched result membership")
     func chatRefreshPreservesArchivedFetchedResultMembership() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()

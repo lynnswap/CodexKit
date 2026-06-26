@@ -281,7 +281,7 @@ public final class CodexFetchedResults<Model: CodexObservableModel> {
         phase = .loading
         lastErrorDescription = nil
         do {
-            let page = try await modelContext.fetchPage(request)
+            let page = try await modelContext.fetchPage(request, excluding: self)
             let newItems = appending ? append(page.items, to: items) : page.items
             items = newItems
             let relationshipRequest = appending ? self.request : request

@@ -31,6 +31,18 @@ public final class CodexModelContainer: @unchecked Sendable {
 public final class CodexModelContext: @unchecked Sendable {
     private static let localCursorPrefix = "codexkit-ui-offset:"
 
+    private struct ChatFetchedResultState: Equatable {
+        var name: String?
+        var preview: String?
+        var modelProvider: String?
+        var isArchived: Bool
+        var createdAt: Date?
+        var updatedAt: Date?
+        var ephemeral: Bool?
+        var workspaceID: CodexWorkspaceID?
+        var workspaceGroupID: CodexWorkspaceGroupID?
+    }
+
     public private(set) weak var container: CodexModelContainer?
     public let appServer: CodexAppServer
 
@@ -243,10 +255,14 @@ public final class CodexModelContext: @unchecked Sendable {
     }
 
     package func fetchPage<Model: CodexObservableModel>(
-        _ request: CodexFetchRequest<Model>
+        _ request: CodexFetchRequest<Model>,
+        excluding excludedRegistration: (any CodexFetchedResultsRegistration)? = nil
     ) async throws -> CodexFetchPage<Model> {
         if Model.self == CodexChat.self {
-            let page = try await fetchChatPage(request as! CodexFetchRequest<CodexChat>)
+            let page = try await fetchChatPage(
+                request as! CodexFetchRequest<CodexChat>,
+                excluding: excludedRegistration
+            )
             return CodexFetchPage(
                 items: page.items.map { $0 as! Model },
                 nextCursor: page.nextCursor,
@@ -256,7 +272,10 @@ public final class CodexModelContext: @unchecked Sendable {
             )
         }
         if Model.self == CodexWorkspace.self {
-            let page = try await fetchWorkspacePage(request as! CodexFetchRequest<CodexWorkspace>)
+            let page = try await fetchWorkspacePage(
+                request as! CodexFetchRequest<CodexWorkspace>,
+                excluding: excludedRegistration
+            )
             return CodexFetchPage(
                 items: page.items.map { $0 as! Model },
                 nextCursor: page.nextCursor,
@@ -265,7 +284,9 @@ public final class CodexModelContext: @unchecked Sendable {
         }
         if Model.self == CodexWorkspaceGroup.self {
             let page = try await fetchWorkspaceGroupPage(
-                request as! CodexFetchRequest<CodexWorkspaceGroup>)
+                request as! CodexFetchRequest<CodexWorkspaceGroup>,
+                excluding: excludedRegistration
+            )
             return CodexFetchPage(
                 items: page.items.map { $0 as! Model },
                 nextCursor: page.nextCursor,
@@ -330,13 +351,17 @@ public final class CodexModelContext: @unchecked Sendable {
         return localCursor(for: itemCount)
     }
 
-    private func fetchChatPage(_ request: CodexFetchRequest<CodexChat>) async throws
+    private func fetchChatPage(
+        _ request: CodexFetchRequest<CodexChat>,
+        excluding excludedRegistration: (any CodexFetchedResultsRegistration)? = nil
+    ) async throws
         -> CodexFetchPage<CodexChat>
     {
         if canUseServerOrderedPages(for: request) == false {
             let fetchedChats = await applyFetchedSnapshots(
                 try await fetchAllThreadSnapshots(matching: request),
-                archived: request.filter.archived == true
+                archived: request.filter.archived == true,
+                excluding: excludedRegistration
             )
             let chats = sort(
                 fetchedChats,
@@ -355,7 +380,8 @@ public final class CodexModelContext: @unchecked Sendable {
         let page = try await appServer.listThreads(threadQuery(from: request))
         let fetchedChats = await applyFetchedSnapshots(
             page.threads,
-            archived: request.filter.archived == true
+            archived: request.filter.archived == true,
+            excluding: excludedRegistration
         )
         let chats = sort(
             fetchedChats,
@@ -369,11 +395,13 @@ public final class CodexModelContext: @unchecked Sendable {
     }
 
     private func fetchWorkspacePage(
-        _ request: CodexFetchRequest<CodexWorkspace>
+        _ request: CodexFetchRequest<CodexWorkspace>,
+        excluding excludedRegistration: (any CodexFetchedResultsRegistration)? = nil
     ) async throws -> CodexFetchPage<CodexWorkspace> {
         let chats = await applyFetchedSnapshots(
             try await fetchAllThreadSnapshots(matching: request),
-            archived: request.filter.archived == true
+            archived: request.filter.archived == true,
+            excluding: excludedRegistration
         )
         let workspaces = unique(chats.compactMap(\.workspace))
         syncWorkspaceChats(
@@ -389,11 +417,13 @@ public final class CodexModelContext: @unchecked Sendable {
     }
 
     private func fetchWorkspaceGroupPage(
-        _ request: CodexFetchRequest<CodexWorkspaceGroup>
+        _ request: CodexFetchRequest<CodexWorkspaceGroup>,
+        excluding excludedRegistration: (any CodexFetchedResultsRegistration)? = nil
     ) async throws -> CodexFetchPage<CodexWorkspaceGroup> {
         let chats = await applyFetchedSnapshots(
             try await fetchAllThreadSnapshots(matching: request),
-            archived: request.filter.archived == true
+            archived: request.filter.archived == true,
+            excluding: excludedRegistration
         )
         let workspaces = unique(chats.compactMap(\.workspace))
         let groups = unique(workspaces.compactMap(\.workspaceGroup))
@@ -421,7 +451,8 @@ public final class CodexModelContext: @unchecked Sendable {
 
     private func applyFetchedSnapshots(
         _ snapshots: [CodexThreadSnapshot],
-        archived: Bool
+        archived: Bool,
+        excluding excludedRegistration: (any CodexFetchedResultsRegistration)? = nil
     ) async -> [CodexChat] {
         var revalidations: [(
             chat: CodexChat,
@@ -430,15 +461,11 @@ public final class CodexModelContext: @unchecked Sendable {
         )] = []
         let chats = snapshots.map { snapshot in
             let existingChat = chatsByID[snapshot.id]
-            let previousArchived = existingChat?.isArchived
+            let previousState = existingChat.map(fetchedResultState(for:))
             let previousWorkspace = existingChat?.workspace
             let previousGroup = previousWorkspace?.workspaceGroup
             let chat = apply(snapshot, archived: archived)
-            let membershipChanged = existingChat != nil
-                && (previousArchived != archived
-                    || previousWorkspace?.id != chat.workspace?.id
-                    || previousGroup?.id != chat.workspace?.workspaceGroup?.id)
-            if membershipChanged {
+            if let previousState, previousState != fetchedResultState(for: chat) {
                 revalidations.append((chat, previousWorkspace, previousGroup))
             }
             return chat
@@ -448,10 +475,25 @@ public final class CodexModelContext: @unchecked Sendable {
                 revalidation.chat,
                 previousWorkspace: revalidation.previousWorkspace,
                 previousGroup: revalidation.previousGroup,
-                archived: revalidation.chat.isArchived
+                archived: revalidation.chat.isArchived,
+                excluding: excludedRegistration
             )
         }
         return chats
+    }
+
+    private func fetchedResultState(for chat: CodexChat) -> ChatFetchedResultState {
+        ChatFetchedResultState(
+            name: chat.name,
+            preview: chat.preview,
+            modelProvider: chat.modelProvider,
+            isArchived: chat.isArchived,
+            createdAt: chat.createdAt,
+            updatedAt: chat.updatedAt,
+            ephemeral: chat.ephemeral,
+            workspaceID: chat.workspace?.id,
+            workspaceGroupID: chat.workspace?.workspaceGroup?.id
+        )
     }
 
     @discardableResult
@@ -733,11 +775,20 @@ public final class CodexModelContext: @unchecked Sendable {
         _ chat: CodexChat,
         previousWorkspace: CodexWorkspace?,
         previousGroup: CodexWorkspaceGroup?,
-        archived: Bool
+        archived: Bool,
+        excluding excludedRegistration: (any CodexFetchedResultsRegistration)? = nil
     ) async {
         fetchedResults.removeAll { $0.value == nil }
         for registration in fetchedResults {
-            await registration.value?.revalidate(
+            guard let value = registration.value else {
+                continue
+            }
+            if let excludedRegistration,
+                (value as AnyObject) === (excludedRegistration as AnyObject)
+            {
+                continue
+            }
+            await value.revalidate(
                 chat,
                 previousWorkspace: previousWorkspace,
                 previousGroup: previousGroup,
