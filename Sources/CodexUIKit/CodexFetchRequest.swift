@@ -198,6 +198,15 @@ package struct CodexFetchPage<Model: CodexObservableModel> {
 }
 
 @MainActor
+package protocol CodexFetchedResultsRegistration: AnyObject {
+    func remove(
+        _ chat: CodexChat,
+        workspace: CodexWorkspace?,
+        group: CodexWorkspaceGroup?
+    )
+}
+
+@MainActor
 @Observable
 public final class CodexFetchedResults<Model: CodexObservableModel> {
     public let modelContext: CodexModelContext
@@ -264,5 +273,40 @@ public final class CodexFetchedResults<Model: CodexObservableModel> {
             }
         }
         return result
+    }
+}
+
+extension CodexFetchedResults: CodexFetchedResultsRegistration {
+    package func remove(
+        _ chat: CodexChat,
+        workspace: CodexWorkspace?,
+        group: CodexWorkspaceGroup?
+    ) {
+        let filteredItems = items.filter {
+            shouldKeep($0, afterRemoving: chat, workspace: workspace, group: group)
+        }
+        guard filteredItems.count != items.count else {
+            return
+        }
+        items = filteredItems
+        sections = modelContext.sections(for: filteredItems, descriptor: request.sectionDescriptor)
+    }
+
+    private func shouldKeep(
+        _ item: Model,
+        afterRemoving chat: CodexChat,
+        workspace: CodexWorkspace?,
+        group: CodexWorkspaceGroup?
+    ) -> Bool {
+        if let item = item as? CodexChat {
+            return item.id != chat.id
+        }
+        if let item = item as? CodexWorkspace, let workspace {
+            return item.id != workspace.id || workspace.chats.isEmpty == false
+        }
+        if let item = item as? CodexWorkspaceGroup, let group {
+            return item.id != group.id || group.workspaces.isEmpty == false
+        }
+        return true
     }
 }

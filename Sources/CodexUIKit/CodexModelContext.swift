@@ -37,6 +37,7 @@ public final class CodexModelContext: @unchecked Sendable {
     private var workspaceGroupsByID: [CodexWorkspaceGroupID: CodexWorkspaceGroup] = [:]
     private var workspacesByID: [CodexWorkspaceID: CodexWorkspace] = [:]
     private var chatsByID: [CodexThreadID: CodexChat] = [:]
+    private var fetchedResults: [WeakFetchedResultsRegistration] = []
 
     package init(container: CodexModelContainer) {
         self.container = container
@@ -54,7 +55,9 @@ public final class CodexModelContext: @unchecked Sendable {
     public func fetchedResults<Model: CodexObservableModel>(
         for request: CodexFetchRequest<Model>
     ) -> CodexFetchedResults<Model> {
-        CodexFetchedResults(modelContext: self, request: request)
+        let results = CodexFetchedResults(modelContext: self, request: request)
+        register(results)
+        return results
     }
 
     public func model(for id: CodexThreadID) -> CodexChat {
@@ -74,10 +77,8 @@ public final class CodexModelContext: @unchecked Sendable {
             sortDescriptors: [.name()],
             sectionDescriptor: .workspaceGroup
         )
-        _ = try await fetch(request)
-        if let latest = workspaceGroupsByID[group.id] {
-            group.setWorkspaces(latest.workspaces)
-        }
+        let workspaces = try await fetch(request)
+        group.setWorkspaces(workspaces.filter { $0.workspaceGroup?.id == group.id })
     }
 
     public func refresh(_ workspace: CodexWorkspace) async throws {
@@ -305,10 +306,14 @@ public final class CodexModelContext: @unchecked Sendable {
     }
 
     private func remove(_ chat: CodexChat) {
+        let workspace = chat.workspace
+        let group = workspace?.workspaceGroup
         chatsByID.removeValue(forKey: chat.id)
-        if let workspace = chat.workspace {
+        if let workspace {
             detach(chat, from: workspace)
         }
+        chat.detachFromContext()
+        removeChatFromRegisteredResults(chat, workspace: workspace, group: group)
     }
 
     package func syncLoadedRelationships<Model: CodexObservableModel>(
@@ -379,6 +384,22 @@ public final class CodexModelContext: @unchecked Sendable {
     private func workspaceIfLoaded(for url: URL) -> CodexWorkspace? {
         let id = CodexWorkspaceID(rawValue: Self.standardizedDirectoryURL(url).path)
         return workspacesByID[id]
+    }
+
+    private func register(_ results: any CodexFetchedResultsRegistration) {
+        fetchedResults.removeAll { $0.value == nil }
+        fetchedResults.append(WeakFetchedResultsRegistration(results))
+    }
+
+    private func removeChatFromRegisteredResults(
+        _ chat: CodexChat,
+        workspace: CodexWorkspace?,
+        group: CodexWorkspaceGroup?
+    ) {
+        fetchedResults.removeAll { $0.value == nil }
+        for registration in fetchedResults {
+            registration.value?.remove(chat, workspace: workspace, group: group)
+        }
     }
 
     private func fetchAllThreadSnapshots<Model: CodexObservableModel>(
@@ -639,6 +660,15 @@ extension ComparisonResult {
         case .orderedSame:
             return .orderedSame
         }
+    }
+}
+
+@MainActor
+private final class WeakFetchedResultsRegistration {
+    weak var value: (any CodexFetchedResultsRegistration)?
+
+    init(_ value: any CodexFetchedResultsRegistration) {
+        self.value = value
     }
 }
 
