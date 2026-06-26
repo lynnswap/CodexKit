@@ -541,6 +541,31 @@ struct CodexModelContextTests {
         #expect(results.nextCursor == "server-next")
     }
 
+    @Test("default chat ordering reloads app-server order after refresh")
+    func defaultChatOrderingReloadsAppServerOrderAfterRefresh() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-alpha", name: "Alpha"),
+            .init(id: "thread-beta", name: "Beta"),
+        ]))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>())
+        try await results.performFetch()
+        let alpha = try #require(results.items.first { $0.id.rawValue == "thread-alpha" })
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-alpha"))
+        try await runtime.transport.enqueueThreadRead(.init(id: "thread-alpha", name: "Alpha"))
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-beta", name: "Beta"),
+            .init(id: "thread-alpha", name: "Alpha"),
+        ]))
+        try await alpha.refresh(includeTurns: false)
+
+        #expect(results.items.map(\.id.rawValue) == ["thread-beta", "thread-alpha"])
+        #expect(await runtime.transport.recordedRequests(method: "thread/list").count == 2)
+    }
+
     @Test("non-recency sort descriptors still apply when recency is present")
     func nonRecencySortDescriptorsStillApplyWhenRecencyIsPresent() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -1579,6 +1604,9 @@ struct CodexModelContextTests {
             id: "thread-any-provider",
             name: "After"
         ))
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-any-provider", name: "After")
+        ]))
         try await chat.refresh(includeTurns: false)
 
         #expect(results.items.first === chat)
@@ -2087,6 +2115,50 @@ struct CodexModelContextTests {
 
         #expect(alpha.updatedAt == completedAt)
         #expect(results.items.map(\.id.rawValue) == ["thread-alpha", "thread-beta"])
+    }
+
+    @Test("chat send refreshes primary recency-sorted fetched results")
+    func chatSendRefreshesPrimaryRecencySortedFetchedResults() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let firstUpdate = Date(timeIntervalSince1970: 1_000)
+        let secondUpdate = Date(timeIntervalSince1970: 2_000)
+        let completedAt = Date(timeIntervalSince1970: 3_000)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-alpha", name: "Alpha", updatedAt: firstUpdate),
+            .init(id: "thread-beta", name: "Beta", updatedAt: secondUpdate),
+        ]))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            sortDescriptors: [.recencyAt(.reverse)]
+        ))
+        try await results.performFetch()
+        let alpha = try #require(results.items.first { $0.id.rawValue == "thread-alpha" })
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-alpha"))
+        try await runtime.transport.enqueueTurnStart(turnID: "turn-alpha", status: "running")
+        let sendTask = Task {
+            try await alpha.send("hello")
+        }
+
+        await runtime.transport.waitForRequest(method: "turn/start")
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-beta", name: "Beta", updatedAt: secondUpdate),
+            .init(id: "thread-alpha", name: "Alpha", updatedAt: completedAt),
+        ]))
+        try await runtime.transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(
+                id: "turn-alpha",
+                status: "completed",
+                completedAt: Int(completedAt.timeIntervalSince1970)
+            ))
+        )
+
+        _ = try await sendTask.value
+
+        #expect(results.items.map(\.id.rawValue) == ["thread-beta", "thread-alpha"])
+        #expect(await runtime.transport.recordedRequests(method: "thread/list").count == 2)
     }
 
     @Test("chat send refreshes incomplete paged results for off-page updates")

@@ -304,7 +304,7 @@ public final class CodexFetchedResults<Model: CodexObservableModel> {
 
 extension CodexFetchedResults: CodexFetchedResultsRegistration {
     package func insert(_ chat: CodexChat, archived: Bool) async {
-        if membershipRequiresServerRefresh {
+        if requiresServerRefreshAfterMutation {
             await refreshAfterMutation()
             return
         }
@@ -319,7 +319,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         workspace: CodexWorkspace?,
         group: CodexWorkspaceGroup?
     ) async {
-        if membershipRequiresServerRefresh {
+        if requiresServerRefreshAfterMutation {
             await refreshAfterMutation()
             return
         }
@@ -336,7 +336,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         previousGroup: CodexWorkspaceGroup?,
         archived: Bool
     ) async {
-        if membershipRequiresServerRefresh {
+        if requiresServerRefreshAfterMutation {
             await refreshAfterMutation()
             return
         }
@@ -369,7 +369,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         workspace: CodexWorkspace?,
         group: CodexWorkspaceGroup?
     ) async {
-        if membershipRequiresServerRefresh {
+        if requiresServerRefreshAfterMutation {
             await refreshAfterMutation()
             return
         }
@@ -390,7 +390,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         archived: Bool,
         removedChats: [CodexChat]
     ) async {
-        if membershipRequiresServerRefresh {
+        if requiresServerRefreshAfterMutation {
             await refreshAfterMutation()
             return
         }
@@ -407,7 +407,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         archived: Bool,
         removedChats: [CodexChat]
     ) async {
-        if membershipRequiresServerRefresh {
+        if requiresServerRefreshAfterMutation {
             await refreshAfterMutation()
             return
         }
@@ -477,11 +477,20 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         membershipRequiresServerRefresh == false
     }
 
+    private var requiresServerRefreshAfterMutation: Bool {
+        membershipRequiresServerRefresh || usesServerOwnedOrdering
+    }
+
     private var membershipRequiresServerRefresh: Bool {
         request.filter.searchTerm?.isEmpty == false
             || request.filter.modelProviders?.isEmpty == false
             || request.filter.sourceKinds != nil
             || request.filter.useStateDBOnly != nil
+    }
+
+    private var usesServerOwnedOrdering: Bool {
+        request.sortDescriptors.first?.key == .recencyAt
+            || (Model.self == CodexChat.self && request.sortDescriptors.isEmpty)
     }
 
     private func refreshAfterLocalRemovalIfNeeded(originalCount: Int) async {
