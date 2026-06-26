@@ -47,7 +47,9 @@ public final class CodexModelContext: @unchecked Sendable {
     public func fetch<Model: CodexObservableModel>(
         _ request: CodexFetchRequest<Model>
     ) async throws -> [Model] {
-        try await fetchPage(request).items
+        let items = try await fetchPage(request).items
+        syncLoadedRelationships(items)
+        return items
     }
 
     public func fetchedResults<Model: CodexObservableModel>(
@@ -199,9 +201,7 @@ public final class CodexModelContext: @unchecked Sendable {
                     .map { apply($0, shouldReplaceTurns: $0.turns.isEmpty == false) },
                 using: request.sortDescriptors
             )
-            let page = localPage(chats, for: request)
-            syncWorkspaceChats(page.items)
-            return page
+            return localPage(chats, for: request)
         }
 
         let page = try await appServer.listThreads(threadQuery(from: request))
@@ -209,7 +209,6 @@ public final class CodexModelContext: @unchecked Sendable {
             page.threads.map { apply($0, shouldReplaceTurns: $0.turns.isEmpty == false) },
             using: request.sortDescriptors
         )
-        syncWorkspaceChats(chats)
         return CodexFetchPage(
             items: chats,
             nextCursor: page.nextCursor,
@@ -333,6 +332,12 @@ public final class CodexModelContext: @unchecked Sendable {
         chatsByID.removeValue(forKey: chat.id)
         if let workspace = chat.workspace {
             workspace.setChats(workspace.chats.filter { $0 !== chat })
+        }
+    }
+
+    package func syncLoadedRelationships<Model: CodexObservableModel>(_ items: [Model]) {
+        if let chats = items as? [CodexChat] {
+            syncWorkspaceChats(chats)
         }
     }
 
@@ -467,10 +472,11 @@ public final class CodexModelContext: @unchecked Sendable {
     private func sort(_ chats: [CodexChat], using descriptors: [CodexSortDescriptor<CodexChat>])
         -> [CodexChat]
     {
-        guard descriptors.contains(where: { $0.key == .recencyAt }) == false else {
+        let localDescriptors = descriptors.filter { $0.key != .recencyAt }
+        guard localDescriptors.isEmpty == false else {
             return chats
         }
-        return sortModels(chats, using: descriptors) { descriptor, lhs, rhs in
+        return sortModels(chats, using: localDescriptors) { descriptor, lhs, rhs in
             switch descriptor.key {
             case .name:
                 compare(lhs.title, rhs.title, order: descriptor.order)

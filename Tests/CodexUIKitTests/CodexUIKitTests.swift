@@ -128,11 +128,15 @@ struct CodexModelContextTests {
     func nameSortedChatPagesAreSlicedAfterLocalSorting() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspace = temporaryDirectory()
 
         try await runtime.transport.enqueueThreadList(
-            .init(threads: [.init(id: "thread-zulu", name: "Zulu")], nextCursor: "server-next"))
+            .init(
+                threads: [.init(id: "thread-zulu", workspace: workspace, name: "Zulu")],
+                nextCursor: "server-next"
+            ))
         try await runtime.transport.enqueueThreadList(
-            .init(threads: [.init(id: "thread-alpha", name: "Alpha")]))
+            .init(threads: [.init(id: "thread-alpha", workspace: workspace, name: "Alpha")]))
 
         let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
             sortDescriptors: [.name()],
@@ -140,7 +144,9 @@ struct CodexModelContextTests {
         ))
         try await results.performFetch()
 
+        let fetchedWorkspace = try #require(results.items.first?.workspace)
         #expect(results.items.map(\.title) == ["Alpha"])
+        #expect(fetchedWorkspace.chats.map(\.title) == ["Alpha"])
         #expect(results.nextCursor?.isEmpty == false)
 
         let initialRequests = await runtime.transport.recordedRequests(method: "thread/list")
@@ -154,13 +160,17 @@ struct CodexModelContextTests {
         #expect(secondParams.limit == nil)
 
         try await runtime.transport.enqueueThreadList(
-            .init(threads: [.init(id: "thread-zulu", name: "Zulu")], nextCursor: "server-next"))
+            .init(
+                threads: [.init(id: "thread-zulu", workspace: workspace, name: "Zulu")],
+                nextCursor: "server-next"
+            ))
         try await runtime.transport.enqueueThreadList(
-            .init(threads: [.init(id: "thread-alpha", name: "Alpha")]))
+            .init(threads: [.init(id: "thread-alpha", workspace: workspace, name: "Alpha")]))
 
         try await results.loadNextPage()
 
         #expect(results.items.map(\.title) == ["Alpha", "Zulu"])
+        #expect(fetchedWorkspace.chats.map(\.title) == ["Alpha", "Zulu"])
         #expect(results.nextCursor == nil)
     }
 
@@ -209,6 +219,24 @@ struct CodexModelContextTests {
         try await results.performFetch()
 
         #expect(results.items.map(\.id.rawValue) == ["thread-server-first", "thread-server-second"])
+    }
+
+    @Test("non-recency sort descriptors still apply when recency is present")
+    func nonRecencySortDescriptorsStillApplyWhenRecencyIsPresent() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-zulu", name: "Zulu"),
+            .init(id: "thread-alpha", name: "Alpha"),
+        ]))
+
+        let results = context.fetchedResults(
+            for: CodexFetchRequest<CodexChat>(sortDescriptors: [.name(), .recencyAt(.reverse)])
+        )
+        try await results.performFetch()
+
+        #expect(results.items.map(\.title) == ["Alpha", "Zulu"])
     }
 
     @Test("reverse date sorts keep missing dates behind dated chats")
