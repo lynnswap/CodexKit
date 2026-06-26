@@ -95,8 +95,12 @@ public final class CodexModelContext: @unchecked Sendable {
             using: request.sortDescriptors
         )
         workspace.setChats(chats)
-        detachStaleChats(previousChats, from: workspace, keeping: chats)
-        refreshWorkspaceInRegisteredResults(workspace, archived: request.filter.archived == true)
+        let removedChats = detachStaleChats(previousChats, from: workspace, keeping: chats)
+        refreshWorkspaceInRegisteredResults(
+            workspace,
+            archived: request.filter.archived == true,
+            removedChats: removedChats
+        )
     }
 
     public func refresh(_ chat: CodexChat, includeTurns: Bool = true) async throws {
@@ -465,12 +469,15 @@ public final class CodexModelContext: @unchecked Sendable {
         _ previousChats: [CodexChat],
         from workspace: CodexWorkspace,
         keeping refreshedChats: [CodexChat]
-    ) {
+    ) -> [CodexChat] {
         let refreshedIDs = Set(refreshedChats.map(\.id))
-        for chat in previousChats where refreshedIDs.contains(chat.id) == false && !chat.isArchived
-        {
+        let staleChats = previousChats.filter {
+            refreshedIDs.contains($0.id) == false && !$0.isArchived
+        }
+        for chat in staleChats {
             chat.detachFromWorkspace(workspace)
         }
+        return staleChats
     }
 
     private func pruneWorkspaceIfEmpty(_ workspace: CodexWorkspace) {
@@ -551,11 +558,12 @@ public final class CodexModelContext: @unchecked Sendable {
 
     private func refreshWorkspaceInRegisteredResults(
         _ workspace: CodexWorkspace,
-        archived: Bool
+        archived: Bool,
+        removedChats: [CodexChat]
     ) {
         fetchedResults.removeAll { $0.value == nil }
         for registration in fetchedResults {
-            registration.value?.refresh(workspace, archived: archived)
+            registration.value?.refresh(workspace, archived: archived, removedChats: removedChats)
         }
     }
 

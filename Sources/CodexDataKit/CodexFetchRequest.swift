@@ -216,7 +216,7 @@ package protocol CodexFetchedResultsRegistration: AnyObject {
         workspace: CodexWorkspace?,
         group: CodexWorkspaceGroup?
     )
-    func refresh(_ workspace: CodexWorkspace, archived: Bool)
+    func refresh(_ workspace: CodexWorkspace, archived: Bool, removedChats: [CodexChat])
     func refresh(_ group: CodexWorkspaceGroup, archived: Bool)
 }
 
@@ -358,9 +358,13 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         sections = modelContext.sections(for: filteredItems, descriptor: request.sectionDescriptor)
     }
 
-    package func refresh(_ workspace: CodexWorkspace, archived: Bool) {
+    package func refresh(
+        _ workspace: CodexWorkspace,
+        archived: Bool,
+        removedChats: [CodexChat]
+    ) {
         refreshItems(archived: archived) {
-            shouldKeep($0, afterRefreshing: workspace)
+            shouldKeep($0, afterRefreshing: workspace, removedChats: removedChats)
         }
     }
 
@@ -520,16 +524,21 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
 
     private func shouldKeep(
         _ item: Model,
-        afterRefreshing workspace: CodexWorkspace
+        afterRefreshing workspace: CodexWorkspace,
+        removedChats: [CodexChat]
     ) -> Bool {
-        if let item = item as? CodexChat,
-            requestIsScoped(to: workspace)
-        {
-            return workspace.chats.contains { $0 === item }
-                && shouldInclude(
-                    item,
-                    archived: item.isArchived
-                )
+        if let item = item as? CodexChat {
+            if removedChats.contains(where: { $0 === item }) {
+                return false
+            }
+            if requestIsScoped(to: workspace) {
+                return workspace.chats.contains { $0 === item }
+                    && shouldInclude(
+                        item,
+                        archived: item.isArchived
+                    )
+            }
+            return true
         }
         if let item = item as? CodexWorkspace,
             item.id == workspace.id

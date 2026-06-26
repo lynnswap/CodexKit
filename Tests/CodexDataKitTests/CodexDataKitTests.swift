@@ -788,6 +788,29 @@ struct CodexModelContextTests {
         #expect(workspace.chats.map(\.id.rawValue) == ["thread-remaining"])
     }
 
+    @Test("workspace refresh revalidates unscoped fetched results")
+    func workspaceRefreshRevalidatesUnscopedFetchedResults() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-stale", workspace: workspaceURL, name: "Stale"),
+            .init(id: "thread-remaining", workspace: workspaceURL, name: "Remaining"),
+        ]))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>.recentChats)
+        try await results.performFetch()
+        let workspace = try #require(results.items.first?.workspace)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-remaining", workspace: workspaceURL, name: "Remaining")
+        ]))
+        try await workspace.refresh()
+
+        #expect(results.items.map(\.id.rawValue) == ["thread-remaining"])
+        #expect(workspace.chats.map(\.id.rawValue) == ["thread-remaining"])
+    }
+
     @Test("filtered workspace results drop parents with no matching chats")
     func filteredWorkspaceResultsDropParentsWithNoMatchingChats() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
