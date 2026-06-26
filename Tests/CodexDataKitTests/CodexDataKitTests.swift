@@ -920,6 +920,84 @@ struct CodexModelContextTests {
         #expect(results.items.map(\.url) == [backfill])
     }
 
+    @Test("paged workspace revalidation refreshes when a new parent precedes visible items")
+    func pagedWorkspaceRevalidationRefreshesWhenNewParentPrecedesVisibleItems() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let repo = try gitRepository()
+        let incoming = try createDirectory("AIncoming", in: repo)
+        let visible = try createDirectory("BVisible", in: repo)
+        let moving = try createDirectory("CMove", in: repo)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-visible", workspace: visible, name: "Visible"),
+            .init(id: "thread-move", workspace: moving, name: "Move"),
+        ]))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexWorkspace>(
+            sortDescriptors: [.name()],
+            fetchLimit: 1
+        ))
+        try await results.performFetch()
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-move"))
+        #expect(chat.workspace?.url == moving)
+        #expect(results.items.map(\.url) == [visible])
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-move"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-move",
+            workspace: incoming,
+            name: "Move"
+        ))
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-move", workspace: incoming, name: "Move"),
+            .init(id: "thread-visible", workspace: visible, name: "Visible"),
+        ]))
+        try await chat.refresh(includeTurns: false)
+
+        #expect(results.items.map(\.url) == [incoming])
+        #expect(await runtime.transport.recordedRequests(method: "thread/list").count == 2)
+    }
+
+    @Test("paged group revalidation refreshes when a new parent precedes visible items")
+    func pagedGroupRevalidationRefreshesWhenNewParentPrecedesVisibleItems() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let incomingRepo = try gitRepository(named: "AIncoming")
+        let visibleRepo = try gitRepository(named: "BVisible")
+        let movingRepo = try gitRepository(named: "CMove")
+        let incoming = try createDirectory("App", in: incomingRepo)
+        let visible = try createDirectory("App", in: visibleRepo)
+        let moving = try createDirectory("App", in: movingRepo)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-visible", workspace: visible, name: "Visible"),
+            .init(id: "thread-move", workspace: moving, name: "Move"),
+        ]))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexWorkspaceGroup>(
+            sortDescriptors: [.name()],
+            fetchLimit: 1
+        ))
+        try await results.performFetch()
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-move"))
+        #expect(chat.workspace?.url == moving)
+        #expect(results.items.map(\.name) == ["BVisible"])
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-move"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-move",
+            workspace: incoming,
+            name: "Move"
+        ))
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-move", workspace: incoming, name: "Move"),
+            .init(id: "thread-visible", workspace: visible, name: "Visible"),
+        ]))
+        try await chat.refresh(includeTurns: false)
+
+        #expect(results.items.map(\.name) == ["AIncoming"])
+        #expect(await runtime.transport.recordedRequests(method: "thread/list").count == 2)
+    }
+
     @Test("server paginated chat fetches preserve existing workspace relationships")
     func serverPaginatedChatFetchesPreserveExistingWorkspaceRelationships() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -2694,12 +2772,22 @@ private func createDirectory(_ name: String, in parent: URL) throws -> URL {
 
 private func gitRepository() throws -> URL {
     let repo = temporaryDirectory()
+    try createGitMetadata(in: repo)
+    return repo
+}
+
+private func gitRepository(named name: String) throws -> URL {
+    let repo = temporaryDirectory().appendingPathComponent(name, isDirectory: true)
+    try createGitMetadata(in: repo)
+    return repo
+}
+
+private func createGitMetadata(in repo: URL) throws {
     try FileManager.default.createDirectory(at: repo, withIntermediateDirectories: true)
     try FileManager.default.createDirectory(
         at: repo.appendingPathComponent(".git", isDirectory: true),
         withIntermediateDirectories: true
     )
-    return repo
 }
 
 private struct ThreadListParams: Decodable, Sendable {

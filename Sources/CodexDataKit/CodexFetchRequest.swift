@@ -323,10 +323,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         guard let model = insertionModel(for: chat, archived: archived) else {
             return
         }
-        guard upsert(model) else {
-            await refreshAfterMutation()
-            return
-        }
+        await upsertOrRefresh(model)
     }
 
     package func archive(
@@ -339,10 +336,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             return
         }
         if let model = insertionModel(for: chat, archived: true) {
-            guard upsert(model) else {
-                await refreshAfterMutation()
-                return
-            }
+            await upsertOrRefresh(model)
         } else {
             await remove(chat, workspace: workspace, group: group)
         }
@@ -376,13 +370,10 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         guard canEvaluateFilterLocally,
             let model = insertionModel(for: chat, archived: archived)
         else {
-            await refreshAfterLocalRemovalIfNeeded(originalCount: originalCount)
+            await backfillAfterLocalRemovalIfNeeded(originalCount: originalCount)
             return
         }
-        guard upsert(model) else {
-            await refreshAfterLocalRemovalIfNeeded(originalCount: originalCount)
-            return
-        }
+        await upsertOrRefresh(model)
     }
 
     package func remove(
@@ -403,7 +394,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         }
         items = filteredItems
         sections = modelContext.sections(for: filteredItems, descriptor: request.sectionDescriptor)
-        await refreshAfterLocalRemovalIfNeeded(originalCount: originalCount)
+        await backfillAfterLocalRemovalIfNeeded(originalCount: originalCount)
     }
 
     package func refresh(
@@ -475,6 +466,15 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
     }
 
     @discardableResult
+    private func upsertOrRefresh(_ model: Model) async -> Bool {
+        guard upsert(model) else {
+            await refreshAfterMutation()
+            return false
+        }
+        return true
+    }
+
+    @discardableResult
     private func upsert(_ model: Model) -> Bool {
         var nextItems = items
         let insertedModel: Bool
@@ -540,7 +540,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             || (Model.self == CodexChat.self && request.sortDescriptors.isEmpty)
     }
 
-    private func refreshAfterLocalRemovalIfNeeded(originalCount: Int) async {
+    private func backfillAfterLocalRemovalIfNeeded(originalCount: Int) async {
         let missingCount = originalCount - items.count
         guard missingCount > 0, shouldRefreshAfterLocalRemoval else {
             return
