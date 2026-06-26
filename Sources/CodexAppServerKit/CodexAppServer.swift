@@ -757,6 +757,14 @@ public actor CodexAppServer {
 
     /// Starts a ChatGPT browser login flow.
     ///
+    /// - Returns: A login handle containing the browser authentication URL.
+    /// - Throws: A transport, JSON-RPC, or app-server login error.
+    public func loginChatGPT() async throws -> CodexLoginHandle {
+        try await loginChatGPT(callbackURLScheme: nil)
+    }
+
+    /// Starts a ChatGPT browser login flow.
+    ///
     /// - Parameter callbackURLScheme: Optional URL scheme for native web authentication callbacks.
     /// - Returns: A login handle containing the browser authentication URL.
     /// - Throws: A transport, JSON-RPC, or app-server login error.

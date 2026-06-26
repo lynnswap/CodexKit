@@ -2759,7 +2759,8 @@ struct CodexAppServerKitTests {
         let accountEvents = await server.accountEvents()
         await transport.waitForNotificationStreamCount(1)
 
-        let handle = try await server.loginChatGPT()
+        let login: () async throws -> CodexLoginHandle = server.loginChatGPT
+        let handle = try await login()
 
         #expect(handle == .chatGPT(
             id: "login-1",
