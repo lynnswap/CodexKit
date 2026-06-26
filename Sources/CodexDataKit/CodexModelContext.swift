@@ -994,7 +994,7 @@ public final class CodexModelContext: @unchecked Sendable {
         return request.sortDescriptors.count == 1 && primarySort.threadSortKey != nil
     }
 
-    private func localCursor(for offset: Int) -> String {
+    package func localCursor(for offset: Int) -> String {
         "\(Self.localCursorPrefix)\(offset)"
     }
 

@@ -513,10 +513,19 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             nextItems.insert(model, at: 0)
             insertedModel = true
         }
-        items = loadedWindowItems(
-            modelContext.sortedItems(nextItems, for: request),
+        let sortedItems = modelContext.sortedItems(nextItems, for: request)
+        let windowItems = loadedWindowItems(
+            sortedItems,
             insertedModel: insertedModel
         )
+        items = windowItems
+        if insertedModel,
+            nextCursor == nil,
+            sortedItems.count > windowItems.count
+        {
+            let cursorOffset = modelContext.localCursorOffset(from: request.cursor) + windowItems.count
+            nextCursor = modelContext.localCursor(for: cursorOffset)
+        }
         sections = modelContext.sections(for: items, descriptor: request.sectionDescriptor)
         return true
     }
