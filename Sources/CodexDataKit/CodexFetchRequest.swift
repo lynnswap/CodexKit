@@ -451,13 +451,17 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
     }
 
     private func refreshAfterLocalRemovalIfNeeded(originalCount: Int) async {
-        guard items.count < originalCount, shouldRefreshAfterLocalRemoval else {
+        let missingCount = originalCount - items.count
+        guard missingCount > 0, shouldRefreshAfterLocalRemoval else {
             return
         }
+        var request = request
+        request.cursor = modelContext.backfillCursor(after: items.count, currentCursor: nextCursor)
+        request.fetchLimit = missingCount
         do {
-            try await loadNextPage()
+            try await load(request, appending: true)
         } catch {
-            // loadNextPage records the failed phase; the server mutation has already succeeded.
+            // load records the failed phase; the server mutation has already succeeded.
         }
     }
 

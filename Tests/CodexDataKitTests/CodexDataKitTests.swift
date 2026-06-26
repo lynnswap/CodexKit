@@ -1260,6 +1260,34 @@ struct CodexModelContextTests {
         #expect(results.items.map(\.id.rawValue) == ["thread-keep", "thread-backfill"])
     }
 
+    @Test("local paged fetched results recompute backfill cursors after removals")
+    func localPagedFetchedResultsRecomputeBackfillCursorsAfterRemovals() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-a", workspace: workspaceURL, name: "A"),
+            .init(id: "thread-b", workspace: workspaceURL, name: "B"),
+            .init(id: "thread-c", workspace: workspaceURL, name: "C"),
+        ]))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            sortDescriptors: [.name()],
+            fetchLimit: 2
+        ))
+        try await results.performFetch()
+        let chat = try #require(results.items.first)
+
+        try await runtime.transport.enqueueEmpty(for: "thread/delete")
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-b", workspace: workspaceURL, name: "B"),
+            .init(id: "thread-c", workspace: workspaceURL, name: "C"),
+        ]))
+        try await chat.delete()
+
+        #expect(results.items.map(\.id.rawValue) == ["thread-b", "thread-c"])
+    }
+
     @Test("starting a chat inserts it into active fetched results")
     func startingChatInsertsItIntoActiveFetchedResults() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()

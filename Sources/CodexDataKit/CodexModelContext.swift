@@ -280,6 +280,13 @@ public final class CodexModelContext: @unchecked Sendable {
         return items
     }
 
+    package func backfillCursor(after itemCount: Int, currentCursor: String?) -> String? {
+        guard currentCursor?.hasPrefix(Self.localCursorPrefix) == true else {
+            return currentCursor
+        }
+        return localCursor(for: itemCount)
+    }
+
     private func fetchChatPage(_ request: CodexFetchRequest<CodexChat>) async throws
         -> CodexFetchPage<CodexChat>
     {
