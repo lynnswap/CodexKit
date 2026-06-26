@@ -262,7 +262,11 @@ public final class CodexFetchedResults<Model: CodexObservableModel> {
             let page = try await modelContext.fetchPage(request)
             let newItems = appending ? append(page.items, to: items) : page.items
             items = newItems
-            modelContext.syncLoadedRelationships(newItems, request: request)
+            modelContext.syncLoadedRelationships(
+                newItems,
+                request: request,
+                pageIsComplete: page.nextCursor == nil
+            )
             sections = modelContext.sections(for: newItems, descriptor: request.sectionDescriptor)
             nextCursor = page.nextCursor
             backwardsCursor = page.backwardsCursor
@@ -301,7 +305,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         workspace: CodexWorkspace?,
         group: CodexWorkspaceGroup?
     ) {
-        if let model = archivedChatModel(for: chat) {
+        if let model = insertionModel(for: chat, archived: true) {
             upsert(model)
         } else {
             remove(chat, workspace: workspace, group: group)
@@ -349,15 +353,6 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         sections = modelContext.sections(for: filteredItems, descriptor: request.sectionDescriptor)
     }
 
-    private func archivedChatModel(for chat: CodexChat) -> Model? {
-        guard Model.self == CodexChat.self,
-              shouldInclude(chat, archived: true)
-        else {
-            return nil
-        }
-        return chat as? Model
-    }
-
     private func insertionModel(for chat: CodexChat, archived: Bool) -> Model? {
         guard shouldInclude(chat, archived: archived) else {
             return nil
@@ -365,15 +360,16 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         if let chat = chat as? Model {
             return chat
         }
-        guard archived == false else {
-            return nil
-        }
         if let workspace = chat.workspace as? Model {
             return workspace
         }
-        if let workspaceGroup = chat.workspace?.workspaceGroup,
+        if let workspace = chat.workspace,
+           let workspaceGroup = workspace.workspaceGroup,
            let group = workspaceGroup as? Model
         {
+            if workspaceGroup.workspaces.contains(where: { $0 === workspace }) == false {
+                workspaceGroup.setWorkspaces(workspaceGroup.workspaces + [workspace])
+            }
             return group
         }
         return nil

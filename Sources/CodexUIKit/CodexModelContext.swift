@@ -47,9 +47,13 @@ public final class CodexModelContext: @unchecked Sendable {
     public func fetch<Model: CodexObservableModel>(
         _ request: CodexFetchRequest<Model>
     ) async throws -> [Model] {
-        let items = try await fetchPage(request).items
-        syncLoadedRelationships(items, request: request)
-        return items
+        let page = try await fetchPage(request)
+        syncLoadedRelationships(
+            page.items,
+            request: request,
+            pageIsComplete: page.nextCursor == nil
+        )
+        return page.items
     }
 
     public func fetchedResults<Model: CodexObservableModel>(
@@ -83,7 +87,11 @@ public final class CodexModelContext: @unchecked Sendable {
 
     public func refresh(_ workspace: CodexWorkspace) async throws {
         let request = CodexFetchRequest<CodexChat>.chats(in: workspace)
-        let chats = try await fetch(request)
+        let chats = sort(
+            try await fetchAllThreadSnapshots(matching: request)
+                .map { apply($0, archived: request.filter.archived == true) },
+            using: request.sortDescriptors
+        )
         workspace.setChats(chats)
     }
 
@@ -267,7 +275,10 @@ public final class CodexModelContext: @unchecked Sendable {
         let workspaces = unique(chats.compactMap(\.workspace))
         syncWorkspaceChats(
             chats,
-            preservingExisting: shouldPreserveExistingWorkspaceChats(for: request),
+            preservingExisting: shouldPreserveExistingWorkspaceChats(
+                for: request,
+                pageIsComplete: true
+            ),
             workspaceFilter: request.filter.workspace
         )
         return localPage(sort(workspaces, using: request.sortDescriptors), for: request)
@@ -282,12 +293,18 @@ public final class CodexModelContext: @unchecked Sendable {
         let groups = unique(workspaces.compactMap(\.workspaceGroup))
         syncWorkspaceChats(
             chats,
-            preservingExisting: shouldPreserveExistingWorkspaceChats(for: request),
+            preservingExisting: shouldPreserveExistingWorkspaceChats(
+                for: request,
+                pageIsComplete: true
+            ),
             workspaceFilter: request.filter.workspace
         )
         syncGroupWorkspaces(
             workspaces,
-            preservingExisting: shouldPreserveExistingWorkspaceChats(for: request)
+            preservingExisting: shouldPreserveExistingWorkspaceChats(
+                for: request,
+                pageIsComplete: true
+            )
         )
         return localPage(sort(groups, using: request.sortDescriptors), for: request)
     }
@@ -372,12 +389,16 @@ public final class CodexModelContext: @unchecked Sendable {
 
     package func syncLoadedRelationships<Model: CodexObservableModel>(
         _ items: [Model],
-        request: CodexFetchRequest<Model>
+        request: CodexFetchRequest<Model>,
+        pageIsComplete: Bool
     ) {
         if let chats = items as? [CodexChat] {
             syncWorkspaceChats(
                 chats,
-                preservingExisting: shouldPreserveExistingWorkspaceChats(for: request),
+                preservingExisting: shouldPreserveExistingWorkspaceChats(
+                    for: request,
+                    pageIsComplete: pageIsComplete
+                ),
                 workspaceFilter: request.filter.workspace
             )
         }
@@ -444,9 +465,11 @@ public final class CodexModelContext: @unchecked Sendable {
     }
 
     private func shouldPreserveExistingWorkspaceChats<Model: CodexObservableModel>(
-        for request: CodexFetchRequest<Model>
+        for request: CodexFetchRequest<Model>,
+        pageIsComplete: Bool
     ) -> Bool {
-        (Model.self == CodexChat.self && (request.cursor != nil || request.fetchLimit != nil))
+        (Model.self == CodexChat.self
+            && (pageIsComplete == false || request.cursor != nil || request.fetchLimit != nil))
             || request.filter.archived == true
             || request.filter.searchTerm != nil
             || request.filter.modelProviders != nil
