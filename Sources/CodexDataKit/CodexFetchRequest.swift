@@ -285,13 +285,10 @@ public final class CodexFetchedResults<Model: CodexObservableModel> {
             let newItems = appending ? append(page.items, to: items) : page.items
             items = newItems
             let relationshipRequest = appending ? self.request : request
-            let relationshipItems = page.relationshipItems ?? newItems
-            let relationshipIsComplete = page.relationshipIsComplete
-                ?? (page.nextCursor == nil && relationshipRequest.cursor == nil)
             modelContext.syncLoadedRelationships(
-                relationshipItems,
+                from: page,
                 request: relationshipRequest,
-                relationshipIsComplete: relationshipIsComplete
+                loadedItems: newItems
             )
             sections = modelContext.sections(for: newItems, descriptor: request.sectionDescriptor)
             nextCursor = page.nextCursor

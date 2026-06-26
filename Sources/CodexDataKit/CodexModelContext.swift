@@ -48,11 +48,7 @@ public final class CodexModelContext: @unchecked Sendable {
         _ request: CodexFetchRequest<Model>
     ) async throws -> [Model] {
         let page = try await fetchPage(request)
-        syncLoadedRelationships(
-            page.items,
-            request: request,
-            relationshipIsComplete: request.cursor == nil && page.nextCursor == nil
-        )
+        syncLoadedRelationships(from: page, request: request)
         return page.items
     }
 
@@ -491,6 +487,21 @@ public final class CodexModelContext: @unchecked Sendable {
     }
 
     package func syncLoadedRelationships<Model: CodexObservableModel>(
+        from page: CodexFetchPage<Model>,
+        request: CodexFetchRequest<Model>,
+        loadedItems: [Model]? = nil
+    ) {
+        let relationshipItems = page.relationshipItems ?? loadedItems ?? page.items
+        let relationshipIsComplete = page.relationshipIsComplete
+            ?? (page.nextCursor == nil && request.cursor == nil)
+        syncLoadedRelationships(
+            relationshipItems,
+            request: request,
+            relationshipIsComplete: relationshipIsComplete
+        )
+    }
+
+    private func syncLoadedRelationships<Model: CodexObservableModel>(
         _ items: [Model],
         request: CodexFetchRequest<Model>,
         relationshipIsComplete: Bool
