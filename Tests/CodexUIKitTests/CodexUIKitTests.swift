@@ -6,6 +6,20 @@ import Testing
 
 @MainActor
 struct CodexModelContextTests {
+    @Test("container releases its main context without a retain cycle")
+    func containerReleasesMainContextWithoutRetainCycle() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        weak var weakContainer: CodexModelContainer?
+
+        do {
+            let container = CodexModelContainer(appServer: runtime.server)
+            weakContainer = container
+            _ = container.mainContext
+        }
+
+        #expect(weakContainer == nil)
+    }
+
     @Test("fetched results use thread/list and mutate existing chat objects")
     func fetchedResultsMutateExistingChats() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -146,7 +160,7 @@ struct CodexModelContextTests {
 
         let fetchedWorkspace = try #require(results.items.first?.workspace)
         #expect(results.items.map(\.title) == ["Alpha"])
-        #expect(fetchedWorkspace.chats.map(\.title) == ["Alpha"])
+        #expect(fetchedWorkspace.chats.map(\.title) == ["Alpha", "Zulu"])
         #expect(results.nextCursor?.isEmpty == false)
 
         let initialRequests = await runtime.transport.recordedRequests(method: "thread/list")
@@ -195,6 +209,31 @@ struct CodexModelContextTests {
         #expect(fetchedWorkspace.chats.map(\.title) == ["Alpha", "Zulu"])
     }
 
+    @Test("filtered chat fetches keep previously loaded workspace chats")
+    func filteredChatFetchesKeepPreviouslyLoadedWorkspaceChats() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspace = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-keep", workspace: workspace, name: "Keep"),
+            .init(id: "thread-match", workspace: workspace, name: "Match"),
+        ]))
+        let allResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>.recentChats)
+        try await allResults.performFetch()
+        let fetchedWorkspace = try #require(allResults.items.first?.workspace)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-match", workspace: workspace, name: "Match")
+        ]))
+        let filteredResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            filter: .init(searchTerm: "Match")
+        ))
+        try await filteredResults.performFetch()
+
+        #expect(Set(fetchedWorkspace.chats.map(\.id.rawValue)) == ["thread-keep", "thread-match"])
+    }
+
     @Test("recency sort preserves app-server ordering")
     func recencySortPreservesAppServerOrdering() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -219,6 +258,24 @@ struct CodexModelContextTests {
         try await results.performFetch()
 
         #expect(results.items.map(\.id.rawValue) == ["thread-server-first", "thread-server-second"])
+    }
+
+    @Test("primary recency sort preserves app-server ordering when secondary descriptors exist")
+    func primaryRecencySortPreservesAppServerOrderingWithSecondaryDescriptors() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-zulu", name: "Zulu"),
+            .init(id: "thread-alpha", name: "Alpha"),
+        ]))
+
+        let results = context.fetchedResults(
+            for: CodexFetchRequest<CodexChat>(sortDescriptors: [.recencyAt(.reverse), .name()])
+        )
+        try await results.performFetch()
+
+        #expect(results.items.map(\.title) == ["Zulu", "Alpha"])
     }
 
     @Test("non-recency sort descriptors still apply when recency is present")

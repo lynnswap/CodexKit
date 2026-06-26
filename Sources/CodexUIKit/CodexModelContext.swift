@@ -31,10 +31,8 @@ public final class CodexModelContainer: @unchecked Sendable {
 public final class CodexModelContext: @unchecked Sendable {
     private static let localCursorPrefix = "codexkit-ui-offset:"
 
-    public let container: CodexModelContainer
-    public var appServer: CodexAppServer {
-        container.appServer
-    }
+    public private(set) weak var container: CodexModelContainer?
+    public let appServer: CodexAppServer
 
     private var workspaceGroupsByID: [CodexWorkspaceGroupID: CodexWorkspaceGroup] = [:]
     private var workspacesByID: [CodexWorkspaceID: CodexWorkspace] = [:]
@@ -42,6 +40,7 @@ public final class CodexModelContext: @unchecked Sendable {
 
     package init(container: CodexModelContainer) {
         self.container = container
+        self.appServer = container.appServer
     }
 
     public func fetch<Model: CodexObservableModel>(
@@ -318,7 +317,10 @@ public final class CodexModelContext: @unchecked Sendable {
     private func syncWorkspaceChats(_ chats: [CodexChat]) {
         let workspaces = unique(chats.compactMap(\.workspace))
         for workspace in workspaces {
-            workspace.setChats(chats.filter { $0.workspace === workspace })
+            let fetchedChats = chats.filter { $0.workspace === workspace }
+            let fetchedIDs = Set(fetchedChats.map(\.id))
+            let remainingChats = workspace.chats.filter { fetchedIDs.contains($0.id) == false }
+            workspace.setChats(fetchedChats + remainingChats)
         }
     }
 
@@ -446,6 +448,9 @@ public final class CodexModelContext: @unchecked Sendable {
     private func sort(_ chats: [CodexChat], using descriptors: [CodexSortDescriptor<CodexChat>])
         -> [CodexChat]
     {
+        guard descriptors.first?.key != .recencyAt else {
+            return chats
+        }
         let localDescriptors = descriptors.filter { $0.key != .recencyAt }
         guard localDescriptors.isEmpty == false else {
             return chats
