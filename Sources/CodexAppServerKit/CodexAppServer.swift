@@ -1,0 +1,1061 @@
+import Foundation
+
+/// A live connection to a Codex app-server process.
+///
+/// `CodexAppServer` owns the app-server transport, performs the initial
+/// JSON-RPC handshake, and routes server notifications to thread, turn, and
+/// login domain objects.
+public actor CodexAppServer {
+    /// Options for creating a Codex app-server container.
+    public struct Configuration: Sendable {
+        /// Options for launching a local `codex app-server` process.
+        public struct LocalProcess: Sendable {
+            /// The `codex` executable path or command name.
+            ///
+            /// Set this when the executable is not available through the process
+            /// environment. When `nil`, the default transport command is used.
+            public var executable: String?
+
+            /// Command-line arguments passed to the app-server executable.
+            ///
+            /// When `nil`, the transport uses the default arguments for starting
+            /// `codex app-server`.
+            public var arguments: [String]?
+
+            /// Environment variables supplied to the app-server process.
+            public var environment: [String: String]
+
+            /// The Codex home directory used by the app-server process.
+            public var codexHomeURL: URL
+
+            /// Creates a configuration for launching a local app-server process.
+            ///
+            /// - Parameters:
+            ///   - executable: The `codex` executable path or command name.
+            ///   - arguments: Command-line arguments for the app-server process.
+            ///   - environment: Environment variables for the app-server process.
+            ///   - codexHomeURL: Codex home directory, or `nil` to use the local-process default.
+            public init(
+                executable: String? = nil,
+                arguments: [String]? = nil,
+                environment: [String: String] = ProcessInfo.processInfo.environment,
+                codexHomeURL: URL? = nil
+            ) {
+                self.executable = executable
+                self.arguments = arguments
+                self.environment = environment
+                self.codexHomeURL = codexHomeURL ?? Self.defaultCodexHomeURL(environment: environment)
+            }
+
+            /// Returns the default Codex home for a local app-server process.
+            ///
+            /// The value honors `CODEX_HOME` first. On macOS command-line runs,
+            /// it then matches the Codex CLI convention of `~/.codex`. Other
+            /// Apple platform environments prefer Application Support so the
+            /// default stays inside the app container when this API is compiled
+            /// for a non-command-line host.
+            public static func defaultCodexHomeURL(
+                environment: [String: String] = ProcessInfo.processInfo.environment,
+                homeDirectoryForCurrentUser: URL = FileManager.default.homeDirectoryForCurrentUser,
+                applicationSupportDirectory: URL? = FileManager.default.urls(
+                    for: .applicationSupportDirectory,
+                    in: .userDomainMask
+                ).first
+            ) -> URL {
+                if let codexHome = environment["CODEX_HOME"]?.trimmingCharacters(
+                    in: .whitespacesAndNewlines
+                ),
+                   codexHome.isEmpty == false {
+                    return URL(fileURLWithPath: codexHome, isDirectory: true)
+                }
+#if os(macOS)
+                if let home = environment["HOME"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   home.isEmpty == false {
+                    return URL(fileURLWithPath: home, isDirectory: true)
+                        .appendingPathComponent(".codex", isDirectory: true)
+                }
+#endif
+                if let applicationSupportDirectory {
+                    return applicationSupportDirectory
+                        .appendingPathComponent("Codex", isDirectory: true)
+                }
+                return homeDirectoryForCurrentUser
+                    .appendingPathComponent("Library", isDirectory: true)
+                    .appendingPathComponent("Application Support", isDirectory: true)
+                    .appendingPathComponent("Codex", isDirectory: true)
+            }
+        }
+
+        /// Local process launch settings for the app-server runtime.
+        public var localProcess: LocalProcess
+
+        /// The client name sent in the app-server `initialize` request.
+        public var clientName: String
+
+        /// The client version sent in the app-server `initialize` request.
+        public var clientVersion: String
+
+        /// Handles JSON-RPC requests initiated by the app-server.
+        ///
+        /// App-server uses these requests for host-side decisions such as
+        /// command approvals, file-change approvals, and user-input prompts.
+        public var serverRequestHandler: CodexAppServerRequestHandler
+
+        /// Creates a configuration for a Codex app-server container.
+        ///
+        /// - Parameters:
+        ///   - localProcess: Local process launch settings.
+        ///   - clientName: Client name sent during app-server initialization.
+        ///   - clientVersion: Client version sent during app-server initialization.
+        ///   - serverRequestHandler: Handler for app-server-initiated JSON-RPC requests.
+        public init(
+            localProcess: LocalProcess = .init(),
+            clientName: String = "CodexAppServerKit",
+            clientVersion: String = "1",
+            serverRequestHandler: @escaping CodexAppServerRequestHandler =
+                Self.defaultServerRequestHandler
+        ) {
+            self.localProcess = localProcess
+            self.clientName = clientName
+            self.clientVersion = clientVersion
+            self.serverRequestHandler = serverRequestHandler
+        }
+
+        private struct ApprovalDeclineResponse: Encodable {
+            var decision: String
+        }
+
+        public static func defaultServerRequestHandler(
+            request: CodexAppServerRequest
+        ) async throws -> CodexAppServerResponse {
+            switch request.method {
+            case "item/commandExecution/requestApproval",
+                 "item/fileChange/requestApproval":
+                try .result(ApprovalDeclineResponse(decision: "decline"))
+            default:
+                try .emptyResult()
+            }
+        }
+    }
+
+    private let client: AppServerClient
+    private let router: CodexAppServerNotificationRouter
+    private var retainedReviewCleanupIdentitiesBySourceThreadID: [CodexThreadID: [CodexReviewIdentity]] = [:]
+    private var reviewRestartContextsByTokenID: [CodexReviewRestartToken.ID: CodexReviewRestartContext] = [:]
+
+    package nonisolated var appServerClient: AppServerClient {
+        client
+    }
+
+    /// Starts a Codex app-server process and initializes the client session.
+    ///
+    /// The initializer completes after the app-server has accepted the
+    /// `initialize` request and notification routing is ready.
+    ///
+    /// - Parameter configuration: Container and local-process configuration.
+    /// - Throws: A transport, JSON-RPC, or app-server initialization error.
+    public init(configuration: Configuration = .init()) async throws {
+        let transportConfiguration = AppServerProcessTransport.Configuration(
+            executable: configuration.localProcess.executable,
+            arguments: configuration.localProcess.arguments,
+            environment: configuration.localProcess.environment,
+            codexHomeURL: configuration.localProcess.codexHomeURL,
+            serverRequestHandler: configuration.serverRequestHandler
+        )
+        let transport = try AppServerProcessTransport(configuration: transportConfiguration)
+        let client = AppServerClient(transport: transport)
+        do {
+            _ = try await client.initialize(
+                clientName: configuration.clientName,
+                clientVersion: configuration.clientVersion
+            )
+        } catch {
+            await client.close()
+            throw error
+        }
+        let router = CodexAppServerNotificationRouter(client: client)
+        await router.start()
+        self.client = client
+        self.router = router
+    }
+
+    package init(
+        client: AppServerClient,
+        router: CodexAppServerNotificationRouter
+    ) {
+        self.client = client
+        self.router = router
+    }
+
+    package init(
+        transport: any JSONRPC.Transport
+    ) async throws {
+        let client = AppServerClient(transport: transport)
+        let configuration = Configuration()
+        do {
+            _ = try await client.initialize(
+                clientName: configuration.clientName,
+                clientVersion: configuration.clientVersion
+            )
+        } catch {
+            await client.close()
+            throw error
+        }
+        let router = CodexAppServerNotificationRouter(client: client)
+        await router.start()
+        self.client = client
+        self.router = router
+    }
+
+    package static func testing(
+        transport: any JSONRPC.Transport
+    ) async throws -> CodexAppServer {
+        try await CodexAppServer(transport: transport)
+    }
+
+    /// Closes the app-server connection and stops notification routing.
+    ///
+    /// Call this when the container is no longer needed. Closing is idempotent
+    /// from the perspective of public callers.
+    public func close() async {
+        await router.stop()
+        await client.close()
+    }
+
+    package func notificationStream() async -> AsyncThrowingStream<JSONRPC.Notification, Error> {
+        await client.notificationStream()
+    }
+
+    /// Returns account-related app-server notifications as typed domain events.
+    ///
+    /// The stream includes login completion, account update, and Codex
+    /// rate-limit update notifications. Notifications with newer account
+    /// methods are preserved as `.unknown`; malformed known notifications are
+    /// reported as `.malformed` without terminating the stream.
+    ///
+    /// - Returns: A stream of account domain events.
+    public func accountEvents() async -> AsyncThrowingStream<CodexAccountEvent, Error> {
+        let notifications = await client.notificationStream()
+        return AsyncThrowingStream(bufferingPolicy: .unbounded) { continuation in
+            let task = Task {
+                do {
+                    for try await notification in notifications {
+                        guard let event = Self.accountEvent(from: notification) else {
+                            continue
+                        }
+                        continuation.yield(event)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in
+                task.cancel()
+            }
+        }
+    }
+
+    /// Creates a new Codex thread in a workspace.
+    ///
+    /// - Parameters:
+    ///   - workspace: The workspace directory for the thread.
+    ///   - instructions: Optional base and developer instructions.
+    ///   - options: Thread creation options, including model, approval, and sandbox settings.
+    /// - Returns: A domain handle for the created thread.
+    /// - Throws: A transport, JSON-RPC, or app-server request error.
+    public func startThread(
+        in workspace: URL,
+        instructions: CodexInstructions? = nil,
+        options: CodexThread.Options = .init()
+    ) async throws -> CodexThread {
+        let approvalMode = options.approvalMode ?? .autoReview
+        let response = try await client.send(
+            AppServerAPI.Thread.Start.Request(
+                params: .init(
+                    cwd: workspace.path,
+                    model: options.model,
+                    modelProvider: options.modelProvider,
+                    ephemeral: options.ephemeral,
+                    baseInstructions: instructions?.base,
+                    developerInstructions: instructions?.developer,
+                    approvalPolicy: approvalMode.approvalPolicy,
+                    approvalsReviewer: approvalMode.approvalsReviewer,
+                    sandbox: options.sandbox?.threadSandboxValue,
+                    serviceName: options.serviceName,
+                    serviceTier: options.serviceTier,
+                    personality: options.personality?.rawValue,
+                    config: options.config?.mapValues(\.appServerJSONValue),
+                    permissions: options.permissions?.appServerPermissions,
+                    sessionStartSource: options.sessionStartSource?.appServerSource,
+                    threadSource: options.threadSource?.appServerSource
+                )
+            ))
+        return CodexThread(
+            id: .init(rawValue: response.threadID),
+            workspace: workspace,
+            model: response.model ?? options.model,
+            client: client,
+            router: router
+        )
+    }
+
+    /// Starts a Codex code review in a workspace.
+    ///
+    /// This creates a source thread for `workspace` and starts the app-server
+    /// review lifecycle from that thread, so callers do not need to manually
+    /// sequence `startThread` and `CodexThread.startReview`.
+    ///
+    /// - Parameters:
+    ///   - workspace: The workspace directory to review.
+    ///   - target: The repository changes or custom instructions to review.
+    ///   - instructions: Optional base and developer instructions for the source thread.
+    ///   - options: Thread creation options, including model, approval, and sandbox settings.
+    ///   - delivery: Whether the app-server should run the review inline or in a detached review thread.
+    ///   - transcriptErrorHandlingPolicy: How collection should treat transcript errors.
+    /// - Returns: A live review session.
+    /// - Throws: A transport, JSON-RPC, or app-server request error.
+    public func startReview(
+        in workspace: URL,
+        target: CodexReviewTarget,
+        instructions: CodexInstructions? = nil,
+        options: CodexThread.Options = .init(),
+        delivery: CodexReviewDelivery = .inline,
+        transcriptErrorHandlingPolicy: CodexTranscriptErrorHandlingPolicy = .preserveTranscript
+    ) async throws -> CodexReviewSession {
+        try Task.checkCancellation()
+        let thread = try await startThreadIgnoringCallerCancellation(
+            in: workspace,
+            instructions: instructions,
+            options: options
+        )
+        do {
+            try Task.checkCancellation()
+        } catch {
+            await deleteThreadIgnoringCallerCancellation(thread.id)
+            throw error
+        }
+
+        let review: CodexReviewSession
+        do {
+            review = try await startReviewIgnoringCallerCancellation(
+                thread: thread,
+                target: target,
+                delivery: delivery,
+                transcriptErrorHandlingPolicy: transcriptErrorHandlingPolicy
+            )
+        } catch {
+            await deleteThreadIgnoringCallerCancellation(thread.id)
+            throw error
+        }
+
+        do {
+            try Task.checkCancellation()
+            return review
+        } catch {
+            await cleanupReviewIgnoringCallerCancellation(review.identity)
+            throw error
+        }
+    }
+
+    /// Resumes an existing Codex thread.
+    ///
+    /// - Parameters:
+    ///   - id: The thread identifier to resume.
+    ///   - options: Resume options that may override the stored thread context.
+    /// - Returns: A domain handle for the resumed thread.
+    /// - Throws: A transport, JSON-RPC, or app-server request error.
+    public func resumeThread(
+        _ id: CodexThreadID,
+        options: CodexThread.ResumeOptions = .init()
+    ) async throws -> CodexThread {
+        let response = try await client.send(
+            AppServerAPI.Thread.Resume.Request(
+                threadID: id.rawValue,
+                params: threadStartParams(options: options)
+            ))
+        return thread(from: response.thread, model: response.model ?? options.model)
+    }
+
+    /// Restores a persisted app-server review run as a live review session handle.
+    ///
+    /// The restored session can consume review events and cancel the active
+    /// review turn. The active turn thread is resumed first so app-server has
+    /// the stored thread context loaded before the review handle is rebuilt.
+    ///
+    /// - Parameters:
+    ///   - identity: Persisted review run identity.
+    ///   - options: Options for the restored review response stream.
+    ///   - threadOptions: Resume options for the active turn thread. When `model` is
+    ///     `nil`, `identity.model` is used.
+    /// - Returns: A live review session handle for the persisted run.
+    /// - Throws: A transport, JSON-RPC, or app-server request error.
+    public func resumeReview(
+        _ identity: CodexReviewIdentity,
+        options: CodexReviewResumeOptions = .init(),
+        threadOptions: CodexThread.ResumeOptions = .init()
+    ) async throws -> CodexReviewSession {
+        var threadOptions = threadOptions
+        if threadOptions.model == nil {
+            threadOptions.model = identity.model
+        }
+        let activeThread = try await resumeThread(identity.activeTurnThreadID, options: threadOptions)
+        return await activeThread.reviewSession(
+            identity,
+            model: activeThread.model ?? identity.model,
+            transcriptErrorHandlingPolicy: options.transcriptErrorHandlingPolicy
+        )
+    }
+
+    /// Cancels a running review and prepares it for a later restart.
+    ///
+    /// The returned token is process-local to this ``CodexAppServer`` instance.
+    /// Cleanup ownership for the interrupted review is retained internally until
+    /// ``cleanupReview(_:additionalCleanupThreadIDs:)`` is called for the same
+    /// source thread.
+    ///
+    /// - Parameters:
+    ///   - identity: Persisted review run identity to interrupt.
+    ///   - options: Options for the restored review response stream used during cancellation.
+    ///   - threadOptions: Resume options for the active turn thread. When `model` is
+    ///     `nil`, `identity.model` is used.
+    /// - Returns: A token that can be passed to ``restartPreparedReview(_:target:delivery:threadOptions:transcriptErrorHandlingPolicy:)``.
+    /// - Throws: A transport, JSON-RPC, or app-server request error.
+    public func prepareReviewRestart(
+        _ identity: CodexReviewIdentity,
+        options: CodexReviewResumeOptions = .init(),
+        threadOptions: CodexThread.ResumeOptions = .init()
+    ) async throws -> CodexReviewRestartToken {
+        let review = try await resumeReview(identity, options: options, threadOptions: threadOptions)
+        let cancellation = try await review.cancel { retryCancellation in
+            if retryCancellation.turnID != Optional(identity.turnID) {
+                await self.rememberReviewCleanupIdentity(
+                    for: retryCancellation,
+                    sourceIdentity: identity,
+                    model: review.model
+                )
+            }
+        }
+        try await review.response.waitForCancelledResponse(cancellation)
+        rememberReviewCleanupIdentity(identity)
+        rememberReviewCleanupIdentity(
+            for: cancellation,
+            sourceIdentity: identity,
+            model: review.model
+        )
+        discardReviewRestartContexts(sourceThreadID: identity.sourceThreadID)
+
+        let token = CodexReviewRestartToken(
+            id: UUID().uuidString,
+            interruptedIdentity: identity
+        )
+        reviewRestartContextsByTokenID[token.id] = CodexReviewRestartContext(
+            interruptedIdentity: identity,
+            rollbackThreadID: cancellation.threadID,
+            rollbackModel: review.model
+        )
+        return token
+    }
+
+    /// Restarts a review that was previously prepared by ``prepareReviewRestart(_:options:threadOptions:)``.
+    ///
+    /// The restart first reloads and rolls back the thread that owned the
+    /// interrupted active turn, then reloads the source thread and starts a new
+    /// review from that source.
+    ///
+    /// - Parameters:
+    ///   - token: Token returned by ``prepareReviewRestart(_:options:threadOptions:)``.
+    ///   - target: The repository changes or custom instructions to review.
+    ///   - delivery: Whether the app-server should run the review inline or in a detached review thread.
+    ///   - threadOptions: Resume options for the source thread. For inline
+    ///     reviews, `token.interruptedIdentity.model` is used when `model` is
+    ///     `nil`; detached review restarts leave source-thread model selection
+    ///     to app-server unless the caller supplies an explicit model.
+    ///   - transcriptErrorHandlingPolicy: How collection should treat transcript errors for the new review.
+    /// - Returns: A live review session for the restarted review.
+    /// - Throws: ``CodexAppServerError/reviewRestartUnavailable(_:)`` when the token is stale.
+    public func restartPreparedReview(
+        _ token: CodexReviewRestartToken,
+        target: CodexReviewTarget,
+        delivery: CodexReviewDelivery = .inline,
+        threadOptions: CodexThread.ResumeOptions = .init(),
+        transcriptErrorHandlingPolicy: CodexTranscriptErrorHandlingPolicy = .preserveTranscript
+    ) async throws -> CodexReviewSession {
+        try Task.checkCancellation()
+        guard var context = reviewRestartContextsByTokenID[token.id],
+              context.isRestarting == false else {
+            throw CodexAppServerError.reviewRestartUnavailable(token.id)
+        }
+        context.isRestarting = true
+        reviewRestartContextsByTokenID[token.id] = context
+
+        do {
+            if context.rollbackCompleted == false {
+                let rollbackThread = try await resumeThread(
+                    context.rollbackThreadID,
+                    options: .init(model: context.rollbackModel)
+                )
+                try await rollbackThread.rollback(turnCount: 1)
+                context.rollbackCompleted = true
+                reviewRestartContextsByTokenID[token.id] = context
+            }
+
+            try Task.checkCancellation()
+            var sourceThreadOptions = threadOptions
+            if sourceThreadOptions.model == nil,
+               context.interruptedIdentity.activeTurnThreadID == context.interruptedIdentity.sourceThreadID {
+                sourceThreadOptions.model = context.interruptedIdentity.model
+            }
+            let sourceThread = try await resumeThread(
+                context.interruptedIdentity.sourceThreadID,
+                options: sourceThreadOptions
+            )
+            try Task.checkCancellation()
+
+            let review = try await startReviewIgnoringCallerCancellation(
+                thread: sourceThread,
+                target: target,
+                delivery: delivery,
+                transcriptErrorHandlingPolicy: transcriptErrorHandlingPolicy
+            )
+            do {
+                try Task.checkCancellation()
+            } catch {
+                await cleanupReviewIgnoringCallerCancellation(review.identity)
+                throw error
+            }
+
+            reviewRestartContextsByTokenID.removeValue(forKey: token.id)
+            return review
+        } catch {
+            context.isRestarting = false
+            if reviewRestartContextsByTokenID[token.id]?.isRestarting == true {
+                reviewRestartContextsByTokenID[token.id] = context
+            }
+            throw error
+        }
+    }
+
+    /// Deletes all app-server threads owned by a review lifecycle.
+    ///
+    /// Retained cleanup identities from prepared restarts are included, duplicate
+    /// thread identifiers are removed, and the source thread is deleted last.
+    /// Delete failures are intentionally ignored to match best-effort cleanup
+    /// behavior.
+    ///
+    /// - Parameters:
+    ///   - identity: Review identity whose source thread owns the lifecycle.
+    ///   - additionalCleanupThreadIDs: Extra cleanup ID sequences, in preferred
+    ///     per-sequence order, to merge with retained review cleanup IDs.
+    public func cleanupReview(
+        _ identity: CodexReviewIdentity,
+        additionalCleanupThreadIDs: [[CodexThreadID]] = []
+    ) async {
+        let sourceThreadID = identity.sourceThreadID
+        let retainedIdentities = retainedReviewCleanupIdentitiesBySourceThreadID.removeValue(
+            forKey: sourceThreadID
+        ) ?? []
+        discardReviewRestartContexts(sourceThreadID: sourceThreadID)
+
+        let cleanupThreadIDs = Self.orderedReviewCleanupThreadIDs(
+            sourceThreadID: sourceThreadID,
+            sequences: retainedIdentities.map(\.cleanupThreadIDs)
+                + [identity.cleanupThreadIDs]
+                + additionalCleanupThreadIDs
+        )
+        for threadID in cleanupThreadIDs {
+            try? await deleteThread(threadID)
+        }
+    }
+
+    /// Forks an existing Codex thread into a new thread.
+    ///
+    /// - Parameters:
+    ///   - id: The source thread identifier.
+    ///   - options: Options for the forked thread.
+    /// - Returns: A domain handle for the forked thread.
+    /// - Throws: A transport, JSON-RPC, or app-server request error.
+    public func forkThread(
+        _ id: CodexThreadID,
+        options: CodexThread.Options = .init()
+    ) async throws -> CodexThread {
+        let response = try await client.send(
+            AppServerAPI.Thread.Fork.Request(
+                threadID: id.rawValue,
+                params: threadStartParams(options: options)
+            ))
+        return thread(from: response.thread)
+    }
+
+    /// Restores an archived Codex thread.
+    ///
+    /// - Parameter id: The archived thread identifier.
+    /// - Returns: A domain handle for the restored thread.
+    /// - Throws: A transport, JSON-RPC, or app-server request error.
+    public func unarchiveThread(_ id: CodexThreadID) async throws -> CodexThread {
+        let response = try await client.send(
+            AppServerAPI.Thread.Unarchive.Request(
+                params: .init(threadID: id.rawValue)
+            ))
+        return thread(from: response.thread)
+    }
+
+    /// Archives a Codex thread.
+    ///
+    /// - Parameter id: The thread identifier to archive.
+    /// - Throws: A transport, JSON-RPC, or app-server request error.
+    public func archiveThread(_ id: CodexThreadID) async throws {
+        let _: EmptyResponse = try await client.send(
+            AppServerAPI.Thread.Archive.Request(
+                params: .init(threadID: id.rawValue)
+            ))
+    }
+
+    /// Permanently deletes a Codex thread.
+    ///
+    /// - Parameter id: The thread identifier to delete.
+    /// - Throws: A transport, JSON-RPC, or app-server request error.
+    public func deleteThread(_ id: CodexThreadID) async throws {
+        let _: EmptyResponse = try await client.send(
+            AppServerAPI.Thread.Delete.Request(
+                params: .init(threadID: id.rawValue)
+            ))
+    }
+
+    /// Lists Codex threads visible to the app-server account.
+    ///
+    /// - Parameter query: Paging and filtering options.
+    /// - Returns: A page of thread snapshots.
+    /// - Throws: A transport, JSON-RPC, or app-server request error.
+    public func listThreads(_ query: CodexThreadQuery = .init()) async throws -> CodexThreadPage {
+        let response = try await client.send(
+            AppServerAPI.Thread.List.Request(
+                params: .init(
+                    archived: query.archived,
+                    cursor: query.cursor,
+                    cwd: query.workspace.map { .paths([$0.path]) },
+                    limit: query.limit,
+                    modelProviders: query.modelProviders,
+                    searchTerm: query.searchTerm,
+                    sortDirection: query.sortDirection?.rawValue,
+                    sortKey: query.sortKey?.rawValue,
+                    sourceKinds: query.sourceKinds?.map(\.rawValue),
+                    useStateDbOnly: query.useStateDBOnly
+                )))
+        return .init(
+            threads: response.data.map(Self.threadSnapshot),
+            nextCursor: response.nextCursor,
+            backwardsCursor: response.backwardsCursor
+        )
+    }
+
+    /// Lists available Codex models.
+    ///
+    /// - Parameter includeHidden: Whether hidden models should be included.
+    /// - Returns: The complete model list across all app-server result pages.
+    /// - Throws: A transport, JSON-RPC, or app-server request error.
+    public func models(includeHidden: Bool = false) async throws -> [CodexModel] {
+        var cursor: String?
+        var models: [CodexModel] = []
+        repeat {
+            let response = try await client.send(
+                AppServerAPI.Model.List.Request(
+                    params: .init(cursor: cursor, includeHidden: includeHidden)
+                ))
+            models.append(contentsOf: response.data)
+            cursor = response.nextCursor
+        } while cursor != nil
+        return models
+    }
+
+    /// Reads the active Codex account.
+    ///
+    /// - Parameter refreshToken: Whether the app-server should refresh token state before returning.
+    /// - Returns: The active account, or `nil` when no account is signed in.
+    /// - Throws: A transport, JSON-RPC, or app-server request error.
+    public func account(refreshToken: Bool = false) async throws -> CodexAccount? {
+        let response = try await client.send(
+            AppServerAPI.Account.Read.Request(params: .init(refreshToken: refreshToken))
+        )
+        return response.account.map(Self.account)
+    }
+
+    /// Reads the app-server configuration visible to Codex clients.
+    ///
+    /// - Returns: Model, reasoning, review model, and service-tier settings.
+    /// - Throws: A transport, JSON-RPC, or app-server request error.
+    public func configuration() async throws -> CodexConfiguration {
+        let response = try await client.send(AppServerAPI.Config.Read.Request())
+        let reasoningEffort = response.config.modelReasoningEffort.map {
+            CodexReasoningEffort(rawValue: $0)
+        }
+        return .init(
+            model: response.config.model,
+            reviewModel: response.config.reviewModel,
+            reasoningEffort: reasoningEffort,
+            serviceTier: response.config.serviceTier
+        )
+    }
+
+    /// Applies a partial update to the app-server configuration.
+    ///
+    /// Fields left unchanged in the patch are not sent. Fields explicitly set
+    /// to `nil` are cleared in the app-server configuration.
+    ///
+    /// - Parameter patch: The configuration fields to update.
+    /// - Throws: A transport, JSON-RPC, or app-server configuration error.
+    public func updateConfiguration(_ patch: CodexConfigurationPatch) async throws {
+        var edits: [AppServerAPI.Config.Edit] = []
+        if patch.updatesReviewModel {
+            edits.append(.init(
+                keyPath: "review_model",
+                value: patch.reviewModel.map(AppServerAPI.Config.Value.string) ?? .null
+            ))
+        }
+        if patch.updatesReasoningEffort {
+            edits.append(.init(
+                keyPath: "model_reasoning_effort",
+                value: patch.reasoningEffort.map { .string($0.rawValue) } ?? .null
+            ))
+        }
+        if patch.updatesServiceTier {
+            edits.append(.init(
+                keyPath: "service_tier",
+                value: patch.serviceTier.map(AppServerAPI.Config.Value.string) ?? .null
+            ))
+        }
+        guard edits.isEmpty == false else {
+            return
+        }
+        let _: AppServerAPI.Config.BatchWrite.Response = try await client.send(
+            AppServerAPI.Config.BatchWrite.Request(params: .init(edits: edits))
+        )
+    }
+
+    /// Reads Codex account rate-limit information.
+    ///
+    /// - Returns: Current plan type and rate-limit windows reported by the app-server.
+    /// - Throws: A transport, JSON-RPC, or app-server request error.
+    public func rateLimits() async throws -> CodexRateLimits {
+        let response = try await client.send(AppServerAPI.Account.RateLimits.Read.Request())
+        return .init(appServer: response)
+    }
+
+    /// Starts an API-key login flow.
+    ///
+    /// - Parameter apiKey: The OpenAI API key to register with Codex.
+    /// - Returns: The login handle reported by the app-server.
+    /// - Throws: A transport, JSON-RPC, or app-server login error.
+    @discardableResult
+    public func loginAPIKey(_ apiKey: String) async throws -> CodexLoginHandle {
+        let response = try await client.send(
+            AppServerAPI.Account.Login.Start.Request(
+                params: .init(type: "apiKey", apiKey: apiKey)
+            ))
+        return try Self.loginHandle(from: response)
+    }
+
+    /// Starts a ChatGPT browser login flow.
+    ///
+    /// - Returns: A login handle containing the browser authentication URL.
+    /// - Throws: A transport, JSON-RPC, or app-server login error.
+    public func loginChatGPT() async throws -> CodexLoginHandle {
+        let response = try await client.send(
+            AppServerAPI.Account.Login.Start.Request(
+                params: .init(type: "chatgpt")
+            ))
+        return try Self.loginHandle(from: response)
+    }
+
+    /// Starts a ChatGPT device-code login flow.
+    ///
+    /// - Returns: A login handle containing device-code instructions.
+    /// - Throws: A transport, JSON-RPC, or app-server login error.
+    public func loginChatGPTDeviceCode() async throws -> CodexLoginHandle {
+        let response = try await client.send(
+            AppServerAPI.Account.Login.Start.Request(
+                params: .init(type: "chatgptDeviceCode")
+            ))
+        return try Self.loginHandle(from: response)
+    }
+
+    /// Cancels a pending login flow.
+    ///
+    /// Handles without an app-server login identifier are treated as already complete.
+    ///
+    /// - Parameter handle: The login handle returned from a login-start method.
+    /// - Throws: A transport, JSON-RPC, or app-server login error.
+    public func cancelLogin(_ handle: CodexLoginHandle) async throws {
+        guard let id = handle.id else {
+            return
+        }
+        try await cancelLogin(id: id)
+    }
+
+    /// Cancels a pending login flow by identifier.
+    ///
+    /// - Parameter id: The app-server login identifier.
+    /// - Throws: A transport, JSON-RPC, or app-server login error.
+    public func cancelLogin(id: CodexLoginHandle.ID) async throws {
+        let _: AppServerAPI.Account.Login.Cancel.Response = try await client.send(
+            AppServerAPI.Account.Login.Cancel.Request(params: .init(loginID: id.rawValue))
+        )
+    }
+
+    /// Logs out of the active Codex account.
+    ///
+    /// - Throws: A transport, JSON-RPC, or app-server request error.
+    public func logout() async throws {
+        let _: EmptyResponse = try await client.send(AppServerAPI.Account.Logout.Request())
+    }
+
+    private func threadStartParams(options: CodexThread.Options) -> AppServerAPI.Thread.Start.Params {
+        .init(
+            model: options.model,
+            modelProvider: options.modelProvider,
+            ephemeral: options.ephemeral,
+            approvalPolicy: options.approvalMode?.approvalPolicy,
+            approvalsReviewer: options.approvalMode?.approvalsReviewer,
+            sandbox: options.sandbox?.threadSandboxValue,
+            serviceName: options.serviceName,
+            serviceTier: options.serviceTier,
+            personality: options.personality?.rawValue,
+            config: options.config?.mapValues(\.appServerJSONValue),
+            permissions: options.permissions?.appServerPermissions,
+            sessionStartSource: options.sessionStartSource?.appServerSource,
+            threadSource: options.threadSource?.appServerSource
+        )
+    }
+
+    private func thread(from snapshot: AppServerAPI.Thread.Snapshot, model: String? = nil) -> CodexThread {
+        CodexThread(
+            id: .init(rawValue: snapshot.id),
+            workspace: snapshot.cwd.map { URL(fileURLWithPath: $0, isDirectory: true) },
+            model: model,
+            client: client,
+            router: router
+        )
+    }
+
+    private func rememberReviewCleanupIdentity(_ identity: CodexReviewIdentity) {
+        let sourceThreadID = identity.sourceThreadID
+        if retainedReviewCleanupIdentitiesBySourceThreadID[sourceThreadID, default: []]
+            .contains(identity) == false {
+            retainedReviewCleanupIdentitiesBySourceThreadID[sourceThreadID, default: []].append(identity)
+        }
+    }
+
+    private func rememberReviewCleanupIdentity(
+        for cancellation: CodexTurnCancellation,
+        sourceIdentity: CodexReviewIdentity,
+        model: String?
+    ) {
+        let cancelledIdentity = Self.reviewCleanupIdentity(
+            for: cancellation,
+            sourceIdentity: sourceIdentity,
+            model: model
+        )
+        rememberReviewCleanupIdentity(cancelledIdentity)
+    }
+
+    private func discardReviewRestartContexts(sourceThreadID: CodexThreadID) {
+        reviewRestartContextsByTokenID = reviewRestartContextsByTokenID.filter { _, context in
+            context.interruptedIdentity.sourceThreadID != sourceThreadID
+        }
+    }
+
+    private func startThreadIgnoringCallerCancellation(
+        in workspace: URL,
+        instructions: CodexInstructions?,
+        options: CodexThread.Options
+    ) async throws -> CodexThread {
+        try await Task.detached { [self] in
+            try await startThread(
+                in: workspace,
+                instructions: instructions,
+                options: options
+            )
+        }.value
+    }
+
+    private func startReviewIgnoringCallerCancellation(
+        thread: CodexThread,
+        target: CodexReviewTarget,
+        delivery: CodexReviewDelivery,
+        transcriptErrorHandlingPolicy: CodexTranscriptErrorHandlingPolicy
+    ) async throws -> CodexReviewSession {
+        try await Task.detached {
+            try await thread.startReview(
+                target: target,
+                delivery: delivery,
+                transcriptErrorHandlingPolicy: transcriptErrorHandlingPolicy
+            )
+        }.value
+    }
+
+    private func deleteThreadIgnoringCallerCancellation(_ id: CodexThreadID) async {
+        await Task.detached { [self] in
+            try? await deleteThread(id)
+        }.value
+    }
+
+    private func cleanupReviewIgnoringCallerCancellation(_ identity: CodexReviewIdentity) async {
+        await Task.detached { [self] in
+            await cleanupReview(identity)
+        }.value
+    }
+
+    private nonisolated static func reviewCleanupIdentity(
+        for cancellation: CodexTurnCancellation,
+        sourceIdentity: CodexReviewIdentity,
+        model: String?
+    ) -> CodexReviewIdentity {
+        CodexReviewIdentity(
+            threadID: sourceIdentity.sourceThreadID,
+            turnID: cancellation.turnID ?? sourceIdentity.turnID,
+            reviewThreadID: cancellation.threadID == sourceIdentity.sourceThreadID ? nil : cancellation.threadID,
+            model: model ?? sourceIdentity.model
+        )
+    }
+
+    private nonisolated static func orderedReviewCleanupThreadIDs(
+        sourceThreadID: CodexThreadID,
+        sequences: [[CodexThreadID]]
+    ) -> [CodexThreadID] {
+        var seen: Set<CodexThreadID> = []
+        var threadIDs: [CodexThreadID] = []
+        for sequence in sequences {
+            for threadID in sequence where threadID != sourceThreadID && seen.insert(threadID).inserted {
+                threadIDs.append(threadID)
+            }
+        }
+        if seen.insert(sourceThreadID).inserted {
+            threadIDs.append(sourceThreadID)
+        }
+        return threadIDs
+    }
+
+    package nonisolated static func threadSnapshot(
+        from snapshot: AppServerAPI.Thread.Snapshot
+    ) -> CodexThreadSnapshot {
+        .init(
+            id: .init(rawValue: snapshot.id),
+            workspace: snapshot.cwd.map { URL(fileURLWithPath: $0, isDirectory: true) },
+            name: snapshot.name,
+            preview: snapshot.preview,
+            turns: (snapshot.turns ?? []).map {
+                CodexTurnSnapshot(
+                    id: .init(rawValue: $0.id),
+                    status: $0.status.map(CodexTurnStatus.init(rawValue:)),
+                    errorMessage: $0.error?.message,
+                    items: AppServerThreadItemMapping.threadItems(from: $0.items)
+                )
+            }
+        )
+    }
+
+    private nonisolated static func account(from snapshot: AppServerAPI.Account.Snapshot) -> CodexAccount {
+        .init(
+            id: snapshot.id,
+            kind: .init(rawValue: snapshot.kind.rawValue) ?? .chatGPT,
+            label: snapshot.label,
+            planType: snapshot.planType
+        )
+    }
+
+    private nonisolated static func loginHandle(
+        from response: AppServerAPI.Account.Login.Response
+    ) throws -> CodexLoginHandle {
+        switch response {
+        case .apiKey:
+            return .apiKey
+        case .chatgpt(let loginID, let authURL):
+            guard let url = URL(string: authURL) else {
+                throw CodexAppServerError.jsonRPC(
+                    code: -32602, message: "Invalid ChatGPT authentication URL.")
+            }
+            return .chatGPT(id: .init(rawValue: loginID), authenticationURL: url)
+        case .chatgptDeviceCode(let loginID, let verificationURL, let userCode):
+            guard let url = URL(string: verificationURL) else {
+                throw CodexAppServerError.jsonRPC(
+                    code: -32602, message: "Invalid ChatGPT device-code verification URL.")
+            }
+            return .chatGPTDeviceCode(
+                id: .init(rawValue: loginID),
+                verificationURL: url,
+                userCode: userCode
+            )
+        case .chatgptAuthTokens:
+            return .apiKey
+        }
+    }
+
+    private nonisolated static func accountEvent(
+        from notification: JSONRPC.Notification
+    ) -> CodexAccountEvent? {
+        switch notification.method {
+        case "account/login/completed":
+            do {
+                let payload = try JSONDecoder().decode(
+                    AppServerAccountLoginCompletedNotification.self,
+                    from: notification.params
+                )
+                return .loginCompleted(.init(
+                    loginID: payload.loginID.map(CodexLoginHandle.ID.init(rawValue:)),
+                    success: payload.success,
+                    error: payload.error
+                ))
+            } catch {
+                return .malformed(method: notification.method, message: error.localizedDescription)
+            }
+        case "account/updated":
+            return .accountUpdated
+        case "account/rateLimits/updated":
+            do {
+                let payload = try JSONDecoder().decode(
+                    AppServerAccountRateLimitsUpdatedNotification.self,
+                    from: notification.params
+                )
+                guard AppServerAPI.Account.RateLimits.Response
+                    .isCodexRateLimit(payload.rateLimits.limitID)
+                else {
+                    return nil
+                }
+                return .rateLimitsUpdated(.init(
+                    appServer: .init(rateLimits: payload.rateLimits)
+                ))
+            } catch {
+                return .malformed(method: notification.method, message: error.localizedDescription)
+            }
+        case let method where method.hasPrefix("account/"):
+            return .unknown(.init(method: notification.method, params: notification.params))
+        default:
+            return nil
+        }
+    }
+
+}
+
+private struct CodexReviewRestartContext: Sendable {
+    var interruptedIdentity: CodexReviewIdentity
+    var rollbackThreadID: CodexThreadID
+    var rollbackModel: String?
+    var rollbackCompleted: Bool = false
+    var isRestarting: Bool = false
+}
+
+private struct AppServerAccountLoginCompletedNotification: Decodable, Equatable, Sendable {
+    var error: String?
+    var loginID: String?
+    var success: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case error
+        case loginID = "loginId"
+        case success
+    }
+}
+
+private struct AppServerAccountRateLimitsUpdatedNotification: Decodable, Equatable, Sendable {
+    var rateLimits: AppServerAPI.Account.RateLimits.Snapshot
+}
