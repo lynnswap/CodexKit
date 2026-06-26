@@ -237,13 +237,27 @@ public final class CodexChat: CodexObservableModel {
     }
 
     package func apply(_ snapshot: CodexThreadSnapshot, workspace: CodexWorkspace?) {
-        self.workspace = workspace
-        name = snapshot.name
-        preview = snapshot.preview
-        modelProvider = snapshot.modelProvider
-        createdAt = snapshot.createdAt
-        updatedAt = snapshot.updatedAt
-        ephemeral = snapshot.ephemeral
+        if snapshot.hasField(.workspace) {
+            self.workspace = workspace
+        }
+        if snapshot.hasField(.name) {
+            name = snapshot.name
+        }
+        if snapshot.hasField(.preview) {
+            preview = snapshot.preview
+        }
+        if snapshot.hasField(.modelProvider) {
+            modelProvider = snapshot.modelProvider
+        }
+        if snapshot.hasField(.createdAt) {
+            createdAt = snapshot.createdAt
+        }
+        if snapshot.hasField(.updatedAt) {
+            updatedAt = snapshot.updatedAt
+        }
+        if snapshot.hasField(.ephemeral) {
+            ephemeral = snapshot.ephemeral
+        }
         if let turns = snapshot.turns {
             if snapshot.turnItemsAreAuthoritative {
                 replaceTurns(with: turns)

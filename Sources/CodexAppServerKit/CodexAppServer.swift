@@ -949,8 +949,36 @@ public actor CodexAppServer {
             updatedAt: snapshot.updatedAt.map { Date(timeIntervalSince1970: TimeInterval($0)) },
             ephemeral: snapshot.ephemeral,
             turns: turnSnapshots(from: snapshot.turns, includesTurns: includesTurns),
-            turnItemsAreAuthoritative: includesTurns
+            turnItemsAreAuthoritative: includesTurns,
+            presentFields: threadSnapshotPresentFields(from: snapshot)
         )
+    }
+
+    private nonisolated static func threadSnapshotPresentFields(
+        from snapshot: AppServerAPI.Thread.Snapshot
+    ) -> Set<CodexThreadSnapshot.Field> {
+        var fields: Set<CodexThreadSnapshot.Field> = []
+        for field in snapshot.presentFields {
+            switch field {
+            case .cwd:
+                fields.insert(.workspace)
+            case .name:
+                fields.insert(.name)
+            case .preview:
+                fields.insert(.preview)
+            case .modelProvider:
+                fields.insert(.modelProvider)
+            case .createdAt:
+                fields.insert(.createdAt)
+            case .updatedAt:
+                fields.insert(.updatedAt)
+            case .ephemeral:
+                fields.insert(.ephemeral)
+            case .turns:
+                fields.insert(.turns)
+            }
+        }
+        return fields
     }
 
     private nonisolated static func turnSnapshots(

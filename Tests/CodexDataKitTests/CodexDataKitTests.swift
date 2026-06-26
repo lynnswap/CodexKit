@@ -342,6 +342,41 @@ struct CodexModelContextTests {
         #expect(staleChat.workspace == nil)
     }
 
+    @Test("one-shot chat fetch notifies registered results after pruning stale chats")
+    func oneShotChatFetchNotifiesRegisteredResultsAfterPruningStaleChats() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspace = temporaryDirectory()
+        let initialPage = CodexThreadPage(threads: [
+            .init(id: "thread-stale", workspace: workspace, name: "Stale")
+        ])
+
+        try await runtime.transport.enqueueThreadList(initialPage)
+        let workspaceResults = context.fetchedResults(for: CodexFetchRequest<CodexWorkspace>.workspaces)
+        try await workspaceResults.performFetch()
+
+        try await runtime.transport.enqueueThreadList(initialPage)
+        let chatResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            sortDescriptors: [.name()]
+        ))
+        try await chatResults.performFetch()
+
+        try await runtime.transport.enqueueThreadList(initialPage)
+        let groupResults = context.fetchedResults(
+            for: CodexFetchRequest<CodexWorkspaceGroup>.workspaceGroups
+        )
+        try await groupResults.performFetch()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: []))
+        _ = try await context.fetch(CodexFetchRequest<CodexChat>.recentChats)
+
+        #expect(chatResults.items.isEmpty)
+        #expect(workspaceResults.items.isEmpty)
+        #expect(workspaceResults.sections.isEmpty)
+        #expect(groupResults.items.isEmpty)
+        #expect(groupResults.sections.isEmpty)
+    }
+
     @Test("workspace chats preserve fetched chat order")
     func workspaceChatsPreserveFetchedChatOrder() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -2431,12 +2466,17 @@ struct CodexModelContextTests {
     func metadataOnlyRefreshPreservesTurns() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+        let updatedAt = Date(timeIntervalSince1970: 1_000)
 
         try await runtime.transport.enqueueThreadList(
             .init(threads: [
                 .init(
                     id: "thread-refresh",
+                    workspace: workspaceURL,
                     name: "Before",
+                    modelProvider: "openai",
+                    updatedAt: updatedAt,
                     turns: [.init(id: "turn-refresh", status: .running)]
                 )
             ]))
@@ -2457,6 +2497,9 @@ struct CodexModelContextTests {
         try await chat.refresh(includeTurns: false)
 
         #expect(chat.title == "After")
+        #expect(chat.workspace?.url == workspaceURL)
+        #expect(chat.modelProvider == "openai")
+        #expect(chat.updatedAt == updatedAt)
         #expect(chat.turns.first === turn)
         #expect(turn.status == CodexTurnStatus.running)
 

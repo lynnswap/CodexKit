@@ -590,6 +590,56 @@ struct CodexAppServerKitTests {
         #expect(publicSnapshot == summarySnapshot)
     }
 
+    @Test func threadSnapshotsTrackOmittedAndNullFields() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueJSON(
+            """
+            {
+              "data": [
+                {
+                  "id": "thread-partial",
+                  "name": null,
+                  "updatedAt": 1000
+                }
+              ]
+            }
+            """,
+            for: "thread/list"
+        )
+        let client = AppServerClient(transport: transport)
+        let server = CodexAppServer(
+            client: client,
+            router: CodexAppServerNotificationRouter(client: client)
+        )
+
+        let page = try await server.listThreads()
+        let snapshot = try #require(page.threads.first)
+
+        #expect(snapshot.hasField(.name))
+        #expect(snapshot.name == nil)
+        #expect(snapshot.hasField(.updatedAt))
+        #expect(snapshot.updatedAt == Date(timeIntervalSince1970: 1000))
+        #expect(!snapshot.hasField(.workspace))
+        #expect(!snapshot.hasField(.modelProvider))
+    }
+
+    @Test func threadSnapshotEncodingPreservesPresentNullFields() throws {
+        let snapshot = AppServerAPI.Thread.Snapshot(
+            id: "thread-partial",
+            name: nil,
+            updatedAt: nil,
+            presentFields: [.name, .updatedAt]
+        )
+
+        let data = try JSONEncoder().encode(snapshot)
+        let object = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+
+        #expect(object["id"] as? String == "thread-partial")
+        #expect(object["name"] is NSNull)
+        #expect(object["updatedAt"] is NSNull)
+        #expect(object["cwd"] == nil)
+    }
+
     @Test func threadReadUsesIncludeTurnsToInterpretEmptyTurns() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueue(

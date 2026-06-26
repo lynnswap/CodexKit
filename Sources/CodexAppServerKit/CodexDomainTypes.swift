@@ -1042,6 +1042,17 @@ package struct CodexTurn: Identifiable, Sendable {
 }
 
 public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
+    package enum Field: String, Hashable, Sendable {
+        case workspace
+        case name
+        case preview
+        case modelProvider
+        case createdAt
+        case updatedAt
+        case ephemeral
+        case turns
+    }
+
     public var id: CodexThreadID
     public var workspace: URL?
     public var name: String?
@@ -1052,6 +1063,7 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
     public var ephemeral: Bool?
     public var turns: [CodexTurnSnapshot]?
     package var turnItemsAreAuthoritative: Bool
+    package var presentFields: Set<Field>
 
     public static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.id == rhs.id
@@ -1086,7 +1098,17 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
             updatedAt: updatedAt,
             ephemeral: ephemeral,
             turns: turns,
-            turnItemsAreAuthoritative: turns != nil
+            turnItemsAreAuthoritative: turns != nil,
+            presentFields: Self.presentFields(
+                workspace: workspace,
+                name: name,
+                preview: preview,
+                modelProvider: modelProvider,
+                createdAt: createdAt,
+                updatedAt: updatedAt,
+                ephemeral: ephemeral,
+                turns: turns
+            )
         )
     }
 
@@ -1100,7 +1122,8 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
         updatedAt: Date? = nil,
         ephemeral: Bool? = nil,
         turns: [CodexTurnSnapshot]? = nil,
-        turnItemsAreAuthoritative: Bool
+        turnItemsAreAuthoritative: Bool,
+        presentFields: Set<Field>? = nil
     ) {
         self.id = id
         self.workspace = workspace
@@ -1112,6 +1135,58 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
         self.ephemeral = ephemeral
         self.turns = turns
         self.turnItemsAreAuthoritative = turnItemsAreAuthoritative
+        self.presentFields = presentFields ?? Self.presentFields(
+            workspace: workspace,
+            name: name,
+            preview: preview,
+            modelProvider: modelProvider,
+            createdAt: createdAt,
+            updatedAt: updatedAt,
+            ephemeral: ephemeral,
+            turns: turns
+        )
+    }
+
+    package func hasField(_ field: Field) -> Bool {
+        presentFields.contains(field)
+    }
+
+    private static func presentFields(
+        workspace: URL?,
+        name: String?,
+        preview: String?,
+        modelProvider: String?,
+        createdAt: Date?,
+        updatedAt: Date?,
+        ephemeral: Bool?,
+        turns: [CodexTurnSnapshot]?
+    ) -> Set<Field> {
+        var fields: Set<Field> = []
+        if workspace != nil {
+            fields.insert(.workspace)
+        }
+        if name != nil {
+            fields.insert(.name)
+        }
+        if preview != nil {
+            fields.insert(.preview)
+        }
+        if modelProvider != nil {
+            fields.insert(.modelProvider)
+        }
+        if createdAt != nil {
+            fields.insert(.createdAt)
+        }
+        if updatedAt != nil {
+            fields.insert(.updatedAt)
+        }
+        if ephemeral != nil {
+            fields.insert(.ephemeral)
+        }
+        if turns != nil {
+            fields.insert(.turns)
+        }
+        return fields
     }
 }
 
