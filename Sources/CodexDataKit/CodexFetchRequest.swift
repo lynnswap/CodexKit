@@ -282,7 +282,7 @@ public final class CodexFetchedResults<Model: CodexObservableModel> {
         lastErrorDescription = nil
         do {
             let page = try await modelContext.fetchPage(request, excluding: self)
-            let newItems = appending ? append(page.items, to: items) : page.items
+            let newItems = loadedItems(from: page, appending: appending)
             items = newItems
             let relationshipRequest = appending ? self.request : request
             await modelContext.syncLoadedRelationships(
@@ -301,6 +301,19 @@ public final class CodexFetchedResults<Model: CodexObservableModel> {
             phase = .failed(message)
             throw error
         }
+    }
+
+    private func loadedItems(
+        from page: CodexFetchPage<Model>,
+        appending: Bool
+    ) -> [Model] {
+        guard appending else {
+            return page.items
+        }
+        if page.relationshipIsComplete == true, let authoritativeItems = page.relationshipItems {
+            return Array(authoritativeItems.prefix(items.count + page.items.count))
+        }
+        return append(page.items, to: items)
     }
 
     private func append(_ incoming: [Model], to existing: [Model]) -> [Model] {

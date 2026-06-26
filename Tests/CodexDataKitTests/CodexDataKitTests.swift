@@ -279,6 +279,32 @@ struct CodexModelContextTests {
         #expect(results.nextCursor == nil)
     }
 
+    @Test("local paged chat load reconciles stale loaded items")
+    func localPagedChatLoadReconcilesStaleLoadedItems() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspace = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-alpha", workspace: workspace, name: "Alpha"),
+            .init(id: "thread-zulu", workspace: workspace, name: "Zulu"),
+        ]))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            sortDescriptors: [.name()],
+            fetchLimit: 1
+        ))
+        try await results.performFetch()
+        #expect(results.items.map(\.title) == ["Alpha"])
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-beta", workspace: workspace, name: "Beta"),
+            .init(id: "thread-zulu", workspace: workspace, name: "Zulu"),
+        ]))
+        try await results.loadNextPage()
+
+        #expect(results.items.map(\.title) == ["Beta", "Zulu"])
+    }
+
     @Test("name-sorted chat pages prune stale workspace relationships from full local results")
     func nameSortedChatPagesPruneStaleWorkspaceRelationshipsFromFullLocalResults() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -1131,6 +1157,34 @@ struct CodexModelContextTests {
         #expect(requests.count == 2)
     }
 
+    @Test("local paged workspace load reconciles stale loaded items")
+    func localPagedWorkspaceLoadReconcilesStaleLoadedItems() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let firstWorkspace = temporaryDirectory().appendingPathComponent("Alpha", isDirectory: true)
+        let secondWorkspace = temporaryDirectory().appendingPathComponent("Beta", isDirectory: true)
+        let thirdWorkspace = temporaryDirectory().appendingPathComponent("Zulu", isDirectory: true)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-alpha", workspace: firstWorkspace, name: "Alpha"),
+            .init(id: "thread-zulu", workspace: thirdWorkspace, name: "Zulu"),
+        ]))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexWorkspace>(
+            sortDescriptors: [.name()],
+            fetchLimit: 1
+        ))
+        try await results.performFetch()
+        #expect(results.items.map(\.name) == ["Alpha"])
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-beta", workspace: secondWorkspace, name: "Beta"),
+            .init(id: "thread-zulu", workspace: thirdWorkspace, name: "Zulu"),
+        ]))
+        try await results.loadNextPage()
+
+        #expect(results.items.map(\.name) == ["Beta", "Zulu"])
+    }
+
     @Test("workspace regrouping removes it from previous group")
     func workspaceRegroupingRemovesItFromPreviousGroup() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -1332,6 +1386,37 @@ struct CodexModelContextTests {
         #expect(await runtime.transport.recordedRequests(method: "thread/list").count == 2)
     }
 
+    @Test("local paged group load reconciles stale loaded items")
+    func localPagedGroupLoadReconcilesStaleLoadedItems() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let alphaRepo = try gitRepository(named: "Alpha")
+        let betaRepo = try gitRepository(named: "Beta")
+        let zuluRepo = try gitRepository(named: "Zulu")
+        let alpha = try createDirectory("App", in: alphaRepo)
+        let beta = try createDirectory("App", in: betaRepo)
+        let zulu = try createDirectory("App", in: zuluRepo)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-alpha", workspace: alpha, name: "Alpha"),
+            .init(id: "thread-zulu", workspace: zulu, name: "Zulu"),
+        ]))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexWorkspaceGroup>(
+            sortDescriptors: [.name()],
+            fetchLimit: 1
+        ))
+        try await results.performFetch()
+        #expect(results.items.map(\.name) == ["Alpha"])
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-beta", workspace: beta, name: "Beta"),
+            .init(id: "thread-zulu", workspace: zulu, name: "Zulu"),
+        ]))
+        try await results.loadNextPage()
+
+        #expect(results.items.map(\.name) == ["Beta", "Zulu"])
+    }
+
     @Test("server paginated chat fetches preserve existing workspace relationships")
     func serverPaginatedChatFetchesPreserveExistingWorkspaceRelationships() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -1355,6 +1440,29 @@ struct CodexModelContextTests {
         try await chatResults.performFetch()
 
         #expect(Set(fetchedWorkspace.chats.map(\.id.rawValue)) == ["thread-existing", "thread-new"])
+    }
+
+    @Test("server paginated chat appends preserve previously loaded items")
+    func serverPaginatedChatAppendsPreservePreviouslyLoadedItems() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspace = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(
+            threads: [
+                .init(id: "thread-existing", workspace: workspace, name: "Existing")
+            ],
+            nextCursor: "server-next"
+        ))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>.recentChats)
+        try await results.performFetch()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-new", workspace: workspace, name: "New")
+        ]))
+        try await results.loadNextPage()
+
+        #expect(results.items.map(\.id.rawValue) == ["thread-existing", "thread-new"])
     }
 
     @Test("fully loaded paginated chat fetches prune stale workspace relationships")

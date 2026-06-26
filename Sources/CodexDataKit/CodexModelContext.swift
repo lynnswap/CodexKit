@@ -282,7 +282,9 @@ public final class CodexModelContext: @unchecked Sendable {
             return CodexFetchPage(
                 items: page.items.map { $0 as! Model },
                 nextCursor: page.nextCursor,
-                backwardsCursor: page.backwardsCursor
+                backwardsCursor: page.backwardsCursor,
+                relationshipItems: page.relationshipItems?.map { $0 as! Model },
+                relationshipIsComplete: page.relationshipIsComplete
             )
         }
         if Model.self == CodexWorkspaceGroup.self {
@@ -293,7 +295,9 @@ public final class CodexModelContext: @unchecked Sendable {
             return CodexFetchPage(
                 items: page.items.map { $0 as! Model },
                 nextCursor: page.nextCursor,
-                backwardsCursor: page.backwardsCursor
+                backwardsCursor: page.backwardsCursor,
+                relationshipItems: page.relationshipItems?.map { $0 as! Model },
+                relationshipIsComplete: page.relationshipIsComplete
             )
         }
         throw CodexModelContextError.unsupportedModelType(String(describing: Model.self))
@@ -417,7 +421,15 @@ public final class CodexModelContext: @unchecked Sendable {
             archivedScope: request.filter.archived
         )
         await removeChatsFromRegisteredResults(removedChats, excluding: excludedRegistration)
-        return localPage(sort(workspaces, using: request.sortDescriptors), for: request)
+        let sortedWorkspaces = sort(workspaces, using: request.sortDescriptors)
+        let page = localPage(sortedWorkspaces, for: request)
+        return CodexFetchPage(
+            items: page.items,
+            nextCursor: page.nextCursor,
+            backwardsCursor: page.backwardsCursor,
+            relationshipItems: sortedWorkspaces,
+            relationshipIsComplete: true
+        )
     }
 
     private func fetchWorkspaceGroupPage(
@@ -451,7 +463,15 @@ public final class CodexModelContext: @unchecked Sendable {
             preservingExisting: preservingGroupWorkspaces,
             archivedScope: request.filter.archived
         )
-        return localPage(sort(groups, using: request.sortDescriptors), for: request)
+        let sortedGroups = sort(groups, using: request.sortDescriptors)
+        let page = localPage(sortedGroups, for: request)
+        return CodexFetchPage(
+            items: page.items,
+            nextCursor: page.nextCursor,
+            backwardsCursor: page.backwardsCursor,
+            relationshipItems: sortedGroups,
+            relationshipIsComplete: true
+        )
     }
 
     private func applyFetchedSnapshots(
