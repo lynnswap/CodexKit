@@ -516,6 +516,7 @@ public final class CodexModelContext: @unchecked Sendable {
             workspaces = Array(workspacesByID.values)
         }
         for workspace in workspaces {
+            let previousChats = workspace.chats
             let fetchedChats = chats.filter { $0.workspace === workspace }
             if preservingExisting {
                 let fetchedIDs = Set(fetchedChats.map(\.id))
@@ -527,7 +528,14 @@ public final class CodexModelContext: @unchecked Sendable {
                     fetchedIDs.contains($0.id) == false
                         && shouldPreserve($0, outside: archivedScope)
                 }
-                workspace.setChats(fetchedChats + preservedChats)
+                let currentChats = fetchedChats + preservedChats
+                workspace.setChats(currentChats)
+                _ = detachStaleChats(
+                    previousChats,
+                    from: workspace,
+                    keeping: currentChats,
+                    archivedScope: archivedScope
+                )
                 pruneWorkspaceIfEmpty(workspace)
             }
         }

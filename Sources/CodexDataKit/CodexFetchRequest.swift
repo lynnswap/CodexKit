@@ -477,15 +477,21 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
     @discardableResult
     private func upsert(_ model: Model) -> Bool {
         var nextItems = items
+        let insertedModel: Bool
         if let index = nextItems.firstIndex(where: { $0.id == model.id }) {
             nextItems[index] = model
+            insertedModel = false
         } else {
             guard canInsertLiveModel else {
                 return false
             }
             nextItems.insert(model, at: 0)
+            insertedModel = true
         }
-        items = limitedItems(modelContext.sortedItems(nextItems, for: request))
+        items = loadedWindowItems(
+            modelContext.sortedItems(nextItems, for: request),
+            insertedModel: insertedModel
+        )
         sections = modelContext.sections(for: items, descriptor: request.sectionDescriptor)
         return true
     }
@@ -494,14 +500,20 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         canEvaluateFilterLocally
             && request.cursor == nil
             && nextCursor == nil
-            && backwardsCursor == nil
     }
 
-    private func limitedItems(_ models: [Model]) -> [Model] {
+    private func loadedWindowItems(_ models: [Model], insertedModel: Bool) -> [Model] {
         guard let fetchLimit = request.fetchLimit else {
             return models
         }
-        return Array(models.prefix(max(fetchLimit, 0)))
+        let loadedCount = items.count
+        let targetCount: Int
+        if insertedModel && (loadedCount < fetchLimit || loadedCount > fetchLimit) {
+            targetCount = loadedCount + 1
+        } else {
+            targetCount = loadedCount
+        }
+        return Array(models.prefix(max(targetCount, 0)))
     }
 
     private var shouldRefreshAfterLocalRemoval: Bool {

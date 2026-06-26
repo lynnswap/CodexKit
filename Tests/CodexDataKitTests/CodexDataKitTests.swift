@@ -419,6 +419,7 @@ struct CodexModelContextTests {
         let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>.recentChats)
         try await results.performFetch()
         let fetchedWorkspace = try #require(results.items.first?.workspace)
+        let staleChat = try #require(results.items.first { $0.id.rawValue == "thread-stale" })
 
         try await runtime.transport.enqueueThreadList(.init(threads: [
             .init(id: "thread-remaining", workspace: workspace, name: "Remaining")
@@ -426,6 +427,7 @@ struct CodexModelContextTests {
         try await results.refresh()
 
         #expect(fetchedWorkspace.chats.map(\.id.rawValue) == ["thread-remaining"])
+        #expect(staleChat.workspace == nil)
     }
 
     @Test("archived false chat refresh prunes stale workspace chats")
@@ -1918,6 +1920,87 @@ struct CodexModelContextTests {
 
         #expect(pagedResults.items.map(\.id.rawValue) == ["thread-new"])
         #expect(await runtime.transport.recordedRequests(method: "thread/list").count == 3)
+    }
+
+    @Test("loaded limited pages stay loaded after local revalidation")
+    func loadedLimitedPagesStayLoadedAfterLocalRevalidation() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-alpha", workspace: workspaceURL, name: "Alpha"),
+            .init(id: "thread-beta", workspace: workspaceURL, name: "Beta"),
+        ]))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            sortDescriptors: [.name()],
+            fetchLimit: 1
+        ))
+        try await results.performFetch()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-alpha", workspace: workspaceURL, name: "Alpha"),
+            .init(id: "thread-beta", workspace: workspaceURL, name: "Beta"),
+        ]))
+        try await results.loadNextPage()
+        let beta = try #require(results.items.last)
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-beta"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-beta",
+            workspace: workspaceURL,
+            name: "Gamma"
+        ))
+        try await beta.refresh(includeTurns: false)
+
+        #expect(results.items.map(\.title) == ["Alpha", "Gamma"])
+    }
+
+    @Test("starting a chat extends fully loaded paged results")
+    func startingChatExtendsFullyLoadedPagedResults() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+        let older = Date(timeIntervalSince1970: 1_000)
+        let newer = Date(timeIntervalSince1970: 2_000)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-newer", workspace: workspaceURL, name: "Newer", updatedAt: newer)
+        ]))
+        let workspaceResults = context.fetchedResults(for: CodexFetchRequest<CodexWorkspace>.workspaces)
+        try await workspaceResults.performFetch()
+        let workspace = try #require(workspaceResults.items.first)
+
+        try await runtime.transport.enqueueThreadList(.init(
+            threads: [
+                .init(id: "thread-newer", workspace: workspaceURL, name: "Newer", updatedAt: newer)
+            ],
+            nextCursor: "page-2"
+        ))
+        let pagedResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            sortDescriptors: [.updatedAt(.reverse)],
+            fetchLimit: 1
+        ))
+        try await pagedResults.performFetch()
+
+        try await runtime.transport.enqueueThreadList(.init(
+            threads: [
+                .init(id: "thread-older", workspace: workspaceURL, name: "Older", updatedAt: older)
+            ],
+            backwardsCursor: "page-1"
+        ))
+        try await pagedResults.loadNextPage()
+        let listRequestCount = await runtime.transport.recordedRequests(method: "thread/list").count
+
+        try await runtime.transport.enqueueThreadStart(threadID: "thread-started")
+        _ = try await workspace.startChat()
+
+        #expect(pagedResults.items.map(\.id.rawValue) == [
+            "thread-started",
+            "thread-newer",
+            "thread-older",
+        ])
+        #expect(await runtime.transport.recordedRequests(method: "thread/list").count == listRequestCount)
     }
 
     @Test("archiving a chat moves it between active fetched results")
