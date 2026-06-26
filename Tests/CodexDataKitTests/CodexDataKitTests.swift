@@ -614,6 +614,34 @@ struct CodexModelContextTests {
         #expect(activeResults.items.isEmpty)
     }
 
+    @Test("archived fetch revalidates active fetched result membership")
+    func archivedFetchRevalidatesActiveFetchedResultMembership() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-archive", workspace: workspaceURL, name: "Archive")
+        ]))
+        let activeResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>.recentChats)
+        try await activeResults.performFetch()
+        let chat = try #require(activeResults.items.first)
+        #expect(chat.isArchived == false)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-archive", workspace: workspaceURL, name: "Archive")
+        ]))
+        let archivedResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            filter: .init(archived: true),
+            sortDescriptors: [.updatedAt(.reverse)]
+        ))
+        try await archivedResults.performFetch()
+
+        #expect(chat.isArchived)
+        #expect(activeResults.items.isEmpty)
+        #expect(archivedResults.items.first === chat)
+    }
+
     @Test("chat refresh preserves server-only filtered fetched results")
     func chatRefreshPreservesServerOnlyFilteredFetchedResults() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
