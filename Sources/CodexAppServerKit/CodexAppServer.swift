@@ -939,7 +939,8 @@ public actor CodexAppServer {
         from snapshot: AppServerAPI.Thread.Snapshot,
         includesTurns: Bool
     ) -> CodexThreadSnapshot {
-        .init(
+        let turns = turnSnapshots(from: snapshot.turns, includesTurns: includesTurns)
+        return .init(
             id: .init(rawValue: snapshot.id),
             workspace: snapshot.cwd.map { URL(fileURLWithPath: $0, isDirectory: true) },
             name: snapshot.name,
@@ -948,14 +949,15 @@ public actor CodexAppServer {
             createdAt: snapshot.createdAt.map { Date(timeIntervalSince1970: TimeInterval($0)) },
             updatedAt: snapshot.updatedAt.map { Date(timeIntervalSince1970: TimeInterval($0)) },
             ephemeral: snapshot.ephemeral,
-            turns: turnSnapshots(from: snapshot.turns, includesTurns: includesTurns),
+            turns: turns,
             turnItemsAreAuthoritative: includesTurns,
-            presentFields: threadSnapshotPresentFields(from: snapshot)
+            presentFields: threadSnapshotPresentFields(from: snapshot, turns: turns)
         )
     }
 
     private nonisolated static func threadSnapshotPresentFields(
-        from snapshot: AppServerAPI.Thread.Snapshot
+        from snapshot: AppServerAPI.Thread.Snapshot,
+        turns: [CodexTurnSnapshot]?
     ) -> Set<CodexThreadSnapshot.Field> {
         var fields: Set<CodexThreadSnapshot.Field> = []
         for field in snapshot.presentFields {
@@ -975,8 +977,13 @@ public actor CodexAppServer {
             case .ephemeral:
                 fields.insert(.ephemeral)
             case .turns:
-                fields.insert(.turns)
+                if turns != nil {
+                    fields.insert(.turns)
+                }
             }
+        }
+        if turns != nil {
+            fields.insert(.turns)
         }
         return fields
     }
@@ -986,7 +993,7 @@ public actor CodexAppServer {
         includesTurns: Bool
     ) -> [CodexTurnSnapshot]? {
         guard let turns else {
-            return nil
+            return includesTurns ? [] : nil
         }
         guard includesTurns || turns.isEmpty == false else {
             return nil

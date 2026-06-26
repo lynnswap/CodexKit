@@ -2863,6 +2863,60 @@ struct CodexModelContextTests {
         #expect(chat.items.isEmpty)
     }
 
+    @Test("included reads without turns clear cached turns and items")
+    func includedReadsWithoutTurnsClearCachedTurnsAndItems() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(
+                id: "thread-omitted-read",
+                name: "Before",
+                turns: [
+                    .init(
+                        id: "turn-omitted-read",
+                        status: .completed,
+                        items: [
+                            .init(
+                                id: "message-omitted-read",
+                                kind: .agentMessage,
+                                content: .message(.init(
+                                    id: "message-omitted-read",
+                                    role: .assistant,
+                                    phase: .finalAnswer,
+                                    text: "Done"
+                                ))
+                            ),
+                        ]
+                    )
+                ]
+            )
+        ]))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>.recentChats)
+        try await results.performFetch()
+        let chat = try #require(results.items.first)
+        #expect(chat.turns.isEmpty == false)
+        #expect(chat.items.isEmpty == false)
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-omitted-read"))
+        try await runtime.transport.enqueueJSON(
+            """
+            {
+              "thread": {
+                "id": "thread-omitted-read",
+                "name": "After"
+              }
+            }
+            """,
+            for: "thread/read"
+        )
+        try await chat.refresh()
+
+        #expect(chat.title == "After")
+        #expect(chat.turns.isEmpty)
+        #expect(chat.items.isEmpty)
+    }
+
     @Test("chat refresh populates transcript items from turn history")
     func chatRefreshPopulatesTranscriptItemsFromTurnHistory() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()

@@ -661,7 +661,34 @@ struct CodexAppServerKitTests {
         let withTurns = try await thread.read(includeTurns: true)
 
         #expect(metadataOnly.turns == nil)
+        #expect(!metadataOnly.hasField(.turns))
         #expect(withTurns.turns == [])
+        #expect(withTurns.hasField(.turns))
+    }
+
+    @Test func threadReadTreatsOmittedTurnsAsEmptyWhenIncluded() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueJSON(
+            """
+            {
+              "thread": {
+                "id": "thread-empty"
+              }
+            }
+            """,
+            for: "thread/read"
+        )
+        let client = AppServerClient(transport: transport)
+        let thread = CodexThread(
+            id: .init(rawValue: "thread-empty"),
+            client: client,
+            router: CodexAppServerNotificationRouter(client: client)
+        )
+
+        let snapshot = try await thread.read(includeTurns: true)
+
+        #expect(snapshot.turns == [])
+        #expect(snapshot.hasField(.turns))
     }
 
     @Test func appServerArchiveThreadSerializesThreadID() async throws {
