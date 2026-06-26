@@ -81,9 +81,18 @@ public final class CodexModelContext: @unchecked Sendable {
             sortDescriptors: [.name()],
             sectionDescriptor: .workspaceGroup
         )
+        let previousChats = group.workspaces.flatMap(\.chats)
         let workspaces = try await fetch(request)
         group.setWorkspaces(workspaces.filter { $0.workspaceGroup?.id == group.id })
-        refreshWorkspaceGroupInRegisteredResults(group, archived: request.filter.archived == true)
+        let currentChatIDs = Set(group.workspaces.flatMap(\.chats).map(\.id))
+        let removedChats = previousChats.filter {
+            currentChatIDs.contains($0.id) == false && !$0.isArchived
+        }
+        refreshWorkspaceGroupInRegisteredResults(
+            group,
+            archived: request.filter.archived == true,
+            removedChats: removedChats
+        )
     }
 
     public func refresh(_ workspace: CodexWorkspace) async throws {
@@ -133,7 +142,8 @@ public final class CodexModelContext: @unchecked Sendable {
             workspace: thread.workspace,
             modelProvider: input.options.modelProvider,
             createdAt: now,
-            updatedAt: now
+            updatedAt: now,
+            ephemeral: input.options.ephemeral
         )
         let chat = apply(snapshot)
         chat.setArchived(false)
@@ -569,11 +579,12 @@ public final class CodexModelContext: @unchecked Sendable {
 
     private func refreshWorkspaceGroupInRegisteredResults(
         _ group: CodexWorkspaceGroup,
-        archived: Bool
+        archived: Bool,
+        removedChats: [CodexChat]
     ) {
         fetchedResults.removeAll { $0.value == nil }
         for registration in fetchedResults {
-            registration.value?.refresh(group, archived: archived)
+            registration.value?.refresh(group, archived: archived, removedChats: removedChats)
         }
     }
 

@@ -731,6 +731,44 @@ struct CodexModelContextTests {
         #expect(fetchedWorkspace.chats.map(\.id.rawValue) == ["thread-new", "thread-remaining"])
     }
 
+    @Test("cursor-started chat fetches never mark workspace relationships complete")
+    func cursorStartedChatFetchesNeverMarkWorkspaceRelationshipsComplete() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspace = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-before", workspace: workspace, name: "Before"),
+            .init(id: "thread-middle", workspace: workspace, name: "Middle"),
+        ]))
+        let allResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>.recentChats)
+        try await allResults.performFetch()
+        let fetchedWorkspace = try #require(allResults.items.first?.workspace)
+
+        try await runtime.transport.enqueueThreadList(.init(
+            threads: [
+                .init(id: "thread-middle", workspace: workspace, name: "Middle")
+            ],
+            nextCursor: "next"
+        ))
+        let cursorResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            sortDescriptors: [.updatedAt(.reverse)],
+            cursor: "cursor"
+        ))
+        try await cursorResults.performFetch()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-after", workspace: workspace, name: "After")
+        ]))
+        try await cursorResults.loadNextPage()
+
+        #expect(Set(fetchedWorkspace.chats.map(\.id.rawValue)) == [
+            "thread-before",
+            "thread-middle",
+            "thread-after",
+        ])
+    }
+
     @Test("group refresh rebuilds workspaces from fetched result")
     func groupRefreshRebuildsWorkspacesFromFetchedResult() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -753,6 +791,31 @@ struct CodexModelContextTests {
         ]))
         try await group.refresh()
 
+        #expect(group.workspaces.map(\.url) == [app])
+    }
+
+    @Test("group refresh removes stale chats from active fetched results")
+    func groupRefreshRemovesStaleChatsFromActiveFetchedResults() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let repo = try gitRepository()
+        let app = try createDirectory("App", in: repo)
+        let tools = try createDirectory("Tools", in: repo)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-app", workspace: app, name: "App"),
+            .init(id: "thread-tools", workspace: tools, name: "Tools"),
+        ]))
+        let chatResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>.recentChats)
+        try await chatResults.performFetch()
+        let group = try #require(chatResults.items.first?.workspace?.workspaceGroup)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-app", workspace: app, name: "App")
+        ]))
+        try await group.refresh()
+
+        #expect(chatResults.items.map(\.id.rawValue) == ["thread-app"])
         #expect(group.workspaces.map(\.url) == [app])
     }
 
@@ -1407,6 +1470,27 @@ struct CodexModelContextTests {
         let params = try request.decodeParams(ThreadStartParams.self)
         #expect(params.cwd == workspaceURL.path)
         #expect(params.model == "gpt-5")
+    }
+
+    @Test("workspace start chat exposes known ephemeral option")
+    func workspaceStartChatExposesKnownEphemeralOption() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(
+            .init(threads: [
+                .init(id: "thread-existing", workspace: workspaceURL, name: "Existing")
+            ]))
+        let workspaceResults = context.fetchedResults(
+            for: CodexFetchRequest<CodexWorkspace>.workspaces)
+        try await workspaceResults.performFetch()
+        let workspace = try #require(workspaceResults.items.first)
+
+        try await runtime.transport.enqueueThreadStart(threadID: "thread-ephemeral")
+        let chat = try await workspace.startChat(.init(options: .init(ephemeral: true)))
+
+        #expect(chat.ephemeral == true)
     }
 }
 

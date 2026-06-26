@@ -223,7 +223,7 @@ package protocol CodexFetchedResultsRegistration: AnyObject {
         group: CodexWorkspaceGroup?
     )
     func refresh(_ workspace: CodexWorkspace, archived: Bool, removedChats: [CodexChat])
-    func refresh(_ group: CodexWorkspaceGroup, archived: Bool)
+    func refresh(_ group: CodexWorkspaceGroup, archived: Bool, removedChats: [CodexChat])
 }
 
 @MainActor
@@ -275,7 +275,7 @@ public final class CodexFetchedResults<Model: CodexObservableModel> {
                 newItems,
                 request: relationshipRequest,
                 relationshipIsComplete: page.nextCursor == nil
-                    && (appending || request.cursor == nil)
+                    && relationshipRequest.cursor == nil
             )
             sections = modelContext.sections(for: newItems, descriptor: request.sectionDescriptor)
             nextCursor = page.nextCursor
@@ -377,9 +377,13 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         upsertLoadedModels(from: workspace)
     }
 
-    package func refresh(_ group: CodexWorkspaceGroup, archived: Bool) {
+    package func refresh(
+        _ group: CodexWorkspaceGroup,
+        archived: Bool,
+        removedChats: [CodexChat]
+    ) {
         guard refreshItems(archived: archived, keeping: {
-            shouldKeep($0, afterRefreshing: group)
+            shouldKeep($0, afterRefreshing: group, removedChats: removedChats)
         }) else {
             return
         }
@@ -574,8 +578,24 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
 
     private func shouldKeep(
         _ item: Model,
-        afterRefreshing group: CodexWorkspaceGroup
+        afterRefreshing group: CodexWorkspaceGroup,
+        removedChats: [CodexChat]
     ) -> Bool {
+        if let item = item as? CodexChat {
+            if removedChats.contains(where: { $0 === item }) {
+                return false
+            }
+            guard canEvaluateFilterLocally else {
+                return true
+            }
+            guard let workspace = item.workspace,
+                group.workspaces.contains(where: { $0 === workspace })
+            else {
+                return true
+            }
+            return workspace.chats.contains { $0 === item }
+                && shouldInclude(item, archived: item.isArchived)
+        }
         if let item = item as? CodexWorkspace,
             item.workspaceGroup?.id == group.id
         {
