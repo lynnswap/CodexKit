@@ -650,6 +650,35 @@ struct CodexModelContextTests {
         #expect(requests.count == 2)
     }
 
+    @Test("workspace regrouping removes it from previous group")
+    func workspaceRegroupingRemovesItFromPreviousGroup() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-regroup", workspace: workspaceURL, name: "Regroup")
+        ]))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexWorkspace>.workspaces)
+        try await results.performFetch()
+        let workspace = try #require(results.items.first)
+        let previousGroup = try #require(workspace.workspaceGroup)
+
+        try FileManager.default.createDirectory(
+            at: workspaceURL.appendingPathComponent(".git", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-regroup", workspace: workspaceURL, name: "Regroup")
+        ]))
+        try await results.performFetch()
+        let currentGroup = try #require(workspace.workspaceGroup)
+
+        #expect(currentGroup !== previousGroup)
+        #expect(previousGroup.workspaces.contains { $0 === workspace } == false)
+        #expect(currentGroup.workspaces.contains { $0 === workspace })
+    }
+
     @Test("paged workspace fetches prune stale workspace chats")
     func pagedWorkspaceFetchesPruneStaleWorkspaceChats() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()

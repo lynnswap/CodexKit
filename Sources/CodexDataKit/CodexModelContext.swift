@@ -409,6 +409,11 @@ public final class CodexModelContext: @unchecked Sendable {
         let workspace: CodexWorkspace
         if let existing = workspacesByID[id] {
             workspace = existing
+            if let previousGroup = workspace.workspaceGroup,
+                previousGroup !== group
+            {
+                previousGroup.setWorkspaces(previousGroup.workspaces.filter { $0 !== workspace })
+            }
             workspace.update(url: standardizedURL, name: name, workspaceGroup: group)
         } else {
             workspace = CodexWorkspace(
