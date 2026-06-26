@@ -20,6 +20,60 @@ struct CodexModelContextTests {
         #expect(weakContainer == nil)
     }
 
+    @Test("parent model refreshes throw after detaching from context")
+    func parentModelRefreshesThrowAfterDetachingFromContext() async throws {
+        var detachedWorkspace: CodexWorkspace?
+        var detachedGroup: CodexWorkspaceGroup?
+        weak var weakContext: CodexModelContext?
+
+        do {
+            let runtime = try await CodexAppServerTestRuntime.start()
+            let container = CodexModelContainer(appServer: runtime.server)
+            let context = container.mainContext
+            weakContext = context
+            let workspaceURL = temporaryDirectory()
+
+            try await runtime.transport.enqueueThreadList(.init(threads: [
+                .init(id: "thread-detach", workspace: workspaceURL, name: "Detach")
+            ]))
+            let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>.recentChats)
+            try await results.performFetch()
+            let chat = try #require(results.items.first)
+            guard let workspace = chat.workspace,
+                let group = workspace.workspaceGroup
+            else {
+                Issue.record("Expected fetched chat to have a workspace and group")
+                return
+            }
+            detachedWorkspace = workspace
+            detachedGroup = group
+        }
+
+        let workspace = try #require(detachedWorkspace)
+        let group = try #require(detachedGroup)
+        #expect(weakContext == nil)
+        #expect(workspace.modelContext == nil)
+        #expect(group.modelContext == nil)
+
+        do {
+            try await workspace.refresh()
+            Issue.record("Expected detached workspace refresh to throw")
+        } catch let error as CodexModelContextError {
+            #expect(error == .modelIsDetached)
+        } catch {
+            Issue.record("Expected modelIsDetached for workspace refresh, got \(error)")
+        }
+
+        do {
+            try await group.refresh()
+            Issue.record("Expected detached group refresh to throw")
+        } catch let error as CodexModelContextError {
+            #expect(error == .modelIsDetached)
+        } catch {
+            Issue.record("Expected modelIsDetached for group refresh, got \(error)")
+        }
+    }
+
     @Test("fetched results use thread/list and mutate existing chat objects")
     func fetchedResultsMutateExistingChats() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -1395,6 +1449,35 @@ struct CodexModelContextTests {
         ]))
         try await chat.delete()
 
+        #expect(results.items.map(\.id.rawValue) == ["thread-backfill"])
+    }
+
+    @Test("server-paginated fetched results backfill without explicit limits")
+    func serverPaginatedFetchedResultsBackfillWithoutExplicitLimits() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(
+            threads: [
+                .init(id: "thread-delete", workspace: workspaceURL, name: "Delete")
+            ],
+            nextCursor: "next"
+        ))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>.recentChats)
+        try await results.performFetch()
+        let chat = try #require(results.items.first)
+
+        try await runtime.transport.enqueueEmpty(for: "thread/delete")
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-backfill", workspace: workspaceURL, name: "Backfill")
+        ]))
+        try await chat.delete()
+
+        let requests = await runtime.transport.recordedRequests(method: "thread/list")
+        let backfillParams = try #require(requests.last).decodeParams(ThreadListParams.self)
+        #expect(backfillParams.cursor == "next")
+        #expect(backfillParams.limit == 1)
         #expect(results.items.map(\.id.rawValue) == ["thread-backfill"])
     }
 

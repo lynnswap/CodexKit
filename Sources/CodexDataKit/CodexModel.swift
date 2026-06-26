@@ -110,7 +110,10 @@ public final class CodexWorkspaceGroup: CodexObservableModel {
     }
 
     public func refresh() async throws {
-        try await modelContext?.refresh(self)
+        guard let modelContext else {
+            throw CodexModelContextError.modelIsDetached
+        }
+        try await modelContext.refresh(self)
     }
 }
 
@@ -168,7 +171,10 @@ public final class CodexWorkspace: CodexObservableModel {
     }
 
     public func refresh() async throws {
-        try await modelContext?.refresh(self)
+        guard let modelContext else {
+            throw CodexModelContextError.modelIsDetached
+        }
+        try await modelContext.refresh(self)
     }
 
     @discardableResult

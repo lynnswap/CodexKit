@@ -470,7 +470,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
     }
 
     private var shouldRefreshAfterLocalRemoval: Bool {
-        request.fetchLimit != nil && nextCursor != nil
+        nextCursor != nil
     }
 
     private var canEvaluateFilterLocally: Bool {
@@ -521,7 +521,6 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         archived: Bool
     ) async -> Bool {
         guard Model.self == CodexChat.self,
-            request.fetchLimit != nil,
             nextCursor != nil,
             shouldInclude(chat, archived: archived)
         else {
