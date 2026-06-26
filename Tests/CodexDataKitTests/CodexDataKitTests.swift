@@ -1173,6 +1173,7 @@ struct CodexModelContextTests {
             workspace: workspaceURL,
             name: "Renamed"
         ))
+        try await runtime.transport.enqueueThreadList(.init(threads: []))
         try await chat.refresh(includeTurns: false)
 
         #expect(filteredResults.items.isEmpty)
@@ -1744,6 +1745,31 @@ struct CodexModelContextTests {
         #expect(results.items.isEmpty)
     }
 
+    @Test("search-filtered chat refresh reloads server membership")
+    func searchFilteredChatRefreshReloadsServerMembership() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-search", name: "Untitled")
+        ]))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            filter: .init(searchTerm: "needle")
+        ))
+        try await results.performFetch()
+        let chat = try #require(results.items.first)
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-search"))
+        try await runtime.transport.enqueueThreadRead(.init(id: "thread-search", name: "Untitled"))
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-search", name: "Untitled")
+        ]))
+        try await chat.refresh(includeTurns: false)
+
+        #expect(results.items.first === chat)
+        #expect(await runtime.transport.recordedRequests(method: "thread/list").count == 2)
+    }
+
     @Test("paged chat refresh reloads incomplete results after sort key changes")
     func pagedChatRefreshReloadsIncompleteResultsAfterSortKeyChanges() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -1979,6 +2005,57 @@ struct CodexModelContextTests {
 
         #expect(alpha.updatedAt == completedAt)
         #expect(results.items.map(\.id.rawValue) == ["thread-alpha", "thread-beta"])
+    }
+
+    @Test("chat send refreshes incomplete paged results for off-page updates")
+    func chatSendRefreshesIncompletePagedResultsForOffPageUpdates() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let firstUpdate = Date(timeIntervalSince1970: 1_000)
+        let secondUpdate = Date(timeIntervalSince1970: 2_000)
+        let completedAt = Date(timeIntervalSince1970: 3_000)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-alpha", name: "Alpha", updatedAt: firstUpdate),
+            .init(id: "thread-beta", name: "Beta", updatedAt: secondUpdate),
+        ]))
+        let allResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>.recentChats)
+        try await allResults.performFetch()
+        let alpha = try #require(allResults.items.first { $0.id.rawValue == "thread-alpha" })
+
+        try await runtime.transport.enqueueThreadList(.init(
+            threads: [.init(id: "thread-beta", name: "Beta", updatedAt: secondUpdate)],
+            nextCursor: "next"
+        ))
+        let pagedResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            sortDescriptors: [.updatedAt(.reverse)],
+            fetchLimit: 1
+        ))
+        try await pagedResults.performFetch()
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-alpha"))
+        try await runtime.transport.enqueueTurnStart(turnID: "turn-alpha", status: "running")
+        try await runtime.transport.enqueueThreadList(.init(
+            threads: [.init(id: "thread-alpha", name: "Alpha", updatedAt: completedAt)],
+            nextCursor: "next"
+        ))
+        let sendTask = Task {
+            try await alpha.send("hello")
+        }
+
+        await runtime.transport.waitForRequest(method: "turn/start")
+        try await runtime.transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(
+                id: "turn-alpha",
+                status: "completed",
+                completedAt: Int(completedAt.timeIntervalSince1970)
+            ))
+        )
+
+        _ = try await sendTask.value
+
+        #expect(pagedResults.items.map(\.id.rawValue) == ["thread-alpha"])
     }
 
     @Test("workspace starts new chats through its model context")

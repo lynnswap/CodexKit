@@ -304,6 +304,10 @@ public final class CodexFetchedResults<Model: CodexObservableModel> {
 
 extension CodexFetchedResults: CodexFetchedResultsRegistration {
     package func insert(_ chat: CodexChat, archived: Bool) async {
+        if shouldRefreshForServerSearch {
+            await refreshAfterMutation()
+            return
+        }
         if shouldRefreshForUnknownProvider(chat, archived: archived) {
             await refreshAfterMutation()
             return
@@ -320,6 +324,10 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         workspace: CodexWorkspace?,
         group: CodexWorkspaceGroup?
     ) async {
+        if shouldRefreshForServerSearch {
+            await refreshAfterMutation()
+            return
+        }
         if canEvaluateFilterLocally == false {
             await refreshAfterServerFilteredMutationIfNeeded()
             return
@@ -341,6 +349,10 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         previousGroup: CodexWorkspaceGroup?,
         archived: Bool
     ) async {
+        if shouldRefreshForServerSearch {
+            await refreshAfterMutation()
+            return
+        }
         if shouldRefreshForUnknownProvider(chat, archived: archived) {
             await refreshAfterMutation()
             return
@@ -357,7 +369,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         }
         items = modelContext.sortedItems(filteredItems, for: request)
         sections = modelContext.sections(for: items, descriptor: request.sectionDescriptor)
-        if await refreshAfterPagedRevalidationIfNeeded(chat) {
+        if await refreshAfterPagedRevalidationIfNeeded(chat, archived: archived) {
             return
         }
         guard canEvaluateFilterLocally,
@@ -470,6 +482,10 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         request.filter.sourceKinds == nil && request.filter.useStateDBOnly == nil
     }
 
+    private var shouldRefreshForServerSearch: Bool {
+        request.filter.searchTerm?.isEmpty == false
+    }
+
     private func refreshAfterLocalRemovalIfNeeded(originalCount: Int) async {
         let missingCount = originalCount - items.count
         guard missingCount > 0, shouldRefreshAfterLocalRemoval else {
@@ -500,11 +516,14 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         }
     }
 
-    private func refreshAfterPagedRevalidationIfNeeded(_ chat: CodexChat) async -> Bool {
+    private func refreshAfterPagedRevalidationIfNeeded(
+        _ chat: CodexChat,
+        archived: Bool
+    ) async -> Bool {
         guard Model.self == CodexChat.self,
             request.fetchLimit != nil,
             nextCursor != nil,
-            items.contains(where: { $0.id == chat.id })
+            shouldInclude(chat, archived: archived)
         else {
             return false
         }
