@@ -249,7 +249,9 @@ public final class CodexModelContext: @unchecked Sendable {
             return CodexFetchPage(
                 items: page.items.map { $0 as! Model },
                 nextCursor: page.nextCursor,
-                backwardsCursor: page.backwardsCursor
+                backwardsCursor: page.backwardsCursor,
+                relationshipItems: page.relationshipItems?.map { $0 as! Model },
+                relationshipIsComplete: page.relationshipIsComplete
             )
         }
         if Model.self == CodexWorkspace.self {
@@ -336,7 +338,14 @@ public final class CodexModelContext: @unchecked Sendable {
                     .map { apply($0, archived: request.filter.archived == true) },
                 using: request.sortDescriptors
             )
-            return localPage(chats, for: request)
+            let page = localPage(chats, for: request)
+            return CodexFetchPage(
+                items: page.items,
+                nextCursor: page.nextCursor,
+                backwardsCursor: page.backwardsCursor,
+                relationshipItems: chats,
+                relationshipIsComplete: true
+            )
         }
 
         let page = try await appServer.listThreads(threadQuery(from: request))

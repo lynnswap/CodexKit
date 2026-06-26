@@ -279,6 +279,36 @@ struct CodexModelContextTests {
         #expect(results.nextCursor == nil)
     }
 
+    @Test("name-sorted chat pages prune stale workspace relationships from full local results")
+    func nameSortedChatPagesPruneStaleWorkspaceRelationshipsFromFullLocalResults() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspace = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-alpha", workspace: workspace, name: "Alpha"),
+            .init(id: "thread-zulu", workspace: workspace, name: "Zulu"),
+        ]))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            sortDescriptors: [.name()],
+            fetchLimit: 1
+        ))
+        try await results.performFetch()
+        let fetchedWorkspace = try #require(results.items.first?.workspace)
+        let staleChat = context.model(for: CodexThreadID(rawValue: "thread-zulu"))
+        #expect(fetchedWorkspace.chats.map(\.title) == ["Alpha", "Zulu"])
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-alpha", workspace: workspace, name: "Alpha"),
+            .init(id: "thread-beta", workspace: workspace, name: "Beta"),
+        ]))
+        try await results.refresh()
+
+        #expect(results.items.map(\.title) == ["Alpha"])
+        #expect(fetchedWorkspace.chats.map(\.title) == ["Alpha", "Beta"])
+        #expect(staleChat.workspace == nil)
+    }
+
     @Test("workspace chats preserve fetched chat order")
     func workspaceChatsPreserveFetchedChatOrder() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()

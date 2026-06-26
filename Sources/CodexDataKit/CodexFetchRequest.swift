@@ -213,6 +213,8 @@ package struct CodexFetchPage<Model: CodexObservableModel> {
     package var items: [Model]
     package var nextCursor: String?
     package var backwardsCursor: String?
+    package var relationshipItems: [Model]? = nil
+    package var relationshipIsComplete: Bool? = nil
 }
 
 @MainActor
@@ -283,11 +285,13 @@ public final class CodexFetchedResults<Model: CodexObservableModel> {
             let newItems = appending ? append(page.items, to: items) : page.items
             items = newItems
             let relationshipRequest = appending ? self.request : request
+            let relationshipItems = page.relationshipItems ?? newItems
+            let relationshipIsComplete = page.relationshipIsComplete
+                ?? (page.nextCursor == nil && relationshipRequest.cursor == nil)
             modelContext.syncLoadedRelationships(
-                newItems,
+                relationshipItems,
                 request: relationshipRequest,
-                relationshipIsComplete: page.nextCursor == nil
-                    && relationshipRequest.cursor == nil
+                relationshipIsComplete: relationshipIsComplete
             )
             sections = modelContext.sections(for: newItems, descriptor: request.sectionDescriptor)
             nextCursor = page.nextCursor

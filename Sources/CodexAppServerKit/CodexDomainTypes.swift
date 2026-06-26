@@ -1053,6 +1053,18 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
     public var turns: [CodexTurnSnapshot]?
     package var turnItemsAreAuthoritative: Bool
 
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.id == rhs.id
+            && lhs.workspace == rhs.workspace
+            && lhs.name == rhs.name
+            && lhs.preview == rhs.preview
+            && lhs.modelProvider == rhs.modelProvider
+            && lhs.createdAt == rhs.createdAt
+            && lhs.updatedAt == rhs.updatedAt
+            && lhs.ephemeral == rhs.ephemeral
+            && lhs.turns == rhs.turns
+    }
+
     public init(
         id: CodexThreadID,
         workspace: URL? = nil,

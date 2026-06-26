@@ -578,6 +578,18 @@ struct CodexAppServerKitTests {
         #expect(page.threads.first?.turns == nil)
     }
 
+    @Test func threadSnapshotEqualityIgnoresTurnAuthorityFlag() {
+        let turns = [CodexTurnSnapshot(id: "turn-1", status: .completed)]
+        let publicSnapshot = CodexThreadSnapshot(id: "thread-1", turns: turns)
+        let summarySnapshot = CodexThreadSnapshot(
+            id: "thread-1",
+            turns: turns,
+            turnItemsAreAuthoritative: false
+        )
+
+        #expect(publicSnapshot == summarySnapshot)
+    }
+
     @Test func threadReadUsesIncludeTurnsToInterpretEmptyTurns() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueue(
