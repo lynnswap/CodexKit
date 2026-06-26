@@ -593,7 +593,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         archived: Bool
     ) async -> Bool {
         guard Model.self == CodexChat.self,
-            nextCursor != nil,
+            (nextCursor != nil || request.cursor != nil),
             shouldInclude(chat, archived: archived)
         else {
             return false

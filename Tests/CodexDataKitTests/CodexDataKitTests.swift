@@ -2468,6 +2468,58 @@ struct CodexModelContextTests {
         #expect(offsetPage.nextCursor == nil)
     }
 
+    @Test("cursor-started local pages refetch when visible chats move before the cursor")
+    func cursorStartedLocalPagesRefetchWhenVisibleChatsMoveBeforeCursor() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+        let initialThreads = [
+            CodexThreadSnapshot(id: "thread-a", workspace: workspaceURL, name: "A"),
+            CodexThreadSnapshot(id: "thread-b", workspace: workspaceURL, name: "B"),
+            CodexThreadSnapshot(id: "thread-c", workspace: workspaceURL, name: "C"),
+        ]
+
+        try await runtime.transport.enqueueThreadList(.init(threads: initialThreads))
+        let firstPage = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            sortDescriptors: [.name()],
+            fetchLimit: 1
+        ))
+        try await firstPage.performFetch()
+        let cursor = try #require(firstPage.nextCursor)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: initialThreads))
+        let offsetPage = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            sortDescriptors: [.name()],
+            fetchLimit: 2,
+            cursor: cursor
+        ))
+        try await offsetPage.performFetch()
+        let movingChat = try #require(offsetPage.items.first)
+        #expect(offsetPage.items.map(\.title) == ["B", "C"])
+        #expect(offsetPage.nextCursor == nil)
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-b"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-b",
+            workspace: workspaceURL,
+            name: "0"
+        ))
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-b", workspace: workspaceURL, name: "0"),
+            .init(id: "thread-a", workspace: workspaceURL, name: "A"),
+            .init(id: "thread-c", workspace: workspaceURL, name: "C"),
+        ]))
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-b", workspace: workspaceURL, name: "0"),
+            .init(id: "thread-a", workspace: workspaceURL, name: "A"),
+            .init(id: "thread-c", workspace: workspaceURL, name: "C"),
+        ]))
+        try await movingChat.refresh(includeTurns: false)
+
+        #expect(offsetPage.items.map(\.title) == ["A", "C"])
+        #expect(offsetPage.nextCursor == nil)
+    }
+
     @Test("starting a chat inserts it into active fetched results")
     func startingChatInsertsItIntoActiveFetchedResults() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
