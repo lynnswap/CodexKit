@@ -95,7 +95,13 @@ extension CodexSectionDescriptor where Model == CodexChat {
 public struct CodexFetchFilter<Model: CodexObservableModel>: Sendable, Hashable {
     public var archived: Bool?
     public var workspace: URL?
-    public var searchTerm: String?
+    public var searchTerm: String? {
+        didSet {
+            if searchTerm?.isEmpty == true {
+                searchTerm = nil
+            }
+        }
+    }
     public var modelProviders: [String]? {
         didSet {
             if modelProviders?.isEmpty == true {
@@ -116,7 +122,7 @@ public struct CodexFetchFilter<Model: CodexObservableModel>: Sendable, Hashable 
     ) {
         self.archived = archived
         self.workspace = workspace
-        self.searchTerm = searchTerm
+        self.searchTerm = searchTerm?.isEmpty == true ? nil : searchTerm
         self.modelProviders = modelProviders?.isEmpty == true ? nil : modelProviders
         self.sourceKinds = sourceKinds
         self.useStateDBOnly = useStateDBOnly

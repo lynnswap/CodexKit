@@ -616,7 +616,7 @@ public final class CodexModelContext: @unchecked Sendable {
     ) -> Bool {
         (Model.self == CodexChat.self
             && relationshipIsComplete == false)
-            || request.filter.searchTerm != nil
+            || request.filter.searchTerm?.isEmpty == false
             || request.filter.modelProviders?.isEmpty == false
             || request.filter.sourceKinds != nil
             || request.filter.useStateDBOnly != nil

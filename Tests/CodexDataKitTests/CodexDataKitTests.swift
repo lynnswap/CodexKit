@@ -288,6 +288,34 @@ struct CodexModelContextTests {
         #expect(Set(fetchedWorkspace.chats.map(\.id.rawValue)) == ["thread-keep", "thread-match"])
     }
 
+    @Test("empty search terms behave like unfiltered chat fetches")
+    func emptySearchTermsBehaveLikeUnfilteredChatFetches() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspace = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-stale", workspace: workspace, name: "Stale"),
+            .init(id: "thread-remaining", workspace: workspace, name: "Remaining"),
+        ]))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            filter: .init(searchTerm: "")
+        ))
+        try await results.performFetch()
+        let fetchedWorkspace = try #require(results.items.first?.workspace)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-remaining", workspace: workspace, name: "Remaining")
+        ]))
+        try await results.refresh()
+
+        let requests = await runtime.transport.recordedRequests(method: "thread/list")
+        let firstParams = try #require(requests.first).decodeParams(ThreadListParams.self)
+        #expect(firstParams.searchTerm == nil)
+        #expect(results.items.map(\.id.rawValue) == ["thread-remaining"])
+        #expect(fetchedWorkspace.chats.map(\.id.rawValue) == ["thread-remaining"])
+    }
+
     @Test("filtered workspace fetches keep previously loaded workspace chats")
     func filteredWorkspaceFetchesKeepPreviouslyLoadedWorkspaceChats() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
