@@ -1065,6 +1065,28 @@ struct CodexModelContextTests {
         #expect(workspace.chats.map(\.title) == ["Renamed"])
     }
 
+    @Test("workspace refresh prunes empty workspace from group")
+    func workspaceRefreshPrunesEmptyWorkspaceFromGroup() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let repo = try gitRepository()
+        let workspaceURL = try createDirectory("App", in: repo)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-stale", workspace: workspaceURL, name: "Stale")
+        ]))
+        let groupResults = context.fetchedResults(for: CodexFetchRequest<CodexWorkspaceGroup>.workspaceGroups)
+        try await groupResults.performFetch()
+        let group = try #require(groupResults.items.first)
+        let workspace = try #require(group.workspaces.first)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: []))
+        try await workspace.refresh()
+
+        #expect(workspace.chats.isEmpty)
+        #expect(group.workspaces.isEmpty)
+    }
+
     @Test("filtered workspace results drop parents with no matching chats")
     func filteredWorkspaceResultsDropParentsWithNoMatchingChats() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -1341,6 +1363,34 @@ struct CodexModelContextTests {
         #expect(providerResults.items.first === chat)
     }
 
+    @Test("starting a chat refreshes server-filtered fetched results")
+    func startingChatRefreshesServerFilteredFetchedResults() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-existing", workspace: workspaceURL, name: "Existing")
+        ]))
+        let workspaceResults = context.fetchedResults(for: CodexFetchRequest<CodexWorkspace>.workspaces)
+        try await workspaceResults.performFetch()
+        let workspace = try #require(workspaceResults.items.first)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: []))
+        let serverResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            filter: .init(sourceKinds: [.appServer])
+        ))
+        try await serverResults.performFetch()
+
+        try await runtime.transport.enqueueThreadStart(threadID: "thread-new")
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-new", workspace: workspaceURL, name: "New")
+        ]))
+        let chat = try await workspace.startChat()
+
+        #expect(serverResults.items.first === chat)
+    }
+
     @Test("empty provider filters revalidate as all providers")
     func emptyProviderFiltersRevalidateAsAllProviders() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -1455,6 +1505,35 @@ struct CodexModelContextTests {
         #expect(archivedWorkspaceResults.items.first?.chats.first === chat)
         #expect(archivedGroupResults.items.first?.workspaces.first?.url == workspaceURL)
         #expect(archivedGroupResults.items.first?.workspaces.first?.chats.first === chat)
+    }
+
+    @Test("archiving a chat refreshes server-filtered archived results")
+    func archivingChatRefreshesServerFilteredArchivedResults() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: []))
+        let archivedResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            filter: .init(archived: true, sourceKinds: [.appServer])
+        ))
+        try await archivedResults.performFetch()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-archive", workspace: workspaceURL, name: "Archive")
+        ]))
+        let activeResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>.recentChats)
+        try await activeResults.performFetch()
+        let chat = try #require(activeResults.items.first)
+
+        try await runtime.transport.enqueueEmpty(for: "thread/archive")
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-archive", workspace: workspaceURL, name: "Archive")
+        ]))
+        try await chat.archive()
+
+        #expect(activeResults.items.isEmpty)
+        #expect(archivedResults.items.first === chat)
     }
 
     @Test("metadata-only chat refresh preserves existing turn objects")

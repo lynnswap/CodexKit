@@ -118,6 +118,7 @@ public final class CodexModelContext: @unchecked Sendable {
         }
         let currentChats = chats + preservedChats
         workspace.setChats(currentChats)
+        pruneWorkspaceIfEmpty(workspace)
         let removedChats = detachStaleChats(
             previousChats,
             from: workspace,
@@ -167,7 +168,7 @@ public final class CodexModelContext: @unchecked Sendable {
         let chat = apply(snapshot)
         chat.setArchived(false)
         workspace.moveChatToFront(chat)
-        insertChatIntoRegisteredResults(chat, archived: false)
+        await insertChatIntoRegisteredResults(chat, archived: false)
         return chat
     }
 
@@ -581,10 +582,10 @@ public final class CodexModelContext: @unchecked Sendable {
         fetchedResults.append(WeakFetchedResultsRegistration(results))
     }
 
-    private func insertChatIntoRegisteredResults(_ chat: CodexChat, archived: Bool) {
+    private func insertChatIntoRegisteredResults(_ chat: CodexChat, archived: Bool) async {
         fetchedResults.removeAll { $0.value == nil }
         for registration in fetchedResults {
-            registration.value?.insert(chat, archived: archived)
+            await registration.value?.insert(chat, archived: archived)
         }
     }
 

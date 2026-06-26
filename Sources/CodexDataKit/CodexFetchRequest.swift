@@ -205,7 +205,7 @@ package struct CodexFetchPage<Model: CodexObservableModel> {
 
 @MainActor
 package protocol CodexFetchedResultsRegistration: AnyObject {
-    func insert(_ chat: CodexChat, archived: Bool)
+    func insert(_ chat: CodexChat, archived: Bool) async
     func archive(
         _ chat: CodexChat,
         workspace: CodexWorkspace?,
@@ -303,8 +303,9 @@ public final class CodexFetchedResults<Model: CodexObservableModel> {
 }
 
 extension CodexFetchedResults: CodexFetchedResultsRegistration {
-    package func insert(_ chat: CodexChat, archived: Bool) {
+    package func insert(_ chat: CodexChat, archived: Bool) async {
         guard let model = insertionModel(for: chat, archived: archived) else {
+            await refreshAfterServerFilteredMutationIfNeeded()
             return
         }
         upsert(model)
@@ -315,6 +316,10 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         workspace: CodexWorkspace?,
         group: CodexWorkspaceGroup?
     ) async {
+        if canEvaluateFilterLocally == false {
+            await refreshAfterServerFilteredMutationIfNeeded()
+            return
+        }
         if let model = insertionModel(for: chat, archived: true) {
             upsert(model)
         } else {
@@ -462,6 +467,17 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             try await load(request, appending: true)
         } catch {
             // load records the failed phase; the server mutation has already succeeded.
+        }
+    }
+
+    private func refreshAfterServerFilteredMutationIfNeeded() async {
+        guard canEvaluateFilterLocally == false else {
+            return
+        }
+        do {
+            try await performFetch()
+        } catch {
+            // performFetch records the failed phase; the server mutation has already succeeded.
         }
     }
 
