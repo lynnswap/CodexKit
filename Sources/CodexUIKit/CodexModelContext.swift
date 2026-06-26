@@ -51,7 +51,7 @@ public final class CodexModelContext: @unchecked Sendable {
         syncLoadedRelationships(
             page.items,
             request: request,
-            pageIsComplete: page.nextCursor == nil
+            relationshipIsComplete: request.cursor == nil && page.nextCursor == nil
         )
         return page.items
     }
@@ -83,16 +83,20 @@ public final class CodexModelContext: @unchecked Sendable {
         )
         let workspaces = try await fetch(request)
         group.setWorkspaces(workspaces.filter { $0.workspaceGroup?.id == group.id })
+        refreshWorkspaceGroupInRegisteredResults(group, archived: request.filter.archived == true)
     }
 
     public func refresh(_ workspace: CodexWorkspace) async throws {
         let request = CodexFetchRequest<CodexChat>.chats(in: workspace)
+        let previousChats = workspace.chats
         let chats = sort(
             try await fetchAllThreadSnapshots(matching: request)
                 .map { apply($0, archived: request.filter.archived == true) },
             using: request.sortDescriptors
         )
         workspace.setChats(chats)
+        detachStaleChats(previousChats, from: workspace, keeping: chats)
+        refreshWorkspaceInRegisteredResults(workspace, archived: request.filter.archived == true)
     }
 
     public func refresh(_ chat: CodexChat, includeTurns: Bool = true) async throws {
@@ -277,7 +281,7 @@ public final class CodexModelContext: @unchecked Sendable {
             chats,
             preservingExisting: shouldPreserveExistingWorkspaceChats(
                 for: request,
-                pageIsComplete: true
+                relationshipIsComplete: true
             ),
             workspaceFilter: request.filter.workspace
         )
@@ -295,7 +299,7 @@ public final class CodexModelContext: @unchecked Sendable {
             chats,
             preservingExisting: shouldPreserveExistingWorkspaceChats(
                 for: request,
-                pageIsComplete: true
+                relationshipIsComplete: true
             ),
             workspaceFilter: request.filter.workspace
         )
@@ -303,7 +307,7 @@ public final class CodexModelContext: @unchecked Sendable {
             workspaces,
             preservingExisting: shouldPreserveExistingWorkspaceChats(
                 for: request,
-                pageIsComplete: true
+                relationshipIsComplete: true
             )
         )
         return localPage(sort(groups, using: request.sortDescriptors), for: request)
@@ -390,14 +394,14 @@ public final class CodexModelContext: @unchecked Sendable {
     package func syncLoadedRelationships<Model: CodexObservableModel>(
         _ items: [Model],
         request: CodexFetchRequest<Model>,
-        pageIsComplete: Bool
+        relationshipIsComplete: Bool
     ) {
         if let chats = items as? [CodexChat] {
             syncWorkspaceChats(
                 chats,
                 preservingExisting: shouldPreserveExistingWorkspaceChats(
                     for: request,
-                    pageIsComplete: pageIsComplete
+                    relationshipIsComplete: relationshipIsComplete
                 ),
                 workspaceFilter: request.filter.workspace
             )
@@ -457,6 +461,18 @@ public final class CodexModelContext: @unchecked Sendable {
         pruneWorkspaceIfEmpty(workspace)
     }
 
+    private func detachStaleChats(
+        _ previousChats: [CodexChat],
+        from workspace: CodexWorkspace,
+        keeping refreshedChats: [CodexChat]
+    ) {
+        let refreshedIDs = Set(refreshedChats.map(\.id))
+        for chat in previousChats where refreshedIDs.contains(chat.id) == false && !chat.isArchived
+        {
+            chat.detachFromWorkspace(workspace)
+        }
+    }
+
     private func pruneWorkspaceIfEmpty(_ workspace: CodexWorkspace) {
         guard workspace.chats.isEmpty, let group = workspace.workspaceGroup else {
             return
@@ -466,10 +482,10 @@ public final class CodexModelContext: @unchecked Sendable {
 
     private func shouldPreserveExistingWorkspaceChats<Model: CodexObservableModel>(
         for request: CodexFetchRequest<Model>,
-        pageIsComplete: Bool
+        relationshipIsComplete: Bool
     ) -> Bool {
         (Model.self == CodexChat.self
-            && (pageIsComplete == false || request.cursor != nil || request.fetchLimit != nil))
+            && relationshipIsComplete == false)
             || request.filter.archived == true
             || request.filter.searchTerm != nil
             || request.filter.modelProviders != nil
@@ -533,6 +549,26 @@ public final class CodexModelContext: @unchecked Sendable {
         }
     }
 
+    private func refreshWorkspaceInRegisteredResults(
+        _ workspace: CodexWorkspace,
+        archived: Bool
+    ) {
+        fetchedResults.removeAll { $0.value == nil }
+        for registration in fetchedResults {
+            registration.value?.refresh(workspace, archived: archived)
+        }
+    }
+
+    private func refreshWorkspaceGroupInRegisteredResults(
+        _ group: CodexWorkspaceGroup,
+        archived: Bool
+    ) {
+        fetchedResults.removeAll { $0.value == nil }
+        for registration in fetchedResults {
+            registration.value?.refresh(group, archived: archived)
+        }
+    }
+
     private func fetchAllThreadSnapshots<Model: CodexObservableModel>(
         matching request: CodexFetchRequest<Model>
     ) async throws -> [CodexThreadSnapshot] {
@@ -593,7 +629,7 @@ public final class CodexModelContext: @unchecked Sendable {
 
     private func localCursorOffset(from cursor: String?) -> Int {
         guard let cursor,
-              cursor.hasPrefix(Self.localCursorPrefix)
+            cursor.hasPrefix(Self.localCursorPrefix)
         else {
             return 0
         }

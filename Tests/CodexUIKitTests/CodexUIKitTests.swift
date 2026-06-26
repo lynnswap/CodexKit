@@ -428,6 +428,42 @@ struct CodexModelContextTests {
         #expect(results.items.first === chat)
     }
 
+    @Test("chat refresh rebuilds server-only filtered sections")
+    func chatRefreshRebuildsServerOnlyFilteredSections() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let oldWorkspaceURL = temporaryDirectory()
+        let newWorkspaceURL = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-source", workspace: oldWorkspaceURL, name: "Source")
+        ]))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            filter: .init(sourceKinds: [.appServer]),
+            sectionDescriptor: .workspace
+        ))
+        try await results.performFetch()
+        let chat = try #require(results.items.first)
+        #expect(
+            results.sections.first?.id == oldWorkspaceURL.standardizedFileURL
+                .resolvingSymlinksInPath().path
+        )
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-source"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-source",
+            workspace: newWorkspaceURL,
+            name: "Source"
+        ))
+        try await chat.refresh(includeTurns: false)
+
+        #expect(results.items.first === chat)
+        #expect(
+            results.sections.first?.id == newWorkspaceURL.standardizedFileURL
+                .resolvingSymlinksInPath().path
+        )
+    }
+
     @Test("recency sort preserves app-server ordering")
     func recencySortPreservesAppServerOrdering() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -664,6 +700,37 @@ struct CodexModelContextTests {
         #expect(Set(fetchedWorkspace.chats.map(\.id.rawValue)) == ["thread-existing", "thread-new"])
     }
 
+    @Test("fully loaded paginated chat fetches prune stale workspace relationships")
+    func fullyLoadedPaginatedChatFetchesPruneStaleWorkspaceRelationships() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspace = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-stale", workspace: workspace, name: "Stale")
+        ]))
+        let workspaceResults = context.fetchedResults(for: CodexFetchRequest<CodexWorkspace>.workspaces)
+        try await workspaceResults.performFetch()
+        let fetchedWorkspace = try #require(workspaceResults.items.first)
+
+        try await runtime.transport.enqueueThreadList(.init(
+            threads: [
+                .init(id: "thread-new", workspace: workspace, name: "New")
+            ],
+            nextCursor: "server-next"
+        ))
+        let chatResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>.recentChats)
+        try await chatResults.performFetch()
+        #expect(Set(fetchedWorkspace.chats.map(\.id.rawValue)) == ["thread-stale", "thread-new"])
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-remaining", workspace: workspace, name: "Remaining")
+        ]))
+        try await chatResults.loadNextPage()
+
+        #expect(fetchedWorkspace.chats.map(\.id.rawValue) == ["thread-new", "thread-remaining"])
+    }
+
     @Test("group refresh rebuilds workspaces from fetched result")
     func groupRefreshRebuildsWorkspacesFromFetchedResult() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -687,6 +754,38 @@ struct CodexModelContextTests {
         try await group.refresh()
 
         #expect(group.workspaces.map(\.url) == [app])
+    }
+
+    @Test("workspace refresh revalidates scoped fetched results")
+    func workspaceRefreshRevalidatesScopedFetchedResults() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-stale", workspace: workspaceURL, name: "Stale"),
+            .init(id: "thread-remaining", workspace: workspaceURL, name: "Remaining"),
+        ]))
+        let workspaceResults = context.fetchedResults(for: CodexFetchRequest<CodexWorkspace>.workspaces)
+        try await workspaceResults.performFetch()
+        let workspace = try #require(workspaceResults.items.first)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-stale", workspace: workspaceURL, name: "Stale"),
+            .init(id: "thread-remaining", workspace: workspaceURL, name: "Remaining"),
+        ]))
+        let scopedResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>.chats(
+            in: workspace
+        ))
+        try await scopedResults.performFetch()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-remaining", workspace: workspaceURL, name: "Remaining")
+        ]))
+        try await workspace.refresh()
+
+        #expect(scopedResults.items.map(\.id.rawValue) == ["thread-remaining"])
+        #expect(workspace.chats.map(\.id.rawValue) == ["thread-remaining"])
     }
 
     @Test("filtered workspace results drop parents with no matching chats")
@@ -778,6 +877,46 @@ struct CodexModelContextTests {
         #expect(workspaceResults.items.isEmpty)
         #expect(groupResults.items.isEmpty)
         #expect(chat.modelContext == nil)
+    }
+
+    @Test("server-only parent results keep parents after local child removal")
+    func serverOnlyParentResultsKeepParentsAfterLocalChildRemoval() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let repo = try gitRepository()
+        let workspaceURL = try createDirectory("App", in: repo)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-delete", workspace: workspaceURL, name: "Delete"),
+            .init(id: "thread-remaining", workspace: workspaceURL, name: "Remaining"),
+        ]))
+        let chatResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>.recentChats)
+        try await chatResults.performFetch()
+        let chat = try #require(chatResults.items.first { $0.id.rawValue == "thread-delete" })
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-delete", workspace: workspaceURL, name: "Delete"),
+            .init(id: "thread-remaining", workspace: workspaceURL, name: "Remaining"),
+        ]))
+        let workspaceResults = context.fetchedResults(for: CodexFetchRequest<CodexWorkspace>(
+            filter: .init(sourceKinds: [.appServer])
+        ))
+        try await workspaceResults.performFetch()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-delete", workspace: workspaceURL, name: "Delete"),
+            .init(id: "thread-remaining", workspace: workspaceURL, name: "Remaining"),
+        ]))
+        let groupResults = context.fetchedResults(for: CodexFetchRequest<CodexWorkspaceGroup>(
+            filter: .init(sourceKinds: [.appServer])
+        ))
+        try await groupResults.performFetch()
+
+        try await runtime.transport.enqueueEmpty(for: "thread/delete")
+        try await chat.delete()
+
+        #expect(workspaceResults.items.first?.url == workspaceURL)
+        #expect(groupResults.items.first?.workspaces.first?.url == workspaceURL)
     }
 
     @Test("starting a chat inserts it into active fetched results")
@@ -919,7 +1058,9 @@ struct CodexModelContextTests {
         try await chat.archive()
 
         #expect(archivedWorkspaceResults.items.first?.url == workspaceURL)
+        #expect(archivedWorkspaceResults.items.first?.chats.first === chat)
         #expect(archivedGroupResults.items.first?.workspaces.first?.url == workspaceURL)
+        #expect(archivedGroupResults.items.first?.workspaces.first?.chats.first === chat)
     }
 
     @Test("metadata-only chat refresh preserves existing turn objects")

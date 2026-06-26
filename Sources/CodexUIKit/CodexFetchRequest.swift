@@ -216,6 +216,8 @@ package protocol CodexFetchedResultsRegistration: AnyObject {
         workspace: CodexWorkspace?,
         group: CodexWorkspaceGroup?
     )
+    func refresh(_ workspace: CodexWorkspace, archived: Bool)
+    func refresh(_ group: CodexWorkspaceGroup, archived: Bool)
 }
 
 @MainActor
@@ -262,10 +264,12 @@ public final class CodexFetchedResults<Model: CodexObservableModel> {
             let page = try await modelContext.fetchPage(request)
             let newItems = appending ? append(page.items, to: items) : page.items
             items = newItems
+            let relationshipRequest = appending ? self.request : request
             modelContext.syncLoadedRelationships(
                 newItems,
-                request: request,
-                pageIsComplete: page.nextCursor == nil
+                request: relationshipRequest,
+                relationshipIsComplete: page.nextCursor == nil
+                    && (appending || request.cursor == nil)
             )
             sections = modelContext.sections(for: newItems, descriptor: request.sectionDescriptor)
             nextCursor = page.nextCursor
@@ -318,7 +322,8 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         previousGroup: CodexWorkspaceGroup?,
         archived: Bool
     ) {
-        guard canLocallyRevalidate else {
+        guard canEvaluateFilterLocally else {
+            sections = modelContext.sections(for: items, descriptor: request.sectionDescriptor)
             return
         }
         let filteredItems = items.filter {
@@ -353,9 +358,27 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         sections = modelContext.sections(for: filteredItems, descriptor: request.sectionDescriptor)
     }
 
+    package func refresh(_ workspace: CodexWorkspace, archived: Bool) {
+        refreshItems(archived: archived) {
+            shouldKeep($0, afterRefreshing: workspace)
+        }
+    }
+
+    package func refresh(_ group: CodexWorkspaceGroup, archived: Bool) {
+        refreshItems(archived: archived) {
+            shouldKeep($0, afterRefreshing: group)
+        }
+    }
+
     private func insertionModel(for chat: CodexChat, archived: Bool) -> Model? {
+        guard canEvaluateFilterLocally else {
+            return nil
+        }
         guard shouldInclude(chat, archived: archived) else {
             return nil
+        }
+        if archived {
+            restoreArchivedRelationships(for: chat)
         }
         if let chat = chat as? Model {
             return chat
@@ -364,8 +387,8 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             return workspace
         }
         if let workspace = chat.workspace,
-           let workspaceGroup = workspace.workspaceGroup,
-           let group = workspaceGroup as? Model
+            let workspaceGroup = workspace.workspaceGroup,
+            let group = workspaceGroup as? Model
         {
             if workspaceGroup.workspaces.contains(where: { $0 === workspace }) == false {
                 workspaceGroup.setWorkspaces(workspaceGroup.workspaces + [workspace])
@@ -390,13 +413,14 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
     }
 
     private var canInsertLiveModel: Bool {
-        request.cursor == nil
+        canEvaluateFilterLocally
+            && request.cursor == nil
             && request.fetchLimit == nil
             && nextCursor == nil
             && backwardsCursor == nil
     }
 
-    private var canLocallyRevalidate: Bool {
+    private var canEvaluateFilterLocally: Bool {
         request.filter.sourceKinds == nil && request.filter.useStateDBOnly == nil
     }
 
@@ -414,7 +438,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
 
         if let workspace = request.filter.workspace {
             guard let chatWorkspace = chat.workspace,
-                  Self.standardizedPath(chatWorkspace.url) == Self.standardizedPath(workspace)
+                Self.standardizedPath(chatWorkspace.url) == Self.standardizedPath(workspace)
             else {
                 return false
             }
@@ -427,23 +451,21 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
                 chat.workspace?.name,
                 chat.title,
             ]
-            guard searchableText.contains(where: { text in
-                text?.localizedCaseInsensitiveContains(searchTerm) == true
-            }) else {
+            guard
+                searchableText.contains(where: { text in
+                    text?.localizedCaseInsensitiveContains(searchTerm) == true
+                })
+            else {
                 return false
             }
         }
 
         if let modelProviders = request.filter.modelProviders {
             guard let modelProvider = chat.modelProvider,
-                  modelProviders.contains(modelProvider)
+                modelProviders.contains(modelProvider)
             else {
                 return false
             }
-        }
-
-        if request.filter.sourceKinds != nil || request.filter.useStateDBOnly != nil {
-            return false
         }
 
         return true
@@ -459,9 +481,15 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             return item.id != chat.id
         }
         if let item = item as? CodexWorkspace, let workspace {
+            guard canEvaluateFilterLocally else {
+                return true
+            }
             return item.id != workspace.id || containsIncludedChat(in: item)
         }
         if let item = item as? CodexWorkspaceGroup, let group {
+            guard canEvaluateFilterLocally else {
+                return true
+            }
             return item.id != group.id || containsIncludedWorkspace(in: item)
         }
         return true
@@ -478,16 +506,110 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             return shouldInclude(chat, archived: archived)
         }
         if let item = item as? CodexWorkspace,
-           item.id == previousWorkspace?.id || item.id == chat.workspace?.id
+            item.id == previousWorkspace?.id || item.id == chat.workspace?.id
         {
             return containsIncludedChat(in: item)
         }
         if let item = item as? CodexWorkspaceGroup,
-           item.id == previousGroup?.id || item.id == chat.workspace?.workspaceGroup?.id
+            item.id == previousGroup?.id || item.id == chat.workspace?.workspaceGroup?.id
         {
             return containsIncludedWorkspace(in: item)
         }
         return true
+    }
+
+    private func shouldKeep(
+        _ item: Model,
+        afterRefreshing workspace: CodexWorkspace
+    ) -> Bool {
+        if let item = item as? CodexChat,
+            requestIsScoped(to: workspace)
+        {
+            return workspace.chats.contains { $0 === item }
+                && shouldInclude(
+                    item,
+                    archived: item.isArchived
+                )
+        }
+        if let item = item as? CodexWorkspace,
+            item.id == workspace.id
+        {
+            guard canEvaluateFilterLocally else {
+                return true
+            }
+            return containsIncludedChat(in: item)
+        }
+        if let item = item as? CodexWorkspaceGroup,
+            let group = workspace.workspaceGroup,
+            item.id == group.id
+        {
+            guard canEvaluateFilterLocally else {
+                return true
+            }
+            return containsIncludedWorkspace(in: item)
+        }
+        return true
+    }
+
+    private func shouldKeep(
+        _ item: Model,
+        afterRefreshing group: CodexWorkspaceGroup
+    ) -> Bool {
+        if let item = item as? CodexWorkspace,
+            item.workspaceGroup?.id == group.id
+        {
+            guard canEvaluateFilterLocally else {
+                return true
+            }
+            return group.workspaces.contains { $0 === item } && containsIncludedChat(in: item)
+        }
+        if let item = item as? CodexWorkspaceGroup,
+            item.id == group.id
+        {
+            guard canEvaluateFilterLocally else {
+                return true
+            }
+            return containsIncludedWorkspace(in: item)
+        }
+        return true
+    }
+
+    private func refreshItems(
+        archived: Bool,
+        keeping shouldKeep: (Model) -> Bool
+    ) {
+        guard requestMatchesArchiveScope(archived) else {
+            sections = modelContext.sections(for: items, descriptor: request.sectionDescriptor)
+            return
+        }
+        let filteredItems = items.filter(shouldKeep)
+        items = filteredItems
+        sections = modelContext.sections(for: filteredItems, descriptor: request.sectionDescriptor)
+    }
+
+    private func restoreArchivedRelationships(for chat: CodexChat) {
+        guard let workspace = chat.workspace else {
+            return
+        }
+        if workspace.chats.contains(where: { $0 === chat }) == false {
+            workspace.setChats([chat] + workspace.chats)
+        }
+        if let group = workspace.workspaceGroup,
+            group.workspaces.contains(where: { $0 === workspace }) == false
+        {
+            group.setWorkspaces(group.workspaces + [workspace])
+        }
+    }
+
+    private func requestMatchesArchiveScope(_ archived: Bool) -> Bool {
+        (request.filter.archived ?? false) == archived
+    }
+
+    private func requestIsScoped(to workspace: CodexWorkspace) -> Bool {
+        guard let filterWorkspace = request.filter.workspace else {
+            return false
+        }
+        return Self.standardizedPath(filterWorkspace) == Self.standardizedPath(workspace.url)
     }
 
     private func containsIncludedWorkspace(in group: CodexWorkspaceGroup) -> Bool {

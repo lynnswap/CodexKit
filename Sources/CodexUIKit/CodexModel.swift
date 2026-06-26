@@ -251,6 +251,12 @@ public final class CodexChat: CodexObservableModel {
         modelContext = nil
     }
 
+    package func detachFromWorkspace(_ workspace: CodexWorkspace) {
+        if self.workspace === workspace {
+            self.workspace = nil
+        }
+    }
+
     public func refresh(includeTurns: Bool = true) async throws {
         guard let modelContext else {
             throw CodexModelContextError.modelIsDetached
