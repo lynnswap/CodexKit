@@ -473,7 +473,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             }
             nextItems.insert(model, at: 0)
         }
-        items = modelContext.sortedItems(nextItems, for: request)
+        items = limitedItems(modelContext.sortedItems(nextItems, for: request))
         sections = modelContext.sections(for: items, descriptor: request.sectionDescriptor)
         return true
     }
@@ -481,9 +481,15 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
     private var canInsertLiveModel: Bool {
         canEvaluateFilterLocally
             && request.cursor == nil
-            && request.fetchLimit == nil
             && nextCursor == nil
             && backwardsCursor == nil
+    }
+
+    private func limitedItems(_ models: [Model]) -> [Model] {
+        guard let fetchLimit = request.fetchLimit else {
+            return models
+        }
+        return Array(models.prefix(max(fetchLimit, 0)))
     }
 
     private var shouldRefreshAfterLocalRemoval: Bool {

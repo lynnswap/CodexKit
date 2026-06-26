@@ -1051,6 +1051,7 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
     public var updatedAt: Date?
     public var ephemeral: Bool?
     public var turns: [CodexTurnSnapshot]?
+    package var turnItemsAreAuthoritative: Bool
 
     public init(
         id: CodexThreadID,
@@ -1063,6 +1064,32 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
         ephemeral: Bool? = nil,
         turns: [CodexTurnSnapshot]? = nil
     ) {
+        self.init(
+            id: id,
+            workspace: workspace,
+            name: name,
+            preview: preview,
+            modelProvider: modelProvider,
+            createdAt: createdAt,
+            updatedAt: updatedAt,
+            ephemeral: ephemeral,
+            turns: turns,
+            turnItemsAreAuthoritative: turns != nil
+        )
+    }
+
+    package init(
+        id: CodexThreadID,
+        workspace: URL? = nil,
+        name: String? = nil,
+        preview: String? = nil,
+        modelProvider: String? = nil,
+        createdAt: Date? = nil,
+        updatedAt: Date? = nil,
+        ephemeral: Bool? = nil,
+        turns: [CodexTurnSnapshot]? = nil,
+        turnItemsAreAuthoritative: Bool
+    ) {
         self.id = id
         self.workspace = workspace
         self.name = name
@@ -1072,6 +1099,7 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
         self.updatedAt = updatedAt
         self.ephemeral = ephemeral
         self.turns = turns
+        self.turnItemsAreAuthoritative = turnItemsAreAuthoritative
     }
 }
 

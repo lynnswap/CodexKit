@@ -948,7 +948,8 @@ public actor CodexAppServer {
             createdAt: snapshot.createdAt.map { Date(timeIntervalSince1970: TimeInterval($0)) },
             updatedAt: snapshot.updatedAt.map { Date(timeIntervalSince1970: TimeInterval($0)) },
             ephemeral: snapshot.ephemeral,
-            turns: turnSnapshots(from: snapshot.turns, includesTurns: includesTurns)
+            turns: turnSnapshots(from: snapshot.turns, includesTurns: includesTurns),
+            turnItemsAreAuthoritative: includesTurns
         )
     }
 

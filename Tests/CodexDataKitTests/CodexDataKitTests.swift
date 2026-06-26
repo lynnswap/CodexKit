@@ -1788,8 +1788,8 @@ struct CodexModelContextTests {
         #expect(chat.title == "After")
     }
 
-    @Test("starting a chat does not overfill paged fetched results")
-    func startingChatDoesNotOverfillPagedFetchedResults() async throws {
+    @Test("starting a chat updates limited fetched results without overfilling")
+    func startingChatUpdatesLimitedFetchedResultsWithoutOverfilling() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         let context = CodexModelContainer(appServer: runtime.server).mainContext
         let workspaceURL = temporaryDirectory()
@@ -1814,7 +1814,35 @@ struct CodexModelContextTests {
         _ = try await workspace.startChat()
 
         #expect(pagedResults.items.count == 1)
-        #expect(pagedResults.items.first?.id.rawValue == "thread-existing")
+        #expect(pagedResults.items.first?.id.rawValue == "thread-new")
+    }
+
+    @Test("starting a chat inserts into underfilled limited fetched results")
+    func startingChatInsertsIntoUnderfilledLimitedFetchedResults() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-existing", workspace: workspaceURL, name: "Existing")
+        ]))
+        let workspaceResults = context.fetchedResults(for: CodexFetchRequest<CodexWorkspace>.workspaces)
+        try await workspaceResults.performFetch()
+        let workspace = try #require(workspaceResults.items.first)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-existing", workspace: workspaceURL, name: "Existing")
+        ]))
+        let limitedResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            sortDescriptors: [.updatedAt(.reverse)],
+            fetchLimit: 2
+        ))
+        try await limitedResults.performFetch()
+
+        try await runtime.transport.enqueueThreadStart(threadID: "thread-new")
+        _ = try await workspace.startChat()
+
+        #expect(limitedResults.items.map(\.id.rawValue) == ["thread-new", "thread-existing"])
     }
 
     @Test("archiving a chat moves it between active fetched results")
@@ -2125,6 +2153,62 @@ struct CodexModelContextTests {
         #expect(chat.title == "After")
         #expect(chat.turns.isEmpty == false)
         #expect(chat.items.isEmpty == false)
+    }
+
+    @Test("thread list summary turns preserve cached transcript items")
+    func threadListSummaryTurnsPreserveCachedTranscriptItems() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(
+                id: "thread-summary",
+                name: "Before",
+                turns: [
+                    .init(
+                        id: "turn-summary",
+                        status: .running,
+                        items: [
+                            .init(
+                                id: "message-summary",
+                                kind: .agentMessage,
+                                content: .message(.init(
+                                    id: "message-summary",
+                                    role: .assistant,
+                                    phase: .finalAnswer,
+                                    text: "Done"
+                                ))
+                            ),
+                        ]
+                    ),
+                    .init(
+                        id: "turn-omitted",
+                        status: .running
+                    )
+                ]
+            )
+        ]))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>.recentChats)
+        try await results.performFetch()
+        let chat = try #require(results.items.first)
+        let turn = try #require(chat.turns.first)
+        let item = try #require(chat.items.first)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(
+                id: "thread-summary",
+                name: "After",
+                turns: [.init(id: "turn-summary", status: .completed)]
+            )
+        ]))
+        try await results.refresh()
+
+        #expect(chat.title == "After")
+        #expect(chat.turns.first === turn)
+        #expect(turn.status == CodexTurnStatus.completed)
+        #expect(chat.turns.contains { $0.id == "turn-omitted" })
+        #expect(chat.items.first === item)
+        #expect(chat.transcript.finalAnswer == "Done")
     }
 
     @Test("explicit empty read turn lists clear cached turns and items")

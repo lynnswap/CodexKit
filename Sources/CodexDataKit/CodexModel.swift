@@ -243,8 +243,13 @@ public final class CodexChat: CodexObservableModel {
         updatedAt = snapshot.updatedAt
         ephemeral = snapshot.ephemeral
         if let turns = snapshot.turns {
-            replaceTurns(with: turns)
-            replaceItems(with: turns)
+            if snapshot.turnItemsAreAuthoritative {
+                replaceTurns(with: turns)
+                replaceItems(with: turns)
+            } else {
+                mergeTurns(with: turns)
+                mergeItems(from: turns)
+            }
         }
     }
 
@@ -339,6 +344,16 @@ public final class CodexChat: CodexObservableModel {
         }
     }
 
+    private func mergeTurns(with records: [CodexTurnSnapshot]) {
+        for record in records {
+            upsertTurn(
+                id: record.id,
+                status: record.status,
+                errorDescription: record.errorMessage
+            )
+        }
+    }
+
     private func replaceItems(with records: [CodexTurnSnapshot]) {
         let existingByKey = Dictionary(uniqueKeysWithValues: items.map { ($0.mergeKey, $0) })
         items = records.flatMap { record in
@@ -350,6 +365,12 @@ public final class CodexChat: CodexObservableModel {
                 }
                 return Item(threadItem: incomingItem, turnID: record.id)
             }
+        }
+    }
+
+    private func mergeItems(from records: [CodexTurnSnapshot]) {
+        for record in records where record.items.isEmpty == false {
+            mergeItems(record.items, turnID: record.id)
         }
     }
 
