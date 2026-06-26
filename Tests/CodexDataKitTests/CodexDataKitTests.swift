@@ -20,6 +20,43 @@ struct CodexModelContextTests {
         #expect(weakContainer == nil)
     }
 
+    @Test("container releases loaded workspace graphs without retain cycles")
+    func containerReleasesLoadedWorkspaceGraphsWithoutRetainCycles() async throws {
+        weak var weakContainer: CodexModelContainer?
+        weak var weakContext: CodexModelContext?
+        weak var weakGroup: CodexWorkspaceGroup?
+        weak var weakWorkspace: CodexWorkspace?
+        weak var weakChat: CodexChat?
+
+        do {
+            let runtime = try await CodexAppServerTestRuntime.start()
+            let container = CodexModelContainer(appServer: runtime.server)
+            let context = container.mainContext
+            weakContainer = container
+            weakContext = context
+
+            try await runtime.transport.enqueueThreadList(.init(threads: [
+                .init(id: "thread-release", workspace: temporaryDirectory(), name: "Release")
+            ]))
+            let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>.recentChats)
+            try await results.performFetch()
+            let chat = try #require(results.items.first)
+            weakChat = chat
+            weakWorkspace = chat.workspace
+            weakGroup = chat.workspace?.workspaceGroup
+
+            #expect(weakGroup != nil)
+            #expect(weakWorkspace != nil)
+            #expect(weakChat != nil)
+        }
+
+        #expect(weakContainer == nil)
+        #expect(weakContext == nil)
+        #expect(weakGroup == nil)
+        #expect(weakWorkspace == nil)
+        #expect(weakChat == nil)
+    }
+
     @Test("parent model refreshes throw after detaching from context")
     func parentModelRefreshesThrowAfterDetachingFromContext() async throws {
         var detachedWorkspace: CodexWorkspace?
@@ -1843,6 +1880,44 @@ struct CodexModelContextTests {
         _ = try await workspace.startChat()
 
         #expect(limitedResults.items.map(\.id.rawValue) == ["thread-new", "thread-existing"])
+    }
+
+    @Test("starting a chat refreshes incomplete paged fetched results")
+    func startingChatRefreshesIncompletePagedFetchedResults() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-existing", workspace: workspaceURL, name: "Existing")
+        ]))
+        let workspaceResults = context.fetchedResults(for: CodexFetchRequest<CodexWorkspace>.workspaces)
+        try await workspaceResults.performFetch()
+        let workspace = try #require(workspaceResults.items.first)
+
+        try await runtime.transport.enqueueThreadList(.init(
+            threads: [
+                .init(id: "thread-existing", workspace: workspaceURL, name: "Existing")
+            ],
+            nextCursor: "next"
+        ))
+        let pagedResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            sortDescriptors: [.updatedAt(.reverse)],
+            fetchLimit: 1
+        ))
+        try await pagedResults.performFetch()
+
+        try await runtime.transport.enqueueThreadStart(threadID: "thread-new")
+        try await runtime.transport.enqueueThreadList(.init(
+            threads: [
+                .init(id: "thread-new", workspace: workspaceURL, name: "New")
+            ],
+            nextCursor: "next"
+        ))
+        _ = try await workspace.startChat()
+
+        #expect(pagedResults.items.map(\.id.rawValue) == ["thread-new"])
+        #expect(await runtime.transport.recordedRequests(method: "thread/list").count == 3)
     }
 
     @Test("archiving a chat moves it between active fetched results")

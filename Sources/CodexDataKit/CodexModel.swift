@@ -123,8 +123,9 @@ public final class CodexWorkspace: CodexObservableModel {
     public let id: CodexWorkspaceID
     public private(set) var url: URL
     public private(set) var name: String
-    public private(set) var workspaceGroup: CodexWorkspaceGroup?
     public private(set) var chats: [CodexChat]
+
+    public private(set) weak var workspaceGroup: CodexWorkspaceGroup?
 
     @ObservationIgnored
     public private(set) weak var modelContext: CodexModelContext?
@@ -190,7 +191,6 @@ public final class CodexWorkspace: CodexObservableModel {
 @Observable
 public final class CodexChat: CodexObservableModel {
     public let id: CodexThreadID
-    public private(set) var workspace: CodexWorkspace?
     public private(set) var name: String?
     public private(set) var preview: String?
     public private(set) var modelProvider: String?
@@ -202,6 +202,8 @@ public final class CodexChat: CodexObservableModel {
     public private(set) var items: [Item]
     public var phase: CodexDataPhase = .idle
     public var lastErrorDescription: String?
+
+    public private(set) weak var workspace: CodexWorkspace?
 
     @ObservationIgnored
     public private(set) weak var modelContext: CodexModelContext?

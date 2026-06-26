@@ -323,7 +323,10 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         guard let model = insertionModel(for: chat, archived: archived) else {
             return
         }
-        upsert(model)
+        guard upsert(model) else {
+            await refreshAfterMutation()
+            return
+        }
     }
 
     package func archive(
@@ -336,7 +339,10 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             return
         }
         if let model = insertionModel(for: chat, archived: true) {
-            upsert(model)
+            guard upsert(model) else {
+                await refreshAfterMutation()
+                return
+            }
         } else {
             await remove(chat, workspace: workspace, group: group)
         }
@@ -414,7 +420,10 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         }) else {
             return
         }
-        upsertLoadedModels(from: workspace)
+        guard upsertLoadedModels(from: workspace) else {
+            await refreshAfterMutation()
+            return
+        }
     }
 
     package func refresh(
@@ -431,7 +440,10 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         }) else {
             return
         }
-        upsertLoadedModels(from: group)
+        guard upsertLoadedModels(from: group) else {
+            await refreshAfterMutation()
+            return
+        }
     }
 
     private func insertionModel(for chat: CodexChat, archived: Bool) -> Model? {
@@ -745,19 +757,25 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         return true
     }
 
-    private func upsertLoadedModels(from workspace: CodexWorkspace) {
+    private func upsertLoadedModels(from workspace: CodexWorkspace) -> Bool {
         for chat in workspace.chats {
             guard let model = insertionModel(for: chat, archived: chat.isArchived) else {
                 continue
             }
-            upsert(model)
+            guard upsert(model) else {
+                return false
+            }
         }
+        return true
     }
 
-    private func upsertLoadedModels(from group: CodexWorkspaceGroup) {
+    private func upsertLoadedModels(from group: CodexWorkspaceGroup) -> Bool {
         for workspace in group.workspaces {
-            upsertLoadedModels(from: workspace)
+            guard upsertLoadedModels(from: workspace) else {
+                return false
+            }
         }
+        return true
     }
 
     private func restoreArchivedRelationships(for chat: CodexChat) {
