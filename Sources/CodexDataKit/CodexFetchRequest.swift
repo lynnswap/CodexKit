@@ -304,6 +304,10 @@ public final class CodexFetchedResults<Model: CodexObservableModel> {
 
 extension CodexFetchedResults: CodexFetchedResultsRegistration {
     package func insert(_ chat: CodexChat, archived: Bool) async {
+        if shouldRefreshForUnknownProvider(chat, archived: archived) {
+            await refreshAfterMutation()
+            return
+        }
         guard let model = insertionModel(for: chat, archived: archived) else {
             await refreshAfterServerFilteredMutationIfNeeded()
             return
@@ -320,6 +324,10 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             await refreshAfterServerFilteredMutationIfNeeded()
             return
         }
+        if shouldRefreshForUnknownProvider(chat, archived: true) {
+            await refreshAfterMutation()
+            return
+        }
         if let model = insertionModel(for: chat, archived: true) {
             upsert(model)
         } else {
@@ -333,6 +341,10 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         previousGroup: CodexWorkspaceGroup?,
         archived: Bool
     ) async {
+        if shouldRefreshForUnknownProvider(chat, archived: archived) {
+            await refreshAfterMutation()
+            return
+        }
         let originalCount = items.count
         let filteredItems = items.filter {
             shouldKeep(
@@ -477,6 +489,10 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         guard canEvaluateFilterLocally == false else {
             return
         }
+        await refreshAfterMutation()
+    }
+
+    private func refreshAfterMutation() async {
         do {
             try await performFetch()
         } catch {
@@ -501,7 +517,20 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         }
     }
 
-    private func shouldInclude(_ chat: CodexChat, archived: Bool) -> Bool {
+    private func shouldRefreshForUnknownProvider(_ chat: CodexChat, archived: Bool) -> Bool {
+        guard request.filter.modelProviders?.isEmpty == false,
+            chat.modelProvider == nil
+        else {
+            return false
+        }
+        return shouldInclude(chat, archived: archived, evaluatingProvider: false)
+    }
+
+    private func shouldInclude(
+        _ chat: CodexChat,
+        archived: Bool,
+        evaluatingProvider: Bool = true
+    ) -> Bool {
         switch request.filter.archived {
         case .some(let expectedArchived):
             guard expectedArchived == archived else {
@@ -537,7 +566,10 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             }
         }
 
-        if let modelProviders = request.filter.modelProviders, modelProviders.isEmpty == false {
+        if evaluatingProvider,
+            let modelProviders = request.filter.modelProviders,
+            modelProviders.isEmpty == false
+        {
             guard let modelProvider = chat.modelProvider,
                 modelProviders.contains(modelProvider)
             else {

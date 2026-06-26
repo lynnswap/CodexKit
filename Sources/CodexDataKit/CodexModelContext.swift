@@ -178,7 +178,21 @@ public final class CodexModelContext: @unchecked Sendable {
         in chat: CodexChat
     ) async throws -> CodexResponse {
         let thread = try await appServer.resumeThread(chat.id)
-        return try await thread.respond(to: input.prompt, options: input.options)
+        let response = try await thread.respond(to: input.prompt, options: input.options)
+        await apply(response, to: chat)
+        return response
+    }
+
+    package func apply(_ response: CodexResponse, to chat: CodexChat) async {
+        let previousWorkspace = chat.workspace
+        let previousGroup = previousWorkspace?.workspaceGroup
+        chat.apply(response)
+        await revalidateChatInRegisteredResults(
+            chat,
+            previousWorkspace: previousWorkspace,
+            previousGroup: previousGroup,
+            archived: chat.isArchived
+        )
     }
 
     public func cancelActiveTurn(in chat: CodexChat) async throws {
@@ -572,7 +586,6 @@ public final class CodexModelContext: @unchecked Sendable {
     ) -> Bool {
         (Model.self == CodexChat.self
             && relationshipIsComplete == false)
-            || request.filter.archived == true
             || request.filter.searchTerm != nil
             || request.filter.modelProviders?.isEmpty == false
             || request.filter.sourceKinds != nil

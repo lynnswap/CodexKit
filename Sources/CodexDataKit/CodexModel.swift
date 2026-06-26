@@ -281,14 +281,13 @@ public final class CodexChat: CodexObservableModel {
         lastErrorDescription = nil
         do {
             let response = try await modelContext.send(input, in: self)
-            apply(response)
             phase = .loaded
             return response
         } catch {
             if input.options.transcriptErrorHandlingPolicy != .revertTranscript,
                 let response = (error as? CodexAppServerError)?.response
             {
-                apply(response)
+                await modelContext.apply(response, to: self)
             }
             fail(with: error)
             throw error
@@ -361,7 +360,12 @@ public final class CodexChat: CodexObservableModel {
         }
     }
 
-    private func apply(_ response: CodexResponse) {
+    package func apply(_ response: CodexResponse) {
+        if let completedAt = response.completedAt,
+            updatedAt.map({ completedAt > $0 }) ?? true
+        {
+            updatedAt = completedAt
+        }
         upsertTurn(
             id: response.turnID,
             status: response.status,
