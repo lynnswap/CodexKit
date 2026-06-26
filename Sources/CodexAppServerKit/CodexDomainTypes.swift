@@ -1046,6 +1046,10 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
     public var workspace: URL?
     public var name: String?
     public var preview: String?
+    public var modelProvider: String?
+    public var createdAt: Date?
+    public var updatedAt: Date?
+    public var ephemeral: Bool?
     public var turns: [CodexTurnSnapshot]
 
     public init(
@@ -1053,12 +1057,20 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
         workspace: URL? = nil,
         name: String? = nil,
         preview: String? = nil,
+        modelProvider: String? = nil,
+        createdAt: Date? = nil,
+        updatedAt: Date? = nil,
+        ephemeral: Bool? = nil,
         turns: [CodexTurnSnapshot] = []
     ) {
         self.id = id
         self.workspace = workspace
         self.name = name
         self.preview = preview
+        self.modelProvider = modelProvider
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+        self.ephemeral = ephemeral
         self.turns = turns
     }
 }

@@ -943,6 +943,10 @@ public actor CodexAppServer {
             workspace: snapshot.cwd.map { URL(fileURLWithPath: $0, isDirectory: true) },
             name: snapshot.name,
             preview: snapshot.preview,
+            modelProvider: snapshot.modelProvider,
+            createdAt: snapshot.createdAt.map { Date(timeIntervalSince1970: TimeInterval($0)) },
+            updatedAt: snapshot.updatedAt.map { Date(timeIntervalSince1970: TimeInterval($0)) },
+            ephemeral: snapshot.ephemeral,
             turns: (snapshot.turns ?? []).map {
                 CodexTurnSnapshot(
                     id: .init(rawValue: $0.id),

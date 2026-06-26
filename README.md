@@ -63,25 +63,28 @@ For thread management, streaming, review sessions, model/account APIs, login flo
 
 ## CodexUIKit
 
-Use `CodexUIKit` when you want UI-ready observable state for thread lists and conversations.
+Use `CodexUIKit` when you want CoreData-style app-server backed models for native UI code.
 
 ```swift
 import CodexAppServerKit
 import CodexUIKit
 import Foundation
 
-let server = try await CodexAppServer()
-let library = CodexThreadLibrary(
-    server: server,
-    configuration: .init(query: .init(workspace: workspaceURL, limit: 50))
-)
+let container = try await CodexModelContainer()
+let context = container.mainContext
 
-await library.refresh()
+let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>.recentChats)
+try await results.performFetch()
 
-let conversation = try await library.startConversation(in: workspaceURL)
-try await conversation.send("Summarize this project.")
+for chat in results.items {
+    print(chat.title)
+}
+
+let workspace = try await context.fetch(CodexFetchRequest<CodexWorkspace>.workspaces).first
+let chat = try await workspace?.startChat()
+try await chat?.send("Summarize this project.")
 ```
 
-Render thread-list state from `library.sections` and `library.phase`, render conversation state from `conversation.turns`, `conversation.items`, and `conversation.phase`, then send user actions back through `CodexThreadLibrary` and `CodexConversation`.
+Render from `CodexWorkspaceGroup`, `CodexWorkspace`, and `CodexChat` observable model objects. Use `CodexFetchRequest` / `CodexFetchedResults` for CoreData-like fetches, or `@CodexQuery` for SwiftUI views.
 
-For thread-list state, conversation state, selection, pagination, archive/delete actions, and ownership guidance, see [Sources/CodexUIKit/README.md](Sources/CodexUIKit/README.md).
+For model containers, fetch requests, sectioning, SwiftUI queries, and ownership guidance, see [Sources/CodexUIKit/README.md](Sources/CodexUIKit/README.md).

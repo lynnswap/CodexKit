@@ -2,115 +2,132 @@
 
 CodexUIKit provides `@Observable` model objects for building native Codex UIs on top of `CodexAppServerKit`.
 
-Use this package when a native UI needs thread-list state, conversation state, loading/error phase, and user actions without rendering directly from app-server request or notification payloads.
+Use this package when UI code needs app-server backed workspace group, workspace, and chat models without rendering directly from JSON-RPC payloads.
 
 ## Main Types
 
-- `CodexThreadLibrary`: Loads thread lists from `CodexAppServer`, tracks selection, supports pagination, starts conversations, and applies archive, unarchive, and delete actions.
-- `CodexConversation`: Represents one Codex thread for UI rendering, including title, workspace metadata, turn snapshots, transcript items, loading phase, and send/refresh actions.
+- `CodexModelContainer`: Owns the `CodexAppServer` and vends the main `CodexModelContext`.
+- `CodexModelContext`: Fetches models, preserves model identity, and performs app-server actions for attached models.
+- `CodexFetchRequest`: Describes filters, sort descriptors, sectioning, paging, and the model type to fetch.
+- `CodexFetchedResults`: Observable CoreData-style fetch results with items, sections, cursors, loading phase, and errors.
+- `CodexWorkspaceGroup`, `CodexWorkspace`, `CodexChat`: Observable model objects attached to a model context.
+- `CodexQuery`: A SwiftUI `DynamicProperty` wrapper around `CodexFetchedResults`.
 - `CodexUIPhase`: A small UI state enum with `idle`, `loading`, `loaded`, and `failed`.
 
 ## Quick Start
 
 ```swift
-import CodexAppServerKit
 import CodexUIKit
-import Foundation
 
-let server = try await CodexAppServer()
-let library = CodexThreadLibrary(
-    server: server,
-    configuration: .init(query: .init(workspace: workspaceURL, limit: 50))
-)
+let container = try await CodexModelContainer()
+let context = container.mainContext
 
-await library.refresh()
+let chats = context.fetchedResults(for: CodexFetchRequest<CodexChat>.recentChats)
+try await chats.performFetch()
 
-let conversation = try await library.startConversation(in: workspaceURL)
-try await conversation.send("Summarize this project.")
+for chat in chats.items {
+    print(chat.title)
+}
 ```
 
-## Thread Lists
+## Fetching
 
-`CodexThreadLibrary` fetches `CodexThreadSnapshot` records through `CodexAppServer.listThreads(_:)` and keeps stable observable `Section` and `ThreadSummary` objects for UI rendering.
+`CodexFetchRequest` is the CoreData-like API. The request type decides which model is returned.
 
 ```swift
-let library = CodexThreadLibrary(
-    server: server,
-    configuration: .init(
-        query: .init(archived: false, workspace: workspaceURL, limit: 50),
-        sectionTitle: "Workspace Threads"
-    )
+let request = CodexFetchRequest<CodexChat>(
+    filter: .init(
+        archived: false,
+        workspace: workspaceURL,
+        searchTerm: "review"
+    ),
+    sortDescriptors: [.recencyAt(.reverse)],
+    sectionDescriptor: .workspaceGroup,
+    fetchLimit: 50
 )
 
-await library.refresh()
+let results = context.fetchedResults(for: request)
+try await results.performFetch()
+```
 
-for section in library.sections {
-    for thread in section.threads {
-        print(thread.title)
+Fetches preserve object identity. If the same app-server thread appears in a later refresh, CodexUIKit mutates the existing `CodexChat` instance instead of replacing it.
+
+```swift
+try await results.refresh()
+
+if results.nextCursor != nil {
+    try await results.loadNextPage()
+}
+```
+
+## Sectioning
+
+Use `sectionDescriptor` when a UI wants sidebar sections.
+
+```swift
+let workspaces = context.fetchedResults(for: CodexFetchRequest<CodexWorkspace>.workspaces(
+    sectionedBy: .workspaceGroup
+))
+
+let chats = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+    sortDescriptors: [.updatedAt(.reverse)],
+    sectionDescriptor: .workspace
+))
+```
+
+Passing no section descriptor gives a single unsectioned result, matching CoreData's optional `sectionNameKeyPath` shape.
+
+## Models
+
+Models are context-attached observable objects:
+
+```swift
+let workspace = try await context.fetch(CodexFetchRequest<CodexWorkspace>.workspaces).first
+let chat = try await workspace?.startChat()
+try await chat?.send("Explain the latest diff.")
+```
+
+Attached models expose their context:
+
+```swift
+if let server = chat?.modelContext?.appServer {
+    print(server)
+}
+```
+
+Keep review-specific state, parsed findings, and review timelines outside CodexUIKit. CodexUIKit owns generic Codex app-server UI models; higher-level packages can layer their own indices on top of `CodexChat.id`, workspace IDs, or sectioned fetch results.
+
+## SwiftUI
+
+Install the container or context in the environment, then use `@CodexQuery` in views.
+
+```swift
+import SwiftUI
+import CodexUIKit
+
+struct Sidebar: View {
+    @CodexQuery(CodexFetchRequest<CodexChat>(
+        sortDescriptors: [.updatedAt(.reverse)],
+        sectionDescriptor: .workspaceGroup
+    ))
+    private var chats
+
+    var body: some View {
+        List {
+            ForEach(chats.sections) { section in
+                Section(section.title ?? "") {
+                    ForEach(section.items) { chat in
+                        Text(chat.title)
+                    }
+                }
+            }
+        }
     }
 }
+
+Sidebar()
+    .codexModelContainer(container)
 ```
-
-Use `loadNextPage()` when `nextCursor` is available:
-
-```swift
-if library.nextCursor != nil {
-    await library.loadNextPage()
-}
-```
-
-Selection stays on the library:
-
-```swift
-library.selectThread(threadID)
-let conversation = try await library.selectedConversation()
-```
-
-## Conversations
-
-Create a conversation from a selected or newly started thread, then render from observable properties.
-
-```swift
-let conversation = try await library.conversation(for: threadID)
-try await conversation.refresh()
-
-print(conversation.title)
-for item in conversation.items {
-    if let text = item.text {
-        print(text)
-    }
-}
-```
-
-Send prompts through the conversation. The conversation updates its `turns`, `items`, `phase`, and `lastErrorDescription` from the returned `CodexResponse`.
-
-```swift
-let response = try await conversation.send("Explain the latest diff.")
-print(response.finalAnswer ?? "")
-```
-
-## Thread Actions
-
-Library actions call the app-server at the right level and update or reload the list as needed.
-
-```swift
-try await library.archive(threadID)
-try await library.unarchive(threadID)
-try await library.delete(threadID)
-```
-
-`startConversation(in:instructions:options:configuration:)` starts a new server thread and returns a `CodexConversation` for it:
-
-```swift
-let conversation = try await library.startConversation(
-    in: workspaceURL,
-    instructions: .init(developer: "Keep answers concise.")
-)
-```
-
-## State Ownership
-
-Keep the long-lived `CodexAppServer` at the app or feature boundary, then create `CodexThreadLibrary` and `CodexConversation` where the UI state is owned. Render from their observable properties and call their methods for user actions.
 
 ## Testing
 
@@ -122,16 +139,17 @@ import CodexUIKit
 import Testing
 
 @MainActor
-@Test func loadsThreads() async throws {
+@Test func loadsChats() async throws {
     let runtime = try await CodexAppServerTestRuntime.start()
     try await runtime.transport.enqueueThreadList(.init(threads: [
         .init(id: "thread-1", name: "First")
     ]))
 
-    let library = CodexThreadLibrary(server: runtime.server)
-    await library.refresh()
+    let context = CodexModelContainer(appServer: runtime.server).mainContext
+    let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>.recentChats)
+    try await results.performFetch()
 
-    #expect(library.sections.first?.threads.first?.title == "First")
+    #expect(results.items.first?.title == "First")
 }
 ```
 
