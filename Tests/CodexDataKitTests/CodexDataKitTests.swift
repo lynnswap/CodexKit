@@ -423,6 +423,9 @@ struct CodexModelContextTests {
             workspace: workspaceURL,
             name: "Source"
         ))
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-source", workspace: workspaceURL, name: "Source")
+        ]))
         try await chat.refresh(includeTurns: false)
 
         #expect(results.items.first === chat)
@@ -455,6 +458,9 @@ struct CodexModelContextTests {
             workspace: newWorkspaceURL,
             name: "Source"
         ))
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-source", workspace: newWorkspaceURL, name: "Source")
+        ]))
         try await chat.refresh(includeTurns: false)
 
         #expect(results.items.first === chat)
@@ -880,6 +886,34 @@ struct CodexModelContextTests {
         #expect(group.workspaces.map(\.url) == [app])
     }
 
+    @Test("group refresh does not prune unrelated groups")
+    func groupRefreshDoesNotPruneUnrelatedGroups() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let app = temporaryDirectory()
+        let tools = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-app", workspace: app, name: "App"),
+            .init(id: "thread-tools", workspace: tools, name: "Tools"),
+        ]))
+        let chatResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>.recentChats)
+        try await chatResults.performFetch()
+        let appChat = try #require(chatResults.items.first { $0.id.rawValue == "thread-app" })
+        let toolsChat = try #require(chatResults.items.first { $0.id.rawValue == "thread-tools" })
+        let appGroup = try #require(appChat.workspace?.workspaceGroup)
+        let toolsWorkspace = try #require(toolsChat.workspace)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-app", workspace: app, name: "App")
+        ]))
+        try await appGroup.refresh()
+
+        #expect(toolsWorkspace.chats.first === toolsChat)
+        #expect(toolsChat.workspace === toolsWorkspace)
+        #expect(chatResults.items.contains { $0 === toolsChat })
+    }
+
     @Test("group refresh preserves archived-only workspaces")
     func groupRefreshPreservesArchivedOnlyWorkspaces() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -1116,10 +1150,39 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadList(.init(threads: [
             .init(id: "thread-match", workspace: workspaceURL, name: "Renamed")
         ]))
+        try await runtime.transport.enqueueThreadList(.init(threads: []))
         try await workspace.refresh()
 
         #expect(results.items.isEmpty)
         #expect(workspace.chats.map(\.title) == ["Renamed"])
+    }
+
+    @Test("workspace refresh reloads search-filtered results from server")
+    func workspaceRefreshReloadsSearchFilteredResultsFromServer() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-search", workspace: workspaceURL, name: "Untitled")
+        ]))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            filter: .init(searchTerm: "needle")
+        ))
+        try await results.performFetch()
+        let chat = try #require(results.items.first)
+        let workspace = try #require(chat.workspace)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-search", workspace: workspaceURL, name: "Untitled")
+        ]))
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-search", workspace: workspaceURL, name: "Untitled")
+        ]))
+        try await workspace.refresh()
+
+        #expect(results.items.first === chat)
+        #expect(workspace.chats.first === chat)
     }
 
     @Test("workspace refresh prunes empty workspace from group")
@@ -1270,6 +1333,12 @@ struct CodexModelContextTests {
         try await groupResults.performFetch()
 
         try await runtime.transport.enqueueEmpty(for: "thread/delete")
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-remaining", workspace: workspaceURL, name: "Remaining")
+        ]))
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-remaining", workspace: workspaceURL, name: "Remaining")
+        ]))
         try await chat.delete()
 
         #expect(workspaceResults.items.first?.url == workspaceURL)
@@ -1413,6 +1482,14 @@ struct CodexModelContextTests {
         try await providerResults.performFetch()
 
         try await runtime.transport.enqueueThreadStart(threadID: "thread-new")
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(
+                id: "thread-new",
+                workspace: workspaceURL,
+                name: "New",
+                modelProvider: "openai"
+            )
+        ]))
         let chat = try await workspace.startChat(.init(
             options: .init(modelProvider: "openai")
         ))
@@ -1712,6 +1789,10 @@ struct CodexModelContextTests {
 
         try await runtime.transport.enqueueThreadResume(.init(id: "thread-beta"))
         try await runtime.transport.enqueueThreadRead(.init(id: "thread-beta", name: "Aardvark"))
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-beta", name: "Aardvark"),
+            .init(id: "thread-alpha", name: "Alpha"),
+        ]))
         try await beta.refresh(includeTurns: false)
 
         #expect(results.items.map(\.title) == ["Aardvark", "Alpha"])
@@ -1740,6 +1821,7 @@ struct CodexModelContextTests {
             workspace: tools,
             name: "Move"
         ))
+        try await runtime.transport.enqueueThreadList(.init(threads: []))
         try await chat.refresh(includeTurns: false)
 
         #expect(results.items.isEmpty)

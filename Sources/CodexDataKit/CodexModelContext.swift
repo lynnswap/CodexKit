@@ -83,7 +83,32 @@ public final class CodexModelContext: @unchecked Sendable {
         )
         let previousWorkspaces = group.workspaces
         let previousChats = group.workspaces.flatMap(\.chats)
-        let workspaces = try await fetch(request)
+        let snapshots = try await fetchAllThreadSnapshots(matching: request).filter {
+            $0.workspace.map { workspaceURL in
+                let standardizedURL = Self.standardizedDirectoryURL(workspaceURL)
+                return CodexWorkspaceGroupIdentity.identity(for: standardizedURL).id == group.id
+            } ?? false
+        }
+        let chats = snapshots.map { apply($0, archived: request.filter.archived == true) }
+        let workspaces = unique(chats.compactMap(\.workspace))
+        for workspace in unique(previousWorkspaces + workspaces) {
+            let previousWorkspaceChats = workspace.chats
+            let fetchedChats = chats.filter { $0.workspace === workspace }
+            let fetchedIDs = Set(fetchedChats.map(\.id))
+            let preservedChats = previousWorkspaceChats.filter {
+                fetchedIDs.contains($0.id) == false
+                    && shouldPreserve($0, outside: request.filter.archived)
+            }
+            let currentChats = fetchedChats + preservedChats
+            workspace.setChats(currentChats)
+            pruneWorkspaceIfEmpty(workspace)
+            _ = detachStaleChats(
+                previousWorkspaceChats,
+                from: workspace,
+                keeping: currentChats,
+                archivedScope: request.filter.archived
+            )
+        }
         let refreshedWorkspaces = workspaces.filter { $0.workspaceGroup?.id == group.id }
         let refreshedWorkspaceIDs = Set(refreshedWorkspaces.map(\.id))
         let preservedWorkspaces = previousWorkspaces.filter {
@@ -96,7 +121,7 @@ public final class CodexModelContext: @unchecked Sendable {
             currentChatIDs.contains($0.id) == false
                 && isInRefreshedScope($0, archivedScope: request.filter.archived)
         }
-        refreshWorkspaceGroupInRegisteredResults(
+        await refreshWorkspaceGroupInRegisteredResults(
             group,
             archived: request.filter.archived == true,
             removedChats: removedChats
@@ -125,7 +150,7 @@ public final class CodexModelContext: @unchecked Sendable {
             keeping: currentChats,
             archivedScope: request.filter.archived
         )
-        refreshWorkspaceInRegisteredResults(
+        await refreshWorkspaceInRegisteredResults(
             workspace,
             archived: request.filter.archived == true,
             removedChats: removedChats
@@ -657,10 +682,10 @@ public final class CodexModelContext: @unchecked Sendable {
         _ workspace: CodexWorkspace,
         archived: Bool,
         removedChats: [CodexChat]
-    ) {
+    ) async {
         fetchedResults.removeAll { $0.value == nil }
         for registration in fetchedResults {
-            registration.value?.refresh(workspace, archived: archived, removedChats: removedChats)
+            await registration.value?.refresh(workspace, archived: archived, removedChats: removedChats)
         }
     }
 
@@ -668,10 +693,10 @@ public final class CodexModelContext: @unchecked Sendable {
         _ group: CodexWorkspaceGroup,
         archived: Bool,
         removedChats: [CodexChat]
-    ) {
+    ) async {
         fetchedResults.removeAll { $0.value == nil }
         for registration in fetchedResults {
-            registration.value?.refresh(group, archived: archived, removedChats: removedChats)
+            await registration.value?.refresh(group, archived: archived, removedChats: removedChats)
         }
     }
 

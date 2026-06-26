@@ -222,8 +222,8 @@ package protocol CodexFetchedResultsRegistration: AnyObject {
         workspace: CodexWorkspace?,
         group: CodexWorkspaceGroup?
     ) async
-    func refresh(_ workspace: CodexWorkspace, archived: Bool, removedChats: [CodexChat])
-    func refresh(_ group: CodexWorkspaceGroup, archived: Bool, removedChats: [CodexChat])
+    func refresh(_ workspace: CodexWorkspace, archived: Bool, removedChats: [CodexChat]) async
+    func refresh(_ group: CodexWorkspaceGroup, archived: Bool, removedChats: [CodexChat]) async
 }
 
 @MainActor
@@ -304,16 +304,11 @@ public final class CodexFetchedResults<Model: CodexObservableModel> {
 
 extension CodexFetchedResults: CodexFetchedResultsRegistration {
     package func insert(_ chat: CodexChat, archived: Bool) async {
-        if shouldRefreshForServerSearch {
-            await refreshAfterMutation()
-            return
-        }
-        if shouldRefreshForUnknownProvider(chat, archived: archived) {
+        if membershipRequiresServerRefresh {
             await refreshAfterMutation()
             return
         }
         guard let model = insertionModel(for: chat, archived: archived) else {
-            await refreshAfterServerFilteredMutationIfNeeded()
             return
         }
         upsert(model)
@@ -324,15 +319,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         workspace: CodexWorkspace?,
         group: CodexWorkspaceGroup?
     ) async {
-        if shouldRefreshForServerSearch {
-            await refreshAfterMutation()
-            return
-        }
-        if canEvaluateFilterLocally == false {
-            await refreshAfterServerFilteredMutationIfNeeded()
-            return
-        }
-        if shouldRefreshForUnknownProvider(chat, archived: true) {
+        if membershipRequiresServerRefresh {
             await refreshAfterMutation()
             return
         }
@@ -349,11 +336,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         previousGroup: CodexWorkspaceGroup?,
         archived: Bool
     ) async {
-        if shouldRefreshForServerSearch {
-            await refreshAfterMutation()
-            return
-        }
-        if shouldRefreshForUnknownProvider(chat, archived: archived) {
+        if membershipRequiresServerRefresh {
             await refreshAfterMutation()
             return
         }
@@ -386,6 +369,10 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         workspace: CodexWorkspace?,
         group: CodexWorkspaceGroup?
     ) async {
+        if membershipRequiresServerRefresh {
+            await refreshAfterMutation()
+            return
+        }
         let originalCount = items.count
         let filteredItems = items.filter {
             shouldKeep($0, afterRemoving: chat, workspace: workspace, group: group)
@@ -402,7 +389,11 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         _ workspace: CodexWorkspace,
         archived: Bool,
         removedChats: [CodexChat]
-    ) {
+    ) async {
+        if membershipRequiresServerRefresh {
+            await refreshAfterMutation()
+            return
+        }
         guard refreshItems(archived: archived, keeping: {
             shouldKeep($0, afterRefreshing: workspace, removedChats: removedChats)
         }) else {
@@ -415,7 +406,11 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         _ group: CodexWorkspaceGroup,
         archived: Bool,
         removedChats: [CodexChat]
-    ) {
+    ) async {
+        if membershipRequiresServerRefresh {
+            await refreshAfterMutation()
+            return
+        }
         guard refreshItems(archived: archived, keeping: {
             shouldKeep($0, afterRefreshing: group, removedChats: removedChats)
         }) else {
@@ -479,11 +474,14 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
     }
 
     private var canEvaluateFilterLocally: Bool {
-        request.filter.sourceKinds == nil && request.filter.useStateDBOnly == nil
+        membershipRequiresServerRefresh == false
     }
 
-    private var shouldRefreshForServerSearch: Bool {
+    private var membershipRequiresServerRefresh: Bool {
         request.filter.searchTerm?.isEmpty == false
+            || request.filter.modelProviders?.isEmpty == false
+            || request.filter.sourceKinds != nil
+            || request.filter.useStateDBOnly != nil
     }
 
     private func refreshAfterLocalRemovalIfNeeded(originalCount: Int) async {
@@ -499,13 +497,6 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         } catch {
             // load records the failed phase; the server mutation has already succeeded.
         }
-    }
-
-    private func refreshAfterServerFilteredMutationIfNeeded() async {
-        guard canEvaluateFilterLocally == false else {
-            return
-        }
-        await refreshAfterMutation()
     }
 
     private func refreshAfterMutation() async {
@@ -536,20 +527,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         }
     }
 
-    private func shouldRefreshForUnknownProvider(_ chat: CodexChat, archived: Bool) -> Bool {
-        guard request.filter.modelProviders?.isEmpty == false,
-            chat.modelProvider == nil
-        else {
-            return false
-        }
-        return shouldInclude(chat, archived: archived, evaluatingProvider: false)
-    }
-
-    private func shouldInclude(
-        _ chat: CodexChat,
-        archived: Bool,
-        evaluatingProvider: Bool = true
-    ) -> Bool {
+    private func shouldInclude(_ chat: CodexChat, archived: Bool) -> Bool {
         switch request.filter.archived {
         case .some(let expectedArchived):
             guard expectedArchived == archived else {
@@ -585,8 +563,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             }
         }
 
-        if evaluatingProvider,
-            let modelProviders = request.filter.modelProviders,
+        if let modelProviders = request.filter.modelProviders,
             modelProviders.isEmpty == false
         {
             guard let modelProvider = chat.modelProvider,
