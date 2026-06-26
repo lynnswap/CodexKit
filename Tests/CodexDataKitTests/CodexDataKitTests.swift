@@ -876,6 +876,34 @@ struct CodexModelContextTests {
         #expect(Set(group.workspaces.map(\.url)) == Set([app, archived]))
     }
 
+    @Test("active group fetch preserves archived-only workspaces")
+    func activeGroupFetchPreservesArchivedOnlyWorkspaces() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let repo = try gitRepository()
+        let app = try createDirectory("App", in: repo)
+        let archived = try createDirectory("Archived", in: repo)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-archived", workspace: archived, name: "Archived")
+        ]))
+        let archivedResults = context.fetchedResults(for: CodexFetchRequest<CodexWorkspaceGroup>(
+            filter: .init(archived: true)
+        ))
+        try await archivedResults.performFetch()
+        let group = try #require(archivedResults.items.first)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-active", workspace: app, name: "Active")
+        ]))
+        let activeResults = context.fetchedResults(
+            for: CodexFetchRequest<CodexWorkspaceGroup>.workspaceGroups)
+        try await activeResults.performFetch()
+
+        #expect(activeResults.items.first === group)
+        #expect(Set(group.workspaces.map(\.url)) == Set([app, archived]))
+    }
+
     @Test("workspace-scoped group fetches preserve sibling workspaces")
     func workspaceScopedGroupFetchesPreserveSiblingWorkspaces() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -1625,6 +1653,33 @@ struct CodexModelContextTests {
         try await chat.refresh(includeTurns: false)
 
         #expect(results.items.isEmpty)
+    }
+
+    @Test("paged chat refresh reloads incomplete results after sort key changes")
+    func pagedChatRefreshReloadsIncompleteResultsAfterSortKeyChanges() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-alpha", name: "Alpha"),
+            .init(id: "thread-beta", name: "Beta"),
+        ]))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            sortDescriptors: [.name()],
+            fetchLimit: 1
+        ))
+        try await results.performFetch()
+        let alpha = try #require(results.items.first)
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-alpha"))
+        try await runtime.transport.enqueueThreadRead(.init(id: "thread-alpha", name: "Zulu"))
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-alpha", name: "Zulu"),
+            .init(id: "thread-beta", name: "Beta"),
+        ]))
+        try await alpha.refresh(includeTurns: false)
+
+        #expect(results.items.map(\.id.rawValue) == ["thread-beta"])
     }
 
     @Test("thread list empty turn arrays preserve cached turns and items")

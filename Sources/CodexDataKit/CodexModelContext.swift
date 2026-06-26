@@ -353,7 +353,8 @@ public final class CodexModelContext: @unchecked Sendable {
         )
         syncGroupWorkspaces(
             workspaces,
-            preservingExisting: preservingGroupWorkspaces
+            preservingExisting: preservingGroupWorkspaces,
+            archivedScope: request.filter.archived
         )
         return localPage(sort(groups, using: request.sortDescriptors), for: request)
     }
@@ -512,7 +513,8 @@ public final class CodexModelContext: @unchecked Sendable {
 
     private func syncGroupWorkspaces(
         _ workspaces: [CodexWorkspace],
-        preservingExisting: Bool
+        preservingExisting: Bool,
+        archivedScope: Bool?
     ) {
         let fetchedGroups = unique(workspaces.compactMap(\.workspaceGroup))
         let groups = preservingExisting ? fetchedGroups : Array(workspaceGroupsByID.values)
@@ -525,7 +527,12 @@ public final class CodexModelContext: @unchecked Sendable {
                 }
                 group.setWorkspaces(sort(fetchedWorkspaces + remainingWorkspaces, using: [.name()]))
             } else {
-                group.setWorkspaces(sort(fetchedWorkspaces, using: [.name()]))
+                let fetchedIDs = Set(fetchedWorkspaces.map(\.id))
+                let preservedWorkspaces = group.workspaces.filter {
+                    fetchedIDs.contains($0.id) == false
+                        && containsOutOfScopeChat(in: $0, archivedScope: archivedScope)
+                }
+                group.setWorkspaces(sort(fetchedWorkspaces + preservedWorkspaces, using: [.name()]))
             }
         }
     }

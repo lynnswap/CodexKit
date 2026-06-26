@@ -345,6 +345,9 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         }
         items = modelContext.sortedItems(filteredItems, for: request)
         sections = modelContext.sections(for: items, descriptor: request.sectionDescriptor)
+        if await refreshAfterPagedRevalidationIfNeeded(chat) {
+            return
+        }
         guard canEvaluateFilterLocally,
             let model = insertionModel(for: chat, archived: archived)
         else {
@@ -478,6 +481,23 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             try await performFetch()
         } catch {
             // performFetch records the failed phase; the server mutation has already succeeded.
+        }
+    }
+
+    private func refreshAfterPagedRevalidationIfNeeded(_ chat: CodexChat) async -> Bool {
+        guard Model.self == CodexChat.self,
+            request.fetchLimit != nil,
+            nextCursor != nil,
+            items.contains(where: { $0.id == chat.id })
+        else {
+            return false
+        }
+        do {
+            try await performFetch()
+            return true
+        } catch {
+            // performFetch records the failed phase; the server mutation has already succeeded.
+            return false
         }
     }
 
