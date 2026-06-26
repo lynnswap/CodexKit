@@ -406,6 +406,14 @@ for try await event in accountEvents {
 }
 ```
 
+Native web authentication hosts can request a callback scheme and complete the
+login with the received callback URL:
+
+```swift
+let handle = try await appServer.loginChatGPT(callbackURLScheme: "com.example.app.auth")
+try await appServer.completeLogin(handle, callbackURL: callbackURL)
+```
+
 API key and device-code login are also available:
 
 ```swift

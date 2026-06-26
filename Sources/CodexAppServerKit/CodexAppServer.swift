@@ -757,12 +757,18 @@ public actor CodexAppServer {
 
     /// Starts a ChatGPT browser login flow.
     ///
+    /// - Parameter callbackURLScheme: Optional URL scheme for native web authentication callbacks.
     /// - Returns: A login handle containing the browser authentication URL.
     /// - Throws: A transport, JSON-RPC, or app-server login error.
-    public func loginChatGPT() async throws -> CodexLoginHandle {
+    public func loginChatGPT(callbackURLScheme: String? = nil) async throws -> CodexLoginHandle {
+        let nativeWebAuthentication = callbackURLScheme
+            .map(AppServerAPI.Account.Login.NativeWebAuthentication.init(callbackURLScheme:))
         let response = try await client.send(
             AppServerAPI.Account.Login.Start.Request(
-                params: .init(type: "chatgpt")
+                params: .init(
+                    type: "chatgpt",
+                    nativeWebAuthentication: nativeWebAuthentication
+                )
             ))
         return try Self.loginHandle(from: response)
     }
@@ -799,6 +805,36 @@ public actor CodexAppServer {
     public func cancelLogin(id: CodexLoginHandle.ID) async throws {
         let _: AppServerAPI.Account.Login.Cancel.Response = try await client.send(
             AppServerAPI.Account.Login.Cancel.Request(params: .init(loginID: id.rawValue))
+        )
+    }
+
+    /// Completes a pending native ChatGPT login flow.
+    ///
+    /// Handles without an app-server login identifier are treated as already complete.
+    ///
+    /// - Parameters:
+    ///   - handle: The login handle returned from a login-start method.
+    ///   - callbackURL: The callback URL received by the native host application.
+    /// - Throws: A transport, JSON-RPC, or app-server login error.
+    public func completeLogin(_ handle: CodexLoginHandle, callbackURL: URL) async throws {
+        guard let id = handle.id else {
+            return
+        }
+        try await completeLogin(id: id, callbackURL: callbackURL)
+    }
+
+    /// Completes a pending native ChatGPT login flow by identifier.
+    ///
+    /// - Parameters:
+    ///   - id: The app-server login identifier.
+    ///   - callbackURL: The callback URL received by the native host application.
+    /// - Throws: A transport, JSON-RPC, or app-server login error.
+    public func completeLogin(id: CodexLoginHandle.ID, callbackURL: URL) async throws {
+        let _: AppServerAPI.Account.Login.Complete.Response = try await client.send(
+            AppServerAPI.Account.Login.Complete.Request(params: .init(
+                loginID: id.rawValue,
+                callbackURL: callbackURL.absoluteString
+            ))
         )
     }
 

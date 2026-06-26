@@ -2770,6 +2770,14 @@ struct CodexAppServerKitTests {
         let loginParams = try loginRequest.decodeParams(AppServerAPI.Account.Login.Params.self)
         #expect(loginParams.type == "chatgpt")
         #expect(loginParams.codexStreamlinedLogin == true)
+        #expect(loginParams.nativeWebAuthentication == nil)
+        let rawLoginParams = try #require(
+            JSONSerialization.jsonObject(with: loginRequest.params) as? [String: Any]
+        )
+        #expect(rawLoginParams.keys.sorted() == [
+            "codexStreamlinedLogin",
+            "type",
+        ])
 
         try await server.cancelLogin(handle)
         let cancelRequest = try #require(await transport.recordedRequests().last)
@@ -2792,6 +2800,75 @@ struct CodexAppServerKitTests {
             "account/login/start",
             "account/login/cancel",
         ])
+    }
+
+    @Test func loginChatGPTEncodesCallbackURLSchemeWhenSupplied() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueChatGPTLogin(
+            loginID: "login-1",
+            authenticationURL: URL(string: "https://chatgpt.com/auth")!
+        )
+        let client = AppServerClient(transport: transport)
+        let server = CodexAppServer(
+            client: client,
+            router: CodexAppServerNotificationRouter(client: client)
+        )
+
+        let handle = try await server.loginChatGPT(
+            callbackURLScheme: "com.example.codex.auth"
+        )
+
+        #expect(handle.id == "login-1")
+        let request = try #require(await transport.recordedRequests().first)
+        #expect(request.method == "account/login/start")
+        let params = try request.decodeParams(AppServerAPI.Account.Login.Params.self)
+        #expect(params.type == "chatgpt")
+        #expect(params.codexStreamlinedLogin == true)
+        #expect(params.nativeWebAuthentication?.callbackURLScheme == "com.example.codex.auth")
+
+        let rawParams = try #require(
+            JSONSerialization.jsonObject(with: request.params) as? [String: Any]
+        )
+        let nativeWebAuthentication = try #require(
+            rawParams["nativeWebAuthentication"] as? [String: Any]
+        )
+        #expect(nativeWebAuthentication["callbackUrlScheme"] as? String == "com.example.codex.auth")
+    }
+
+    @Test func completeLoginByIDSendsCallbackURL() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueue(
+            AppServerAPI.Account.Login.Complete.Response(),
+            for: "account/login/complete"
+        )
+        let client = AppServerClient(transport: transport)
+        let server = CodexAppServer(
+            client: client,
+            router: CodexAppServerNotificationRouter(client: client)
+        )
+        let callbackURL = URL(string: "com.example.codex.auth://login?code=abc&state=xyz")!
+
+        try await server.completeLogin(id: "login-1", callbackURL: callbackURL)
+
+        let request = try #require(await transport.recordedRequests().first)
+        #expect(request.method == "account/login/complete")
+        let params = try request.decodeParams(AppServerAPI.Account.Login.Complete.Params.self)
+        #expect(params.loginID == "login-1")
+        #expect(params.callbackURL == callbackURL.absoluteString)
+    }
+
+    @Test func completeLoginWithAPIKeyHandleIsNoOp() async throws {
+        let transport = CodexAppServerTestTransport()
+        let client = AppServerClient(transport: transport)
+        let server = CodexAppServer(
+            client: client,
+            router: CodexAppServerNotificationRouter(client: client)
+        )
+        let callbackURL = URL(string: "com.example.codex.auth://login?code=abc")!
+
+        try await server.completeLogin(.apiKey, callbackURL: callbackURL)
+
+        #expect(await transport.recordedRequests().isEmpty)
     }
 
     @Test func responseStreamCancelSendsTurnInterrupt() async throws {
