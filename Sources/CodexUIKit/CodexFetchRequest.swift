@@ -314,6 +314,9 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         previousGroup: CodexWorkspaceGroup?,
         archived: Bool
     ) {
+        guard canLocallyRevalidate else {
+            return
+        }
         let filteredItems = items.filter {
             shouldKeep(
                 $0,
@@ -395,6 +398,10 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             && request.fetchLimit == nil
             && nextCursor == nil
             && backwardsCursor == nil
+    }
+
+    private var canLocallyRevalidate: Bool {
+        request.filter.sourceKinds == nil && request.filter.useStateDBOnly == nil
     }
 
     private func shouldInclude(_ chat: CodexChat, archived: Bool) -> Bool {

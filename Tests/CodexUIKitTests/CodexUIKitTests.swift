@@ -402,6 +402,32 @@ struct CodexModelContextTests {
         #expect(activeResults.items.isEmpty)
     }
 
+    @Test("chat refresh preserves server-only filtered fetched results")
+    func chatRefreshPreservesServerOnlyFilteredFetchedResults() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-source", workspace: workspaceURL, name: "Source")
+        ]))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            filter: .init(sourceKinds: [.appServer])
+        ))
+        try await results.performFetch()
+        let chat = try #require(results.items.first)
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-source"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-source",
+            workspace: workspaceURL,
+            name: "Source"
+        ))
+        try await chat.refresh(includeTurns: false)
+
+        #expect(results.items.first === chat)
+    }
+
     @Test("recency sort preserves app-server ordering")
     func recencySortPreservesAppServerOrdering() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -586,6 +612,31 @@ struct CodexModelContextTests {
 
         let requests = await runtime.transport.recordedRequests(method: "thread/list")
         #expect(requests.count == 2)
+    }
+
+    @Test("paged workspace fetches prune stale workspace chats")
+    func pagedWorkspaceFetchesPruneStaleWorkspaceChats() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspace = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-stale", workspace: workspace, name: "Stale"),
+            .init(id: "thread-remaining", workspace: workspace, name: "Remaining"),
+        ]))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexWorkspace>(
+            sortDescriptors: [.name()],
+            fetchLimit: 1
+        ))
+        try await results.performFetch()
+        let fetchedWorkspace = try #require(results.items.first)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-remaining", workspace: workspace, name: "Remaining")
+        ]))
+        try await results.refresh()
+
+        #expect(fetchedWorkspace.chats.map(\.id.rawValue) == ["thread-remaining"])
     }
 
     @Test("group refresh rebuilds workspaces from fetched result")

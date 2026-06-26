@@ -446,8 +446,7 @@ public final class CodexModelContext: @unchecked Sendable {
     private func shouldPreserveExistingWorkspaceChats<Model: CodexObservableModel>(
         for request: CodexFetchRequest<Model>
     ) -> Bool {
-        request.cursor != nil
-            || request.fetchLimit != nil
+        (Model.self == CodexChat.self && (request.cursor != nil || request.fetchLimit != nil))
             || request.filter.archived == true
             || request.filter.searchTerm != nil
             || request.filter.modelProviders != nil
