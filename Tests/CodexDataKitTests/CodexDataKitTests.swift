@@ -788,6 +788,37 @@ struct CodexModelContextTests {
         #expect(workspace.chats.map(\.id.rawValue) == ["thread-remaining"])
     }
 
+    @Test("workspace refresh inserts newly loaded scoped fetched results")
+    func workspaceRefreshInsertsNewlyLoadedScopedFetchedResults() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-existing", workspace: workspaceURL, name: "Existing")
+        ]))
+        let workspaceResults = context.fetchedResults(for: CodexFetchRequest<CodexWorkspace>.workspaces)
+        try await workspaceResults.performFetch()
+        let workspace = try #require(workspaceResults.items.first)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-existing", workspace: workspaceURL, name: "Existing")
+        ]))
+        let scopedResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>.chats(
+            in: workspace
+        ))
+        try await scopedResults.performFetch()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-existing", workspace: workspaceURL, name: "Existing"),
+            .init(id: "thread-new", workspace: workspaceURL, name: "New"),
+        ]))
+        try await workspace.refresh()
+
+        #expect(Set(scopedResults.items.map(\.id.rawValue)) == ["thread-existing", "thread-new"])
+        #expect(Set(workspace.chats.map(\.id.rawValue)) == ["thread-existing", "thread-new"])
+    }
+
     @Test("workspace refresh revalidates unscoped fetched results")
     func workspaceRefreshRevalidatesUnscopedFetchedResults() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -809,6 +840,31 @@ struct CodexModelContextTests {
 
         #expect(results.items.map(\.id.rawValue) == ["thread-remaining"])
         #expect(workspace.chats.map(\.id.rawValue) == ["thread-remaining"])
+    }
+
+    @Test("group refresh inserts newly loaded workspace fetched results")
+    func groupRefreshInsertsNewlyLoadedWorkspaceFetchedResults() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let repo = try gitRepository()
+        let app = try createDirectory("App", in: repo)
+        let tools = try createDirectory("Tools", in: repo)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-app", workspace: app, name: "App")
+        ]))
+        let workspaceResults = context.fetchedResults(for: CodexFetchRequest<CodexWorkspace>.workspaces)
+        try await workspaceResults.performFetch()
+        let group = try #require(workspaceResults.items.first?.workspaceGroup)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-app", workspace: app, name: "App"),
+            .init(id: "thread-tools", workspace: tools, name: "Tools"),
+        ]))
+        try await group.refresh()
+
+        #expect(Set(workspaceResults.items.map(\.url)) == Set([app, tools]))
+        #expect(Set(group.workspaces.map(\.url)) == Set([app, tools]))
     }
 
     @Test("filtered workspace results drop parents with no matching chats")
@@ -995,6 +1051,31 @@ struct CodexModelContextTests {
         #expect(providerResults.items.first === chat)
     }
 
+    @Test("empty provider filters revalidate as all providers")
+    func emptyProviderFiltersRevalidateAsAllProviders() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-any-provider", name: "Before")
+        ]))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            filter: .init(modelProviders: [])
+        ))
+        try await results.performFetch()
+        let chat = try #require(results.items.first)
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-any-provider"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-any-provider",
+            name: "After"
+        ))
+        try await chat.refresh(includeTurns: false)
+
+        #expect(results.items.first === chat)
+        #expect(chat.title == "After")
+    }
+
     @Test("starting a chat does not overfill paged fetched results")
     func startingChatDoesNotOverfillPagedFetchedResults() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -1109,7 +1190,8 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadRead(
             .init(
                 id: "thread-refresh",
-                name: "After"
+                name: "After",
+                turns: []
             ))
 
         try await chat.refresh(includeTurns: false)
@@ -1125,8 +1207,8 @@ struct CodexModelContextTests {
         #expect(params.includeTurns == false)
     }
 
-    @Test("explicit empty turn lists clear cached turns and items")
-    func explicitEmptyTurnListsClearCachedTurnsAndItems() async throws {
+    @Test("thread list empty turn arrays preserve cached turns and items")
+    func threadListEmptyTurnArraysPreserveCachedTurnsAndItems() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         let context = CodexModelContainer(appServer: runtime.server).mainContext
 
@@ -1164,6 +1246,54 @@ struct CodexModelContextTests {
             .init(id: "thread-clear", name: "After", turns: [])
         ]))
         try await results.refresh()
+
+        #expect(chat.title == "After")
+        #expect(chat.turns.isEmpty == false)
+        #expect(chat.items.isEmpty == false)
+    }
+
+    @Test("explicit empty read turn lists clear cached turns and items")
+    func explicitEmptyReadTurnListsClearCachedTurnsAndItems() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(
+                id: "thread-clear",
+                name: "Before",
+                turns: [
+                    .init(
+                        id: "turn-clear",
+                        status: .completed,
+                        items: [
+                            .init(
+                                id: "message-clear",
+                                kind: .agentMessage,
+                                content: .message(.init(
+                                    id: "message-clear",
+                                    role: .assistant,
+                                    phase: .finalAnswer,
+                                    text: "Done"
+                                ))
+                            ),
+                        ]
+                    )
+                ]
+            )
+        ]))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>.recentChats)
+        try await results.performFetch()
+        let chat = try #require(results.items.first)
+        #expect(chat.turns.isEmpty == false)
+        #expect(chat.items.isEmpty == false)
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-clear"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-clear",
+            name: "After",
+            turns: []
+        ))
+        try await chat.refresh()
 
         #expect(chat.turns.isEmpty)
         #expect(chat.items.isEmpty)

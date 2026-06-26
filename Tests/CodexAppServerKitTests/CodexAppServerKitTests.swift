@@ -559,6 +559,49 @@ struct CodexAppServerKitTests {
         #expect(params.useStateDbOnly == true)
     }
 
+    @Test func threadListTreatsEmptyTurnsAsUnloaded() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueue(
+            AppServerAPI.Thread.List.Response(data: [
+                .init(id: "thread-empty", turns: [])
+            ]),
+            for: "thread/list"
+        )
+        let client = AppServerClient(transport: transport)
+        let server = CodexAppServer(
+            client: client,
+            router: CodexAppServerNotificationRouter(client: client)
+        )
+
+        let page = try await server.listThreads()
+
+        #expect(page.threads.first?.turns == nil)
+    }
+
+    @Test func threadReadUsesIncludeTurnsToInterpretEmptyTurns() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueue(
+            AppServerAPI.Thread.Read.Response(thread: .init(id: "thread-empty", turns: [])),
+            for: "thread/read"
+        )
+        try await transport.enqueue(
+            AppServerAPI.Thread.Read.Response(thread: .init(id: "thread-empty", turns: [])),
+            for: "thread/read"
+        )
+        let client = AppServerClient(transport: transport)
+        let thread = CodexThread(
+            id: .init(rawValue: "thread-empty"),
+            client: client,
+            router: CodexAppServerNotificationRouter(client: client)
+        )
+
+        let metadataOnly = try await thread.read(includeTurns: false)
+        let withTurns = try await thread.read(includeTurns: true)
+
+        #expect(metadataOnly.turns == nil)
+        #expect(withTurns.turns == [])
+    }
+
     @Test func appServerArchiveThreadSerializesThreadID() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueueEmpty(for: "thread/archive")

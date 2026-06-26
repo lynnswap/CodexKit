@@ -495,7 +495,7 @@ public final class CodexModelContext: @unchecked Sendable {
             && relationshipIsComplete == false)
             || request.filter.archived == true
             || request.filter.searchTerm != nil
-            || request.filter.modelProviders != nil
+            || request.filter.modelProviders?.isEmpty == false
             || request.filter.sourceKinds != nil
             || request.filter.useStateDBOnly != nil
     }

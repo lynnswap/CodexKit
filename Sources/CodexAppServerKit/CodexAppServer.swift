@@ -643,7 +643,7 @@ public actor CodexAppServer {
                     useStateDbOnly: query.useStateDBOnly
                 )))
         return .init(
-            threads: response.data.map(Self.threadSnapshot),
+            threads: response.data.map { Self.threadSnapshot(from: $0, includesTurns: false) },
             nextCursor: response.nextCursor,
             backwardsCursor: response.backwardsCursor
         )
@@ -936,7 +936,8 @@ public actor CodexAppServer {
     }
 
     package nonisolated static func threadSnapshot(
-        from snapshot: AppServerAPI.Thread.Snapshot
+        from snapshot: AppServerAPI.Thread.Snapshot,
+        includesTurns: Bool
     ) -> CodexThreadSnapshot {
         .init(
             id: .init(rawValue: snapshot.id),
@@ -947,15 +948,28 @@ public actor CodexAppServer {
             createdAt: snapshot.createdAt.map { Date(timeIntervalSince1970: TimeInterval($0)) },
             updatedAt: snapshot.updatedAt.map { Date(timeIntervalSince1970: TimeInterval($0)) },
             ephemeral: snapshot.ephemeral,
-            turns: snapshot.turns?.map {
-                CodexTurnSnapshot(
-                    id: .init(rawValue: $0.id),
-                    status: $0.status.map(CodexTurnStatus.init(rawValue:)),
-                    errorMessage: $0.error?.message,
-                    items: AppServerThreadItemMapping.threadItems(from: $0.items)
-                )
-            }
+            turns: turnSnapshots(from: snapshot.turns, includesTurns: includesTurns)
         )
+    }
+
+    private nonisolated static func turnSnapshots(
+        from turns: [AppServerAPI.Turn.Payload]?,
+        includesTurns: Bool
+    ) -> [CodexTurnSnapshot]? {
+        guard let turns else {
+            return nil
+        }
+        guard includesTurns || turns.isEmpty == false else {
+            return nil
+        }
+        return turns.map {
+            CodexTurnSnapshot(
+                id: .init(rawValue: $0.id),
+                status: $0.status.map(CodexTurnStatus.init(rawValue:)),
+                errorMessage: $0.error?.message,
+                items: AppServerThreadItemMapping.threadItems(from: $0.items)
+            )
+        }
     }
 
     private nonisolated static func account(from snapshot: AppServerAPI.Account.Snapshot) -> CodexAccount {

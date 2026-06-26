@@ -233,7 +233,7 @@ extension CodexThread {
             AppServerAPI.Thread.Read.Request(
                 params: .init(threadID: id.rawValue, includeTurns: includeTurns)
             ))
-        return CodexAppServer.threadSnapshot(from: response.thread)
+        return CodexAppServer.threadSnapshot(from: response.thread, includesTurns: includeTurns)
     }
 
     /// Renames this thread.
@@ -270,7 +270,7 @@ extension CodexThread {
             AppServerAPI.Thread.Unarchive.Request(
                 params: .init(threadID: id.rawValue)
             ))
-        return CodexAppServer.threadSnapshot(from: response.thread)
+        return CodexAppServer.threadSnapshot(from: response.thread, includesTurns: false)
     }
 
     /// Rolls this thread back by the specified number of turns.

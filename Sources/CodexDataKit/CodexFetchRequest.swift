@@ -96,7 +96,13 @@ public struct CodexFetchFilter<Model: CodexObservableModel>: Sendable, Hashable 
     public var archived: Bool?
     public var workspace: URL?
     public var searchTerm: String?
-    public var modelProviders: [String]?
+    public var modelProviders: [String]? {
+        didSet {
+            if modelProviders?.isEmpty == true {
+                modelProviders = nil
+            }
+        }
+    }
     public var sourceKinds: [CodexThreadSourceKind]?
     public var useStateDBOnly: Bool?
 
@@ -111,7 +117,7 @@ public struct CodexFetchFilter<Model: CodexObservableModel>: Sendable, Hashable 
         self.archived = archived
         self.workspace = workspace
         self.searchTerm = searchTerm
-        self.modelProviders = modelProviders
+        self.modelProviders = modelProviders?.isEmpty == true ? nil : modelProviders
         self.sourceKinds = sourceKinds
         self.useStateDBOnly = useStateDBOnly
     }
@@ -363,15 +369,21 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         archived: Bool,
         removedChats: [CodexChat]
     ) {
-        refreshItems(archived: archived) {
+        guard refreshItems(archived: archived, keeping: {
             shouldKeep($0, afterRefreshing: workspace, removedChats: removedChats)
+        }) else {
+            return
         }
+        upsertLoadedModels(from: workspace)
     }
 
     package func refresh(_ group: CodexWorkspaceGroup, archived: Bool) {
-        refreshItems(archived: archived) {
+        guard refreshItems(archived: archived, keeping: {
             shouldKeep($0, afterRefreshing: group)
+        }) else {
+            return
         }
+        upsertLoadedModels(from: group)
     }
 
     private func insertionModel(for chat: CodexChat, archived: Bool) -> Model? {
@@ -464,7 +476,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             }
         }
 
-        if let modelProviders = request.filter.modelProviders {
+        if let modelProviders = request.filter.modelProviders, modelProviders.isEmpty == false {
             guard let modelProvider = chat.modelProvider,
                 modelProviders.contains(modelProvider)
             else {
@@ -583,17 +595,34 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         return true
     }
 
+    @discardableResult
     private func refreshItems(
         archived: Bool,
         keeping shouldKeep: (Model) -> Bool
-    ) {
+    ) -> Bool {
         guard requestMatchesArchiveScope(archived) else {
             sections = modelContext.sections(for: items, descriptor: request.sectionDescriptor)
-            return
+            return false
         }
         let filteredItems = items.filter(shouldKeep)
         items = filteredItems
         sections = modelContext.sections(for: filteredItems, descriptor: request.sectionDescriptor)
+        return true
+    }
+
+    private func upsertLoadedModels(from workspace: CodexWorkspace) {
+        for chat in workspace.chats {
+            guard let model = insertionModel(for: chat, archived: chat.isArchived) else {
+                continue
+            }
+            upsert(model)
+        }
+    }
+
+    private func upsertLoadedModels(from group: CodexWorkspaceGroup) {
+        for workspace in group.workspaces {
+            upsertLoadedModels(from: workspace)
+        }
     }
 
     private func restoreArchivedRelationships(for chat: CodexChat) {
