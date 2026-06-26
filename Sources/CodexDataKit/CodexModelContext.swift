@@ -94,7 +94,8 @@ public final class CodexModelContext: @unchecked Sendable {
         let snapshots = try await fetchAllThreadSnapshots(matching: request)
         let fetchedChats = await applyFetchedSnapshots(
             snapshots,
-            archived: request.filter.archived == true
+            archived: request.filter.archived == true,
+            scopedWorkspaceURL: request.filter.workspace
         )
         let fetchedChatIDs = Set(fetchedChats.map(\.id))
         let chats = fetchedChats.filter { $0.workspace?.workspaceGroup?.id == group.id }
@@ -146,7 +147,8 @@ public final class CodexModelContext: @unchecked Sendable {
         let snapshots = try await fetchAllThreadSnapshots(matching: request)
         let fetchedChats = await applyFetchedSnapshots(
             snapshots,
-            archived: request.filter.archived == true
+            archived: request.filter.archived == true,
+            scopedWorkspaceURL: request.filter.workspace
         )
         let chats = sort(
             fetchedChats,
@@ -368,6 +370,7 @@ public final class CodexModelContext: @unchecked Sendable {
             let fetchedChats = await applyFetchedSnapshots(
                 try await fetchAllThreadSnapshots(matching: request),
                 archived: request.filter.archived == true,
+                scopedWorkspaceURL: request.filter.workspace,
                 excluding: excludedRegistration
             )
             let chats = sort(
@@ -388,6 +391,7 @@ public final class CodexModelContext: @unchecked Sendable {
         let fetchedChats = await applyFetchedSnapshots(
             page.threads,
             archived: request.filter.archived == true,
+            scopedWorkspaceURL: request.filter.workspace,
             excluding: excludedRegistration
         )
         let chats = sort(
@@ -408,6 +412,7 @@ public final class CodexModelContext: @unchecked Sendable {
         let chats = await applyFetchedSnapshots(
             try await fetchAllThreadSnapshots(matching: request),
             archived: request.filter.archived == true,
+            scopedWorkspaceURL: request.filter.workspace,
             excluding: excludedRegistration
         )
         let workspaces = unique(chats.compactMap(\.workspace))
@@ -439,6 +444,7 @@ public final class CodexModelContext: @unchecked Sendable {
         let chats = await applyFetchedSnapshots(
             try await fetchAllThreadSnapshots(matching: request),
             archived: request.filter.archived == true,
+            scopedWorkspaceURL: request.filter.workspace,
             excluding: excludedRegistration
         )
         let workspaces = unique(chats.compactMap(\.workspace))
@@ -477,6 +483,7 @@ public final class CodexModelContext: @unchecked Sendable {
     private func applyFetchedSnapshots(
         _ snapshots: [CodexThreadSnapshot],
         archived: Bool,
+        scopedWorkspaceURL: URL? = nil,
         excluding excludedRegistration: (any CodexFetchedResultsRegistration)? = nil
     ) async -> [CodexChat] {
         var revalidations: [(
@@ -485,6 +492,7 @@ public final class CodexModelContext: @unchecked Sendable {
             previousGroup: CodexWorkspaceGroup?
         )] = []
         let chats = snapshots.map { snapshot in
+            let snapshot = snapshotForApply(snapshot, scopedWorkspaceURL: scopedWorkspaceURL)
             let existingChat = chatsByID[snapshot.id]
             let previousState = existingChat.map(fetchedResultState(for:))
             let previousWorkspace = existingChat?.workspace
@@ -505,6 +513,30 @@ public final class CodexModelContext: @unchecked Sendable {
             )
         }
         return chats
+    }
+
+    private func snapshotForApply(
+        _ snapshot: CodexThreadSnapshot,
+        scopedWorkspaceURL: URL?
+    ) -> CodexThreadSnapshot {
+        guard let scopedWorkspaceURL, snapshot.hasField(.workspace) == false else {
+            return snapshot
+        }
+        var presentFields = snapshot.presentFields
+        presentFields.insert(.workspace)
+        return CodexThreadSnapshot(
+            id: snapshot.id,
+            workspace: scopedWorkspaceURL,
+            name: snapshot.name,
+            preview: snapshot.preview,
+            modelProvider: snapshot.modelProvider,
+            createdAt: snapshot.createdAt,
+            updatedAt: snapshot.updatedAt,
+            ephemeral: snapshot.ephemeral,
+            turns: snapshot.turns,
+            turnItemsAreAuthoritative: snapshot.turnItemsAreAuthoritative,
+            presentFields: presentFields
+        )
     }
 
     private func fetchedResultState(for chat: CodexChat) -> ChatFetchedResultState {

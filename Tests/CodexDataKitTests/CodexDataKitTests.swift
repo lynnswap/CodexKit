@@ -438,6 +438,43 @@ struct CodexModelContextTests {
         ])
     }
 
+    @Test("workspace-scoped chat fetch applies scoped workspace when snapshots omit cwd")
+    func workspaceScopedChatFetchAppliesScopedWorkspaceWhenSnapshotsOmitCWD() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-existing", workspace: workspaceURL, name: "Existing")
+        ]))
+        let workspaceResults = context.fetchedResults(for: CodexFetchRequest<CodexWorkspace>.workspaces)
+        try await workspaceResults.performFetch()
+        let workspace = try #require(workspaceResults.items.first)
+
+        try await runtime.transport.enqueueJSON(
+            """
+            {
+              "data": [
+                {
+                  "id": "thread-new",
+                  "name": "New"
+                }
+              ]
+            }
+            """,
+            for: "thread/list"
+        )
+        let scopedResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>.chats(
+            in: workspace
+        ))
+        try await scopedResults.performFetch()
+
+        let chat = try #require(scopedResults.items.first)
+        #expect(chat.workspace === workspace)
+        #expect(workspace.chats.first === chat)
+        #expect(chat.title == "New")
+    }
+
     @Test("thread list fetch inserts first-seen parents into registered results")
     func threadListFetchInsertsFirstSeenParentsIntoRegisteredResults() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -1813,6 +1850,40 @@ struct CodexModelContextTests {
 
         #expect(Set(scopedResults.items.map(\.id.rawValue)) == ["thread-existing", "thread-new"])
         #expect(Set(workspace.chats.map(\.id.rawValue)) == ["thread-existing", "thread-new"])
+    }
+
+    @Test("workspace refresh applies scoped workspace when snapshots omit cwd")
+    func workspaceRefreshAppliesScopedWorkspaceWhenSnapshotsOmitCWD() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-existing", workspace: workspaceURL, name: "Existing")
+        ]))
+        let workspaceResults = context.fetchedResults(for: CodexFetchRequest<CodexWorkspace>.workspaces)
+        try await workspaceResults.performFetch()
+        let workspace = try #require(workspaceResults.items.first)
+
+        try await runtime.transport.enqueueJSON(
+            """
+            {
+              "data": [
+                {
+                  "id": "thread-new",
+                  "name": "New"
+                }
+              ]
+            }
+            """,
+            for: "thread/list"
+        )
+        try await workspace.refresh()
+
+        let chat = try #require(workspace.chats.first)
+        #expect(chat.workspace === workspace)
+        #expect(chat.id.rawValue == "thread-new")
+        #expect(chat.title == "New")
     }
 
     @Test("workspace refresh revalidates unscoped fetched results")
