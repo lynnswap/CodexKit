@@ -118,7 +118,7 @@ public final class CodexModelContext: @unchecked Sendable {
         let thread = try await appServer.resumeThread(chat.id)
         let snapshot = try await thread.read(includeTurns: includeTurns)
         let refreshedChat = apply(snapshot)
-        revalidateChatInRegisteredResults(
+        await revalidateChatInRegisteredResults(
             refreshedChat,
             previousWorkspace: previousWorkspace,
             previousGroup: previousGroup,
@@ -174,12 +174,12 @@ public final class CodexModelContext: @unchecked Sendable {
             detach(chat, from: workspace)
         }
         chat.setArchived(true)
-        archiveChatInRegisteredResults(chat, workspace: workspace, group: group)
+        await archiveChatInRegisteredResults(chat, workspace: workspace, group: group)
     }
 
     public func delete(_ chat: CodexChat) async throws {
         try await appServer.deleteThread(chat.id)
-        remove(chat)
+        await remove(chat)
     }
 
     package func fetchPage<Model: CodexObservableModel>(
@@ -297,7 +297,8 @@ public final class CodexModelContext: @unchecked Sendable {
                 for: request,
                 relationshipIsComplete: true
             ),
-            workspaceFilter: request.filter.workspace
+            workspaceFilter: request.filter.workspace,
+            archivedScope: request.filter.archived
         )
         return localPage(sort(workspaces, using: request.sortDescriptors), for: request)
     }
@@ -315,7 +316,8 @@ public final class CodexModelContext: @unchecked Sendable {
                 for: request,
                 relationshipIsComplete: true
             ),
-            workspaceFilter: request.filter.workspace
+            workspaceFilter: request.filter.workspace,
+            archivedScope: request.filter.archived
         )
         syncGroupWorkspaces(
             workspaces,
@@ -394,7 +396,7 @@ public final class CodexModelContext: @unchecked Sendable {
         return group
     }
 
-    private func remove(_ chat: CodexChat) {
+    private func remove(_ chat: CodexChat) async {
         let workspace = chat.workspace
         let group = workspace?.workspaceGroup
         chatsByID.removeValue(forKey: chat.id)
@@ -402,7 +404,7 @@ public final class CodexModelContext: @unchecked Sendable {
             detach(chat, from: workspace)
         }
         chat.detachFromContext()
-        removeChatFromRegisteredResults(chat, workspace: workspace, group: group)
+        await removeChatFromRegisteredResults(chat, workspace: workspace, group: group)
     }
 
     package func syncLoadedRelationships<Model: CodexObservableModel>(
@@ -417,7 +419,8 @@ public final class CodexModelContext: @unchecked Sendable {
                     for: request,
                     relationshipIsComplete: relationshipIsComplete
                 ),
-                workspaceFilter: request.filter.workspace
+                workspaceFilter: request.filter.workspace,
+                archivedScope: request.filter.archived
             )
         }
     }
@@ -425,7 +428,8 @@ public final class CodexModelContext: @unchecked Sendable {
     private func syncWorkspaceChats(
         _ chats: [CodexChat],
         preservingExisting: Bool,
-        workspaceFilter: URL?
+        workspaceFilter: URL?,
+        archivedScope: Bool?
     ) {
         let fetchedWorkspaces = unique(chats.compactMap(\.workspace))
         let workspaces: [CodexWorkspace]
@@ -444,9 +448,23 @@ public final class CodexModelContext: @unchecked Sendable {
                 let remainingChats = workspace.chats.filter { fetchedIDs.contains($0.id) == false }
                 workspace.setChats(fetchedChats + remainingChats)
             } else {
-                workspace.setChats(fetchedChats)
+                let fetchedIDs = Set(fetchedChats.map(\.id))
+                let preservedChats = workspace.chats.filter {
+                    fetchedIDs.contains($0.id) == false
+                        && shouldPreserve($0, outside: archivedScope)
+                }
+                workspace.setChats(fetchedChats + preservedChats)
                 pruneWorkspaceIfEmpty(workspace)
             }
+        }
+    }
+
+    private func shouldPreserve(_ chat: CodexChat, outside archivedScope: Bool?) -> Bool {
+        switch archivedScope {
+        case .some(true):
+            chat.isArchived == false
+        case .some(false), .none:
+            chat.isArchived
         }
     }
 
@@ -531,10 +549,10 @@ public final class CodexModelContext: @unchecked Sendable {
         _ chat: CodexChat,
         workspace: CodexWorkspace?,
         group: CodexWorkspaceGroup?
-    ) {
+    ) async {
         fetchedResults.removeAll { $0.value == nil }
         for registration in fetchedResults {
-            registration.value?.archive(chat, workspace: workspace, group: group)
+            await registration.value?.archive(chat, workspace: workspace, group: group)
         }
     }
 
@@ -543,10 +561,10 @@ public final class CodexModelContext: @unchecked Sendable {
         previousWorkspace: CodexWorkspace?,
         previousGroup: CodexWorkspaceGroup?,
         archived: Bool
-    ) {
+    ) async {
         fetchedResults.removeAll { $0.value == nil }
         for registration in fetchedResults {
-            registration.value?.revalidate(
+            await registration.value?.revalidate(
                 chat,
                 previousWorkspace: previousWorkspace,
                 previousGroup: previousGroup,
@@ -559,10 +577,10 @@ public final class CodexModelContext: @unchecked Sendable {
         _ chat: CodexChat,
         workspace: CodexWorkspace?,
         group: CodexWorkspaceGroup?
-    ) {
+    ) async {
         fetchedResults.removeAll { $0.value == nil }
         for registration in fetchedResults {
-            registration.value?.remove(chat, workspace: workspace, group: group)
+            await registration.value?.remove(chat, workspace: workspace, group: group)
         }
     }
 

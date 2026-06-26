@@ -731,6 +731,38 @@ struct CodexModelContextTests {
         #expect(fetchedWorkspace.chats.map(\.id.rawValue) == ["thread-new", "thread-remaining"])
     }
 
+    @Test("active sync preserves archived workspace chats")
+    func activeSyncPreservesArchivedWorkspaceChats() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspace = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-archived", workspace: workspace, name: "Archived")
+        ]))
+        let archivedResults = context.fetchedResults(for: CodexFetchRequest<CodexWorkspace>(
+            filter: .init(archived: true)
+        ))
+        try await archivedResults.performFetch()
+        let fetchedWorkspace = try #require(archivedResults.items.first)
+        #expect(fetchedWorkspace.chats.map(\.id.rawValue) == ["thread-archived"])
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-active", workspace: workspace, name: "Active")
+        ]))
+        let activeResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>.recentChats)
+        try await activeResults.performFetch()
+
+        #expect(activeResults.items.map(\.id.rawValue) == ["thread-active"])
+        #expect(Set(fetchedWorkspace.chats.map(\.id.rawValue)) == [
+            "thread-archived",
+            "thread-active",
+        ])
+        #expect(archivedResults.items.first?.chats.contains {
+            $0.id.rawValue == "thread-archived"
+        } == true)
+    }
+
     @Test("cursor-started chat fetches never mark workspace relationships complete")
     func cursorStartedChatFetchesNeverMarkWorkspaceRelationshipsComplete() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -1061,6 +1093,34 @@ struct CodexModelContextTests {
         #expect(groupResults.items.first?.workspaces.first?.url == workspaceURL)
     }
 
+    @Test("paged fetched results backfill after local removals")
+    func pagedFetchedResultsBackfillAfterLocalRemovals() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(
+            threads: [
+                .init(id: "thread-delete", workspace: workspaceURL, name: "Delete")
+            ],
+            nextCursor: "next"
+        ))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            sortDescriptors: [.updatedAt(.reverse)],
+            fetchLimit: 1
+        ))
+        try await results.performFetch()
+        let chat = try #require(results.items.first)
+
+        try await runtime.transport.enqueueEmpty(for: "thread/delete")
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-backfill", workspace: workspaceURL, name: "Backfill")
+        ]))
+        try await chat.delete()
+
+        #expect(results.items.map(\.id.rawValue) == ["thread-backfill"])
+    }
+
     @Test("starting a chat inserts it into active fetched results")
     func startingChatInsertsItIntoActiveFetchedResults() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -1268,6 +1328,29 @@ struct CodexModelContextTests {
         let params = try request.decodeParams(ThreadReadParams.self)
         #expect(params.threadID == "thread-refresh")
         #expect(params.includeTurns == false)
+    }
+
+    @Test("server-only chat refresh re-sorts current results")
+    func serverOnlyChatRefreshResortsCurrentResults() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-beta", name: "Beta"),
+            .init(id: "thread-alpha", name: "Alpha"),
+        ]))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            filter: .init(sourceKinds: [.appServer]),
+            sortDescriptors: [.name()]
+        ))
+        try await results.performFetch()
+        let beta = try #require(results.items.first { $0.id.rawValue == "thread-beta" })
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-beta"))
+        try await runtime.transport.enqueueThreadRead(.init(id: "thread-beta", name: "Aardvark"))
+        try await beta.refresh(includeTurns: false)
+
+        #expect(results.items.map(\.title) == ["Aardvark", "Alpha"])
     }
 
     @Test("thread list empty turn arrays preserve cached turns and items")
