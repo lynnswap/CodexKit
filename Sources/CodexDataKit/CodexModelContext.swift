@@ -467,7 +467,7 @@ public final class CodexModelContext: @unchecked Sendable {
             let previousWorkspace = existingChat?.workspace
             let previousGroup = previousWorkspace?.workspaceGroup
             let chat = apply(snapshot, archived: archived)
-            if let previousState, previousState != fetchedResultState(for: chat) {
+            if previousState == nil || previousState != fetchedResultState(for: chat) {
                 revalidations.append((chat, previousWorkspace, previousGroup))
             }
             return chat

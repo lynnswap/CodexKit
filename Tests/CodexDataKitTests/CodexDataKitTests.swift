@@ -377,6 +377,70 @@ struct CodexModelContextTests {
         #expect(groupResults.sections.isEmpty)
     }
 
+    @Test("thread list fetch inserts first-seen chats into registered scoped results")
+    func threadListFetchInsertsFirstSeenChatsIntoRegisteredScopedResults() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+        let initialPage = CodexThreadPage(threads: [
+            .init(id: "thread-existing", workspace: workspaceURL, name: "Existing")
+        ])
+
+        try await runtime.transport.enqueueThreadList(initialPage)
+        let initialChats = try await context.fetch(CodexFetchRequest<CodexChat>.recentChats)
+        let workspace = try #require(initialChats.first?.workspace)
+
+        try await runtime.transport.enqueueThreadList(initialPage)
+        let scopedResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>.chats(
+            in: workspace,
+            sortDescriptors: [.name()],
+            sectionDescriptor: .workspace
+        ))
+        try await scopedResults.performFetch()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-existing", workspace: workspaceURL, name: "Existing"),
+            .init(id: "thread-new", workspace: workspaceURL, name: "New"),
+        ]))
+        _ = try await context.fetch(CodexFetchRequest<CodexChat>.recentChats)
+
+        #expect(scopedResults.items.map(\.id.rawValue) == ["thread-existing", "thread-new"])
+        #expect(scopedResults.sections.count == 1)
+        #expect(scopedResults.sections.first?.items.map(\.id.rawValue) == [
+            "thread-existing",
+            "thread-new",
+        ])
+    }
+
+    @Test("thread list fetch inserts first-seen parents into registered results")
+    func threadListFetchInsertsFirstSeenParentsIntoRegisteredResults() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: []))
+        let workspaceResults = context.fetchedResults(for: CodexFetchRequest<CodexWorkspace>.workspaces)
+        try await workspaceResults.performFetch()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: []))
+        let groupResults = context.fetchedResults(for: CodexFetchRequest<CodexWorkspaceGroup>.workspaceGroups)
+        try await groupResults.performFetch()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-new", workspace: workspaceURL, name: "New")
+        ]))
+        _ = try await context.fetch(CodexFetchRequest<CodexChat>.recentChats)
+
+        let workspace = try #require(workspaceResults.items.first)
+        let group = try #require(groupResults.items.first)
+        #expect(workspaceResults.items.count == 1)
+        #expect(workspace.chats.map(\.id.rawValue) == ["thread-new"])
+        #expect(groupResults.items.count == 1)
+        #expect(group.workspaces.contains { $0 === workspace })
+        #expect(workspaceResults.sections.count == 1)
+        #expect(groupResults.sections.count == 1)
+    }
+
     @Test("workspace chats preserve fetched chat order")
     func workspaceChatsPreserveFetchedChatOrder() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
