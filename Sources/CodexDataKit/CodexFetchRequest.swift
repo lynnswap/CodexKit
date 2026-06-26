@@ -421,6 +421,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             await refreshAfterMutation()
             return
         }
+        let originalCount = items.count
         guard refreshItems(archived: archived, keeping: {
             shouldKeep($0, afterRefreshing: workspace, removedChats: removedChats)
         }) else {
@@ -430,6 +431,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             await refreshAfterMutation()
             return
         }
+        await backfillAfterLocalRemovalIfNeeded(originalCount: originalCount)
     }
 
     package func refresh(
@@ -441,6 +443,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             await refreshAfterMutation()
             return
         }
+        let originalCount = items.count
         guard refreshItems(archived: archived, keeping: {
             shouldKeep($0, afterRefreshing: group, removedChats: removedChats)
         }) else {
@@ -450,6 +453,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             await refreshAfterMutation()
             return
         }
+        await backfillAfterLocalRemovalIfNeeded(originalCount: originalCount)
     }
 
     private func insertionModel(for chat: CodexChat, archived: Bool) -> Model? {

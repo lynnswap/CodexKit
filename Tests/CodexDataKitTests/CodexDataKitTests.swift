@@ -1284,6 +1284,42 @@ struct CodexModelContextTests {
         #expect(results.items.map(\.id) == [currentGroup.id])
     }
 
+    @Test("group refresh prunes stale chats when a workspace moves groups")
+    func groupRefreshPrunesStaleChatsWhenWorkspaceMovesGroups() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-stale", workspace: workspaceURL, name: "Stale"),
+            .init(id: "thread-keep", workspace: workspaceURL, name: "Keep"),
+        ]))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexWorkspaceGroup>.workspaceGroups)
+        try await results.performFetch()
+        let previousGroup = try #require(results.items.first)
+        let workspace = try #require(previousGroup.workspaces.first)
+        let staleChat = try #require(workspace.chats.first { $0.id.rawValue == "thread-stale" })
+        let keepChat = try #require(workspace.chats.first { $0.id.rawValue == "thread-keep" })
+
+        try FileManager.default.createDirectory(
+            at: workspaceURL.appendingPathComponent(".git", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-keep", workspace: workspaceURL, name: "Keep")
+        ]))
+        try await previousGroup.refresh()
+
+        let currentGroup = try #require(workspace.workspaceGroup)
+        #expect(currentGroup !== previousGroup)
+        #expect(previousGroup.workspaces.isEmpty)
+        #expect(currentGroup.workspaces.contains { $0 === workspace })
+        #expect(workspace.chats.map(\.id.rawValue) == ["thread-keep"])
+        #expect(keepChat.workspace === workspace)
+        #expect(staleChat.workspace == nil)
+        #expect(results.items.map(\.id) == [currentGroup.id])
+    }
+
     @Test("paged workspace fetches prune stale workspace chats")
     func pagedWorkspaceFetchesPruneStaleWorkspaceChats() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -2033,6 +2069,64 @@ struct CodexModelContextTests {
 
         #expect(workspace.chats.isEmpty)
         #expect(group.workspaces.isEmpty)
+    }
+
+    @Test("workspace refresh backfills paged chat results after removals")
+    func workspaceRefreshBackfillsPagedChatResultsAfterRemovals() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+        let backfillURL = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(
+            threads: [
+                .init(id: "thread-delete", workspace: workspaceURL, name: "Delete")
+            ],
+            nextCursor: "next"
+        ))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            sortDescriptors: [.updatedAt(.reverse)],
+            fetchLimit: 1
+        ))
+        try await results.performFetch()
+        let workspace = try #require(results.items.first?.workspace)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: []))
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-backfill", workspace: backfillURL, name: "Backfill")
+        ]))
+        try await workspace.refresh()
+
+        #expect(results.items.map(\.id.rawValue) == ["thread-backfill"])
+    }
+
+    @Test("group refresh backfills paged chat results after removals")
+    func groupRefreshBackfillsPagedChatResultsAfterRemovals() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+        let backfillURL = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(
+            threads: [
+                .init(id: "thread-delete", workspace: workspaceURL, name: "Delete")
+            ],
+            nextCursor: "next"
+        ))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            sortDescriptors: [.updatedAt(.reverse)],
+            fetchLimit: 1
+        ))
+        try await results.performFetch()
+        let group = try #require(results.items.first?.workspace?.workspaceGroup)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: []))
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-backfill", workspace: backfillURL, name: "Backfill")
+        ]))
+        try await group.refresh()
+
+        #expect(results.items.map(\.id.rawValue) == ["thread-backfill"])
     }
 
     @Test("filtered workspace results drop parents with no matching chats")

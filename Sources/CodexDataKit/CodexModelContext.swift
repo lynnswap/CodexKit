@@ -100,18 +100,15 @@ public final class CodexModelContext: @unchecked Sendable {
         let fetchedChatIDs = Set(fetchedChats.map(\.id))
         let chats = fetchedChats.filter { $0.workspace?.workspaceGroup?.id == group.id }
         let workspaces = unique(chats.compactMap(\.workspace))
-        let previousWorkspacesStillInGroup = previousWorkspaces.filter {
-            $0.workspaceGroup?.id == group.id
-        }
-        for workspace in unique(previousWorkspacesStillInGroup + workspaces) {
+        for workspace in unique(previousWorkspaces + workspaces) {
             let previousWorkspaceChats = workspace.chats
-            let fetchedChats = chats.filter { $0.workspace === workspace }
-            let fetchedIDs = Set(fetchedChats.map(\.id))
+            let fetchedWorkspaceChats = fetchedChats.filter { $0.workspace === workspace }
+            let fetchedIDs = Set(fetchedWorkspaceChats.map(\.id))
             let preservedChats = previousWorkspaceChats.filter {
                 fetchedIDs.contains($0.id) == false
                     && shouldPreserve($0, outside: request.filter.archived)
             }
-            let currentChats = fetchedChats + preservedChats
+            let currentChats = fetchedWorkspaceChats + preservedChats
             workspace.setChats(currentChats)
             pruneWorkspaceIfEmpty(workspace)
             _ = detachStaleChats(
@@ -120,6 +117,9 @@ public final class CodexModelContext: @unchecked Sendable {
                 keeping: currentChats,
                 archivedScope: request.filter.archived
             )
+        }
+        let previousWorkspacesStillInGroup = previousWorkspaces.filter {
+            $0.workspaceGroup?.id == group.id
         }
         let refreshedWorkspaces = workspaces.filter { $0.workspaceGroup?.id == group.id }
         let refreshedWorkspaceIDs = Set(refreshedWorkspaces.map(\.id))
