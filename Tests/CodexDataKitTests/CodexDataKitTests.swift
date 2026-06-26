@@ -851,6 +851,31 @@ struct CodexModelContextTests {
         #expect(group.workspaces.map(\.url) == [app])
     }
 
+    @Test("group refresh preserves archived-only workspaces")
+    func groupRefreshPreservesArchivedOnlyWorkspaces() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let repo = try gitRepository()
+        let app = try createDirectory("App", in: repo)
+        let archived = try createDirectory("Archived", in: repo)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-archived", workspace: archived, name: "Archived")
+        ]))
+        let archivedResults = context.fetchedResults(for: CodexFetchRequest<CodexWorkspaceGroup>(
+            filter: .init(archived: true)
+        ))
+        try await archivedResults.performFetch()
+        let group = try #require(archivedResults.items.first)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-active", workspace: app, name: "Active")
+        ]))
+        try await group.refresh()
+
+        #expect(Set(group.workspaces.map(\.url)) == Set([app, archived]))
+    }
+
     @Test("workspace refresh revalidates scoped fetched results")
     func workspaceRefreshRevalidatesScopedFetchedResults() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -960,6 +985,56 @@ struct CodexModelContextTests {
 
         #expect(Set(workspaceResults.items.map(\.url)) == Set([app, tools]))
         #expect(Set(group.workspaces.map(\.url)) == Set([app, tools]))
+    }
+
+    @Test("workspace refresh preserves archived chats")
+    func workspaceRefreshPreservesArchivedChats() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-archived", workspace: workspaceURL, name: "Archived")
+        ]))
+        let archivedResults = context.fetchedResults(for: CodexFetchRequest<CodexWorkspace>(
+            filter: .init(archived: true)
+        ))
+        try await archivedResults.performFetch()
+        let workspace = try #require(archivedResults.items.first)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-active", workspace: workspaceURL, name: "Active")
+        ]))
+        try await workspace.refresh()
+
+        #expect(Set(workspace.chats.map(\.id.rawValue)) == [
+            "thread-archived",
+            "thread-active",
+        ])
+    }
+
+    @Test("workspace refresh revalidates unscoped filtered chat results")
+    func workspaceRefreshRevalidatesUnscopedFilteredChatResults() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-match", workspace: workspaceURL, name: "Match")
+        ]))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            filter: .init(searchTerm: "Match")
+        ))
+        try await results.performFetch()
+        let workspace = try #require(results.items.first?.workspace)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-match", workspace: workspaceURL, name: "Renamed")
+        ]))
+        try await workspace.refresh()
+
+        #expect(results.items.isEmpty)
+        #expect(workspace.chats.map(\.title) == ["Renamed"])
     }
 
     @Test("filtered workspace results drop parents with no matching chats")

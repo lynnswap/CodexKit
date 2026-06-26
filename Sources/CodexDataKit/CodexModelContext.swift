@@ -81,12 +81,20 @@ public final class CodexModelContext: @unchecked Sendable {
             sortDescriptors: [.name()],
             sectionDescriptor: .workspaceGroup
         )
+        let previousWorkspaces = group.workspaces
         let previousChats = group.workspaces.flatMap(\.chats)
         let workspaces = try await fetch(request)
-        group.setWorkspaces(workspaces.filter { $0.workspaceGroup?.id == group.id })
+        let refreshedWorkspaces = workspaces.filter { $0.workspaceGroup?.id == group.id }
+        let refreshedWorkspaceIDs = Set(refreshedWorkspaces.map(\.id))
+        let preservedWorkspaces = previousWorkspaces.filter {
+            refreshedWorkspaceIDs.contains($0.id) == false
+                && containsOutOfScopeChat(in: $0, archivedScope: request.filter.archived)
+        }
+        group.setWorkspaces(sort(refreshedWorkspaces + preservedWorkspaces, using: request.sortDescriptors))
         let currentChatIDs = Set(group.workspaces.flatMap(\.chats).map(\.id))
         let removedChats = previousChats.filter {
-            currentChatIDs.contains($0.id) == false && !$0.isArchived
+            currentChatIDs.contains($0.id) == false
+                && isInRefreshedScope($0, archivedScope: request.filter.archived)
         }
         refreshWorkspaceGroupInRegisteredResults(
             group,
@@ -103,8 +111,19 @@ public final class CodexModelContext: @unchecked Sendable {
                 .map { apply($0, archived: request.filter.archived == true) },
             using: request.sortDescriptors
         )
-        workspace.setChats(chats)
-        let removedChats = detachStaleChats(previousChats, from: workspace, keeping: chats)
+        let refreshedIDs = Set(chats.map(\.id))
+        let preservedChats = previousChats.filter {
+            refreshedIDs.contains($0.id) == false
+                && shouldPreserve($0, outside: request.filter.archived)
+        }
+        let currentChats = chats + preservedChats
+        workspace.setChats(currentChats)
+        let removedChats = detachStaleChats(
+            previousChats,
+            from: workspace,
+            keeping: currentChats,
+            archivedScope: request.filter.archived
+        )
         refreshWorkspaceInRegisteredResults(
             workspace,
             archived: request.filter.archived == true,
@@ -468,6 +487,19 @@ public final class CodexModelContext: @unchecked Sendable {
         }
     }
 
+    private func isInRefreshedScope(_ chat: CodexChat, archivedScope: Bool?) -> Bool {
+        switch archivedScope {
+        case .some(true):
+            chat.isArchived
+        case .some(false), .none:
+            chat.isArchived == false
+        }
+    }
+
+    private func containsOutOfScopeChat(in workspace: CodexWorkspace, archivedScope: Bool?) -> Bool {
+        workspace.chats.contains { shouldPreserve($0, outside: archivedScope) }
+    }
+
     private func syncGroupWorkspaces(
         _ workspaces: [CodexWorkspace],
         preservingExisting: Bool
@@ -496,11 +528,13 @@ public final class CodexModelContext: @unchecked Sendable {
     private func detachStaleChats(
         _ previousChats: [CodexChat],
         from workspace: CodexWorkspace,
-        keeping refreshedChats: [CodexChat]
+        keeping refreshedChats: [CodexChat],
+        archivedScope: Bool?
     ) -> [CodexChat] {
         let refreshedIDs = Set(refreshedChats.map(\.id))
         let staleChats = previousChats.filter {
-            refreshedIDs.contains($0.id) == false && !$0.isArchived
+            refreshedIDs.contains($0.id) == false
+                && isInRefreshedScope($0, archivedScope: archivedScope)
         }
         for chat in staleChats {
             chat.detachFromWorkspace(workspace)

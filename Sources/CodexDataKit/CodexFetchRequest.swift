@@ -567,12 +567,11 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             if removedChats.contains(where: { $0 === item }) {
                 return false
             }
+            if workspace.chats.contains(where: { $0 === item }) {
+                return shouldInclude(item, archived: item.isArchived)
+            }
             if requestIsScoped(to: workspace) {
-                return workspace.chats.contains { $0 === item }
-                    && shouldInclude(
-                        item,
-                        archived: item.isArchived
-                    )
+                return false
             }
             return true
         }
