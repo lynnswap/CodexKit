@@ -205,6 +205,12 @@ package protocol CodexFetchedResultsRegistration: AnyObject {
         workspace: CodexWorkspace?,
         group: CodexWorkspaceGroup?
     )
+    func revalidate(
+        _ chat: CodexChat,
+        previousWorkspace: CodexWorkspace?,
+        previousGroup: CodexWorkspaceGroup?,
+        archived: Bool
+    )
     func remove(
         _ chat: CodexChat,
         workspace: CodexWorkspace?,
@@ -300,6 +306,16 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         } else {
             remove(chat, workspace: workspace, group: group)
         }
+    }
+
+    package func revalidate(
+        _ chat: CodexChat,
+        previousWorkspace: CodexWorkspace?,
+        previousGroup: CodexWorkspaceGroup?,
+        archived: Bool
+    ) {
+        remove(chat, workspace: previousWorkspace, group: previousGroup)
+        insert(chat, archived: archived)
     }
 
     package func remove(

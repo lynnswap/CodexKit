@@ -88,9 +88,17 @@ public final class CodexModelContext: @unchecked Sendable {
     }
 
     public func refresh(_ chat: CodexChat, includeTurns: Bool = true) async throws {
+        let previousWorkspace = chat.workspace
+        let previousGroup = previousWorkspace?.workspaceGroup
         let thread = try await appServer.resumeThread(chat.id)
         let snapshot = try await thread.read(includeTurns: includeTurns)
-        apply(snapshot)
+        let refreshedChat = apply(snapshot)
+        revalidateChatInRegisteredResults(
+            refreshedChat,
+            previousWorkspace: previousWorkspace,
+            previousGroup: previousGroup,
+            archived: false
+        )
     }
 
     @discardableResult
@@ -107,6 +115,7 @@ public final class CodexModelContext: @unchecked Sendable {
         let snapshot = CodexThreadSnapshot(
             id: thread.id,
             workspace: thread.workspace,
+            modelProvider: input.options.modelProvider,
             createdAt: now,
             updatedAt: now
         )
@@ -434,7 +443,7 @@ public final class CodexModelContext: @unchecked Sendable {
     ) -> Bool {
         request.cursor != nil
             || request.fetchLimit != nil
-            || request.filter.archived != nil
+            || request.filter.archived == true
             || request.filter.searchTerm != nil
             || request.filter.modelProviders != nil
             || request.filter.sourceKinds != nil
@@ -466,6 +475,23 @@ public final class CodexModelContext: @unchecked Sendable {
         fetchedResults.removeAll { $0.value == nil }
         for registration in fetchedResults {
             registration.value?.archive(chat, workspace: workspace, group: group)
+        }
+    }
+
+    private func revalidateChatInRegisteredResults(
+        _ chat: CodexChat,
+        previousWorkspace: CodexWorkspace?,
+        previousGroup: CodexWorkspaceGroup?,
+        archived: Bool
+    ) {
+        fetchedResults.removeAll { $0.value == nil }
+        for registration in fetchedResults {
+            registration.value?.revalidate(
+                chat,
+                previousWorkspace: previousWorkspace,
+                previousGroup: previousGroup,
+                archived: archived
+            )
         }
     }
 
