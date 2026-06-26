@@ -314,8 +314,21 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         previousGroup: CodexWorkspaceGroup?,
         archived: Bool
     ) {
-        remove(chat, workspace: previousWorkspace, group: previousGroup)
-        insert(chat, archived: archived)
+        let filteredItems = items.filter {
+            shouldKeep(
+                $0,
+                afterRevalidating: chat,
+                previousWorkspace: previousWorkspace,
+                previousGroup: previousGroup,
+                archived: archived
+            )
+        }
+        items = filteredItems
+        sections = modelContext.sections(for: filteredItems, descriptor: request.sectionDescriptor)
+        guard let model = insertionModel(for: chat, archived: archived) else {
+            return
+        }
+        upsert(model)
     }
 
     package func remove(
@@ -368,10 +381,20 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         if let index = nextItems.firstIndex(where: { $0.id == model.id }) {
             nextItems[index] = model
         } else {
+            guard canInsertLiveModel else {
+                return
+            }
             nextItems.insert(model, at: 0)
         }
         items = modelContext.sortedItems(nextItems, for: request)
         sections = modelContext.sections(for: items, descriptor: request.sectionDescriptor)
+    }
+
+    private var canInsertLiveModel: Bool {
+        request.cursor == nil
+            && request.fetchLimit == nil
+            && nextCursor == nil
+            && backwardsCursor == nil
     }
 
     private func shouldInclude(_ chat: CodexChat, archived: Bool) -> Bool {
@@ -433,12 +456,43 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             return item.id != chat.id
         }
         if let item = item as? CodexWorkspace, let workspace {
-            return item.id != workspace.id || workspace.chats.isEmpty == false
+            return item.id != workspace.id || containsIncludedChat(in: item)
         }
         if let item = item as? CodexWorkspaceGroup, let group {
-            return item.id != group.id || group.workspaces.isEmpty == false
+            return item.id != group.id || containsIncludedWorkspace(in: item)
         }
         return true
+    }
+
+    private func shouldKeep(
+        _ item: Model,
+        afterRevalidating chat: CodexChat,
+        previousWorkspace: CodexWorkspace?,
+        previousGroup: CodexWorkspaceGroup?,
+        archived: Bool
+    ) -> Bool {
+        if let item = item as? CodexChat, item.id == chat.id {
+            return shouldInclude(chat, archived: archived)
+        }
+        if let item = item as? CodexWorkspace,
+           item.id == previousWorkspace?.id || item.id == chat.workspace?.id
+        {
+            return containsIncludedChat(in: item)
+        }
+        if let item = item as? CodexWorkspaceGroup,
+           item.id == previousGroup?.id || item.id == chat.workspace?.workspaceGroup?.id
+        {
+            return containsIncludedWorkspace(in: item)
+        }
+        return true
+    }
+
+    private func containsIncludedWorkspace(in group: CodexWorkspaceGroup) -> Bool {
+        group.workspaces.contains { containsIncludedChat(in: $0) }
+    }
+
+    private func containsIncludedChat(in workspace: CodexWorkspace) -> Bool {
+        workspace.chats.contains { shouldInclude($0, archived: $0.isArchived) }
     }
 
     private static func standardizedPath(_ url: URL) -> String {

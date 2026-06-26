@@ -369,6 +369,39 @@ struct CodexModelContextTests {
         #expect(allResults.items.first === chat)
     }
 
+    @Test("chat refresh preserves archived fetched result membership")
+    func chatRefreshPreservesArchivedFetchedResultMembership() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-archived", workspace: workspaceURL, name: "Archived")
+        ]))
+        let archivedResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            filter: .init(archived: true),
+            sortDescriptors: [.updatedAt(.reverse)]
+        ))
+        try await archivedResults.performFetch()
+        let chat = try #require(archivedResults.items.first)
+        #expect(chat.isArchived)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: []))
+        let activeResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>.recentChats)
+        try await activeResults.performFetch()
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-archived"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-archived",
+            workspace: workspaceURL,
+            name: "Archived"
+        ))
+        try await chat.refresh(includeTurns: false)
+
+        #expect(archivedResults.items.first === chat)
+        #expect(activeResults.items.isEmpty)
+    }
+
     @Test("recency sort preserves app-server ordering")
     func recencySortPreservesAppServerOrdering() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -580,6 +613,40 @@ struct CodexModelContextTests {
         #expect(group.workspaces.map(\.url) == [app])
     }
 
+    @Test("filtered workspace results drop parents with no matching chats")
+    func filteredWorkspaceResultsDropParentsWithNoMatchingChats() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-keep", workspace: workspaceURL, name: "Keep"),
+            .init(id: "thread-match", workspace: workspaceURL, name: "Match"),
+        ]))
+        let allResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>.recentChats)
+        try await allResults.performFetch()
+        let chat = try #require(allResults.items.first { $0.id.rawValue == "thread-match" })
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-match", workspace: workspaceURL, name: "Match")
+        ]))
+        let filteredResults = context.fetchedResults(for: CodexFetchRequest<CodexWorkspace>(
+            filter: .init(searchTerm: "Match")
+        ))
+        try await filteredResults.performFetch()
+        #expect(filteredResults.items.isEmpty == false)
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-match"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-match",
+            workspace: workspaceURL,
+            name: "Renamed"
+        ))
+        try await chat.refresh(includeTurns: false)
+
+        #expect(filteredResults.items.isEmpty)
+    }
+
     @Test("removing the last chat removes the workspace from its group")
     func removingLastChatRemovesWorkspaceFromGroup() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -688,6 +755,35 @@ struct CodexModelContextTests {
 
         #expect(chat.modelProvider == "openai")
         #expect(providerResults.items.first === chat)
+    }
+
+    @Test("starting a chat does not overfill paged fetched results")
+    func startingChatDoesNotOverfillPagedFetchedResults() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-existing", workspace: workspaceURL, name: "Existing")
+        ]))
+        let workspaceResults = context.fetchedResults(for: CodexFetchRequest<CodexWorkspace>.workspaces)
+        try await workspaceResults.performFetch()
+        let workspace = try #require(workspaceResults.items.first)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-existing", workspace: workspaceURL, name: "Existing")
+        ]))
+        let pagedResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            sortDescriptors: [.updatedAt(.reverse)],
+            fetchLimit: 1
+        ))
+        try await pagedResults.performFetch()
+
+        try await runtime.transport.enqueueThreadStart(threadID: "thread-new")
+        _ = try await workspace.startChat()
+
+        #expect(pagedResults.items.count == 1)
+        #expect(pagedResults.items.first?.id.rawValue == "thread-existing")
     }
 
     @Test("archiving a chat moves it between active fetched results")

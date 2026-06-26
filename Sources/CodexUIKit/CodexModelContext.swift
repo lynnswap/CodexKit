@@ -97,7 +97,7 @@ public final class CodexModelContext: @unchecked Sendable {
             refreshedChat,
             previousWorkspace: previousWorkspace,
             previousGroup: previousGroup,
-            archived: false
+            archived: refreshedChat.isArchived
         )
     }
 
@@ -120,6 +120,7 @@ public final class CodexModelContext: @unchecked Sendable {
             updatedAt: now
         )
         let chat = apply(snapshot)
+        chat.setArchived(false)
         workspace.moveChatToFront(chat)
         insertChatIntoRegisteredResults(chat, archived: false)
         return chat
@@ -146,6 +147,7 @@ public final class CodexModelContext: @unchecked Sendable {
         if let workspace {
             detach(chat, from: workspace)
         }
+        chat.setArchived(true)
         archiveChatInRegisteredResults(chat, workspace: workspace, group: group)
     }
 
@@ -239,7 +241,7 @@ public final class CodexModelContext: @unchecked Sendable {
         if canUseServerOrderedPages(for: request) == false {
             let chats = sort(
                 try await fetchAllThreadSnapshots(matching: request)
-                    .map(apply),
+                    .map { apply($0, archived: request.filter.archived == true) },
                 using: request.sortDescriptors
             )
             return localPage(chats, for: request)
@@ -247,7 +249,7 @@ public final class CodexModelContext: @unchecked Sendable {
 
         let page = try await appServer.listThreads(threadQuery(from: request))
         let chats = sort(
-            page.threads.map(apply),
+            page.threads.map { apply($0, archived: request.filter.archived == true) },
             using: request.sortDescriptors
         )
         return CodexFetchPage(
@@ -261,7 +263,7 @@ public final class CodexModelContext: @unchecked Sendable {
         _ request: CodexFetchRequest<CodexWorkspace>
     ) async throws -> CodexFetchPage<CodexWorkspace> {
         let chats = try await fetchAllThreadSnapshots(matching: request)
-            .map(apply)
+            .map { apply($0, archived: request.filter.archived == true) }
         let workspaces = unique(chats.compactMap(\.workspace))
         syncWorkspaceChats(
             chats,
@@ -275,7 +277,7 @@ public final class CodexModelContext: @unchecked Sendable {
         _ request: CodexFetchRequest<CodexWorkspaceGroup>
     ) async throws -> CodexFetchPage<CodexWorkspaceGroup> {
         let chats = try await fetchAllThreadSnapshots(matching: request)
-            .map(apply)
+            .map { apply($0, archived: request.filter.archived == true) }
         let workspaces = unique(chats.compactMap(\.workspace))
         let groups = unique(workspaces.compactMap(\.workspaceGroup))
         syncWorkspaceChats(
@@ -291,7 +293,7 @@ public final class CodexModelContext: @unchecked Sendable {
     }
 
     @discardableResult
-    private func apply(_ snapshot: CodexThreadSnapshot) -> CodexChat {
+    private func apply(_ snapshot: CodexThreadSnapshot, archived: Bool? = nil) -> CodexChat {
         let workspace = snapshot.workspace.map(workspace(for:))
         let chat = chat(for: snapshot.id)
         if let previousWorkspace = chat.workspace {
@@ -301,6 +303,9 @@ public final class CodexModelContext: @unchecked Sendable {
             }
         }
         chat.apply(snapshot, workspace: workspace)
+        if let archived {
+            chat.setArchived(archived)
+        }
         workspace?.addChatIfNeeded(chat)
         return chat
     }

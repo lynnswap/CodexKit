@@ -188,6 +188,7 @@ public final class CodexChat: CodexObservableModel {
     public private(set) var name: String?
     public private(set) var preview: String?
     public private(set) var modelProvider: String?
+    public private(set) var isArchived: Bool
     public private(set) var createdAt: Date?
     public private(set) var updatedAt: Date?
     public private(set) var ephemeral: Bool?
@@ -223,6 +224,7 @@ public final class CodexChat: CodexObservableModel {
         self.id = id
         self.turns = []
         self.items = []
+        self.isArchived = false
         self.modelContext = modelContext
     }
 
@@ -238,6 +240,10 @@ public final class CodexChat: CodexObservableModel {
             replaceTurns(with: turns)
             replaceItems(with: turns)
         }
+    }
+
+    package func setArchived(_ isArchived: Bool) {
+        self.isArchived = isArchived
     }
 
     package func detachFromContext() {
