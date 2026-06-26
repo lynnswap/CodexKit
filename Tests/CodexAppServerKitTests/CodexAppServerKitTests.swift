@@ -248,15 +248,23 @@ struct CodexAppServerKitTests {
         #expect(params.ephemeral == true)
         #expect(params.baseInstructions == "Base")
         #expect(params.developerInstructions == "Developer")
-        #expect(params.approvalPolicy == "onRequest")
+        #expect(params.approvalPolicy == "on-request")
         #expect(params.approvalsReviewer == "auto_review")
-        #expect(params.sandbox == "workspaceWrite")
+        #expect(params.sandbox == "workspace-write")
         #expect(params.permissions == .profileID("codex-default"))
         #expect(params.config == ["experimental": .bool(true)])
         #expect(params.personality == "pragmatic")
         #expect(params.serviceName == "app-server-kit-test")
         #expect(params.sessionStartSource == .startup)
         #expect(params.threadSource?.rawValue == "automation")
+    }
+
+    @Test func threadOptionWireValuesUseAppServerConfigSchema() {
+        #expect(CodexApprovalMode.autoReview.approvalPolicy == "on-request")
+        #expect(CodexApprovalMode.denyAll.approvalPolicy == "never")
+        #expect(CodexSandbox.readOnly.threadSandboxValue == "read-only")
+        #expect(CodexSandbox.workspaceWrite.threadSandboxValue == "workspace-write")
+        #expect(CodexSandbox.fullAccess.threadSandboxValue == "danger-full-access")
     }
 
     @Test func appServerResumeThreadPreservesServerReturnedModel() async throws {
@@ -2304,8 +2312,8 @@ struct CodexAppServerKitTests {
         let params = try #require(
             JSONSerialization.jsonObject(with: request.params) as? [String: Any]
         )
-        #expect(params["approvalPolicy"] as? String == "onRequest")
-        #expect(params["approvalPolicy"] as? String != "on-request")
+        #expect(params["approvalPolicy"] as? String == "on-request")
+        #expect(params["approvalPolicy"] as? String != "onRequest")
     }
 
     @Test func messageDeltaLogEntriesUseUniqueEntryIDs() async throws {
