@@ -355,6 +355,14 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         group: CodexWorkspaceGroup?
     ) async {
         if requiresServerRefreshAfterMutation {
+            _ = applyLocalRevalidation([
+                CodexFetchedChatRevalidation(
+                    chat: chat,
+                    previousWorkspace: workspace,
+                    previousGroup: group,
+                    archived: true
+                )
+            ])
             await refreshAfterMutation()
             return
         }
@@ -370,24 +378,11 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             return
         }
         if requiresServerRefreshAfterMutation {
+            _ = applyLocalRevalidation(changes)
             await refreshAfterMutation()
             return
         }
-        let originalCount = items.count
-        var filteredItems = items
-        for change in changes {
-            filteredItems = filteredItems.filter {
-                shouldKeep(
-                    $0,
-                    afterRevalidating: change.chat,
-                    previousWorkspace: change.previousWorkspace,
-                    previousGroup: change.previousGroup,
-                    archived: change.archived
-                )
-            }
-        }
-        items = modelContext.sortedItems(filteredItems, for: request)
-        sections = modelContext.sections(for: items, descriptor: request.sectionDescriptor)
+        let originalCount = applyLocalRevalidation(changes)
         if await refreshAfterPagedRevalidationIfNeeded(changes) {
             return
         }
@@ -409,23 +404,14 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         workspace: CodexWorkspace?,
         group: CodexWorkspaceGroup?
     ) async {
-        let originalCount = items.count
-        let filteredItems = items.filter {
-            shouldKeep($0, afterRemoving: chat, workspace: workspace, group: group)
-        }
+        let originalCount = applyLocalRemoval(of: chat, workspace: workspace, group: group)
         if requiresServerRefreshAfterMutation {
-            if filteredItems.count != items.count {
-                items = filteredItems
-                sections = modelContext.sections(for: filteredItems, descriptor: request.sectionDescriptor)
-            }
             await refreshAfterMutation()
             return
         }
-        guard filteredItems.count != items.count else {
+        guard items.count != originalCount else {
             return
         }
-        items = filteredItems
-        sections = modelContext.sections(for: filteredItems, descriptor: request.sectionDescriptor)
         await backfillAfterLocalRemovalIfNeeded(originalCount: originalCount)
     }
 
@@ -434,14 +420,15 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         archived: Bool,
         removedChats: [CodexChat]
     ) async {
+        let originalCount = items.count
+        let refreshed = refreshItems(archived: archived, keeping: {
+            shouldKeep($0, afterRefreshing: workspace, removedChats: removedChats)
+        })
         if requiresServerRefreshAfterMutation {
             await refreshAfterMutation()
             return
         }
-        let originalCount = items.count
-        guard refreshItems(archived: archived, keeping: {
-            shouldKeep($0, afterRefreshing: workspace, removedChats: removedChats)
-        }) else {
+        guard refreshed else {
             return
         }
         guard upsertLoadedModels(from: workspace) else {
@@ -456,14 +443,15 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         archived: Bool,
         removedChats: [CodexChat]
     ) async {
+        let originalCount = items.count
+        let refreshed = refreshItems(archived: archived, keeping: {
+            shouldKeep($0, afterRefreshing: group, removedChats: removedChats)
+        })
         if requiresServerRefreshAfterMutation {
             await refreshAfterMutation()
             return
         }
-        let originalCount = items.count
-        guard refreshItems(archived: archived, keeping: {
-            shouldKeep($0, afterRefreshing: group, removedChats: removedChats)
-        }) else {
+        guard refreshed else {
             return
         }
         guard upsertLoadedModels(from: group) else {
@@ -797,6 +785,43 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             return containsIncludedWorkspace(in: item)
         }
         return true
+    }
+
+    @discardableResult
+    private func applyLocalRemoval(
+        of chat: CodexChat,
+        workspace: CodexWorkspace?,
+        group: CodexWorkspaceGroup?
+    ) -> Int {
+        let originalCount = items.count
+        let filteredItems = items.filter {
+            shouldKeep($0, afterRemoving: chat, workspace: workspace, group: group)
+        }
+        if filteredItems.count != items.count {
+            items = filteredItems
+            sections = modelContext.sections(for: filteredItems, descriptor: request.sectionDescriptor)
+        }
+        return originalCount
+    }
+
+    @discardableResult
+    private func applyLocalRevalidation(_ changes: [CodexFetchedChatRevalidation]) -> Int {
+        let originalCount = items.count
+        var filteredItems = items
+        for change in changes {
+            filteredItems = filteredItems.filter {
+                shouldKeep(
+                    $0,
+                    afterRevalidating: change.chat,
+                    previousWorkspace: change.previousWorkspace,
+                    previousGroup: change.previousGroup,
+                    archived: change.archived
+                )
+            }
+        }
+        items = modelContext.sortedItems(filteredItems, for: request)
+        sections = modelContext.sections(for: items, descriptor: request.sectionDescriptor)
+        return originalCount
     }
 
     @discardableResult

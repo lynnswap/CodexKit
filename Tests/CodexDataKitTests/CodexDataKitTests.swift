@@ -2076,6 +2076,31 @@ struct CodexModelContextTests {
         #expect(workspace.chats.first === chat)
     }
 
+    @Test("workspace refresh removes known server-filtered chats when refresh fails")
+    func workspaceRefreshRemovesKnownServerFilteredChatsWhenRefreshFails() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-remove", workspace: workspaceURL, name: "Remove")
+        ]))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            filter: .init(sourceKinds: [.appServer])
+        ))
+        try await results.performFetch()
+        let chat = try #require(results.items.first)
+        let workspace = try #require(chat.workspace)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: []))
+        await runtime.transport.enqueueFailure(code: -32000, message: "offline", for: "thread/list")
+        try await workspace.refresh()
+
+        #expect(results.items.isEmpty)
+        #expect(workspace.chats.isEmpty)
+        #expect(await runtime.transport.recordedRequests(method: "thread/list").count == 3)
+    }
+
     @Test("workspace refresh prunes empty workspace from group")
     func workspaceRefreshPrunesEmptyWorkspaceFromGroup() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -2934,6 +2959,30 @@ struct CodexModelContextTests {
         #expect(archivedResults.items.first === chat)
     }
 
+    @Test("server-filtered archive removes active chat when refresh fails")
+    func serverFilteredArchiveRemovesActiveChatWhenRefreshFails() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-archive", workspace: workspaceURL, name: "Archive")
+        ]))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            filter: .init(sourceKinds: [.appServer])
+        ))
+        try await results.performFetch()
+        let chat = try #require(results.items.first)
+
+        try await runtime.transport.enqueueEmpty(for: "thread/archive")
+        await runtime.transport.enqueueFailure(code: -32000, message: "offline", for: "thread/list")
+        try await chat.archive()
+
+        #expect(results.items.isEmpty)
+        #expect(chat.isArchived)
+        #expect(await runtime.transport.recordedRequests(method: "thread/list").count == 2)
+    }
+
     @Test("unarchiving a chat moves it between active fetched results")
     func unarchivingChatMovesItBetweenActiveFetchedResults() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -2966,6 +3015,35 @@ struct CodexModelContextTests {
         #expect(archivedResults.items.isEmpty)
         #expect(unarchivedResults.items.first === chat)
         #expect(chat.workspace?.chats.first === chat)
+    }
+
+    @Test("server-filtered unarchive removes archived chat when refresh fails")
+    func serverFilteredUnarchiveRemovesArchivedChatWhenRefreshFails() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-unarchive", workspace: workspaceURL, name: "Archived")
+        ]))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            filter: .init(archived: true, sourceKinds: [.appServer])
+        ))
+        try await results.performFetch()
+        let chat = try #require(results.items.first)
+
+        try await runtime.transport.enqueueThreadUnarchive(.init(
+            id: "thread-unarchive",
+            workspace: workspaceURL,
+            name: "Restored"
+        ))
+        await runtime.transport.enqueueFailure(code: -32000, message: "offline", for: "thread/list")
+        try await chat.unarchive()
+
+        #expect(results.items.isEmpty)
+        #expect(chat.isArchived == false)
+        #expect(chat.title == "Restored")
+        #expect(await runtime.transport.recordedRequests(method: "thread/list").count == 2)
     }
 
     @Test("archiving a chat inserts parents into archived fetched results")
