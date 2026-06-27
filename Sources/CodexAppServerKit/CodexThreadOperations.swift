@@ -233,20 +233,7 @@ extension CodexThread {
             AppServerAPI.Thread.Read.Request(
                 params: .init(threadID: id.rawValue, includeTurns: includeTurns)
             ))
-        return .init(
-            id: .init(rawValue: response.thread.id),
-            workspace: response.thread.cwd.map { URL(fileURLWithPath: $0, isDirectory: true) },
-            name: response.thread.name,
-            preview: response.thread.preview,
-            turns: (response.thread.turns ?? []).map {
-                CodexTurnSnapshot(
-                    id: .init(rawValue: $0.id),
-                    status: $0.status.map(CodexTurnStatus.init(rawValue:)),
-                    errorMessage: $0.error?.message,
-                    items: AppServerThreadItemMapping.threadItems(from: $0.items)
-                )
-            }
-        )
+        return CodexAppServer.threadSnapshot(from: response.thread, includesTurns: includeTurns)
     }
 
     /// Renames this thread.
@@ -283,7 +270,7 @@ extension CodexThread {
             AppServerAPI.Thread.Unarchive.Request(
                 params: .init(threadID: id.rawValue)
             ))
-        return CodexAppServer.threadSnapshot(from: response.thread)
+        return CodexAppServer.threadSnapshot(from: response.thread, includesTurns: false)
     }
 
     /// Rolls this thread back by the specified number of turns.

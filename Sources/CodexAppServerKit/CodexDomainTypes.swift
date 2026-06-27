@@ -1042,24 +1042,151 @@ package struct CodexTurn: Identifiable, Sendable {
 }
 
 public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
+    package enum Field: String, Hashable, Sendable {
+        case workspace
+        case name
+        case preview
+        case modelProvider
+        case createdAt
+        case updatedAt
+        case ephemeral
+        case turns
+    }
+
     public var id: CodexThreadID
     public var workspace: URL?
     public var name: String?
     public var preview: String?
-    public var turns: [CodexTurnSnapshot]
+    public var modelProvider: String?
+    public var createdAt: Date?
+    public var updatedAt: Date?
+    public var ephemeral: Bool?
+    public var turns: [CodexTurnSnapshot]?
+    package var turnItemsAreAuthoritative: Bool
+    package var presentFields: Set<Field>
+
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.id == rhs.id
+            && lhs.workspace == rhs.workspace
+            && lhs.name == rhs.name
+            && lhs.preview == rhs.preview
+            && lhs.modelProvider == rhs.modelProvider
+            && lhs.createdAt == rhs.createdAt
+            && lhs.updatedAt == rhs.updatedAt
+            && lhs.ephemeral == rhs.ephemeral
+            && lhs.turns == rhs.turns
+    }
 
     public init(
         id: CodexThreadID,
         workspace: URL? = nil,
         name: String? = nil,
         preview: String? = nil,
-        turns: [CodexTurnSnapshot] = []
+        modelProvider: String? = nil,
+        createdAt: Date? = nil,
+        updatedAt: Date? = nil,
+        ephemeral: Bool? = nil,
+        turns: [CodexTurnSnapshot]? = nil
+    ) {
+        self.init(
+            id: id,
+            workspace: workspace,
+            name: name,
+            preview: preview,
+            modelProvider: modelProvider,
+            createdAt: createdAt,
+            updatedAt: updatedAt,
+            ephemeral: ephemeral,
+            turns: turns,
+            turnItemsAreAuthoritative: turns != nil,
+            presentFields: Self.presentFields(
+                workspace: workspace,
+                name: name,
+                preview: preview,
+                modelProvider: modelProvider,
+                createdAt: createdAt,
+                updatedAt: updatedAt,
+                ephemeral: ephemeral,
+                turns: turns
+            )
+        )
+    }
+
+    package init(
+        id: CodexThreadID,
+        workspace: URL? = nil,
+        name: String? = nil,
+        preview: String? = nil,
+        modelProvider: String? = nil,
+        createdAt: Date? = nil,
+        updatedAt: Date? = nil,
+        ephemeral: Bool? = nil,
+        turns: [CodexTurnSnapshot]? = nil,
+        turnItemsAreAuthoritative: Bool,
+        presentFields: Set<Field>? = nil
     ) {
         self.id = id
         self.workspace = workspace
         self.name = name
         self.preview = preview
+        self.modelProvider = modelProvider
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+        self.ephemeral = ephemeral
         self.turns = turns
+        self.turnItemsAreAuthoritative = turnItemsAreAuthoritative
+        self.presentFields = presentFields ?? Self.presentFields(
+            workspace: workspace,
+            name: name,
+            preview: preview,
+            modelProvider: modelProvider,
+            createdAt: createdAt,
+            updatedAt: updatedAt,
+            ephemeral: ephemeral,
+            turns: turns
+        )
+    }
+
+    package func hasField(_ field: Field) -> Bool {
+        presentFields.contains(field)
+    }
+
+    private static func presentFields(
+        workspace: URL?,
+        name: String?,
+        preview: String?,
+        modelProvider: String?,
+        createdAt: Date?,
+        updatedAt: Date?,
+        ephemeral: Bool?,
+        turns: [CodexTurnSnapshot]?
+    ) -> Set<Field> {
+        var fields: Set<Field> = []
+        if workspace != nil {
+            fields.insert(.workspace)
+        }
+        if name != nil {
+            fields.insert(.name)
+        }
+        if preview != nil {
+            fields.insert(.preview)
+        }
+        if modelProvider != nil {
+            fields.insert(.modelProvider)
+        }
+        if createdAt != nil {
+            fields.insert(.createdAt)
+        }
+        if updatedAt != nil {
+            fields.insert(.updatedAt)
+        }
+        if ephemeral != nil {
+            fields.insert(.ephemeral)
+        }
+        if turns != nil {
+            fields.insert(.turns)
+        }
+        return fields
     }
 }
 

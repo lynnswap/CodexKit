@@ -1,6 +1,6 @@
 import Foundation
 
-public enum CodexUIPhase: Equatable, Sendable {
+public enum CodexDataPhase: Equatable, Sendable {
     case idle
     case loading
     case loaded

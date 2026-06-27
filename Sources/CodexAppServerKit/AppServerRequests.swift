@@ -469,6 +469,17 @@ extension AppServerAPI.Thread.Start {
 
 extension AppServerAPI.Thread {
     package struct Snapshot: Codable, Equatable, Sendable {
+        package enum Field: String, Hashable, Sendable {
+            case cwd
+            case name
+            case preview
+            case modelProvider
+            case createdAt
+            case updatedAt
+            case ephemeral
+            case turns
+        }
+
         package var id: String
         package var cwd: String?
         package var name: String?
@@ -478,6 +489,7 @@ extension AppServerAPI.Thread {
         package var updatedAt: Int?
         package var ephemeral: Bool?
         package var turns: [AppServerAPI.Turn.Payload]?
+        package var presentFields: Set<Field>
 
         enum CodingKeys: String, CodingKey {
             case id
@@ -500,7 +512,8 @@ extension AppServerAPI.Thread {
             createdAt: Int? = nil,
             updatedAt: Int? = nil,
             ephemeral: Bool? = nil,
-            turns: [AppServerAPI.Turn.Payload]? = nil
+            turns: [AppServerAPI.Turn.Payload]? = nil,
+            presentFields: Set<Field>? = nil
         ) {
             self.id = id
             self.cwd = cwd
@@ -511,6 +524,133 @@ extension AppServerAPI.Thread {
             self.updatedAt = updatedAt
             self.ephemeral = ephemeral
             self.turns = turns
+            self.presentFields = presentFields ?? Self.presentFields(
+                cwd: cwd,
+                name: name,
+                preview: preview,
+                modelProvider: modelProvider,
+                createdAt: createdAt,
+                updatedAt: updatedAt,
+                ephemeral: ephemeral,
+                turns: turns
+            )
+        }
+
+        package init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            id = try container.decode(String.self, forKey: .id)
+            cwd = try container.decodeIfPresent(String.self, forKey: .cwd)
+            name = try container.decodeIfPresent(String.self, forKey: .name)
+            preview = try container.decodeIfPresent(String.self, forKey: .preview)
+            modelProvider = try container.decodeIfPresent(String.self, forKey: .modelProvider)
+            createdAt = try container.decodeIfPresent(Int.self, forKey: .createdAt)
+            updatedAt = try container.decodeIfPresent(Int.self, forKey: .updatedAt)
+            ephemeral = try container.decodeIfPresent(Bool.self, forKey: .ephemeral)
+            turns = try container.decodeIfPresent([AppServerAPI.Turn.Payload].self, forKey: .turns)
+            presentFields = Self.presentFields(from: container)
+        }
+
+        package func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(id, forKey: .id)
+            try encode(cwd, forKey: .cwd, into: &container)
+            try encode(name, forKey: .name, into: &container)
+            try encode(preview, forKey: .preview, into: &container)
+            try encode(modelProvider, forKey: .modelProvider, into: &container)
+            try encode(createdAt, forKey: .createdAt, into: &container)
+            try encode(updatedAt, forKey: .updatedAt, into: &container)
+            try encode(ephemeral, forKey: .ephemeral, into: &container)
+            try encode(turns, forKey: .turns, into: &container)
+        }
+
+        private func encode<Value: Encodable>(
+            _ value: Value?,
+            forKey key: CodingKeys,
+            into container: inout KeyedEncodingContainer<CodingKeys>
+        ) throws {
+            guard let field = Field(key), presentFields.contains(field) else {
+                return
+            }
+            if let value {
+                try container.encode(value, forKey: key)
+            } else {
+                try container.encodeNil(forKey: key)
+            }
+        }
+
+        private static func presentFields(
+            cwd: String?,
+            name: String?,
+            preview: String?,
+            modelProvider: String?,
+            createdAt: Int?,
+            updatedAt: Int?,
+            ephemeral: Bool?,
+            turns: [AppServerAPI.Turn.Payload]?
+        ) -> Set<Field> {
+            var fields: Set<Field> = []
+            if cwd != nil {
+                fields.insert(.cwd)
+            }
+            if name != nil {
+                fields.insert(.name)
+            }
+            if preview != nil {
+                fields.insert(.preview)
+            }
+            if modelProvider != nil {
+                fields.insert(.modelProvider)
+            }
+            if createdAt != nil {
+                fields.insert(.createdAt)
+            }
+            if updatedAt != nil {
+                fields.insert(.updatedAt)
+            }
+            if ephemeral != nil {
+                fields.insert(.ephemeral)
+            }
+            if turns != nil {
+                fields.insert(.turns)
+            }
+            return fields
+        }
+
+        private static func presentFields(
+            from container: KeyedDecodingContainer<CodingKeys>
+        ) -> Set<Field> {
+            var fields: Set<Field> = []
+            for key in container.allKeys {
+                if let field = Field(key) {
+                    fields.insert(field)
+                }
+            }
+            return fields
+        }
+    }
+}
+
+private extension AppServerAPI.Thread.Snapshot.Field {
+    init?(_ key: AppServerAPI.Thread.Snapshot.CodingKeys) {
+        switch key {
+        case .id:
+            return nil
+        case .cwd:
+            self = .cwd
+        case .name:
+            self = .name
+        case .preview:
+            self = .preview
+        case .modelProvider:
+            self = .modelProvider
+        case .createdAt:
+            self = .createdAt
+        case .updatedAt:
+            self = .updatedAt
+        case .ephemeral:
+            self = .ephemeral
+        case .turns:
+            self = .turns
         }
     }
 }

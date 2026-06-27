@@ -593,11 +593,22 @@ public actor CodexAppServer {
     /// - Returns: A domain handle for the restored thread.
     /// - Throws: A transport, JSON-RPC, or app-server request error.
     public func unarchiveThread(_ id: CodexThreadID) async throws -> CodexThread {
-        let response = try await client.send(
+        let response = try await sendUnarchiveThread(id)
+        return thread(from: response.thread)
+    }
+
+    package func unarchiveThreadSnapshot(_ id: CodexThreadID) async throws -> CodexThreadSnapshot {
+        let response = try await sendUnarchiveThread(id)
+        return Self.threadSnapshot(from: response.thread, includesTurns: false)
+    }
+
+    private func sendUnarchiveThread(
+        _ id: CodexThreadID
+    ) async throws -> AppServerAPI.Thread.Unarchive.Response {
+        try await client.send(
             AppServerAPI.Thread.Unarchive.Request(
                 params: .init(threadID: id.rawValue)
             ))
-        return thread(from: response.thread)
     }
 
     /// Archives a Codex thread.
@@ -643,7 +654,7 @@ public actor CodexAppServer {
                     useStateDbOnly: query.useStateDBOnly
                 )))
         return .init(
-            threads: response.data.map(Self.threadSnapshot),
+            threads: response.data.map { Self.threadSnapshot(from: $0, includesTurns: false) },
             nextCursor: response.nextCursor,
             backwardsCursor: response.backwardsCursor
         )
@@ -936,22 +947,76 @@ public actor CodexAppServer {
     }
 
     package nonisolated static func threadSnapshot(
-        from snapshot: AppServerAPI.Thread.Snapshot
+        from snapshot: AppServerAPI.Thread.Snapshot,
+        includesTurns: Bool
     ) -> CodexThreadSnapshot {
-        .init(
+        let turns = turnSnapshots(from: snapshot.turns, includesTurns: includesTurns)
+        return .init(
             id: .init(rawValue: snapshot.id),
             workspace: snapshot.cwd.map { URL(fileURLWithPath: $0, isDirectory: true) },
             name: snapshot.name,
             preview: snapshot.preview,
-            turns: (snapshot.turns ?? []).map {
-                CodexTurnSnapshot(
-                    id: .init(rawValue: $0.id),
-                    status: $0.status.map(CodexTurnStatus.init(rawValue:)),
-                    errorMessage: $0.error?.message,
-                    items: AppServerThreadItemMapping.threadItems(from: $0.items)
-                )
-            }
+            modelProvider: snapshot.modelProvider,
+            createdAt: snapshot.createdAt.map { Date(timeIntervalSince1970: TimeInterval($0)) },
+            updatedAt: snapshot.updatedAt.map { Date(timeIntervalSince1970: TimeInterval($0)) },
+            ephemeral: snapshot.ephemeral,
+            turns: turns,
+            turnItemsAreAuthoritative: includesTurns,
+            presentFields: threadSnapshotPresentFields(from: snapshot, turns: turns)
         )
+    }
+
+    private nonisolated static func threadSnapshotPresentFields(
+        from snapshot: AppServerAPI.Thread.Snapshot,
+        turns: [CodexTurnSnapshot]?
+    ) -> Set<CodexThreadSnapshot.Field> {
+        var fields: Set<CodexThreadSnapshot.Field> = []
+        for field in snapshot.presentFields {
+            switch field {
+            case .cwd:
+                fields.insert(.workspace)
+            case .name:
+                fields.insert(.name)
+            case .preview:
+                fields.insert(.preview)
+            case .modelProvider:
+                fields.insert(.modelProvider)
+            case .createdAt:
+                fields.insert(.createdAt)
+            case .updatedAt:
+                fields.insert(.updatedAt)
+            case .ephemeral:
+                fields.insert(.ephemeral)
+            case .turns:
+                if turns != nil {
+                    fields.insert(.turns)
+                }
+            }
+        }
+        if turns != nil {
+            fields.insert(.turns)
+        }
+        return fields
+    }
+
+    private nonisolated static func turnSnapshots(
+        from turns: [AppServerAPI.Turn.Payload]?,
+        includesTurns: Bool
+    ) -> [CodexTurnSnapshot]? {
+        guard let turns else {
+            return includesTurns ? [] : nil
+        }
+        guard includesTurns || turns.isEmpty == false else {
+            return nil
+        }
+        return turns.map {
+            CodexTurnSnapshot(
+                id: .init(rawValue: $0.id),
+                status: $0.status.map(CodexTurnStatus.init(rawValue:)),
+                errorMessage: $0.error?.message,
+                items: AppServerThreadItemMapping.threadItems(from: $0.items)
+            )
+        }
     }
 
     private nonisolated static func account(from snapshot: AppServerAPI.Account.Snapshot) -> CodexAccount {

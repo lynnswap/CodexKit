@@ -5,7 +5,7 @@ CodexKit is a Swift package for building macOS apps and tools that talk to a loc
 ## Products
 
 - `CodexAppServerKit`: Swift domain APIs for app-server connections, threads, responses, streaming, reviews, models, accounts, and login flows.
-- `CodexUIKit`: `@Observable` model objects for native Codex UIs, built on top of `CodexAppServerKit`.
+- `CodexDataKit`: SwiftData-style `@Observable` app-server backed model objects and fetch APIs, built on top of `CodexAppServerKit`.
 - `CodexAppServerKitTesting`: An in-memory app-server test runtime for deterministic tests without launching a real process.
 - `CodexKit`: A small shared package target for package-level symbols.
 
@@ -27,7 +27,7 @@ Add the products your target needs:
 
 ```swift
 .product(name: "CodexAppServerKit", package: "CodexKit"),
-.product(name: "CodexUIKit", package: "CodexKit"),
+.product(name: "CodexDataKit", package: "CodexKit"),
 ```
 
 ## CodexAppServerKit
@@ -61,27 +61,30 @@ let response = try await stream.collect()
 
 For thread management, streaming, review sessions, model/account APIs, login flows, and testing utilities, see [Sources/CodexAppServerKit/README.md](Sources/CodexAppServerKit/README.md).
 
-## CodexUIKit
+## CodexDataKit
 
-Use `CodexUIKit` when you want UI-ready observable state for thread lists and conversations.
+Use `CodexDataKit` when you want SwiftData/CoreData-style app-server backed models for native UI code.
 
 ```swift
 import CodexAppServerKit
-import CodexUIKit
+import CodexDataKit
 import Foundation
 
-let server = try await CodexAppServer()
-let library = CodexThreadLibrary(
-    server: server,
-    configuration: .init(query: .init(workspace: workspaceURL, limit: 50))
-)
+let container = try await CodexModelContainer()
+let context = container.mainContext
 
-await library.refresh()
+let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>.recentChats)
+try await results.performFetch()
 
-let conversation = try await library.startConversation(in: workspaceURL)
-try await conversation.send("Summarize this project.")
+for chat in results.items {
+    print(chat.title)
+}
+
+let workspace = try await context.fetch(CodexFetchRequest<CodexWorkspace>.workspaces).first
+let chat = try await workspace?.startChat()
+try await chat?.send("Summarize this project.")
 ```
 
-Render thread-list state from `library.sections` and `library.phase`, render conversation state from `conversation.turns`, `conversation.items`, and `conversation.phase`, then send user actions back through `CodexThreadLibrary` and `CodexConversation`.
+Render from `CodexWorkspaceGroup`, `CodexWorkspace`, and `CodexChat` observable model objects. Use `CodexFetchRequest` / `CodexFetchedResults` for CoreData-like fetches, or `@CodexQuery` for SwiftUI views.
 
-For thread-list state, conversation state, selection, pagination, archive/delete actions, and ownership guidance, see [Sources/CodexUIKit/README.md](Sources/CodexUIKit/README.md).
+For model containers, fetch requests, sectioning, SwiftUI queries, and ownership guidance, see [Sources/CodexDataKit/README.md](Sources/CodexDataKit/README.md).

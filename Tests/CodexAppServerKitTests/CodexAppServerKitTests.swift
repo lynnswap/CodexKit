@@ -559,6 +559,138 @@ struct CodexAppServerKitTests {
         #expect(params.useStateDbOnly == true)
     }
 
+    @Test func threadListTreatsEmptyTurnsAsUnloaded() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueue(
+            AppServerAPI.Thread.List.Response(data: [
+                .init(id: "thread-empty", turns: [])
+            ]),
+            for: "thread/list"
+        )
+        let client = AppServerClient(transport: transport)
+        let server = CodexAppServer(
+            client: client,
+            router: CodexAppServerNotificationRouter(client: client)
+        )
+
+        let page = try await server.listThreads()
+
+        #expect(page.threads.first?.turns == nil)
+    }
+
+    @Test func threadSnapshotEqualityIgnoresTurnAuthorityFlag() {
+        let turns = [CodexTurnSnapshot(id: "turn-1", status: .completed)]
+        let publicSnapshot = CodexThreadSnapshot(id: "thread-1", turns: turns)
+        let summarySnapshot = CodexThreadSnapshot(
+            id: "thread-1",
+            turns: turns,
+            turnItemsAreAuthoritative: false
+        )
+
+        #expect(publicSnapshot == summarySnapshot)
+    }
+
+    @Test func threadSnapshotsTrackOmittedAndNullFields() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueJSON(
+            """
+            {
+              "data": [
+                {
+                  "id": "thread-partial",
+                  "name": null,
+                  "updatedAt": 1000
+                }
+              ]
+            }
+            """,
+            for: "thread/list"
+        )
+        let client = AppServerClient(transport: transport)
+        let server = CodexAppServer(
+            client: client,
+            router: CodexAppServerNotificationRouter(client: client)
+        )
+
+        let page = try await server.listThreads()
+        let snapshot = try #require(page.threads.first)
+
+        #expect(snapshot.hasField(.name))
+        #expect(snapshot.name == nil)
+        #expect(snapshot.hasField(.updatedAt))
+        #expect(snapshot.updatedAt == Date(timeIntervalSince1970: 1000))
+        #expect(!snapshot.hasField(.workspace))
+        #expect(!snapshot.hasField(.modelProvider))
+    }
+
+    @Test func threadSnapshotEncodingPreservesPresentNullFields() throws {
+        let snapshot = AppServerAPI.Thread.Snapshot(
+            id: "thread-partial",
+            name: nil,
+            updatedAt: nil,
+            presentFields: [.name, .updatedAt]
+        )
+
+        let data = try JSONEncoder().encode(snapshot)
+        let object = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+
+        #expect(object["id"] as? String == "thread-partial")
+        #expect(object["name"] is NSNull)
+        #expect(object["updatedAt"] is NSNull)
+        #expect(object["cwd"] == nil)
+    }
+
+    @Test func threadReadUsesIncludeTurnsToInterpretEmptyTurns() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueue(
+            AppServerAPI.Thread.Read.Response(thread: .init(id: "thread-empty", turns: [])),
+            for: "thread/read"
+        )
+        try await transport.enqueue(
+            AppServerAPI.Thread.Read.Response(thread: .init(id: "thread-empty", turns: [])),
+            for: "thread/read"
+        )
+        let client = AppServerClient(transport: transport)
+        let thread = CodexThread(
+            id: .init(rawValue: "thread-empty"),
+            client: client,
+            router: CodexAppServerNotificationRouter(client: client)
+        )
+
+        let metadataOnly = try await thread.read(includeTurns: false)
+        let withTurns = try await thread.read(includeTurns: true)
+
+        #expect(metadataOnly.turns == nil)
+        #expect(!metadataOnly.hasField(.turns))
+        #expect(withTurns.turns == [])
+        #expect(withTurns.hasField(.turns))
+    }
+
+    @Test func threadReadTreatsOmittedTurnsAsEmptyWhenIncluded() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueJSON(
+            """
+            {
+              "thread": {
+                "id": "thread-empty"
+              }
+            }
+            """,
+            for: "thread/read"
+        )
+        let client = AppServerClient(transport: transport)
+        let thread = CodexThread(
+            id: .init(rawValue: "thread-empty"),
+            client: client,
+            router: CodexAppServerNotificationRouter(client: client)
+        )
+
+        let snapshot = try await thread.read(includeTurns: true)
+
+        #expect(snapshot.turns == [])
+        #expect(snapshot.hasField(.turns))
+    }
+
     @Test func appServerArchiveThreadSerializesThreadID() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueueEmpty(for: "thread/archive")
