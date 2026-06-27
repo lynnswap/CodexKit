@@ -894,7 +894,7 @@ public struct CodexReviewSession: Identifiable, Sendable {
     /// The live response stream for the review turn.
     public let response: CodexResponseStream
 
-    private let eventThread: CodexThread
+    package let eventThread: CodexThread
 
     package init(
         threadID: CodexThreadID,

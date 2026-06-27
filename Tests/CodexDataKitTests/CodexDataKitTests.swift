@@ -3980,7 +3980,6 @@ struct CodexModelContextTests {
         )
 
         try await runtime.transport.enqueueThreadResume(.init(id: "thread-review"))
-        try await runtime.transport.enqueueThreadResume(.init(id: "thread-review"))
         try await runtime.transport.enqueueThreadRead(.init(id: "thread-review"))
 
         let observation = try await context.observe(identity)
@@ -3990,6 +3989,7 @@ struct CodexModelContextTests {
 
         #expect(observation.chat.id == "thread-review")
         #expect(context.model(for: identity) === observation.chat)
+        #expect(await runtime.transport.recordedRequests(method: "thread/resume").count == 1)
 
         try await runtime.transport.emitServerNotification(
             method: "item/completed",
@@ -4023,13 +4023,13 @@ struct CodexModelContextTests {
         )
 
         try await runtime.transport.enqueueThreadResume(.init(id: "thread-review"))
-        try await runtime.transport.enqueueThreadResume(.init(id: "thread-review"))
         try await runtime.transport.enqueueThreadRead(.init(id: "thread-review"))
 
         let observation = try await context.observe(identity)
         defer {
             observation.cancel()
         }
+        #expect(await runtime.transport.recordedRequests(method: "thread/resume").count == 1)
 
         try await runtime.transport.emitServerNotification(
             method: "item/agentMessage/delta",

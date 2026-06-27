@@ -244,7 +244,8 @@ public final class CodexModelContext: @unchecked Sendable {
 
     private func activeObservation(
         for chat: CodexChat,
-        includeTurns: Bool
+        includeTurns: Bool,
+        resumedThread: CodexThread? = nil
     ) -> ActiveChatObservation {
         if let observation = activeChatObservationsByID[chat.id] {
             observation.leaseCount += 1
@@ -261,7 +262,8 @@ public final class CodexModelContext: @unchecked Sendable {
             try await self.startObservation(
                 observation,
                 for: chat,
-                includeTurns: includeTurns
+                includeTurns: includeTurns,
+                resumedThread: resumedThread
             )
         }
         return observation
@@ -270,13 +272,18 @@ public final class CodexModelContext: @unchecked Sendable {
     private func startObservation(
         _ observation: ActiveChatObservation,
         for chat: CodexChat,
-        includeTurns: Bool
+        includeTurns: Bool,
+        resumedThread: CodexThread? = nil
     ) async throws {
         chat.phase = .loading
         chat.lastErrorDescription = nil
         let thread: CodexThread
         do {
-            thread = try await appServer.resumeThread(chat.id)
+            if let resumedThread {
+                thread = resumedThread
+            } else {
+                thread = try await appServer.resumeThread(chat.id)
+            }
             try Task.checkCancellation()
             try await refresh(chat, using: thread, includeTurns: includeTurns)
             try Task.checkCancellation()
@@ -356,7 +363,30 @@ public final class CodexModelContext: @unchecked Sendable {
         _ reviewSession: CodexReviewSession,
         includeTurns: Bool = true
     ) async throws -> CodexChatObservation {
-        try await observe(model(for: reviewSession), includeTurns: includeTurns)
+        let chat = model(for: reviewSession)
+        guard chat.modelContext === self else {
+            throw CodexModelContextError.modelIsDetached
+        }
+
+        let activeObservation = activeObservation(
+            for: chat,
+            includeTurns: includeTurns,
+            resumedThread: reviewSession.eventThread
+        )
+        do {
+            try await activeObservation.setupTask?.value
+        } catch {
+            releaseChatObservation(chat.id, observation: activeObservation)
+            throw error
+        }
+
+        let chatID = chat.id
+        return CodexChatObservation(chat: chat) { [weak self, weak activeObservation] in
+            guard let activeObservation else {
+                return
+            }
+            self?.releaseChatObservation(chatID, observation: activeObservation)
+        }
     }
 
     @discardableResult
