@@ -217,6 +217,13 @@ package struct CodexFetchPage<Model: CodexObservableModel> {
     package var relationshipIsComplete: Bool? = nil
 }
 
+package struct CodexFetchedChatRevalidation {
+    package var chat: CodexChat
+    package var previousWorkspace: CodexWorkspace?
+    package var previousGroup: CodexWorkspaceGroup?
+    package var archived: Bool
+}
+
 @MainActor
 package protocol CodexFetchedResultsRegistration: AnyObject {
     func insert(_ chat: CodexChat, archived: Bool) async
@@ -225,12 +232,7 @@ package protocol CodexFetchedResultsRegistration: AnyObject {
         workspace: CodexWorkspace?,
         group: CodexWorkspaceGroup?
     ) async
-    func revalidate(
-        _ chat: CodexChat,
-        previousWorkspace: CodexWorkspace?,
-        previousGroup: CodexWorkspaceGroup?,
-        archived: Bool
-    ) async
+    func revalidate(_ changes: [CodexFetchedChatRevalidation]) async
     func remove(
         _ chat: CodexChat,
         workspace: CodexWorkspace?,
@@ -363,38 +365,43 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         }
     }
 
-    package func revalidate(
-        _ chat: CodexChat,
-        previousWorkspace: CodexWorkspace?,
-        previousGroup: CodexWorkspaceGroup?,
-        archived: Bool
-    ) async {
+    package func revalidate(_ changes: [CodexFetchedChatRevalidation]) async {
+        guard changes.isEmpty == false else {
+            return
+        }
         if requiresServerRefreshAfterMutation {
             await refreshAfterMutation()
             return
         }
         let originalCount = items.count
-        let filteredItems = items.filter {
-            shouldKeep(
-                $0,
-                afterRevalidating: chat,
-                previousWorkspace: previousWorkspace,
-                previousGroup: previousGroup,
-                archived: archived
-            )
+        var filteredItems = items
+        for change in changes {
+            filteredItems = filteredItems.filter {
+                shouldKeep(
+                    $0,
+                    afterRevalidating: change.chat,
+                    previousWorkspace: change.previousWorkspace,
+                    previousGroup: change.previousGroup,
+                    archived: change.archived
+                )
+            }
         }
         items = modelContext.sortedItems(filteredItems, for: request)
         sections = modelContext.sections(for: items, descriptor: request.sectionDescriptor)
-        if await refreshAfterPagedRevalidationIfNeeded(chat, archived: archived) {
+        if await refreshAfterPagedRevalidationIfNeeded(changes) {
             return
         }
-        guard canEvaluateFilterLocally,
-            let model = insertionModel(for: chat, archived: archived)
-        else {
-            await backfillAfterLocalRemovalIfNeeded(originalCount: originalCount)
-            return
+        if canEvaluateFilterLocally {
+            for change in changes {
+                guard let model = insertionModel(for: change.chat, archived: change.archived) else {
+                    continue
+                }
+                guard await upsertOrRefresh(model) else {
+                    return
+                }
+            }
         }
-        await upsertOrRefresh(model)
+        await backfillAfterLocalRemovalIfNeeded(originalCount: originalCount)
     }
 
     package func remove(
@@ -599,12 +606,11 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
     }
 
     private func refreshAfterPagedRevalidationIfNeeded(
-        _ chat: CodexChat,
-        archived: Bool
+        _ changes: [CodexFetchedChatRevalidation]
     ) async -> Bool {
         guard Model.self == CodexChat.self,
             (nextCursor != nil || request.cursor != nil),
-            shouldInclude(chat, archived: archived)
+            changes.contains(where: { shouldInclude($0.chat, archived: $0.archived) })
         else {
             return false
         }

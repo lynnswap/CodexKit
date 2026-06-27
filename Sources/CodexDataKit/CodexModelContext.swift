@@ -493,11 +493,7 @@ public final class CodexModelContext: @unchecked Sendable {
         scopedWorkspaceURL: URL? = nil,
         excluding excludedRegistration: (any CodexFetchedResultsRegistration)? = nil
     ) async -> [CodexChat] {
-        var revalidations: [(
-            chat: CodexChat,
-            previousWorkspace: CodexWorkspace?,
-            previousGroup: CodexWorkspaceGroup?
-        )] = []
+        var revalidations: [CodexFetchedChatRevalidation] = []
         let chats = snapshots.map { snapshot in
             let snapshot = snapshotForApply(snapshot, scopedWorkspaceURL: scopedWorkspaceURL)
             let existingChat = chatsByID[snapshot.id]
@@ -506,19 +502,16 @@ public final class CodexModelContext: @unchecked Sendable {
             let previousGroup = previousWorkspace?.workspaceGroup
             let chat = apply(snapshot, archived: archived)
             if previousState == nil || previousState != fetchedResultState(for: chat) {
-                revalidations.append((chat, previousWorkspace, previousGroup))
+                revalidations.append(CodexFetchedChatRevalidation(
+                    chat: chat,
+                    previousWorkspace: previousWorkspace,
+                    previousGroup: previousGroup,
+                    archived: chat.isArchived
+                ))
             }
             return chat
         }
-        for revalidation in revalidations {
-            await revalidateChatInRegisteredResults(
-                revalidation.chat,
-                previousWorkspace: revalidation.previousWorkspace,
-                previousGroup: revalidation.previousGroup,
-                archived: revalidation.chat.isArchived,
-                excluding: excludedRegistration
-            )
-        }
+        await revalidateChatsInRegisteredResults(revalidations, excluding: excludedRegistration)
         return chats
     }
 
@@ -861,6 +854,24 @@ public final class CodexModelContext: @unchecked Sendable {
         archived: Bool,
         excluding excludedRegistration: (any CodexFetchedResultsRegistration)? = nil
     ) async {
+        await revalidateChatsInRegisteredResults(
+            [CodexFetchedChatRevalidation(
+                chat: chat,
+                previousWorkspace: previousWorkspace,
+                previousGroup: previousGroup,
+                archived: archived
+            )],
+            excluding: excludedRegistration
+        )
+    }
+
+    private func revalidateChatsInRegisteredResults(
+        _ changes: [CodexFetchedChatRevalidation],
+        excluding excludedRegistration: (any CodexFetchedResultsRegistration)? = nil
+    ) async {
+        guard changes.isEmpty == false else {
+            return
+        }
         fetchedResults.removeAll { $0.value == nil }
         for registration in fetchedResults {
             guard let value = registration.value else {
@@ -871,12 +882,7 @@ public final class CodexModelContext: @unchecked Sendable {
             {
                 continue
             }
-            await value.revalidate(
-                chat,
-                previousWorkspace: previousWorkspace,
-                previousGroup: previousGroup,
-                archived: archived
-            )
+            await value.revalidate(changes)
         }
     }
 

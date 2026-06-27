@@ -3130,6 +3130,44 @@ struct CodexModelContextTests {
         #expect(await runtime.transport.recordedRequests(method: "thread/list").count == 2)
     }
 
+    @Test("thread list fetch coalesces server-filtered revalidations")
+    func threadListFetchCoalescesServerFilteredRevalidations() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-first", name: "First"),
+            .init(id: "thread-second", name: "Second"),
+        ]))
+        let allResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>.recentChats)
+        try await allResults.performFetch()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-first", name: "First"),
+            .init(id: "thread-second", name: "Second"),
+        ]))
+        let searchResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            filter: .init(searchTerm: "needle")
+        ))
+        try await searchResults.performFetch()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-first", name: "First renamed"),
+            .init(id: "thread-second", name: "Second renamed"),
+        ]))
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-first", name: "First renamed"),
+            .init(id: "thread-second", name: "Second renamed"),
+        ]))
+        try await allResults.performFetch()
+
+        #expect(searchResults.items.map(\.title) == ["First renamed", "Second renamed"])
+        let recordedRequests = await runtime.transport.recordedRequests(method: "thread/list")
+        #expect(recordedRequests.count == 4)
+        let refreshParams = try #require(recordedRequests.last).decodeParams(ThreadListParams.self)
+        #expect(refreshParams.searchTerm == "needle")
+    }
+
     @Test("paged chat refresh reloads incomplete results after sort key changes")
     func pagedChatRefreshReloadsIncompleteResultsAfterSortKeyChanges() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
