@@ -43,7 +43,7 @@ extension CodexThread {
     /// Log-oriented item events for this thread.
     ///
     /// This includes command, tool, file-change, diagnostic, and unknown
-    /// app-server items that are useful for review logs or progress views.
+    /// app-server items that are useful for output logs or progress views.
     public var logEntries: CodexThreadLogSequence {
         .init(events: events)
     }

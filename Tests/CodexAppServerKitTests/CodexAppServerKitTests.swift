@@ -799,7 +799,7 @@ struct CodexAppServerKitTests {
         #expect(notification.payload.item?.status == "completed")
     }
 
-    @Test func threadStartReviewSerializesTargetAndStreamsTypedReviewLogs() async throws {
+    @Test func threadStartReviewSerializesTargetAndStreamsReviewEvents() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueue(
             AppServerAPI.Review.Start.Response(
@@ -893,27 +893,33 @@ struct CodexAppServerKitTests {
             params: ThreadIDParams(threadID: "thread-review")
         )
 
-        let logs = try await collect(review.logEntries)
-        #expect(logs.count == 4)
-        #expect(logs.first?.turnID == "turn-review")
-        #expect(logs.first?.item?.kind == .commandExecution)
-        #expect(logs.first?.item?.text == "passed")
-        #expect(logs.contains {
-            if case .reasoning(let reasoning) = $0.item?.content {
+        let events = try await collect(review.events)
+        let completedItems = events.compactMap { event -> (item: CodexThreadItem, turnID: CodexTurnID?)? in
+            guard case .itemCompleted(let item, let turnID) = event else {
+                return nil
+            }
+            return (item, turnID)
+        }
+        #expect(completedItems.count == 4)
+        #expect(completedItems.first?.turnID == "turn-review")
+        #expect(completedItems.first?.item.kind == .commandExecution)
+        #expect(completedItems.first?.item.text == "passed")
+        #expect(completedItems.contains {
+            if case .reasoning(let reasoning) = $0.item.content {
                 reasoning.summary == ["Checked the diff"]
             } else {
                 false
             }
         })
-        #expect(logs.contains {
-            if case .toolCall(let toolCall) = $0.item?.content {
+        #expect(completedItems.contains {
+            if case .toolCall(let toolCall) = $0.item.content {
                 toolCall.name == "review_read"
             } else {
                 false
             }
         })
-        #expect(logs.contains {
-            if case .fileChange(let fileChange) = $0.item?.content {
+        #expect(completedItems.contains {
+            if case .fileChange(let fileChange) = $0.item.content {
                 fileChange.path == "Sources/File.swift"
             } else {
                 false
@@ -1114,10 +1120,6 @@ struct CodexAppServerKitTests {
             events: eventSequence,
             terminalTurnID: "turn-current"
         ))
-        let logs = try await collect(CodexReviewLogSequence(
-            events: eventSequence,
-            terminalTurnID: "turn-current"
-        ))
         let progress = try await collect(CodexReviewProgressSequence(
             events: eventSequence,
             terminalTurnID: "turn-current"
@@ -1125,8 +1127,6 @@ struct CodexAppServerKitTests {
 
         #expect(reviewEvents.count == 3)
         #expect(reviewEvents.contains(.statusChanged(.running)))
-        #expect(logs.map(\.turnID) == ["turn-current"])
-        #expect(logs.first?.item?.text == "Current review")
         #expect(progress.count == 3)
         #expect(progress.last?.result?.turnID == "turn-current")
         #expect(progress.last?.transcript.responseText == "Current review")
@@ -1624,9 +1624,6 @@ struct CodexAppServerKitTests {
             Issue.record("Expected review.events to receive turn-only completion.")
         }
         #expect(try await eventIterator.next() == nil)
-
-        var logIterator = review.logEntries.makeAsyncIterator()
-        #expect(try await logIterator.next() == nil)
 
         var progressIterator = review.progress.makeAsyncIterator()
         let progress = try #require(try await progressIterator.next())
