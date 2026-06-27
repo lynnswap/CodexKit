@@ -206,6 +206,9 @@ public final class CodexChat: CodexObservableModel {
     public private(set) weak var workspace: CodexWorkspace?
 
     @ObservationIgnored
+    private var liveMergeState = LiveMergeState()
+
+    @ObservationIgnored
     public private(set) weak var modelContext: CodexModelContext?
 
     public var title: String {
@@ -299,6 +302,13 @@ public final class CodexChat: CodexObservableModel {
         }
     }
 
+    public func observe(includeTurns: Bool = true) async throws -> CodexChatObservation {
+        guard let modelContext else {
+            throw CodexModelContextError.modelIsDetached
+        }
+        return try await modelContext.observe(self, includeTurns: includeTurns)
+    }
+
     @discardableResult
     public func send(_ input: CodexChatMessageInput) async throws -> CodexResponse {
         guard let modelContext else {
@@ -372,7 +382,8 @@ public final class CodexChat: CodexObservableModel {
             upsertTurn(
                 id: record.id,
                 status: record.status,
-                errorDescription: record.errorMessage
+                errorDescription: record.errorMessage,
+                preservesExistingUsage: true
             )
         }
     }
@@ -400,13 +411,23 @@ public final class CodexChat: CodexObservableModel {
     private func upsertTurn(
         id: CodexTurnID,
         status: CodexTurnStatus?,
-        errorDescription: String?
+        errorDescription: String?,
+        usage: CodexTokenUsage? = nil,
+        preservesExistingUsage: Bool = false
     ) {
         if let turn = turns.first(where: { $0.id == id }) {
             turn.status = status
             turn.errorDescription = errorDescription
+            if preservesExistingUsage == false || usage != nil {
+                turn.usage = usage
+            }
         } else {
-            turns.append(Turn(id: id, status: status, errorDescription: errorDescription))
+            turns.append(Turn(
+                id: id,
+                status: status,
+                errorDescription: errorDescription,
+                usage: usage
+            ))
         }
     }
 
@@ -419,9 +440,81 @@ public final class CodexChat: CodexObservableModel {
         upsertTurn(
             id: response.turnID,
             status: response.status,
-            errorDescription: response.errorMessage
+            errorDescription: response.errorMessage,
+            usage: response.usage,
+            preservesExistingUsage: true
         )
         mergeItems(response.transcript.items, turnID: response.turnID)
+    }
+
+    package func apply(_ event: CodexThreadEvent) {
+        switch event {
+        case .turnStarted(let turnID):
+            upsertTurn(
+                id: turnID,
+                status: .running,
+                errorDescription: nil,
+                preservesExistingUsage: true
+            )
+            phase = .loading
+            lastErrorDescription = nil
+        case .turnCompleted(let response):
+            apply(response)
+            if response.errorMessage != nil || response.status?.isFailure == true {
+                let message = response.errorMessage ?? response.status?.rawValue ?? "Turn failed"
+                fail(with: message)
+            } else {
+                phase = .loaded
+                lastErrorDescription = nil
+            }
+        case .turnFailed(let turnID, let message):
+            if let turnID {
+                upsertTurn(
+                    id: turnID,
+                    status: .failed,
+                    errorDescription: message,
+                    preservesExistingUsage: true
+                )
+            }
+            fail(with: message)
+        case .itemStarted(let item, let turnID),
+             .itemUpdated(let item, let turnID),
+             .itemCompleted(let item, let turnID):
+            mergeItems([item], turnID: turnID)
+            markRunningIfNeeded()
+        case .message(let message, let turnID):
+            let item = CodexThreadItem(
+                id: message.id,
+                kind: message.role == .user ? .userMessage : .agentMessage,
+                content: .message(message)
+            )
+            mergeItems([item], turnID: turnID)
+            markRunningIfNeeded()
+        case .messageDelta(let delta, let turnID):
+            merge(delta, turnID: turnID)
+            markRunningIfNeeded()
+        case .reasoningSummaryPartAdded(let part, let turnID):
+            start(part, turnID: turnID)
+            markRunningIfNeeded()
+        case .reasoningDelta(let delta, let turnID):
+            merge(delta, turnID: turnID)
+            markRunningIfNeeded()
+        case .tokenUsageUpdated(let usage, let turnID):
+            if let turnID {
+                setUsage(usage, for: turnID)
+            }
+        case .statusChanged(let status):
+            switch status {
+            case .running, .unknown:
+                markRunningIfNeeded()
+            case .closed:
+                phase = .loaded
+            }
+        case .closed:
+            phase = .loaded
+        case .unknown:
+            break
+        }
     }
 
     private func mergeItems(_ incomingItems: [CodexThreadItem], turnID: CodexTurnID?) {
@@ -431,6 +524,11 @@ public final class CodexChat: CodexObservableModel {
         let existingByKey = Dictionary(uniqueKeysWithValues: items.map { ($0.mergeKey, $0) })
         var merged = items
         for incomingItem in incomingItems {
+            if incomingItem.kind == .reasoning && incomingItem.id.contains(":summary:") == false
+                && incomingItem.id.contains(":content:") == false
+            {
+                removeReasoningParts(parentItemID: incomingItem.id, from: &merged)
+            }
             let incomingKey = ItemKey(id: incomingItem.id, turnID: turnID)
             if let existing = existingByKey[incomingKey] {
                 existing.update(from: incomingItem, turnID: turnID)
@@ -441,8 +539,134 @@ public final class CodexChat: CodexObservableModel {
         items = merged
     }
 
-    private func fail(with error: any Error) {
+    private func merge(_ delta: CodexMessageDelta, turnID: CodexTurnID?) {
+        let itemID = delta.itemID ?? scopedFallbackMessageID(turnID: turnID)
+        let key = ItemKey(id: itemID, turnID: turnID)
+        let previousAccumulatedText = liveMergeState.messageDeltaTextByItemKey[key] ?? ""
+        let accumulatedText = previousAccumulatedText + delta.text
+        liveMergeState.messageDeltaTextByItemKey[key] = accumulatedText
+
+        let existingMessage = item(for: key)?.message
+        let text = mergedDeltaText(
+            existingText: existingMessage?.text,
+            previousAccumulatedText: previousAccumulatedText,
+            accumulatedText: accumulatedText,
+            deltaText: delta.text
+        )
+        let message = CodexMessage(
+            id: itemID,
+            role: existingMessage?.role ?? .assistant,
+            phase: delta.phase ?? existingMessage?.phase,
+            text: text
+        )
+        mergeItems([
+            .init(id: itemID, kind: .agentMessage, content: .message(message)),
+        ], turnID: turnID)
+    }
+
+    private func start(_ part: CodexReasoningPart, turnID: CodexTurnID?) {
+        let key = ItemKey(id: part.id, turnID: turnID)
+        guard item(for: key) == nil else {
+            return
+        }
+        mergeItems([
+            .init(id: part.id, kind: .reasoning, content: .reasoning(.empty)),
+        ], turnID: turnID)
+    }
+
+    private func merge(_ delta: CodexReasoningDelta, turnID: CodexTurnID?) {
+        let key = ItemKey(id: delta.id, turnID: turnID)
+        let previousAccumulatedText = liveMergeState.reasoningDeltaTextByItemKey[key] ?? ""
+        let accumulatedText = previousAccumulatedText + delta.delta
+        liveMergeState.reasoningDeltaTextByItemKey[key] = accumulatedText
+
+        let existingReasoning = item(for: key)?.reasoning
+        let existingText: String?
+        switch delta.part.kind {
+        case .summary:
+            existingText = existingReasoning?.summary.joined(separator: "\n")
+        case .text:
+            existingText = existingReasoning?.content.joined(separator: "\n")
+        }
+        let text = mergedDeltaText(
+            existingText: existingText,
+            previousAccumulatedText: previousAccumulatedText,
+            accumulatedText: accumulatedText,
+            deltaText: delta.delta
+        )
+        let reasoning: CodexReasoning
+        switch delta.part.kind {
+        case .summary:
+            reasoning = .init(summary: text)
+        case .text:
+            reasoning = .init(content: text)
+        }
+        mergeItems([
+            .init(id: delta.id, kind: .reasoning, content: .reasoning(reasoning)),
+        ], turnID: turnID)
+    }
+
+    private func mergedDeltaText(
+        existingText: String?,
+        previousAccumulatedText: String,
+        accumulatedText: String,
+        deltaText: String
+    ) -> String {
+        guard let existingText, existingText.isEmpty == false else {
+            return accumulatedText
+        }
+        if existingText.hasPrefix(accumulatedText) {
+            return existingText
+        }
+        if existingText == previousAccumulatedText {
+            return accumulatedText
+        }
+        return existingText + deltaText
+    }
+
+    private func scopedFallbackMessageID(turnID: CodexTurnID?) -> String {
+        turnID.map { "agent-message-delta:\($0.rawValue)" } ?? "agent-message-delta"
+    }
+
+    private func setUsage(_ usage: CodexTokenUsage, for turnID: CodexTurnID) {
+        if let turn = turns.first(where: { $0.id == turnID }) {
+            turn.usage = usage
+        } else {
+            turns.append(Turn(id: turnID, usage: usage))
+        }
+    }
+
+    private func item(for key: ItemKey) -> Item? {
+        items.first { $0.mergeKey == key }
+    }
+
+    private func removeReasoningParts(parentItemID: String, from items: inout [Item]) {
+        let prefixes = ["\(parentItemID):summary:", "\(parentItemID):content:"]
+        items.removeAll { item in
+            prefixes.contains { item.id.hasPrefix($0) }
+        }
+        liveMergeState.reasoningDeltaTextByItemKey = liveMergeState.reasoningDeltaTextByItemKey
+            .filter { key, _ in
+                prefixes.contains { key.id.hasPrefix($0) } == false
+            }
+    }
+
+    private func markRunningIfNeeded() {
+        if phase != .loading {
+            phase = .loading
+        }
+    }
+
+    package func fail(with error: any Error) {
         let message = error.localizedDescription
+        fail(with: message)
+    }
+
+    package func resetLiveMergeState() {
+        liveMergeState = LiveMergeState()
+    }
+
+    private func fail(with message: String) {
         lastErrorDescription = message
         phase = .failed(message)
     }
@@ -452,21 +676,29 @@ public final class CodexChat: CodexObservableModel {
         var turnID: CodexTurnID?
     }
 
+    private struct LiveMergeState {
+        var messageDeltaTextByItemKey: [ItemKey: String] = [:]
+        var reasoningDeltaTextByItemKey: [ItemKey: String] = [:]
+    }
+
     @MainActor
     @Observable
     public final class Turn {
         public let id: CodexTurnID
         public var status: CodexTurnStatus?
         public var errorDescription: String?
+        public var usage: CodexTokenUsage?
 
         public init(
             id: CodexTurnID,
             status: CodexTurnStatus? = nil,
-            errorDescription: String? = nil
+            errorDescription: String? = nil,
+            usage: CodexTokenUsage? = nil
         ) {
             self.id = id
             self.status = status
             self.errorDescription = errorDescription
+            self.usage = usage
         }
     }
 
@@ -485,6 +717,13 @@ public final class CodexChat: CodexObservableModel {
 
         public var message: CodexMessage? {
             threadItem.message
+        }
+
+        public var reasoning: CodexReasoning? {
+            if case .reasoning(let reasoning) = content {
+                return reasoning
+            }
+            return nil
         }
 
         fileprivate var threadItem: CodexThreadItem {

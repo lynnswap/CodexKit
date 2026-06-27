@@ -76,6 +76,14 @@ public final class CodexModelContext: @unchecked Sendable {
         chat(for: id)
     }
 
+    public func model(for reviewIdentity: CodexReviewIdentity) -> CodexChat {
+        chat(for: reviewIdentity.activeTurnThreadID)
+    }
+
+    public func model(for reviewSession: CodexReviewSession) -> CodexChat {
+        model(for: reviewSession.identity)
+    }
+
     public func model(for id: CodexWorkspaceID) -> CodexWorkspace? {
         workspacesByID[id]
     }
@@ -176,9 +184,17 @@ public final class CodexModelContext: @unchecked Sendable {
     }
 
     public func refresh(_ chat: CodexChat, includeTurns: Bool = true) async throws {
+        let thread = try await appServer.resumeThread(chat.id)
+        try await refresh(chat, using: thread, includeTurns: includeTurns)
+    }
+
+    private func refresh(
+        _ chat: CodexChat,
+        using thread: CodexThread,
+        includeTurns: Bool
+    ) async throws {
         let previousWorkspace = chat.workspace
         let previousGroup = previousWorkspace?.workspaceGroup
-        let thread = try await appServer.resumeThread(chat.id)
         let snapshot = try await thread.read(includeTurns: includeTurns)
         let refreshedChat = apply(snapshot)
         await revalidateChatInRegisteredResults(
@@ -187,6 +203,55 @@ public final class CodexModelContext: @unchecked Sendable {
             previousGroup: previousGroup,
             archived: refreshedChat.isArchived
         )
+    }
+
+    public func observe(
+        _ chat: CodexChat,
+        includeTurns: Bool = true
+    ) async throws -> CodexChatObservation {
+        guard chat.modelContext === self else {
+            throw CodexModelContextError.modelIsDetached
+        }
+
+        chat.phase = .loading
+        chat.lastErrorDescription = nil
+        let thread: CodexThread
+        do {
+            thread = try await appServer.resumeThread(chat.id)
+            try await refresh(chat, using: thread, includeTurns: includeTurns)
+            chat.resetLiveMergeState()
+            chat.phase = .loaded
+            chat.lastErrorDescription = nil
+        } catch {
+            chat.fail(with: error)
+            throw error
+        }
+        let task = Task { @MainActor in
+            do {
+                for try await event in thread.events {
+                    try Task.checkCancellation()
+                    await apply(event, to: chat)
+                }
+            } catch is CancellationError {
+            } catch {
+                chat.fail(with: error)
+            }
+        }
+        return CodexChatObservation(chat: chat, task: task)
+    }
+
+    public func observe(
+        _ reviewIdentity: CodexReviewIdentity,
+        includeTurns: Bool = true
+    ) async throws -> CodexChatObservation {
+        try await observe(model(for: reviewIdentity), includeTurns: includeTurns)
+    }
+
+    public func observe(
+        _ reviewSession: CodexReviewSession,
+        includeTurns: Bool = true
+    ) async throws -> CodexChatObservation {
+        try await observe(reviewSession.identity, includeTurns: includeTurns)
     }
 
     @discardableResult
@@ -243,6 +308,28 @@ public final class CodexModelContext: @unchecked Sendable {
             previousGroup: previousGroup,
             archived: chat.isArchived
         )
+    }
+
+    package func apply(_ event: CodexThreadEvent, to chat: CodexChat) async {
+        let previousWorkspace = chat.workspace
+        let previousGroup = previousWorkspace?.workspaceGroup
+        let previousState = fetchedResultState(for: chat)
+        let previousUpdatedAt = chat.updatedAt
+        chat.apply(event)
+        if let workspace = chat.workspace,
+            let updatedAt = chat.updatedAt,
+            previousUpdatedAt.map({ updatedAt > $0 }) ?? true
+        {
+            workspace.moveChatToFront(chat)
+        }
+        if previousState != fetchedResultState(for: chat) {
+            await revalidateChatInRegisteredResults(
+                chat,
+                previousWorkspace: previousWorkspace,
+                previousGroup: previousGroup,
+                archived: chat.isArchived
+            )
+        }
     }
 
     public func cancelActiveTurn(in chat: CodexChat) async throws {

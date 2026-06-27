@@ -97,6 +97,28 @@ if let server = chat?.modelContext?.appServer {
 
 Keep review-specific state, parsed findings, and review timelines outside CodexDataKit. CodexDataKit owns generic Codex app-server data models; higher-level packages can layer their own indices on top of `CodexChat.id`, workspace IDs, or sectioned fetch results.
 
+## Live Chat Observation
+
+Use `CodexChat.observe()` or `CodexModelContext.observe(_:)` when a detail view needs an initial transcript snapshot plus live app-server events applied to the same observable chat object.
+
+```swift
+let chat = context.model(for: CodexThreadID(rawValue: "thread-1"))
+let observation = try await context.observe(chat)
+
+// Render directly from chat.turns, chat.items, chat.phase, and chat.lastErrorDescription.
+// Keep observation alive for as long as the UI should receive live updates.
+observation.cancel()
+```
+
+Observation first refreshes the chat with `includeTurns: true`, then consumes `CodexThread.events`. Turn, item, message, delta, usage, completion, and failure events mutate the existing `CodexChat`, `CodexChat.Turn`, and `CodexChat.Item` instances in place.
+
+For review UIs that persist app-server review identity, resolve and observe the active review thread without introducing a separate aggregate:
+
+```swift
+let observation = try await context.observe(reviewIdentity)
+let reviewChat = observation.chat
+```
+
 ## SwiftUI
 
 Install the container or context in the environment, then use `@CodexQuery` in views.

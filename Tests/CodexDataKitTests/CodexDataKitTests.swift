@@ -3660,6 +3660,202 @@ struct CodexModelContextTests {
         #expect(chat.transcript.finalAnswer == "Done")
     }
 
+    @Test("chat observation refreshes a snapshot and applies live events in place")
+    func chatObservationRefreshesSnapshotAndAppliesLiveEventsInPlace() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let completedAt = Date(timeIntervalSince1970: 4_000)
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-live"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-live",
+            turns: [
+                .init(
+                    id: "turn-existing",
+                    status: .completed,
+                    items: [
+                        .init(
+                            id: "message-existing",
+                            kind: .agentMessage,
+                            content: .message(.init(
+                                id: "message-existing",
+                                role: .assistant,
+                                phase: .finalAnswer,
+                                text: "Snapshot"
+                            ))
+                        ),
+                    ]
+                ),
+            ]
+        ))
+
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-live"))
+        let observation = try await chat.observe()
+        defer {
+            observation.cancel()
+        }
+
+        let snapshotItem = try #require(chat.items.first)
+        #expect(observation.chat === chat)
+        #expect(chat.phase == .loaded)
+        #expect(snapshotItem.text == "Snapshot")
+
+        try await runtime.transport.emitServerNotification(
+            method: "item/updated",
+            params: ThreadItemParams(
+                threadID: "thread-live",
+                turnID: "turn-existing",
+                item: .init(
+                    id: "message-existing",
+                    type: "agentMessage",
+                    text: "Snapshot updated",
+                    phase: "final_answer"
+                )
+            )
+        )
+        #expect(await eventually { snapshotItem.text == "Snapshot updated" })
+        #expect(chat.items.first === snapshotItem)
+
+        try await runtime.transport.emitServerNotification(
+            method: "turn/started",
+            params: TurnStartedParams(threadID: "thread-live", turnID: "turn-live")
+        )
+        try await runtime.transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(
+                threadID: "thread-live",
+                turnID: "turn-live",
+                itemID: "message-live",
+                delta: "Hel",
+                phase: "final_answer"
+            )
+        )
+        #expect(await eventually {
+            chat.items.contains { $0.id == "message-live" && $0.text == "Hel" }
+        })
+        let liveItem = try #require(chat.items.first { $0.id == "message-live" })
+
+        try await runtime.transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(
+                threadID: "thread-live",
+                turnID: "turn-live",
+                itemID: "message-live",
+                delta: "lo",
+                phase: "final_answer"
+            )
+        )
+        try await runtime.transport.emitServerNotification(
+            method: "thread/tokenUsage/updated",
+            params: TokenUsageParams(
+                threadID: "thread-live",
+                turnID: "turn-live",
+                tokenUsage: .init(
+                    total: .init(inputTokens: 5, outputTokens: 7, totalTokens: 12),
+                    modelContextWindow: 200_000
+                )
+            )
+        )
+        try await runtime.transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(
+                id: "turn-live",
+                status: "completed",
+                completedAt: Int(completedAt.timeIntervalSince1970)
+            ))
+        )
+
+        #expect(await eventually {
+            chat.turns.contains { $0.id == "turn-live" && $0.status == .completed }
+                && liveItem.text == "Hello"
+                && chat.phase == .loaded
+        })
+        let liveTurn = try #require(chat.turns.first { $0.id == "turn-live" })
+        #expect(chat.items.first { $0.id == "message-live" } === liveItem)
+        #expect(liveTurn.usage?.totalTokens == 12)
+        #expect(liveTurn.usage?.modelContextWindow == 200_000)
+        #expect(chat.updatedAt == completedAt)
+        #expect(chat.transcript.finalAnswer == "Hello")
+        #expect(await runtime.transport.recordedRequests(method: "thread/resume").count == 1)
+
+        observation.cancel()
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-live"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-live",
+            turns: [
+                .init(
+                    id: "turn-live",
+                    status: .completed,
+                    items: [
+                        .init(
+                            id: "message-live",
+                            kind: .agentMessage,
+                            content: .message(.init(
+                                id: "message-live",
+                                role: .assistant,
+                                phase: .finalAnswer,
+                                text: "Hello"
+                            ))
+                        ),
+                    ]
+                ),
+            ]
+        ))
+
+        let restartedObservation = try await chat.observe()
+        defer {
+            restartedObservation.cancel()
+        }
+
+        #expect(await eventually {
+            chat.items.first { $0.id == "message-live" }?.text == "Hello"
+        })
+        #expect(chat.items.filter { $0.id == "message-live" }.count == 1)
+        #expect(await runtime.transport.recordedRequests(method: "thread/resume").count == 2)
+    }
+
+    @Test("review identity observation resolves the active review thread chat")
+    func reviewIdentityObservationResolvesActiveReviewThreadChat() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let identity = CodexReviewIdentity(
+            threadID: "thread-source",
+            turnID: "turn-review",
+            reviewThreadID: "thread-review"
+        )
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-review"))
+        try await runtime.transport.enqueueThreadRead(.init(id: "thread-review"))
+
+        let observation = try await context.observe(identity)
+        defer {
+            observation.cancel()
+        }
+
+        #expect(observation.chat.id == "thread-review")
+        #expect(context.model(for: identity) === observation.chat)
+
+        try await runtime.transport.emitServerNotification(
+            method: "item/completed",
+            params: ThreadItemParams(
+                threadID: "thread-review",
+                turnID: "turn-review",
+                item: .init(
+                    id: "review-message",
+                    type: "agentMessage",
+                    text: "Review complete",
+                    phase: "final_answer"
+                )
+            )
+        )
+
+        #expect(await eventually {
+            observation.chat.items.contains {
+                $0.id == "review-message" && $0.text == "Review complete"
+            }
+        })
+    }
+
     @Test("chat send revalidates recent fetched results")
     func chatSendRevalidatesRecentFetchedResults() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -3977,6 +4173,32 @@ private struct ThreadItemParams: Encodable, Sendable {
     }
 }
 
+private struct TurnStartedParams: Encodable, Sendable {
+    var threadID: String
+    var turnID: String
+
+    enum CodingKeys: String, CodingKey {
+        case threadID = "threadId"
+        case turnID = "turnId"
+    }
+}
+
+private struct TurnDeltaParams: Encodable, Sendable {
+    var threadID: String
+    var turnID: String
+    var itemID: String?
+    var delta: String
+    var phase: String?
+
+    enum CodingKeys: String, CodingKey {
+        case threadID = "threadId"
+        case turnID = "turnId"
+        case itemID = "itemId"
+        case delta
+        case phase
+    }
+}
+
 private struct TurnCompletedParams: Encodable, Sendable {
     var turn: Turn
 
@@ -3985,4 +4207,43 @@ private struct TurnCompletedParams: Encodable, Sendable {
         var status: String?
         var completedAt: Int?
     }
+}
+
+private struct TokenUsageParams: Encodable, Sendable {
+    var threadID: String
+    var turnID: String
+    var tokenUsage: TokenUsage
+
+    enum CodingKeys: String, CodingKey {
+        case threadID = "threadId"
+        case turnID = "turnId"
+        case tokenUsage
+    }
+
+    struct TokenUsage: Encodable, Sendable {
+        var total: Breakdown
+        var modelContextWindow: Int?
+    }
+
+    struct Breakdown: Encodable, Sendable {
+        var cachedInputTokens: Int = 0
+        var inputTokens: Int
+        var outputTokens: Int
+        var reasoningOutputTokens: Int = 0
+        var totalTokens: Int
+    }
+}
+
+@MainActor
+private func eventually(
+    attempts: Int = 50,
+    _ condition: @MainActor () async -> Bool
+) async -> Bool {
+    for _ in 0..<attempts {
+        if await condition() {
+            return true
+        }
+        try? await Task.sleep(for: .milliseconds(10))
+    }
+    return await condition()
 }
