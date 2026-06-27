@@ -127,6 +127,22 @@ if let snapshot = chat.turnSnapshot(for: turnID) {
 
 `CodexChatTurnSnapshot` keeps references to the existing observable `CodexChat.Turn` and `CodexChat.Item` objects. It is not a separate live model and does not copy ownership of transcript state.
 
+For streaming detail surfaces that render one turn at a time, fold `CodexChatChange` values through `CodexChatTurnProjection`:
+
+```swift
+var projection = CodexChatTurnProjection(selection: .latest)
+
+for await change in observation.changes {
+    let update = projection.apply(change)
+    guard update.affectsSelectedTurn, let snapshot = update.snapshot else {
+        continue
+    }
+    render(snapshot.items)
+}
+```
+
+`CodexChatTurnProjection` owns generic change folding, item identity, item order, and latest/explicit turn selection. App-specific rendering projections should stay outside CodexDataKit.
+
 For review UIs that persist app-server review identity, resolve and observe the active review thread without introducing a separate aggregate:
 
 ```swift
