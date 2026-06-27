@@ -410,6 +410,9 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             return
         }
         guard items.count != originalCount else {
+            if modelContext.localCursorOffset(from: request.cursor) > 0 {
+                await refreshAfterMutation()
+            }
             return
         }
         await backfillAfterLocalRemovalIfNeeded(originalCount: originalCount)

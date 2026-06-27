@@ -2543,6 +2543,50 @@ struct CodexModelContextTests {
         #expect(offsetPage.nextCursor == nil)
     }
 
+    @Test("cursor-started local pages refetch when earlier chats are removed")
+    func cursorStartedLocalPagesRefetchWhenEarlierChatsAreRemoved() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+        let initialThreads = [
+            CodexThreadSnapshot(id: "thread-a", workspace: workspaceURL, name: "A"),
+            CodexThreadSnapshot(id: "thread-b", workspace: workspaceURL, name: "B"),
+            CodexThreadSnapshot(id: "thread-c", workspace: workspaceURL, name: "C"),
+            CodexThreadSnapshot(id: "thread-d", workspace: workspaceURL, name: "D"),
+            CodexThreadSnapshot(id: "thread-e", workspace: workspaceURL, name: "E"),
+        ]
+
+        try await runtime.transport.enqueueThreadList(.init(threads: initialThreads))
+        var firstPage: CodexFetchedResults<CodexChat>? = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            sortDescriptors: [.name()],
+            fetchLimit: 2
+        ))
+        try await firstPage?.performFetch()
+        let cursor = try #require(firstPage?.nextCursor)
+        let deletedChat = context.model(for: CodexThreadID(rawValue: "thread-a"))
+        firstPage = nil
+
+        try await runtime.transport.enqueueThreadList(.init(threads: initialThreads))
+        let offsetPage = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            sortDescriptors: [.name()],
+            fetchLimit: 2,
+            cursor: cursor
+        ))
+        try await offsetPage.performFetch()
+        #expect(offsetPage.items.map(\.title) == ["C", "D"])
+
+        try await runtime.transport.enqueueEmpty(for: "thread/delete")
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-b", workspace: workspaceURL, name: "B"),
+            .init(id: "thread-c", workspace: workspaceURL, name: "C"),
+            .init(id: "thread-d", workspace: workspaceURL, name: "D"),
+            .init(id: "thread-e", workspace: workspaceURL, name: "E"),
+        ]))
+        try await deletedChat.delete()
+
+        #expect(offsetPage.items.map(\.title) == ["D", "E"])
+    }
+
     @Test("cursor-started local pages refetch when visible chats move before the cursor")
     func cursorStartedLocalPagesRefetchWhenVisibleChatsMoveBeforeCursor() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
