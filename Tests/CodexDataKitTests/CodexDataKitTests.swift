@@ -3619,6 +3619,161 @@ struct CodexModelContextTests {
         #expect(chat.transcript.finalAnswer == "Done")
     }
 
+    @Test("chat turn helpers scope items and preserve identity")
+    func chatTurnHelpersScopeItemsAndPreserveIdentity() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-snapshot"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-snapshot",
+            turns: [
+                .init(
+                    id: "turn-alpha",
+                    status: .completed,
+                    items: [
+                        .init(
+                            id: "message-alpha-user",
+                            kind: .userMessage,
+                            content: .message(.init(
+                                id: "message-alpha-user",
+                                role: .user,
+                                text: "Question"
+                            ))
+                        ),
+                        .init(
+                            id: "message-alpha-agent",
+                            kind: .agentMessage,
+                            content: .message(.init(
+                                id: "message-alpha-agent",
+                                role: .assistant,
+                                phase: .finalAnswer,
+                                text: "Alpha answer"
+                            ))
+                        ),
+                    ]
+                ),
+                .init(
+                    id: "turn-beta",
+                    status: .running,
+                    items: [
+                        .init(
+                            id: "message-beta",
+                            kind: .agentMessage,
+                            content: .message(.init(
+                                id: "message-beta",
+                                role: .assistant,
+                                text: "Beta update"
+                            ))
+                        ),
+                    ]
+                ),
+            ]
+        ))
+
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-snapshot"))
+        try await chat.refresh()
+
+        let alphaTurn = try #require(chat.turn(id: "turn-alpha"))
+        let alphaItem = try #require(chat.items.first { $0.id == "message-alpha-user" })
+        let alphaItems = chat.items(in: "turn-alpha")
+        let betaItems = chat.items(in: "turn-beta")
+        let snapshot = try #require(chat.turnSnapshot(for: "turn-alpha"))
+
+        #expect(alphaItems.map(\.id) == ["message-alpha-user", "message-alpha-agent"])
+        #expect(betaItems.map(\.id) == ["message-beta"])
+        #expect(alphaItems.first === alphaItem)
+        #expect(snapshot.turn === alphaTurn)
+        #expect(snapshot.items.first === alphaItem)
+        #expect(snapshot.items.map(\.id) == alphaItems.map(\.id))
+        #expect(snapshot.threadItems.map(\.id) == ["message-alpha-user", "message-alpha-agent"])
+        #expect(snapshot.transcript.finalAnswer == "Alpha answer")
+        #expect(snapshot.status == CodexTurnStatus.completed)
+        #expect(snapshot.errorDescription == nil)
+        #expect(snapshot.usage == nil)
+    }
+
+    @Test("chat turn snapshots expose metadata and missing turn results")
+    func chatTurnSnapshotsExposeMetadataAndMissingTurnResults() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-turn-metadata"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-turn-metadata",
+            turns: [
+                .init(
+                    id: "turn-completed",
+                    status: .completed,
+                    items: [
+                        .init(
+                            id: "message-completed",
+                            kind: .agentMessage,
+                            content: .message(.init(
+                                id: "message-completed",
+                                role: .assistant,
+                                phase: .finalAnswer,
+                                text: "Done"
+                            ))
+                        ),
+                    ]
+                ),
+                .init(
+                    id: "turn-failed",
+                    status: .failed,
+                    errorMessage: "Tool failed",
+                    items: [
+                        .init(
+                            id: "message-failed",
+                            kind: .agentMessage,
+                            content: .message(.init(
+                                id: "message-failed",
+                                role: .assistant,
+                                text: "Failed"
+                            ))
+                        ),
+                    ]
+                ),
+            ]
+        ))
+
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-turn-metadata"))
+        let observation = try await chat.observe()
+        defer {
+            observation.cancel()
+        }
+
+        let failedSnapshot = try #require(chat.turnSnapshot(for: "turn-failed"))
+        #expect(failedSnapshot.status == CodexTurnStatus.failed)
+        #expect(failedSnapshot.errorDescription == "Tool failed")
+        #expect(failedSnapshot.usage == nil)
+        #expect(chat.turn(id: "turn-missing") == nil)
+        #expect(chat.items(in: "turn-missing").isEmpty)
+        #expect(chat.turnSnapshot(for: "turn-missing") == nil)
+
+        try await runtime.transport.emitServerNotification(
+            method: "thread/tokenUsage/updated",
+            params: TokenUsageParams(
+                threadID: "thread-turn-metadata",
+                turnID: "turn-completed",
+                tokenUsage: .init(
+                    total: .init(inputTokens: 13, outputTokens: 21, totalTokens: 34),
+                    modelContextWindow: 128_000
+                )
+            )
+        )
+
+        #expect(await eventually {
+            chat.turnSnapshot(for: "turn-completed")?.usage?.totalTokens == 34
+        })
+        let completedTurn = try #require(chat.turn(id: "turn-completed"))
+        let completedSnapshot = try #require(chat.turnSnapshot(for: "turn-completed"))
+        #expect(completedSnapshot.turn === completedTurn)
+        #expect(completedSnapshot.usage?.inputTokens == 13)
+        #expect(completedSnapshot.usage?.outputTokens == 21)
+        #expect(completedSnapshot.usage?.modelContextWindow == 128_000)
+    }
+
     @Test("chat send merges response transcript into observable items")
     func chatSendMergesTranscriptItems() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()

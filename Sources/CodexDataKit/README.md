@@ -112,6 +112,21 @@ observation.cancel()
 
 Observation first refreshes the chat with `includeTurns: true`, then consumes `CodexThread.events`. Turn, item, message, delta, usage, completion, and failure events mutate the existing `CodexChat`, `CodexChat.Turn`, and `CodexChat.Item` instances in place.
 
+When a UI needs one turn at a time, use the turn-scoped read projections instead of filtering the whole chat in higher-level packages:
+
+```swift
+if let snapshot = chat.turnSnapshot(for: turnID) {
+    render(
+        status: snapshot.status,
+        error: snapshot.errorDescription,
+        usage: snapshot.usage,
+        transcript: snapshot.transcript
+    )
+}
+```
+
+`CodexChatTurnSnapshot` keeps references to the existing observable `CodexChat.Turn` and `CodexChat.Item` objects. It is not a separate live model and does not copy ownership of transcript state.
+
 For review UIs that persist app-server review identity, resolve and observe the active review thread without introducing a separate aggregate:
 
 ```swift
