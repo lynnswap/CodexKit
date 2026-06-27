@@ -593,11 +593,22 @@ public actor CodexAppServer {
     /// - Returns: A domain handle for the restored thread.
     /// - Throws: A transport, JSON-RPC, or app-server request error.
     public func unarchiveThread(_ id: CodexThreadID) async throws -> CodexThread {
-        let response = try await client.send(
+        let response = try await sendUnarchiveThread(id)
+        return thread(from: response.thread)
+    }
+
+    package func unarchiveThreadSnapshot(_ id: CodexThreadID) async throws -> CodexThreadSnapshot {
+        let response = try await sendUnarchiveThread(id)
+        return Self.threadSnapshot(from: response.thread, includesTurns: false)
+    }
+
+    private func sendUnarchiveThread(
+        _ id: CodexThreadID
+    ) async throws -> AppServerAPI.Thread.Unarchive.Response {
+        try await client.send(
             AppServerAPI.Thread.Unarchive.Request(
                 params: .init(threadID: id.rawValue)
             ))
-        return thread(from: response.thread)
     }
 
     /// Archives a Codex thread.

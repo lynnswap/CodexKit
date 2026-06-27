@@ -2248,6 +2248,29 @@ struct CodexModelContextTests {
         #expect(chat.modelContext == nil)
     }
 
+    @Test("server-filtered delete removes known chat when refresh fails")
+    func serverFilteredDeleteRemovesKnownChatWhenRefreshFails() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-delete", name: "Delete")
+        ]))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            filter: .init(sourceKinds: [.appServer])
+        ))
+        try await results.performFetch()
+        let chat = try #require(results.items.first)
+
+        try await runtime.transport.enqueueEmpty(for: "thread/delete")
+        await runtime.transport.enqueueFailure(code: -32000, message: "offline", for: "thread/list")
+        try await chat.delete()
+
+        #expect(results.items.isEmpty)
+        #expect(chat.modelContext == nil)
+        #expect(await runtime.transport.recordedRequests(method: "thread/list").count == 2)
+    }
+
     @Test("server-only parent results keep parents after local child removal")
     func serverOnlyParentResultsKeepParentsAfterLocalChildRemoval() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -2909,6 +2932,40 @@ struct CodexModelContextTests {
 
         #expect(unarchivedResults.items.isEmpty)
         #expect(archivedResults.items.first === chat)
+    }
+
+    @Test("unarchiving a chat moves it between active fetched results")
+    func unarchivingChatMovesItBetweenActiveFetchedResults() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-unarchive", workspace: workspaceURL, name: "Archived")
+        ]))
+        let archivedResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            filter: .init(archived: true),
+            sortDescriptors: [.updatedAt(.reverse)]
+        ))
+        try await archivedResults.performFetch()
+        let chat = try #require(archivedResults.items.first)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: []))
+        let unarchivedResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>.recentChats)
+        try await unarchivedResults.performFetch()
+
+        try await runtime.transport.enqueueThreadUnarchive(.init(
+            id: "thread-unarchive",
+            workspace: workspaceURL,
+            name: "Restored"
+        ))
+        try await chat.unarchive()
+
+        #expect(chat.isArchived == false)
+        #expect(chat.title == "Restored")
+        #expect(archivedResults.items.isEmpty)
+        #expect(unarchivedResults.items.first === chat)
+        #expect(chat.workspace?.chats.first === chat)
     }
 
     @Test("archiving a chat inserts parents into archived fetched results")

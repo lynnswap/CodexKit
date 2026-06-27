@@ -343,6 +343,13 @@ public final class CodexChat: CodexObservableModel {
         try await modelContext.archive(self)
     }
 
+    public func unarchive() async throws {
+        guard let modelContext else {
+            throw CodexModelContextError.modelIsDetached
+        }
+        try await modelContext.unarchive(self)
+    }
+
     public func delete() async throws {
         guard let modelContext else {
             throw CodexModelContextError.modelIsDetached

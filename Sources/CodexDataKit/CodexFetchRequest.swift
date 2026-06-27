@@ -409,13 +409,17 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         workspace: CodexWorkspace?,
         group: CodexWorkspaceGroup?
     ) async {
-        if requiresServerRefreshAfterMutation {
-            await refreshAfterMutation()
-            return
-        }
         let originalCount = items.count
         let filteredItems = items.filter {
             shouldKeep($0, afterRemoving: chat, workspace: workspace, group: group)
+        }
+        if requiresServerRefreshAfterMutation {
+            if filteredItems.count != items.count {
+                items = filteredItems
+                sections = modelContext.sections(for: filteredItems, descriptor: request.sectionDescriptor)
+            }
+            await refreshAfterMutation()
+            return
         }
         guard filteredItems.count != items.count else {
             return

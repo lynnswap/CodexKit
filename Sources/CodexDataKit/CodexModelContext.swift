@@ -261,6 +261,24 @@ public final class CodexModelContext: @unchecked Sendable {
         await archiveChatInRegisteredResults(chat, workspace: workspace, group: group)
     }
 
+    public func unarchive(_ chat: CodexChat) async throws {
+        let previousWorkspace = chat.workspace
+        let previousGroup = previousWorkspace?.workspaceGroup
+        var snapshot = try await appServer.unarchiveThreadSnapshot(chat.id)
+        if snapshot.hasField(.workspace) == false,
+            let previousWorkspace
+        {
+            snapshot = snapshotForApply(snapshot, scopedWorkspaceURL: previousWorkspace.url)
+        }
+        let restoredChat = apply(snapshot, archived: false)
+        await revalidateChatInRegisteredResults(
+            restoredChat,
+            previousWorkspace: previousWorkspace,
+            previousGroup: previousGroup,
+            archived: false
+        )
+    }
+
     public func delete(_ chat: CodexChat) async throws {
         try await appServer.deleteThread(chat.id)
         await remove(chat)
