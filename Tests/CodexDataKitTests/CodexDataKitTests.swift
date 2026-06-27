@@ -4092,6 +4092,145 @@ struct CodexModelContextTests {
         #expect(await runtime.transport.recordedRequests(method: "thread/resume").count == 1)
     }
 
+    @Test("chat observations stream snapshots and item text changes")
+    func chatObservationsStreamSnapshotsAndItemTextChanges() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-changes"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-changes",
+            turns: [
+                .init(
+                    id: "turn-existing",
+                    status: .completed,
+                    items: [
+                        .init(
+                            id: "message-existing",
+                            kind: .agentMessage,
+                            content: .message(.init(
+                                id: "message-existing",
+                                role: .assistant,
+                                phase: .finalAnswer,
+                                text: "Snapshot"
+                            ))
+                        ),
+                    ]
+                ),
+            ]
+        ))
+
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-changes"))
+        let observation = try await chat.observe()
+        defer {
+            observation.cancel()
+        }
+        let changes = ChatChangeRecorder(stream: observation.changes)
+
+        guard case .snapshot(let snapshot) = await changes.next() else {
+            Issue.record("Expected initial chat snapshot change.")
+            return
+        }
+        #expect(snapshot.chatID == "thread-changes")
+        #expect(snapshot.items.map(\.text) == ["Snapshot"])
+
+        try await runtime.transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(
+                threadID: "thread-changes",
+                turnID: "turn-live",
+                itemID: "message-live",
+                delta: "Hel",
+                phase: "final_answer"
+            )
+        )
+
+        let insertedChange = await changes.itemInserted(id: "message-live", text: "Hel")
+        #expect(insertedChange != nil)
+
+        try await runtime.transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(
+                threadID: "thread-changes",
+                turnID: "turn-live",
+                itemID: "message-live",
+                delta: "lo",
+                phase: "final_answer"
+            )
+        )
+
+        guard case .itemTextAppended(let id, let turnID, let delta, let item) =
+            await changes.itemTextAppended(id: "message-live", delta: "lo")
+        else {
+            Issue.record("Expected appended text change.")
+            return
+        }
+        #expect(id == "message-live")
+        #expect(turnID == "turn-live")
+        #expect(delta == "lo")
+        #expect(item.text == "Hello")
+
+        try await runtime.transport.emitServerNotification(
+            method: "item/updated",
+            params: ThreadItemParams(
+                threadID: "thread-changes",
+                turnID: "turn-live",
+                item: .init(
+                    id: "message-live",
+                    type: "agentMessage",
+                    text: "Rewritten",
+                    phase: "final_answer"
+                )
+            )
+        )
+
+        let updatedChange = await changes.itemUpdated(id: "message-live", text: "Rewritten")
+        #expect(updatedChange != nil)
+    }
+
+    @Test("duplicate chat observations receive independent change streams")
+    func duplicateChatObservationsReceiveIndependentChangeStreams() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-shared-changes"))
+        try await runtime.transport.enqueueThreadRead(.init(id: "thread-shared-changes"))
+
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-shared-changes"))
+        let firstObservation = try await chat.observe()
+        let secondObservation = try await chat.observe()
+        defer {
+            firstObservation.cancel()
+            secondObservation.cancel()
+        }
+        let firstChanges = ChatChangeRecorder(stream: firstObservation.changes)
+        let secondChanges = ChatChangeRecorder(stream: secondObservation.changes)
+        _ = await firstChanges.next()
+        _ = await secondChanges.next()
+
+        try await runtime.transport.emitServerNotification(
+            method: "item/commandExecution/outputDelta",
+            params: OutputDeltaParams(
+                threadID: "thread-shared-changes",
+                turnID: "turn-shared-changes",
+                itemID: "command-shared-changes",
+                delta: "line 1\n"
+            )
+        )
+
+        let firstInserted = await firstChanges.itemInserted(
+            id: "command-shared-changes",
+            text: "line 1\n"
+        )
+        let secondInserted = await secondChanges.itemInserted(
+            id: "command-shared-changes",
+            text: "line 1\n"
+        )
+        #expect(firstInserted != nil)
+        #expect(secondInserted != nil)
+        #expect(await runtime.transport.recordedRequests(method: "thread/resume").count == 1)
+    }
+
     @Test("chat observation preserves loading phase for running snapshots")
     func chatObservationPreservesLoadingPhaseForRunningSnapshots() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -4648,4 +4787,82 @@ private func eventually(
         try? await Task.sleep(for: .milliseconds(10))
     }
     return await condition()
+}
+
+private final class ChatChangeRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var changes: [CodexChatChange] = []
+    private var task: Task<Void, Never>?
+
+    init(stream: AsyncStream<CodexChatChange>) {
+        task = Task { [weak self] in
+            for await change in stream {
+                self?.append(change)
+            }
+        }
+    }
+
+    deinit {
+        task?.cancel()
+    }
+
+    func next() async -> CodexChatChange? {
+        await next { _ in true }
+    }
+
+    func itemInserted(id: String, text: String?) async -> CodexChatChange? {
+        await next { change in
+            if case .itemInserted(let item) = change {
+                return item.id == id && item.text == text
+            }
+            return false
+        }
+    }
+
+    func itemUpdated(id: String, text: String?) async -> CodexChatChange? {
+        await next { change in
+            if case .itemUpdated(let item) = change {
+                return item.id == id && item.text == text
+            }
+            return false
+        }
+    }
+
+    func itemTextAppended(id: String, delta: String) async -> CodexChatChange? {
+        await next { change in
+            if case .itemTextAppended(let changeID, _, let changeDelta, _) = change {
+                return changeID == id && changeDelta == delta
+            }
+            return false
+        }
+    }
+
+    private func append(_ change: CodexChatChange) {
+        lock.lock()
+        defer { lock.unlock() }
+        changes.append(change)
+    }
+
+    private func popFirst(
+        matching predicate: (CodexChatChange) -> Bool
+    ) -> CodexChatChange? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let index = changes.firstIndex(where: predicate) else {
+            return nil
+        }
+        return changes.remove(at: index)
+    }
+
+    private func next(
+        matching predicate: (CodexChatChange) -> Bool
+    ) async -> CodexChatChange? {
+        for _ in 0..<50 {
+            if let change = popFirst(matching: predicate) {
+                return change
+            }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return popFirst(matching: predicate)
+    }
 }

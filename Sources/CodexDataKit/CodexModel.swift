@@ -27,6 +27,14 @@ public struct CodexWorkspaceID: RawRepresentable, Hashable, Sendable, Codable,
     }
 }
 
+private extension Array where Element == CodexChatChange {
+    mutating func appendIfPresent(_ change: CodexChatChange?) {
+        if let change {
+            append(change)
+        }
+    }
+}
+
 public struct CodexWorkspaceGroupID: RawRepresentable, Hashable, Sendable, Codable,
     CustomStringConvertible,
     ExpressibleByStringLiteral
@@ -408,58 +416,72 @@ public final class CodexChat: CodexObservableModel {
         }
     }
 
+    @discardableResult
     private func upsertTurn(
         id: CodexTurnID,
         status: CodexTurnStatus?,
         errorDescription: String?,
         usage: CodexTokenUsage? = nil,
         preservesExistingUsage: Bool = false
-    ) {
+    ) -> CodexChatChange? {
         if let turn = turns.first(where: { $0.id == id }) {
+            let previousSnapshot = CodexChatTurnStateSnapshot(turn: turn)
             turn.status = status
             turn.errorDescription = errorDescription
             if preservesExistingUsage == false || usage != nil {
                 turn.usage = usage
             }
+            let snapshot = CodexChatTurnStateSnapshot(turn: turn)
+            return snapshot == previousSnapshot ? nil : .turnUpdated(snapshot)
         } else {
-            turns.append(Turn(
+            let turn = Turn(
                 id: id,
                 status: status,
                 errorDescription: errorDescription,
                 usage: usage
-            ))
+            )
+            turns.append(turn)
+            return .turnInserted(CodexChatTurnStateSnapshot(turn: turn))
         }
     }
 
-    package func apply(_ response: CodexResponse) {
+    @discardableResult
+    package func apply(_ response: CodexResponse) -> [CodexChatChange] {
+        let previousPhase = phase
+        var changes: [CodexChatChange] = []
         if let completedAt = response.completedAt,
             updatedAt.map({ completedAt > $0 }) ?? true
         {
             updatedAt = completedAt
         }
-        upsertTurn(
+        changes.appendIfPresent(upsertTurn(
             id: response.turnID,
             status: response.status,
             errorDescription: response.errorMessage,
             usage: response.usage,
             preservesExistingUsage: true
-        )
-        mergeItems(response.transcript.items, turnID: response.turnID)
+        ))
+        changes.append(contentsOf: mergeItems(response.transcript.items, turnID: response.turnID))
+        appendPhaseChange(to: &changes, previousPhase: previousPhase)
+        return changes
     }
 
-    package func apply(_ event: CodexThreadEvent) {
+    @discardableResult
+    package func apply(_ event: CodexThreadEvent) -> [CodexChatChange] {
+        let previousPhase = phase
+        var changes: [CodexChatChange] = []
         switch event {
         case .turnStarted(let turnID):
-            upsertTurn(
+            changes.appendIfPresent(upsertTurn(
                 id: turnID,
                 status: .running,
                 errorDescription: nil,
                 preservesExistingUsage: true
-            )
+            ))
             phase = .loading
             lastErrorDescription = nil
         case .turnCompleted(let response):
-            apply(response)
+            changes.append(contentsOf: apply(response))
             if response.errorMessage != nil || response.status?.isFailure == true {
                 let message = response.errorMessage ?? response.status?.rawValue ?? "Turn failed"
                 fail(with: message)
@@ -469,20 +491,20 @@ public final class CodexChat: CodexObservableModel {
             }
         case .turnFailed(let turnID, let message):
             if let turnID {
-                upsertTurn(
+                changes.appendIfPresent(upsertTurn(
                     id: turnID,
                     status: .failed,
                     errorDescription: message,
                     preservesExistingUsage: true
-                )
+                ))
             }
             fail(with: message)
         case .itemStarted(let item, let turnID),
              .itemCompleted(let item, let turnID):
-            mergeItems([item], turnID: turnID)
+            changes.append(contentsOf: mergeItems([item], turnID: turnID))
             markRunningIfNeeded()
         case .itemUpdated(let item, let turnID):
-            mergeItems([item], turnID: turnID, accumulatesOutputDeltas: true)
+            changes.append(contentsOf: mergeItems([item], turnID: turnID, accumulatesOutputDeltas: true))
             markRunningIfNeeded()
         case .message(let message, let turnID):
             let item = CodexThreadItem(
@@ -490,20 +512,20 @@ public final class CodexChat: CodexObservableModel {
                 kind: message.role == .user ? .userMessage : .agentMessage,
                 content: .message(message)
             )
-            mergeItems([item], turnID: turnID)
+            changes.append(contentsOf: mergeItems([item], turnID: turnID))
             markRunningIfNeeded()
         case .messageDelta(let delta, let turnID):
-            merge(delta, turnID: turnID)
+            changes.append(contentsOf: merge(delta, turnID: turnID))
             markRunningIfNeeded()
         case .reasoningSummaryPartAdded(let part, let turnID):
-            start(part, turnID: turnID)
+            changes.append(contentsOf: start(part, turnID: turnID))
             markRunningIfNeeded()
         case .reasoningDelta(let delta, let turnID):
-            merge(delta, turnID: turnID)
+            changes.append(contentsOf: merge(delta, turnID: turnID))
             markRunningIfNeeded()
         case .tokenUsageUpdated(let usage, let turnID):
             if let turnID {
-                setUsage(usage, for: turnID)
+                changes.appendIfPresent(setUsage(usage, for: turnID))
             }
         case .statusChanged(let status):
             switch status {
@@ -517,41 +539,56 @@ public final class CodexChat: CodexObservableModel {
         case .unknown:
             break
         }
+        appendPhaseChange(to: &changes, previousPhase: previousPhase)
+        return changes
     }
 
+    @discardableResult
     private func mergeItems(
         _ incomingItems: [CodexThreadItem],
         turnID: CodexTurnID?,
         accumulatesOutputDeltas: Bool = false
-    ) {
+    ) -> [CodexChatChange] {
         guard incomingItems.isEmpty == false else {
-            return
+            return []
         }
         let existingByKey = Dictionary(uniqueKeysWithValues: items.map { ($0.mergeKey, $0) })
         var merged = items
+        var changes: [CodexChatChange] = []
         for incomingItem in incomingItems {
             if incomingItem.kind == .reasoning && incomingItem.id.contains(":summary:") == false
                 && incomingItem.id.contains(":content:") == false
             {
-                removeReasoningParts(parentItemID: incomingItem.id, from: &merged)
+                changes.append(contentsOf: removeReasoningParts(parentItemID: incomingItem.id, from: &merged))
             }
             let incomingKey = ItemKey(id: incomingItem.id, turnID: turnID)
             if let existing = existingByKey[incomingKey] {
+                let previousSnapshot = CodexChatItemSnapshot(item: existing)
                 if accumulatesOutputDeltas,
                     mergeOutputDelta(incomingItem, into: existing, key: incomingKey)
                 {
-                    continue
+                    changes.appendIfPresent(changeForUpdatedItem(
+                        existing,
+                        previousSnapshot: previousSnapshot
+                    ))
                 } else {
                     existing.update(from: incomingItem, turnID: turnID)
+                    changes.appendIfPresent(changeForUpdatedItem(
+                        existing,
+                        previousSnapshot: previousSnapshot
+                    ))
                 }
             } else {
                 if accumulatesOutputDeltas {
                     seedOutputDeltaStateIfNeeded(incomingItem, key: incomingKey)
                 }
-                merged.append(Item(threadItem: incomingItem, turnID: turnID))
+                let item = Item(threadItem: incomingItem, turnID: turnID)
+                merged.append(item)
+                changes.append(.itemInserted(CodexChatItemSnapshot(item: item)))
             }
         }
         items = merged
+        return changes
     }
 
     private func seedOutputDeltaStateIfNeeded(_ item: CodexThreadItem, key: ItemKey) {
@@ -666,7 +703,7 @@ public final class CodexChat: CodexObservableModel {
         )
     }
 
-    private func merge(_ delta: CodexMessageDelta, turnID: CodexTurnID?) {
+    private func merge(_ delta: CodexMessageDelta, turnID: CodexTurnID?) -> [CodexChatChange] {
         let itemID = delta.itemID ?? scopedFallbackMessageID(turnID: turnID)
         let key = ItemKey(id: itemID, turnID: turnID)
         let previousAccumulatedText = liveMergeState.messageDeltaTextByItemKey[key] ?? ""
@@ -686,22 +723,22 @@ public final class CodexChat: CodexObservableModel {
             phase: delta.phase ?? existingMessage?.phase,
             text: text
         )
-        mergeItems([
+        return mergeItems([
             .init(id: itemID, kind: .agentMessage, content: .message(message)),
         ], turnID: turnID)
     }
 
-    private func start(_ part: CodexReasoningPart, turnID: CodexTurnID?) {
+    private func start(_ part: CodexReasoningPart, turnID: CodexTurnID?) -> [CodexChatChange] {
         let key = ItemKey(id: part.id, turnID: turnID)
         guard item(for: key) == nil else {
-            return
+            return []
         }
-        mergeItems([
+        return mergeItems([
             .init(id: part.id, kind: .reasoning, content: .reasoning(.empty)),
         ], turnID: turnID)
     }
 
-    private func merge(_ delta: CodexReasoningDelta, turnID: CodexTurnID?) {
+    private func merge(_ delta: CodexReasoningDelta, turnID: CodexTurnID?) -> [CodexChatChange] {
         let key = ItemKey(id: delta.id, turnID: turnID)
         let previousAccumulatedText = liveMergeState.reasoningDeltaTextByItemKey[key] ?? ""
         let accumulatedText = previousAccumulatedText + delta.delta
@@ -728,7 +765,7 @@ public final class CodexChat: CodexObservableModel {
         case .text:
             reasoning = .init(content: text)
         }
-        mergeItems([
+        return mergeItems([
             .init(id: delta.id, kind: .reasoning, content: .reasoning(reasoning)),
         ], turnID: turnID)
     }
@@ -751,15 +788,50 @@ public final class CodexChat: CodexObservableModel {
         return existingText + deltaText
     }
 
+    private func changeForUpdatedItem(
+        _ item: Item,
+        previousSnapshot: CodexChatItemSnapshot
+    ) -> CodexChatChange? {
+        let snapshot = CodexChatItemSnapshot(item: item)
+        guard snapshot != previousSnapshot else {
+            return nil
+        }
+        if let delta = appendedText(previousText: previousSnapshot.text, currentText: item.text) {
+            return .itemTextAppended(
+                id: item.id,
+                turnID: item.turnID,
+                delta: delta,
+                item: snapshot
+            )
+        }
+        return .itemUpdated(snapshot)
+    }
+
+    private func appendedText(previousText: String?, currentText: String?) -> String? {
+        guard let currentText else {
+            return nil
+        }
+        let previousText = previousText ?? ""
+        guard currentText.hasPrefix(previousText), currentText.count > previousText.count else {
+            return nil
+        }
+        return String(currentText.dropFirst(previousText.count))
+    }
+
     private func scopedFallbackMessageID(turnID: CodexTurnID?) -> String {
         turnID.map { "agent-message-delta:\($0.rawValue)" } ?? "agent-message-delta"
     }
 
-    private func setUsage(_ usage: CodexTokenUsage, for turnID: CodexTurnID) {
+    private func setUsage(_ usage: CodexTokenUsage, for turnID: CodexTurnID) -> CodexChatChange? {
         if let turn = turns.first(where: { $0.id == turnID }) {
+            let previousSnapshot = CodexChatTurnStateSnapshot(turn: turn)
             turn.usage = usage
+            let snapshot = CodexChatTurnStateSnapshot(turn: turn)
+            return snapshot == previousSnapshot ? nil : .turnUpdated(snapshot)
         } else {
-            turns.append(Turn(id: turnID, usage: usage))
+            let turn = Turn(id: turnID, usage: usage)
+            turns.append(turn)
+            return .turnInserted(CodexChatTurnStateSnapshot(turn: turn))
         }
     }
 
@@ -767,8 +839,14 @@ public final class CodexChat: CodexObservableModel {
         items.first { $0.mergeKey == key }
     }
 
-    private func removeReasoningParts(parentItemID: String, from items: inout [Item]) {
+    private func removeReasoningParts(
+        parentItemID: String,
+        from items: inout [Item]
+    ) -> [CodexChatChange] {
         let prefixes = ["\(parentItemID):summary:", "\(parentItemID):content:"]
+        let removedItems = items.filter { item in
+            prefixes.contains { item.id.hasPrefix($0) }
+        }
         items.removeAll { item in
             prefixes.contains { item.id.hasPrefix($0) }
         }
@@ -776,6 +854,9 @@ public final class CodexChat: CodexObservableModel {
             .filter { key, _ in
                 prefixes.contains { key.id.hasPrefix($0) } == false
             }
+        return removedItems.map { item in
+            .itemRemoved(id: item.id, turnID: item.turnID)
+        }
     }
 
     private func markRunningIfNeeded() {
@@ -807,6 +888,15 @@ public final class CodexChat: CodexObservableModel {
             return
         }
         phase = .loaded
+    }
+
+    private func appendPhaseChange(
+        to changes: inout [CodexChatChange],
+        previousPhase: CodexDataPhase
+    ) {
+        if phase != previousPhase {
+            changes.append(.phaseChanged(phase))
+        }
     }
 
     package func fail(with error: any Error) {

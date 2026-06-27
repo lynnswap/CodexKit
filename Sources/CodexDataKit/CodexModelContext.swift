@@ -47,10 +47,44 @@ public final class CodexModelContext: @unchecked Sendable {
         var leaseCount = 0
         var setupTask: Task<Void, Error>?
         var eventTask: Task<Void, Never>?
+        var changeContinuations: [UUID: AsyncStream<CodexChatChange>.Continuation] = [:]
 
         func cancel() {
             setupTask?.cancel()
             eventTask?.cancel()
+            finishChangeStreams()
+        }
+
+        func makeChangeStream(
+            initialSnapshot: CodexChatSnapshot
+        ) -> (id: UUID, stream: AsyncStream<CodexChatChange>) {
+            let id = UUID()
+            let pair = AsyncStream<CodexChatChange>.makeStream(bufferingPolicy: .unbounded)
+            changeContinuations[id] = pair.continuation
+            pair.continuation.yield(.snapshot(initialSnapshot))
+            return (id, pair.stream)
+        }
+
+        func removeChangeStream(id: UUID) {
+            changeContinuations.removeValue(forKey: id)?.finish()
+        }
+
+        func yield(_ changes: [CodexChatChange]) {
+            guard changes.isEmpty == false else {
+                return
+            }
+            for continuation in changeContinuations.values {
+                for change in changes {
+                    continuation.yield(change)
+                }
+            }
+        }
+
+        func finishChangeStreams() {
+            for continuation in changeContinuations.values {
+                continuation.finish()
+            }
+            changeContinuations.removeAll(keepingCapacity: true)
         }
     }
 
@@ -209,6 +243,9 @@ public final class CodexModelContext: @unchecked Sendable {
         let previousGroup = previousWorkspace?.workspaceGroup
         let snapshot = try await thread.read(includeTurns: includeTurns)
         let refreshedChat = apply(snapshot)
+        activeChatObservationsByID[refreshedChat.id]?.yield([
+            .snapshot(CodexChatSnapshot(chat: refreshedChat)),
+        ])
         await revalidateChatInRegisteredResults(
             refreshedChat,
             previousWorkspace: previousWorkspace,
@@ -233,13 +270,7 @@ public final class CodexModelContext: @unchecked Sendable {
             throw error
         }
 
-        let chatID = chat.id
-        return CodexChatObservation(chat: chat) { [weak self, weak activeObservation] in
-            guard let activeObservation else {
-                return
-            }
-            self?.releaseChatObservation(chatID, observation: activeObservation)
-        }
+        return makeChatObservation(chat: chat, activeObservation: activeObservation)
     }
 
     private func activeObservation(
@@ -302,12 +333,15 @@ public final class CodexModelContext: @unchecked Sendable {
             do {
                 for try await event in thread.events {
                     try Task.checkCancellation()
-                    await apply(event, to: chat)
+                    let changes = await apply(event, to: chat)
+                    observation.yield(changes)
                 }
             } catch is CancellationError {
             } catch {
                 chat.fail(with: error)
+                observation.yield([.phaseChanged(chat.phase)])
             }
+            observation.finishChangeStreams()
             finishChatObservationIfIdle(chat.id, observation: observation)
         }
     }
@@ -380,11 +414,23 @@ public final class CodexModelContext: @unchecked Sendable {
             throw error
         }
 
+        return makeChatObservation(chat: chat, activeObservation: activeObservation)
+    }
+
+    private func makeChatObservation(
+        chat: CodexChat,
+        activeObservation: ActiveChatObservation
+    ) -> CodexChatObservation {
         let chatID = chat.id
-        return CodexChatObservation(chat: chat) { [weak self, weak activeObservation] in
+        let changeStream = activeObservation.makeChangeStream(
+            initialSnapshot: CodexChatSnapshot(chat: chat)
+        )
+        return CodexChatObservation(chat: chat, changes: changeStream.stream) {
+            [weak self, weak activeObservation] in
             guard let activeObservation else {
                 return
             }
+            activeObservation.removeChangeStream(id: changeStream.id)
             self?.releaseChatObservation(chatID, observation: activeObservation)
         }
     }
@@ -426,11 +472,12 @@ public final class CodexModelContext: @unchecked Sendable {
         return response
     }
 
-    package func apply(_ response: CodexResponse, to chat: CodexChat) async {
+    @discardableResult
+    package func apply(_ response: CodexResponse, to chat: CodexChat) async -> [CodexChatChange] {
         let previousWorkspace = chat.workspace
         let previousGroup = previousWorkspace?.workspaceGroup
         let previousUpdatedAt = chat.updatedAt
-        chat.apply(response)
+        let changes = chat.apply(response)
         if let workspace = chat.workspace,
             let updatedAt = chat.updatedAt,
             previousUpdatedAt.map({ updatedAt > $0 }) ?? true
@@ -443,14 +490,17 @@ public final class CodexModelContext: @unchecked Sendable {
             previousGroup: previousGroup,
             archived: chat.isArchived
         )
+        activeChatObservationsByID[chat.id]?.yield(changes)
+        return changes
     }
 
-    package func apply(_ event: CodexThreadEvent, to chat: CodexChat) async {
+    @discardableResult
+    package func apply(_ event: CodexThreadEvent, to chat: CodexChat) async -> [CodexChatChange] {
         let previousWorkspace = chat.workspace
         let previousGroup = previousWorkspace?.workspaceGroup
         let previousState = fetchedResultState(for: chat)
         let previousUpdatedAt = chat.updatedAt
-        chat.apply(event)
+        let changes = chat.apply(event)
         if let workspace = chat.workspace,
             let updatedAt = chat.updatedAt,
             previousUpdatedAt.map({ updatedAt > $0 }) ?? true
@@ -465,6 +515,7 @@ public final class CodexModelContext: @unchecked Sendable {
                 archived: chat.isArchived
             )
         }
+        return changes
     }
 
     public func cancelActiveTurn(in chat: CodexChat) async throws {

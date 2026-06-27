@@ -28,6 +28,10 @@ let package = Package(
     targets: [
         .target(
             name: "CodexKit",
+            dependencies: [
+                "CodexAppServerKit",
+                "CodexDataKit",
+            ],
             swiftSettings: [
                 .enableUpcomingFeature("ApproachableConcurrency"),
             ],
