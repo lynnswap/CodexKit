@@ -295,7 +295,7 @@ public final class CodexChat: CodexObservableModel {
         lastErrorDescription = nil
         do {
             try await modelContext.refresh(self, includeTurns: includeTurns)
-            phase = .loaded
+            syncPhaseWithTurnsAfterRefresh()
         } catch {
             fail(with: error)
             throw error
@@ -318,7 +318,7 @@ public final class CodexChat: CodexObservableModel {
         lastErrorDescription = nil
         do {
             let response = try await modelContext.send(input, in: self)
-            phase = .loaded
+            syncPhaseWithTurnsAfterRefresh()
             return response
         } catch {
             if input.options.transcriptErrorHandlingPolicy != .revertTranscript,
@@ -478,9 +478,11 @@ public final class CodexChat: CodexObservableModel {
             }
             fail(with: message)
         case .itemStarted(let item, let turnID),
-             .itemUpdated(let item, let turnID),
              .itemCompleted(let item, let turnID):
             mergeItems([item], turnID: turnID)
+            markRunningIfNeeded()
+        case .itemUpdated(let item, let turnID):
+            mergeItems([item], turnID: turnID, accumulatesOutputDeltas: true)
             markRunningIfNeeded()
         case .message(let message, let turnID):
             let item = CodexThreadItem(
@@ -508,16 +510,20 @@ public final class CodexChat: CodexObservableModel {
             case .running, .unknown:
                 markRunningIfNeeded()
             case .closed:
-                phase = .loaded
+                markLoadedIfNotFailed()
             }
         case .closed:
-            phase = .loaded
+            markLoadedIfNotFailed()
         case .unknown:
             break
         }
     }
 
-    private func mergeItems(_ incomingItems: [CodexThreadItem], turnID: CodexTurnID?) {
+    private func mergeItems(
+        _ incomingItems: [CodexThreadItem],
+        turnID: CodexTurnID?,
+        accumulatesOutputDeltas: Bool = false
+    ) {
         guard incomingItems.isEmpty == false else {
             return
         }
@@ -531,12 +537,133 @@ public final class CodexChat: CodexObservableModel {
             }
             let incomingKey = ItemKey(id: incomingItem.id, turnID: turnID)
             if let existing = existingByKey[incomingKey] {
-                existing.update(from: incomingItem, turnID: turnID)
+                if accumulatesOutputDeltas,
+                    mergeOutputDelta(incomingItem, into: existing, key: incomingKey)
+                {
+                    continue
+                } else {
+                    existing.update(from: incomingItem, turnID: turnID)
+                }
             } else {
+                if accumulatesOutputDeltas {
+                    seedOutputDeltaStateIfNeeded(incomingItem, key: incomingKey)
+                }
                 merged.append(Item(threadItem: incomingItem, turnID: turnID))
             }
         }
         items = merged
+    }
+
+    private func seedOutputDeltaStateIfNeeded(_ item: CodexThreadItem, key: ItemKey) {
+        guard let delta = outputDeltaText(from: item) else {
+            return
+        }
+        liveMergeState.outputDeltaTextByItemKey[key] = delta
+    }
+
+    @discardableResult
+    private func mergeOutputDelta(
+        _ incomingItem: CodexThreadItem,
+        into existing: Item,
+        key: ItemKey
+    ) -> Bool {
+        guard existing.kind == incomingItem.kind,
+            let delta = outputDeltaText(from: incomingItem)
+        else {
+            return false
+        }
+
+        let previousAccumulatedText = liveMergeState.outputDeltaTextByItemKey[key] ?? ""
+        let accumulatedText = previousAccumulatedText + delta
+        liveMergeState.outputDeltaTextByItemKey[key] = accumulatedText
+        let mergedText = mergedDeltaText(
+            existingText: outputText(from: existing.threadItem),
+            previousAccumulatedText: previousAccumulatedText,
+            accumulatedText: accumulatedText,
+            deltaText: delta
+        )
+        liveMergeState.outputDeltaTextByItemKey[key] = mergedText
+        existing.update(
+            from: itemByReplacingOutput(
+                in: existing.threadItem,
+                with: mergedText,
+                using: incomingItem
+            ),
+            turnID: key.turnID
+        )
+        return true
+    }
+
+    private func outputDeltaText(from item: CodexThreadItem) -> String? {
+        switch item.content {
+        case .command(let command)
+            where command.command.isEmpty && command.cwd == nil && command.exitCode == nil:
+            command.output
+        case .fileChange(let fileChange)
+            where fileChange.path == nil:
+            fileChange.output
+        case .toolCall(let toolCall)
+            where toolCall.namespace == nil && toolCall.server == nil && toolCall.name == nil
+                && toolCall.arguments == nil && toolCall.error == nil:
+            toolCall.result
+        default:
+            nil
+        }
+    }
+
+    private func outputText(from item: CodexThreadItem) -> String? {
+        switch item.content {
+        case .command(let command):
+            command.output
+        case .fileChange(let fileChange):
+            fileChange.output
+        case .toolCall(let toolCall):
+            toolCall.result
+        default:
+            nil
+        }
+    }
+
+    private func itemByReplacingOutput(
+        in existingItem: CodexThreadItem,
+        with output: String,
+        using incomingItem: CodexThreadItem
+    ) -> CodexThreadItem {
+        let content: CodexThreadItem.Content
+        switch existingItem.content {
+        case .command(var command):
+            if case .command(let incomingCommand) = incomingItem.content,
+                let status = incomingCommand.status
+            {
+                command.status = status
+            }
+            command.output = output
+            content = .command(command)
+        case .fileChange(var fileChange):
+            if case .fileChange(let incomingFileChange) = incomingItem.content,
+                let status = incomingFileChange.status
+            {
+                fileChange.status = status
+            }
+            fileChange.output = output
+            content = .fileChange(fileChange)
+        case .toolCall(var toolCall):
+            if case .toolCall(let incomingToolCall) = incomingItem.content,
+                let status = incomingToolCall.status
+            {
+                toolCall.status = status
+            }
+            toolCall.result = output
+            content = .toolCall(toolCall)
+        default:
+            content = existingItem.content
+        }
+        return CodexThreadItem(
+            id: existingItem.id,
+            kind: existingItem.kind,
+            content: content,
+            rawPayload: incomingItem.rawPayload ?? existingItem.rawPayload
+        )
     }
 
     private func merge(_ delta: CodexMessageDelta, turnID: CodexTurnID?) {
@@ -657,6 +784,31 @@ public final class CodexChat: CodexObservableModel {
         }
     }
 
+    package func syncPhaseWithTurnsAfterRefresh() {
+        guard let latestTurn = turns.last else {
+            phase = .loaded
+            lastErrorDescription = nil
+            return
+        }
+        switch latestTurn.status {
+        case .running:
+            phase = .loading
+            lastErrorDescription = nil
+        case .failed, .interrupted, .cancelled:
+            fail(with: latestTurn.errorDescription ?? latestTurn.status?.rawValue ?? "Turn failed")
+        case .completed, .unknown, .none:
+            phase = .loaded
+            lastErrorDescription = nil
+        }
+    }
+
+    private func markLoadedIfNotFailed() {
+        if case .failed = phase {
+            return
+        }
+        phase = .loaded
+    }
+
     package func fail(with error: any Error) {
         let message = error.localizedDescription
         fail(with: message)
@@ -679,6 +831,7 @@ public final class CodexChat: CodexObservableModel {
     private struct LiveMergeState {
         var messageDeltaTextByItemKey: [ItemKey: String] = [:]
         var reasoningDeltaTextByItemKey: [ItemKey: String] = [:]
+        var outputDeltaTextByItemKey: [ItemKey: String] = [:]
     }
 
     @MainActor

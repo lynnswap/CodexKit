@@ -4,12 +4,15 @@ import Foundation
 public final class CodexChatObservation {
     public let chat: CodexChat
 
-    private let task: Task<Void, Never>
+    private let cancellation: @MainActor () -> Void
     public private(set) var isCancelled = false
 
-    package init(chat: CodexChat, task: Task<Void, Never>) {
+    package init(
+        chat: CodexChat,
+        cancellation: @escaping @MainActor () -> Void
+    ) {
         self.chat = chat
-        self.task = task
+        self.cancellation = cancellation
     }
 
     public func cancel() {
@@ -17,10 +20,10 @@ public final class CodexChatObservation {
             return
         }
         isCancelled = true
-        task.cancel()
+        cancellation()
     }
 
     isolated deinit {
-        task.cancel()
+        cancel()
     }
 }

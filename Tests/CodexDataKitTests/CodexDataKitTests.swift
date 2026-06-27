@@ -3980,6 +3980,7 @@ struct CodexModelContextTests {
         )
 
         try await runtime.transport.enqueueThreadResume(.init(id: "thread-review"))
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-review"))
         try await runtime.transport.enqueueThreadRead(.init(id: "thread-review"))
 
         let observation = try await context.observe(identity)
@@ -4008,6 +4009,202 @@ struct CodexModelContextTests {
             observation.chat.items.contains {
                 $0.id == "review-message" && $0.text == "Review complete"
             }
+        })
+    }
+
+    @Test("review identity observation seeds turn-only review notifications")
+    func reviewIdentityObservationSeedsTurnOnlyReviewNotifications() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let identity = CodexReviewIdentity(
+            threadID: "thread-source",
+            turnID: "turn-review",
+            reviewThreadID: "thread-review"
+        )
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-review"))
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-review"))
+        try await runtime.transport.enqueueThreadRead(.init(id: "thread-review"))
+
+        let observation = try await context.observe(identity)
+        defer {
+            observation.cancel()
+        }
+
+        try await runtime.transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnOnlyDeltaParams(
+                turnID: "turn-review",
+                itemID: "review-message",
+                delta: "Turn-only review",
+                phase: "final_answer"
+            )
+        )
+
+        #expect(await eventually {
+            observation.chat.items.contains {
+                $0.id == "review-message" && $0.text == "Turn-only review"
+            }
+        })
+    }
+
+    @Test("duplicate chat observations share one live consumer")
+    func duplicateChatObservationsShareOneLiveConsumer() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-duplicate"))
+        try await runtime.transport.enqueueThreadRead(.init(id: "thread-duplicate"))
+
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-duplicate"))
+        let firstObservation = try await chat.observe()
+        let secondObservation = try await chat.observe()
+        defer {
+            firstObservation.cancel()
+            secondObservation.cancel()
+        }
+
+        try await runtime.transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(
+                threadID: "thread-duplicate",
+                turnID: "turn-duplicate",
+                itemID: "message-duplicate",
+                delta: "Hel",
+                phase: "final_answer"
+            )
+        )
+        try await runtime.transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(
+                threadID: "thread-duplicate",
+                turnID: "turn-duplicate",
+                itemID: "message-duplicate",
+                delta: "lo",
+                phase: "final_answer"
+            )
+        )
+
+        #expect(await eventually {
+            chat.items.first { $0.id == "message-duplicate" }?.text == "Hello"
+        })
+        #expect(chat.items.filter { $0.id == "message-duplicate" }.count == 1)
+        #expect(await runtime.transport.recordedRequests(method: "thread/resume").count == 1)
+    }
+
+    @Test("chat observation preserves loading phase for running snapshots")
+    func chatObservationPreservesLoadingPhaseForRunningSnapshots() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-running"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-running",
+            turns: [.init(id: "turn-running", status: .running)]
+        ))
+
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-running"))
+        let observation = try await chat.observe()
+        defer {
+            observation.cancel()
+        }
+
+        #expect(chat.phase == .loading)
+        #expect(chat.turn(id: "turn-running")?.status == .running)
+    }
+
+    @Test("thread closed notifications preserve failed chat phase")
+    func threadClosedNotificationsPreserveFailedChatPhase() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-failed"))
+        try await runtime.transport.enqueueThreadRead(.init(id: "thread-failed"))
+
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-failed"))
+        let observation = try await chat.observe()
+        defer {
+            observation.cancel()
+        }
+
+        await runtime.transport.emitServerNotificationJSON(
+            method: "turn/failed",
+            json: """
+            {
+              "threadId": "thread-failed",
+              "turnId": "turn-failed",
+              "error": { "message": "Tool failed" }
+            }
+            """
+        )
+
+        #expect(await eventually { chat.phase == .failed("Tool failed") })
+
+        try await runtime.transport.emitServerNotification(
+            method: "thread/status/changed",
+            params: ThreadStatusParams(threadID: "thread-failed", status: .init(type: "closed"))
+        )
+        try await runtime.transport.emitServerNotification(
+            method: "thread/closed",
+            params: ThreadClosedParams(threadID: "thread-failed")
+        )
+
+        #expect(await eventually { chat.phase == .failed("Tool failed") })
+    }
+
+    @Test("live item output deltas accumulate until replacement arrives")
+    func liveItemOutputDeltasAccumulateUntilReplacementArrives() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-output"))
+        try await runtime.transport.enqueueThreadRead(.init(id: "thread-output"))
+
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-output"))
+        let observation = try await chat.observe()
+        defer {
+            observation.cancel()
+        }
+
+        try await runtime.transport.emitServerNotification(
+            method: "item/commandExecution/outputDelta",
+            params: OutputDeltaParams(
+                threadID: "thread-output",
+                turnID: "turn-output",
+                itemID: "command-output",
+                delta: "Hel"
+            )
+        )
+        try await runtime.transport.emitServerNotification(
+            method: "item/commandExecution/outputDelta",
+            params: OutputDeltaParams(
+                threadID: "thread-output",
+                turnID: "turn-output",
+                itemID: "command-output",
+                delta: "lo"
+            )
+        )
+
+        #expect(await eventually {
+            chat.items.first { $0.id == "command-output" }?.text == "Hello"
+        })
+
+        try await runtime.transport.emitServerNotification(
+            method: "item/completed",
+            params: ThreadItemParams(
+                threadID: "thread-output",
+                turnID: "turn-output",
+                item: .init(
+                    id: "command-output",
+                    type: "commandExecution",
+                    text: "Completed output",
+                    phase: nil
+                )
+            )
+        )
+
+        #expect(await eventually {
+            chat.items.first { $0.id == "command-output" }?.text == "Completed output"
         })
     }
 
@@ -4351,6 +4548,56 @@ private struct TurnDeltaParams: Encodable, Sendable {
         case itemID = "itemId"
         case delta
         case phase
+    }
+}
+
+private struct TurnOnlyDeltaParams: Encodable, Sendable {
+    var turnID: String
+    var itemID: String?
+    var delta: String
+    var phase: String?
+
+    enum CodingKeys: String, CodingKey {
+        case turnID = "turnId"
+        case itemID = "itemId"
+        case delta
+        case phase
+    }
+}
+
+private struct OutputDeltaParams: Encodable, Sendable {
+    var threadID: String
+    var turnID: String
+    var itemID: String
+    var delta: String
+
+    enum CodingKeys: String, CodingKey {
+        case threadID = "threadId"
+        case turnID = "turnId"
+        case itemID = "itemId"
+        case delta
+    }
+}
+
+private struct ThreadStatusParams: Encodable, Sendable {
+    var threadID: String
+    var status: Status
+
+    enum CodingKeys: String, CodingKey {
+        case threadID = "threadId"
+        case status
+    }
+
+    struct Status: Encodable, Sendable {
+        var type: String
+    }
+}
+
+private struct ThreadClosedParams: Encodable, Sendable {
+    var threadID: String
+
+    enum CodingKeys: String, CodingKey {
+        case threadID = "threadId"
     }
 }
 
