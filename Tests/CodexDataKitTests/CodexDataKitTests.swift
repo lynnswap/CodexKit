@@ -2783,6 +2783,10 @@ struct CodexModelContextTests {
 
         #expect(pagedResults.items.map(\.id.rawValue) == ["thread-new", "thread-existing"])
         #expect(pagedResults.nextCursor == nil)
+        let listRequests = await runtime.transport.recordedRequests(method: "thread/list")
+        #expect(listRequests.count == 3)
+        let nextPageParams = try #require(listRequests.last).decodeParams(ThreadListParams.self)
+        #expect(nextPageParams.cursor == nil)
     }
 
     @Test("starting a chat inserts into underfilled limited fetched results")

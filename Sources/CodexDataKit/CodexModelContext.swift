@@ -1009,6 +1009,9 @@ public final class CodexModelContext: @unchecked Sendable {
     private func canUseServerOrderedPages<Model: CodexObservableModel>(
         for request: CodexFetchRequest<Model>
     ) -> Bool {
+        if request.cursor?.hasPrefix(Self.localCursorPrefix) == true {
+            return false
+        }
         guard let primarySort = request.sortDescriptors.first else {
             return true
         }
