@@ -53,6 +53,8 @@ public final class CodexModelContext: @unchecked Sendable {
         var eventThread: CodexThread?
         var includesTurns = false
         var isFinished = false
+        var isBufferingEvents = false
+        var bufferedEvents: [CodexThreadEvent] = []
         var changeContinuations: [UUID: AsyncStream<CodexChatChange>.Continuation] = [:]
 
         func cancel() {
@@ -60,7 +62,29 @@ public final class CodexModelContext: @unchecked Sendable {
             setupTask?.cancel()
             eventTask?.cancel()
             turnsUpgradeTask?.cancel()
+            bufferedEvents.removeAll(keepingCapacity: true)
             finishChangeStreams()
+        }
+
+        func beginBufferingEvents() {
+            isBufferingEvents = true
+        }
+
+        func appendBufferedEvent(_ event: CodexThreadEvent) {
+            bufferedEvents.append(event)
+        }
+
+        func finishBufferingEvents() -> [CodexThreadEvent] {
+            isBufferingEvents = false
+            defer {
+                bufferedEvents.removeAll(keepingCapacity: true)
+            }
+            return bufferedEvents
+        }
+
+        func discardBufferedEvents() {
+            isBufferingEvents = false
+            bufferedEvents.removeAll(keepingCapacity: true)
         }
 
         func makeChangeStream(
@@ -249,15 +273,26 @@ public final class CodexModelContext: @unchecked Sendable {
     ) async throws {
         let previousWorkspace = chat.workspace
         let previousGroup = previousWorkspace?.workspaceGroup
-        let snapshot = try await thread.read(includeTurns: includeTurns)
+        let observation = activeChatObservationsByID[chat.id]
+        observation?.beginBufferingEvents()
+        let snapshot: CodexThreadSnapshot
+        do {
+            snapshot = try await thread.read(includeTurns: includeTurns)
+        } catch {
+            observation?.discardBufferedEvents()
+            throw error
+        }
         let refreshedChat = apply(snapshot)
         if includeTurns {
-            refreshedChat.resetLiveMergeState()
+            refreshedChat.resetLiveMergeStateFromCurrentItems()
         }
         refreshedChat.syncPhaseAfterRefresh(includeTurns: includeTurns)
-        activeChatObservationsByID[refreshedChat.id]?.yield([
-            .snapshot(CodexChatSnapshot(chat: refreshedChat)),
-        ])
+        observation?.yield([.snapshot(CodexChatSnapshot(chat: refreshedChat))])
+        let bufferedEvents = observation?.finishBufferingEvents() ?? []
+        for event in bufferedEvents {
+            let changes = await apply(event, to: refreshedChat)
+            observation?.yield(changes)
+        }
         await revalidateChatInRegisteredResults(
             refreshedChat,
             previousWorkspace: previousWorkspace,
@@ -386,6 +421,8 @@ public final class CodexModelContext: @unchecked Sendable {
             }
             observation.eventThread = thread
             try Task.checkCancellation()
+            observation.beginBufferingEvents()
+            await startEventTask(observation, for: chat, thread: thread)
             try await refresh(chat, using: thread, includeTurns: includeTurns)
             try Task.checkCancellation()
             observation.includesTurns = includeTurns
@@ -394,24 +431,42 @@ public final class CodexModelContext: @unchecked Sendable {
             discardChatObservation(chat.id, observation: observation)
             throw error
         }
+    }
 
-        observation.eventTask = Task { @MainActor [weak self, weak chat, weak observation] in
-            guard let self, let chat, let observation else {
-                return
-            }
-            do {
-                for try await event in thread.events {
-                    try Task.checkCancellation()
-                    let changes = await apply(event, to: chat)
-                    observation.yield(changes)
+    private func startEventTask(
+        _ observation: ActiveChatObservation,
+        for chat: CodexChat,
+        thread: CodexThread
+    ) async {
+        await withCheckedContinuation { (ready: CheckedContinuation<Void, Never>) in
+            observation.eventTask = Task { @MainActor [weak self, weak chat, weak observation] in
+                guard let self, let chat, let observation else {
+                    ready.resume()
+                    return
                 }
-            } catch is CancellationError {
-            } catch {
-                chat.fail(with: error)
-                observation.yield([.phaseChanged(chat.phase)])
+                let events = await thread.makeLiveEventStream()
+                ready.resume()
+                do {
+                    for try await event in events {
+                        try Task.checkCancellation()
+                        if observation.isBufferingEvents {
+                            observation.appendBufferedEvent(event)
+                            continue
+                        }
+                        let changes = await self.apply(event, to: chat)
+                        observation.yield(changes)
+                    }
+                } catch is CancellationError {
+                } catch {
+                    chat.fail(with: error)
+                    observation.yield([.phaseChanged(chat.phase)])
+                }
+                while observation.isBufferingEvents {
+                    try? await Task.sleep(for: .milliseconds(1))
+                }
+                observation.finishChangeStreams()
+                self.finishChatObservationIfIdle(chat.id, observation: observation)
             }
-            observation.finishChangeStreams()
-            finishChatObservationIfIdle(chat.id, observation: observation)
         }
     }
 

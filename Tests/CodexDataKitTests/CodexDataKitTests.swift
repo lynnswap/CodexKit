@@ -4126,6 +4126,21 @@ struct CodexModelContextTests {
 
         #expect(chat.turnSnapshot(for: "turn-restarted") != nil)
         #expect(await runtime.transport.recordedRequests(method: "thread/resume").count == 2)
+
+        try await runtime.transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(
+                threadID: "thread-finished",
+                turnID: "turn-restarted",
+                itemID: "message-restarted",
+                delta: "Live after restart",
+                phase: "final_answer"
+            )
+        )
+
+        #expect(await eventually {
+            chat.items.first { $0.id == "message-restarted" }?.text == "Live after restart"
+        })
     }
 
     @Test("chat observation keeps refreshed output snapshots idempotent with replayed deltas")
@@ -4634,6 +4649,48 @@ struct CodexModelContextTests {
         })
     }
 
+    @Test("replacement file change updates do not append output")
+    func replacementFileChangeUpdatesDoNotAppendOutput() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-patch-replacement"))
+        try await runtime.transport.enqueueThreadRead(.init(id: "thread-patch-replacement"))
+
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-patch-replacement"))
+        let observation = try await chat.observe()
+        defer {
+            observation.cancel()
+        }
+
+        try await runtime.transport.emitServerNotification(
+            method: "item/fileChange/patchUpdated",
+            params: FileChangePatchUpdatedParams(
+                threadID: "thread-patch-replacement",
+                turnID: "turn-patch-replacement",
+                itemID: "file-patch",
+                displayText: "Patch one"
+            )
+        )
+        #expect(await eventually {
+            chat.items.first { $0.id == "file-patch" }?.text == "Patch one"
+        })
+
+        try await runtime.transport.emitServerNotification(
+            method: "item/fileChange/patchUpdated",
+            params: FileChangePatchUpdatedParams(
+                threadID: "thread-patch-replacement",
+                turnID: "turn-patch-replacement",
+                itemID: "file-patch",
+                displayText: "Patch two"
+            )
+        )
+
+        #expect(await eventually {
+            chat.items.first { $0.id == "file-patch" }?.text == "Patch two"
+        })
+    }
+
     @Test("chat send revalidates recent fetched results")
     func chatSendRevalidatesRecentFetchedResults() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -5002,6 +5059,31 @@ private struct OutputDeltaParams: Encodable, Sendable {
         case turnID = "turnId"
         case itemID = "itemId"
         case delta
+    }
+}
+
+private struct FileChangePatchUpdatedParams: Encodable, Sendable {
+    var threadID: String
+    var turnID: String
+    var itemID: String
+    var changes: Changes
+
+    init(threadID: String, turnID: String, itemID: String, displayText: String) {
+        self.threadID = threadID
+        self.turnID = turnID
+        self.itemID = itemID
+        self.changes = .init(displayText: displayText)
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case threadID = "threadId"
+        case turnID = "turnId"
+        case itemID = "itemId"
+        case changes
+    }
+
+    struct Changes: Encodable, Sendable {
+        var displayText: String
     }
 }
 

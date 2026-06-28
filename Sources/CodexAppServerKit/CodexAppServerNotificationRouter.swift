@@ -56,6 +56,19 @@ package actor CodexAppServerNotificationRouter {
     package func events(for threadID: CodexThreadID) -> AsyncThrowingStream<
         CodexThreadEvent, Error
     > {
+        threadEventStream(for: threadID, replaysHistory: true)
+    }
+
+    package func liveEvents(for threadID: CodexThreadID) -> AsyncThrowingStream<
+        CodexThreadEvent, Error
+    > {
+        threadEventStream(for: threadID, replaysHistory: false)
+    }
+
+    private func threadEventStream(
+        for threadID: CodexThreadID,
+        replaysHistory: Bool
+    ) -> AsyncThrowingStream<CodexThreadEvent, Error> {
         let (stream, continuation) = AsyncThrowingStream<CodexThreadEvent, Error>.makeStream(
             bufferingPolicy: .unbounded
         )
@@ -63,7 +76,12 @@ package actor CodexAppServerNotificationRouter {
         continuation.onTermination = { _ in
             Task { await self.removeThreadSubscriber(subscriptionID, threadID: threadID) }
         }
-        addThreadSubscriber(subscriptionID, threadID: threadID, continuation: continuation)
+        addThreadSubscriber(
+            subscriptionID,
+            threadID: threadID,
+            continuation: continuation,
+            replaysHistory: replaysHistory
+        )
         return stream
     }
 
@@ -197,15 +215,18 @@ package actor CodexAppServerNotificationRouter {
     private func addThreadSubscriber(
         _ subscriptionID: UUID,
         threadID: CodexThreadID,
-        continuation: AsyncThrowingStream<CodexThreadEvent, Error>.Continuation
+        continuation: AsyncThrowingStream<CodexThreadEvent, Error>.Continuation,
+        replaysHistory: Bool = true
     ) {
         let history = threadHistoryByThreadID[threadID] ?? []
-        for event in history {
-            continuation.yield(event)
-        }
-        if history.contains(where: Self.isTerminalThreadEvent) {
-            continuation.finish()
-            return
+        if replaysHistory {
+            for event in history {
+                continuation.yield(event)
+            }
+            if history.contains(where: Self.isTerminalThreadEvent) {
+                continuation.finish()
+                return
+            }
         }
         threadSubscribersByThreadID[threadID, default: [:]][subscriptionID] = .init(
             continuation: continuation)
@@ -1013,7 +1034,11 @@ extension AppServerJSONValue {
             String(value)
         case .bool(let value):
             value ? "true" : "false"
-        case .array, .object:
+        case .object(let value):
+            value["displayText"]?.displayText
+                ?? value["text"]?.displayText
+                ?? (try? JSONEncoder().encode(self)).flatMap { String(data: $0, encoding: .utf8) }
+        case .array:
             (try? JSONEncoder().encode(self)).flatMap { String(data: $0, encoding: .utf8) }
         case .null:
             nil

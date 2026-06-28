@@ -27,6 +27,10 @@ extension CodexThread {
         }
     }
 
+    package func makeLiveEventStream() async -> AsyncThrowingStream<CodexThreadEvent, Error> {
+        await router.liveEvents(for: id)
+    }
+
     /// Agent messages emitted by this thread.
     ///
     /// This sequence is derived from `events` and is useful when callers only

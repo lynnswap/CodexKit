@@ -513,7 +513,11 @@ public final class CodexChat: CodexObservableModel {
             markRunningIfNeeded()
         case .itemUpdated(let item, let turnID):
             insertRunningTurnIfMissing(turnID, into: &changes)
-            changes.append(contentsOf: mergeItems([item], turnID: turnID, accumulatesOutputDeltas: true))
+            changes.append(contentsOf: mergeItems(
+                [item],
+                turnID: turnID,
+                accumulatesOutputDeltas: isOutputDeltaUpdate(item)
+            ))
             markRunningIfNeeded()
         case .message(let message, let turnID):
             insertRunningTurnIfMissing(turnID, into: &changes)
@@ -628,17 +632,17 @@ public final class CodexChat: CodexObservableModel {
 
         let previousAccumulatedText = liveMergeState.outputDeltaTextByItemKey[key] ?? ""
         let accumulatedText = previousAccumulatedText + delta
-        liveMergeState.outputDeltaTextByItemKey[key] = accumulatedText
-        let mergedText = mergedDeltaText(
+        let merge = mergedDeltaText(
             existingText: outputText(from: existing.threadItem),
             previousAccumulatedText: previousAccumulatedText,
             accumulatedText: accumulatedText,
             deltaText: delta
         )
+        liveMergeState.outputDeltaTextByItemKey[key] = merge.accumulatedText
         existing.update(
             from: itemByReplacingOutput(
                 in: existing.threadItem,
-                with: mergedText,
+                with: merge.text,
                 using: incomingItem
             ),
             turnID: key.turnID
@@ -659,6 +663,15 @@ public final class CodexChat: CodexObservableModel {
             errorDescription: nil,
             preservesExistingUsage: true
         ))
+    }
+
+    private func isOutputDeltaUpdate(_ item: CodexThreadItem) -> Bool {
+        guard let rawPayload = item.rawPayload,
+              let payload = try? JSONDecoder().decode(ItemProgressPayload.self, from: rawPayload)
+        else {
+            return false
+        }
+        return payload.delta != nil
     }
 
     private func outputDeltaText(from item: CodexThreadItem) -> String? {
@@ -738,20 +751,20 @@ public final class CodexChat: CodexObservableModel {
         let key = ItemKey(id: itemID, turnID: turnID)
         let previousAccumulatedText = liveMergeState.messageDeltaTextByItemKey[key] ?? ""
         let accumulatedText = previousAccumulatedText + delta.text
-        liveMergeState.messageDeltaTextByItemKey[key] = accumulatedText
 
         let existingMessage = item(for: key)?.message
-        let text = mergedDeltaText(
+        let merge = mergedDeltaText(
             existingText: existingMessage?.text,
             previousAccumulatedText: previousAccumulatedText,
             accumulatedText: accumulatedText,
             deltaText: delta.text
         )
+        liveMergeState.messageDeltaTextByItemKey[key] = merge.accumulatedText
         let message = CodexMessage(
             id: itemID,
             role: existingMessage?.role ?? .assistant,
             phase: delta.phase ?? existingMessage?.phase,
-            text: text
+            text: merge.text
         )
         return mergeItems([
             .init(id: itemID, kind: .agentMessage, content: .message(message)),
@@ -772,7 +785,6 @@ public final class CodexChat: CodexObservableModel {
         let key = ItemKey(id: delta.id, turnID: turnID)
         let previousAccumulatedText = liveMergeState.reasoningDeltaTextByItemKey[key] ?? ""
         let accumulatedText = previousAccumulatedText + delta.delta
-        liveMergeState.reasoningDeltaTextByItemKey[key] = accumulatedText
 
         let existingReasoning = item(for: key)?.reasoning
         let existingText: String?
@@ -782,18 +794,19 @@ public final class CodexChat: CodexObservableModel {
         case .text:
             existingText = existingReasoning?.content.joined(separator: "\n")
         }
-        let text = mergedDeltaText(
+        let merge = mergedDeltaText(
             existingText: existingText,
             previousAccumulatedText: previousAccumulatedText,
             accumulatedText: accumulatedText,
             deltaText: delta.delta
         )
+        liveMergeState.reasoningDeltaTextByItemKey[key] = merge.accumulatedText
         let reasoning: CodexReasoning
         switch delta.part.kind {
         case .summary:
-            reasoning = .init(summary: text)
+            reasoning = .init(summary: merge.text)
         case .text:
-            reasoning = .init(content: text)
+            reasoning = .init(content: merge.text)
         }
         return mergeItems([
             .init(id: delta.id, kind: .reasoning, content: .reasoning(reasoning)),
@@ -805,17 +818,22 @@ public final class CodexChat: CodexObservableModel {
         previousAccumulatedText: String,
         accumulatedText: String,
         deltaText: String
-    ) -> String {
+    ) -> DeltaTextMerge {
         guard let existingText, existingText.isEmpty == false else {
-            return accumulatedText
+            return .init(text: accumulatedText, accumulatedText: accumulatedText)
         }
         if existingText.hasPrefix(accumulatedText) {
-            return existingText
+            return .init(text: existingText, accumulatedText: accumulatedText)
+        }
+        if deltaText.isEmpty == false,
+           existingText == previousAccumulatedText,
+           (existingText.hasPrefix(deltaText) || existingText.hasSuffix(deltaText)) {
+            return .init(text: existingText, accumulatedText: previousAccumulatedText)
         }
         if existingText == previousAccumulatedText {
-            return accumulatedText
+            return .init(text: accumulatedText, accumulatedText: accumulatedText)
         }
-        return existingText + deltaText
+        return .init(text: existingText + deltaText, accumulatedText: accumulatedText)
     }
 
     private func changeForUpdatedItem(
@@ -953,8 +971,23 @@ public final class CodexChat: CodexObservableModel {
         fail(with: message)
     }
 
-    package func resetLiveMergeState() {
+    package func resetLiveMergeStateFromCurrentItems() {
         liveMergeState = LiveMergeState()
+        for item in items {
+            let key = item.mergeKey
+            if let text = item.message?.text, text.isEmpty == false {
+                liveMergeState.messageDeltaTextByItemKey[key] = text
+            }
+            if let reasoning = item.reasoning {
+                let text = reasoning.text
+                if text.isEmpty == false {
+                    liveMergeState.reasoningDeltaTextByItemKey[key] = text
+                }
+            }
+            if let output = outputText(from: item.threadItem), output.isEmpty == false {
+                liveMergeState.outputDeltaTextByItemKey[key] = output
+            }
+        }
     }
 
     private func fail(with message: String) {
@@ -971,6 +1004,15 @@ public final class CodexChat: CodexObservableModel {
         var messageDeltaTextByItemKey: [ItemKey: String] = [:]
         var reasoningDeltaTextByItemKey: [ItemKey: String] = [:]
         var outputDeltaTextByItemKey: [ItemKey: String] = [:]
+    }
+
+    private struct DeltaTextMerge {
+        var text: String
+        var accumulatedText: String
+    }
+
+    private struct ItemProgressPayload: Decodable {
+        var delta: String?
     }
 
     @MainActor
