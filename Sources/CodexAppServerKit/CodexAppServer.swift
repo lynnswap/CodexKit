@@ -644,7 +644,7 @@ public actor CodexAppServer {
                 params: .init(
                     archived: query.archived,
                     cursor: query.cursor,
-                    cwd: query.workspace.map { .paths([$0.path]) },
+                    cwd: query.workspaces.map { .paths($0.map(\.path)) },
                     limit: query.limit,
                     modelProviders: query.modelProviders,
                     searchTerm: query.searchTerm,
@@ -959,6 +959,10 @@ public actor CodexAppServer {
             modelProvider: snapshot.modelProvider,
             createdAt: snapshot.createdAt.map { Date(timeIntervalSince1970: TimeInterval($0)) },
             updatedAt: snapshot.updatedAt.map { Date(timeIntervalSince1970: TimeInterval($0)) },
+            recencyAt: snapshot.recencyAt.map { Date(timeIntervalSince1970: TimeInterval($0)) },
+            status: snapshot.status.map {
+                CodexThreadStatus(type: $0.type, activeFlags: $0.activeFlags)
+            },
             ephemeral: snapshot.ephemeral,
             turns: turns,
             turnItemsAreAuthoritative: includesTurns,
@@ -985,6 +989,10 @@ public actor CodexAppServer {
                 fields.insert(.createdAt)
             case .updatedAt:
                 fields.insert(.updatedAt)
+            case .recencyAt:
+                fields.insert(.recencyAt)
+            case .status:
+                fields.insert(.status)
             case .ephemeral:
                 fields.insert(.ephemeral)
             case .turns:

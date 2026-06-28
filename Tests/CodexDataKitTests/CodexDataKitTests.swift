@@ -209,6 +209,47 @@ struct CodexModelContextTests {
         #expect(params.useStateDbOnly == true)
     }
 
+    @Test("fetch requests pass multiple workspace filters to thread list")
+    func fetchRequestTranslatesMultipleWorkspaceFilters() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let app = temporaryDirectory()
+        let tools = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: []))
+
+        _ = try await context.fetch(CodexFetchRequest<CodexChat>(
+            filter: .init(workspaces: [app, tools])
+        ))
+
+        let recorded = try #require(
+            await runtime.transport.recordedRequests(method: "thread/list").first)
+        let params = try recorded.decodeParams(ThreadListParams.self)
+        #expect(params.cwd == .paths([app.path, tools.path]))
+    }
+
+    @Test("fetched chat exposes app-server thread status and recency")
+    func fetchedChatExposesThreadStatusAndRecency() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let recencyAt = Date(timeIntervalSince1970: 1234)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(
+                id: "thread-active",
+                name: "Active",
+                recencyAt: recencyAt,
+                status: .active(activeFlags: [.waitingOnUserInput])
+            )
+        ]))
+
+        let chats = try await context.fetch(CodexFetchRequest<CodexChat>.recentChats)
+        let chat = try #require(chats.first)
+
+        #expect(chat.recencyAt == recencyAt)
+        #expect(chat.status == .active(activeFlags: [.waitingOnUserInput]))
+    }
+
     @Test("fetched results preserve configured cursor on initial fetch")
     func fetchedResultsPreserveConfiguredCursorOnInitialFetch() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()

@@ -205,6 +205,8 @@ public final class CodexChat: CodexObservableModel {
     public private(set) var isArchived: Bool
     public private(set) var createdAt: Date?
     public private(set) var updatedAt: Date?
+    public private(set) var recencyAt: Date?
+    public private(set) var status: CodexThreadStatus?
     public private(set) var ephemeral: Bool?
     public private(set) var turns: [Turn]
     public private(set) var items: [Item]
@@ -265,6 +267,12 @@ public final class CodexChat: CodexObservableModel {
         }
         if snapshot.hasField(.updatedAt) {
             updatedAt = snapshot.updatedAt
+        }
+        if snapshot.hasField(.recencyAt) {
+            recencyAt = snapshot.recencyAt
+        }
+        if snapshot.hasField(.status) {
+            status = snapshot.status
         }
         if snapshot.hasField(.ephemeral) {
             ephemeral = snapshot.ephemeral
@@ -529,9 +537,11 @@ public final class CodexChat: CodexObservableModel {
             }
         case .statusChanged(let status):
             switch status {
-            case .running, .unknown:
+            case .active, .unknown:
+                self.status = status
                 markRunningIfNeeded()
-            case .closed:
+            case .notLoaded, .idle, .systemError:
+                self.status = status
                 markLoadedIfNotFailed()
             }
         case .closed:

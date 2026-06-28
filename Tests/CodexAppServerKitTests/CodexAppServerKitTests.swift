@@ -559,6 +559,64 @@ struct CodexAppServerKitTests {
         #expect(params.useStateDbOnly == true)
     }
 
+    @Test func appServerListThreadsSerializesMultipleWorkspaceFilters() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueue(
+            AppServerAPI.Thread.List.Response(data: []),
+            for: "thread/list"
+        )
+        let client = AppServerClient(transport: transport)
+        let server = CodexAppServer(
+            client: client,
+            router: CodexAppServerNotificationRouter(client: client)
+        )
+        let app = URL(fileURLWithPath: "/tmp/project/App", isDirectory: true)
+        let tools = URL(fileURLWithPath: "/tmp/project/Tools", isDirectory: true)
+
+        _ = try await server.listThreads(.init(workspaces: [app, tools]))
+
+        let request = try #require(await transport.recordedRequests().first)
+        let params = try JSONDecoder().decode(
+            AppServerAPI.Thread.List.Params.self,
+            from: request.params
+        )
+        #expect(params.cwd == .paths([app.path, tools.path]))
+    }
+
+    @Test func appServerListThreadsMapsStatusAndRecency() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueJSON(
+            """
+            {
+              "data": [
+                {
+                  "id": "thread-active",
+                  "recencyAt": 1234,
+                  "status": {
+                    "type": "active",
+                    "activeFlags": ["waitingOnApproval"]
+                  }
+                }
+              ]
+            }
+            """,
+            for: "thread/list"
+        )
+        let client = AppServerClient(transport: transport)
+        let server = CodexAppServer(
+            client: client,
+            router: CodexAppServerNotificationRouter(client: client)
+        )
+
+        let page = try await server.listThreads()
+        let snapshot = try #require(page.threads.first)
+
+        #expect(snapshot.hasField(.recencyAt))
+        #expect(snapshot.recencyAt == Date(timeIntervalSince1970: 1234))
+        #expect(snapshot.hasField(.status))
+        #expect(snapshot.status == .active(activeFlags: [.waitingOnApproval]))
+    }
+
     @Test func threadListTreatsEmptyTurnsAsUnloaded() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueue(
@@ -1102,7 +1160,7 @@ struct CodexAppServerKitTests {
         )
         let events = [
             CodexThreadEvent.message(oldMessage, turnID: "turn-old"),
-            .statusChanged(.running),
+            .statusChanged(.active(activeFlags: [])),
             .message(currentMessage, turnID: "turn-current"),
             .turnCompleted(.init(turnID: "turn-old", status: .completed)),
             .turnCompleted(.init(turnID: "turn-current", status: .completed)),
@@ -1126,7 +1184,7 @@ struct CodexAppServerKitTests {
         ))
 
         #expect(reviewEvents.count == 3)
-        #expect(reviewEvents.contains(.statusChanged(.running)))
+        #expect(reviewEvents.contains(.statusChanged(.active(activeFlags: []))))
         #expect(progress.count == 3)
         #expect(progress.last?.result?.turnID == "turn-current")
         #expect(progress.last?.transcript.responseText == "Current review")
@@ -1810,10 +1868,10 @@ struct CodexAppServerKitTests {
     }
 
     @Test func threadStatusNormalizesAppServerLiveStates() {
-        #expect(CodexThreadStatus(rawValue: "active") == .running)
-        #expect(CodexThreadStatus(rawValue: "idle") == .running)
-        #expect(CodexThreadStatus(rawValue: "notLoaded") == .closed)
-        #expect(CodexThreadStatus(rawValue: "systemError") == .unknown("systemError"))
+        #expect(CodexThreadStatus(rawValue: "active") == .active(activeFlags: []))
+        #expect(CodexThreadStatus(rawValue: "idle") == .idle)
+        #expect(CodexThreadStatus(rawValue: "notLoaded") == .notLoaded)
+        #expect(CodexThreadStatus(rawValue: "systemError") == .systemError)
     }
 
     @Test func clientRetriesOverloadedRequestsThenSucceeds() async throws {

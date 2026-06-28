@@ -94,7 +94,21 @@ extension CodexSectionDescriptor where Model == CodexChat {
 
 public struct CodexFetchFilter<Model: CodexObservableModel>: Sendable, Hashable {
     public var archived: Bool?
-    public var workspace: URL?
+    public var workspaces: [URL]? {
+        didSet {
+            if workspaces?.isEmpty == true {
+                workspaces = nil
+            }
+        }
+    }
+    public var workspace: URL? {
+        get {
+            workspaces?.first
+        }
+        set {
+            workspaces = newValue.map { [$0] }
+        }
+    }
     public var searchTerm: String? {
         didSet {
             if searchTerm?.isEmpty == true {
@@ -121,13 +135,15 @@ public struct CodexFetchFilter<Model: CodexObservableModel>: Sendable, Hashable 
     public init(
         archived: Bool? = nil,
         workspace: URL? = nil,
+        workspaces: [URL]? = nil,
         searchTerm: String? = nil,
         modelProviders: [String]? = nil,
         sourceKinds: [CodexThreadSourceKind]? = nil,
         useStateDBOnly: Bool? = nil
     ) {
         self.archived = archived
-        self.workspace = workspace
+        let workspaceList = workspaces ?? workspace.map { [$0] }
+        self.workspaces = workspaceList?.isEmpty == true ? nil : workspaceList
         self.searchTerm = searchTerm?.isEmpty == true ? nil : searchTerm
         self.modelProviders = modelProviders?.isEmpty == true ? nil : modelProviders
         self.sourceKinds = sourceKinds?.isEmpty == true ? nil : sourceKinds
@@ -630,9 +646,11 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             }
         }
 
-        if let workspace = request.filter.workspace {
+        if let workspaces = request.filter.workspaces {
             guard let chatWorkspace = chat.workspace,
-                Self.standardizedPath(chatWorkspace.url) == Self.standardizedPath(workspace)
+                workspaces.contains(where: {
+                    Self.standardizedPath(chatWorkspace.url) == Self.standardizedPath($0)
+                })
             else {
                 return false
             }
@@ -882,10 +900,12 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
     }
 
     private func requestIsScoped(to workspace: CodexWorkspace) -> Bool {
-        guard let filterWorkspace = request.filter.workspace else {
+        guard let filterWorkspaces = request.filter.workspaces else {
             return false
         }
-        return Self.standardizedPath(filterWorkspace) == Self.standardizedPath(workspace.url)
+        return filterWorkspaces.contains {
+            Self.standardizedPath($0) == Self.standardizedPath(workspace.url)
+        }
     }
 
     private func containsIncludedWorkspace(in group: CodexWorkspaceGroup) -> Bool {

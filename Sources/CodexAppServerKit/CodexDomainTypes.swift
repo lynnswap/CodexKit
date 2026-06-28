@@ -952,6 +952,8 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
         case modelProvider
         case createdAt
         case updatedAt
+        case recencyAt
+        case status
         case ephemeral
         case turns
     }
@@ -963,6 +965,8 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
     public var modelProvider: String?
     public var createdAt: Date?
     public var updatedAt: Date?
+    public var recencyAt: Date?
+    public var status: CodexThreadStatus?
     public var ephemeral: Bool?
     public var turns: [CodexTurnSnapshot]?
     package var turnItemsAreAuthoritative: Bool
@@ -976,6 +980,8 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
             && lhs.modelProvider == rhs.modelProvider
             && lhs.createdAt == rhs.createdAt
             && lhs.updatedAt == rhs.updatedAt
+            && lhs.recencyAt == rhs.recencyAt
+            && lhs.status == rhs.status
             && lhs.ephemeral == rhs.ephemeral
             && lhs.turns == rhs.turns
     }
@@ -988,6 +994,8 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
         modelProvider: String? = nil,
         createdAt: Date? = nil,
         updatedAt: Date? = nil,
+        recencyAt: Date? = nil,
+        status: CodexThreadStatus? = nil,
         ephemeral: Bool? = nil,
         turns: [CodexTurnSnapshot]? = nil
     ) {
@@ -999,6 +1007,8 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
             modelProvider: modelProvider,
             createdAt: createdAt,
             updatedAt: updatedAt,
+            recencyAt: recencyAt,
+            status: status,
             ephemeral: ephemeral,
             turns: turns,
             turnItemsAreAuthoritative: turns != nil,
@@ -1009,6 +1019,8 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
                 modelProvider: modelProvider,
                 createdAt: createdAt,
                 updatedAt: updatedAt,
+                recencyAt: recencyAt,
+                status: status,
                 ephemeral: ephemeral,
                 turns: turns
             )
@@ -1023,6 +1035,8 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
         modelProvider: String? = nil,
         createdAt: Date? = nil,
         updatedAt: Date? = nil,
+        recencyAt: Date? = nil,
+        status: CodexThreadStatus? = nil,
         ephemeral: Bool? = nil,
         turns: [CodexTurnSnapshot]? = nil,
         turnItemsAreAuthoritative: Bool,
@@ -1035,6 +1049,8 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
         self.modelProvider = modelProvider
         self.createdAt = createdAt
         self.updatedAt = updatedAt
+        self.recencyAt = recencyAt
+        self.status = status
         self.ephemeral = ephemeral
         self.turns = turns
         self.turnItemsAreAuthoritative = turnItemsAreAuthoritative
@@ -1045,6 +1061,8 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
             modelProvider: modelProvider,
             createdAt: createdAt,
             updatedAt: updatedAt,
+            recencyAt: recencyAt,
+            status: status,
             ephemeral: ephemeral,
             turns: turns
         )
@@ -1061,6 +1079,8 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
         modelProvider: String?,
         createdAt: Date?,
         updatedAt: Date?,
+        recencyAt: Date?,
+        status: CodexThreadStatus?,
         ephemeral: Bool?,
         turns: [CodexTurnSnapshot]?
     ) -> Set<Field> {
@@ -1082,6 +1102,12 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
         }
         if updatedAt != nil {
             fields.insert(.updatedAt)
+        }
+        if recencyAt != nil {
+            fields.insert(.recencyAt)
+        }
+        if status != nil {
+            fields.insert(.status)
         }
         if ephemeral != nil {
             fields.insert(.ephemeral)
@@ -1115,7 +1141,15 @@ public struct CodexTurnSnapshot: Identifiable, Equatable, Sendable {
 public struct CodexThreadQuery: Equatable, Sendable {
     public var archived: Bool?
     public var cursor: String?
-    public var workspace: URL?
+    public var workspaces: [URL]?
+    public var workspace: URL? {
+        get {
+            workspaces?.first
+        }
+        set {
+            workspaces = newValue.map { [$0] }
+        }
+    }
     public var limit: Int?
     public var searchTerm: String?
     public var modelProviders: [String]?
@@ -1128,6 +1162,7 @@ public struct CodexThreadQuery: Equatable, Sendable {
         archived: Bool? = nil,
         cursor: String? = nil,
         workspace: URL? = nil,
+        workspaces: [URL]? = nil,
         limit: Int? = nil,
         searchTerm: String? = nil,
         modelProviders: [String]? = nil,
@@ -1138,7 +1173,7 @@ public struct CodexThreadQuery: Equatable, Sendable {
     ) {
         self.archived = archived
         self.cursor = cursor
-        self.workspace = workspace
+        self.workspaces = Self.normalizedWorkspaces(workspaces ?? workspace.map { [$0] })
         self.limit = limit
         self.searchTerm = searchTerm
         self.modelProviders = modelProviders
@@ -1146,6 +1181,14 @@ public struct CodexThreadQuery: Equatable, Sendable {
         self.sortKey = sortKey
         self.sourceKinds = sourceKinds
         self.useStateDBOnly = useStateDBOnly
+    }
+
+    private static func normalizedWorkspaces(_ workspaces: [URL]?) -> [URL]? {
+        guard let workspaces else {
+            return nil
+        }
+        let normalized = workspaces.filter { $0.path.isEmpty == false }
+        return normalized.isEmpty ? nil : normalized
     }
 }
 
@@ -2129,31 +2172,79 @@ public enum CodexThreadLogEntry: Identifiable, Equatable, Sendable {
     }
 }
 
+public struct CodexThreadActiveFlag: RawRepresentable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public var rawValue: String
+
+    public init(rawValue: String) {
+        self.rawValue = rawValue
+    }
+
+    public init(stringLiteral value: String) {
+        self.rawValue = value
+    }
+
+    public static let waitingOnApproval = Self(rawValue: "waitingOnApproval")
+    public static let waitingOnUserInput = Self(rawValue: "waitingOnUserInput")
+}
+
 public enum CodexThreadStatus: Equatable, Sendable {
-    case running
-    case closed
+    case notLoaded
+    case idle
+    case systemError
+    case active(activeFlags: [CodexThreadActiveFlag])
     case unknown(String)
 
     public init(rawValue: String) {
         switch rawValue {
-        case "running", "loaded", "active", "idle":
-            self = .running
-        case "closed", "notLoaded":
-            self = .closed
+        case "notLoaded", "closed":
+            self = .notLoaded
+        case "idle":
+            self = .idle
+        case "systemError":
+            self = .systemError
+        case "running", "loaded", "active":
+            self = .active(activeFlags: [])
         case let rawValue:
             self = .unknown(rawValue)
         }
     }
 
+    package init(type: String, activeFlags: [String]? = nil) {
+        switch type {
+        case "active":
+            self = .active(activeFlags: activeFlags?.map(CodexThreadActiveFlag.init(rawValue:)) ?? [])
+        default:
+            self.init(rawValue: type)
+        }
+    }
+
     public var rawValue: String {
         switch self {
-        case .running:
-            "running"
-        case .closed:
-            "closed"
+        case .notLoaded:
+            "notLoaded"
+        case .idle:
+            "idle"
+        case .systemError:
+            "systemError"
+        case .active:
+            "active"
         case .unknown(let rawValue):
             rawValue
         }
+    }
+
+    public var isActive: Bool {
+        if case .active = self {
+            return true
+        }
+        return false
+    }
+
+    public var activeFlags: [CodexThreadActiveFlag] {
+        if case .active(let activeFlags) = self {
+            return activeFlags
+        }
+        return []
     }
 }
 

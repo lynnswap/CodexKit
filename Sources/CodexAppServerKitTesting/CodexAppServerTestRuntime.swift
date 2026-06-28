@@ -345,9 +345,22 @@ public actor CodexAppServerTestTransport {
             modelProvider: snapshot.modelProvider,
             createdAt: snapshot.createdAt.map { Int($0.timeIntervalSince1970) },
             updatedAt: snapshot.updatedAt.map { Int($0.timeIntervalSince1970) },
+            recencyAt: snapshot.recencyAt.map { Int($0.timeIntervalSince1970) },
+            status: snapshot.status.map(Self.apiStatus(from:)),
             ephemeral: snapshot.ephemeral,
             turns: snapshot.turns?.map(Self.apiTurn(from:))
         )
+    }
+
+    private static func apiStatus(
+        from status: CodexThreadStatus
+    ) -> AppServerAPI.Thread.Snapshot.Status {
+        switch status {
+        case .active(let activeFlags):
+            .init(type: status.rawValue, activeFlags: activeFlags.map(\.rawValue))
+        case .notLoaded, .idle, .systemError, .unknown:
+            .init(type: status.rawValue)
+        }
     }
 
     private static func apiTurn(from snapshot: CodexTurnSnapshot) -> AppServerAPI.Turn.Payload {

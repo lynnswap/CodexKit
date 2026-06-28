@@ -569,7 +569,7 @@ package actor CodexAppServerNotificationRouter {
         else {
             return nil
         }
-        return .init(rawValue: type)
+        return .init(type: type, activeFlags: payload.status?.activeFlags)
     }
 
     private func turnResult(from data: Data, context: NotificationContext) -> CodexResponse {
@@ -722,6 +722,7 @@ private struct ItemProgressPayload: Decodable {
 private struct ThreadStatusPayload: Decodable {
     struct Status: Decodable {
         var type: String?
+        var activeFlags: [String]?
     }
 
     var status: Status?

@@ -38,6 +38,8 @@ public final class CodexModelContext: @unchecked Sendable {
         var isArchived: Bool
         var createdAt: Date?
         var updatedAt: Date?
+        var recencyAt: Date?
+        var status: CodexThreadStatus?
         var ephemeral: Bool?
         var workspaceID: CodexWorkspaceID?
         var workspaceGroupID: CodexWorkspaceGroupID?
@@ -149,7 +151,7 @@ public final class CodexModelContext: @unchecked Sendable {
         let fetchedChats = await applyFetchedSnapshots(
             snapshots,
             archived: request.filter.archived == true,
-            scopedWorkspaceURL: request.filter.workspace
+            scopedWorkspaceURL: request.filter.singleWorkspace
         )
         let fetchedChatIDs = Set(fetchedChats.map(\.id))
         let chats = fetchedChats.filter { $0.workspace?.workspaceGroup?.id == group.id }
@@ -202,7 +204,7 @@ public final class CodexModelContext: @unchecked Sendable {
         let fetchedChats = await applyFetchedSnapshots(
             snapshots,
             archived: request.filter.archived == true,
-            scopedWorkspaceURL: request.filter.workspace
+            scopedWorkspaceURL: request.filter.singleWorkspace
         )
         let chats = sort(
             fetchedChats,
@@ -668,7 +670,7 @@ public final class CodexModelContext: @unchecked Sendable {
             let fetchedChats = await applyFetchedSnapshots(
                 try await fetchAllThreadSnapshots(matching: request),
                 archived: request.filter.archived == true,
-                scopedWorkspaceURL: request.filter.workspace,
+                scopedWorkspaceURL: request.filter.singleWorkspace,
                 excluding: excludedRegistration
             )
             let chats = sort(
@@ -689,7 +691,7 @@ public final class CodexModelContext: @unchecked Sendable {
         let fetchedChats = await applyFetchedSnapshots(
             page.threads,
             archived: request.filter.archived == true,
-            scopedWorkspaceURL: request.filter.workspace,
+            scopedWorkspaceURL: request.filter.singleWorkspace,
             excluding: excludedRegistration
         )
         let chats = sort(
@@ -710,7 +712,7 @@ public final class CodexModelContext: @unchecked Sendable {
         let chats = await applyFetchedSnapshots(
             try await fetchAllThreadSnapshots(matching: request),
             archived: request.filter.archived == true,
-            scopedWorkspaceURL: request.filter.workspace,
+            scopedWorkspaceURL: request.filter.singleWorkspace,
             excluding: excludedRegistration
         )
         let workspaces = unique(chats.compactMap(\.workspace))
@@ -720,7 +722,7 @@ public final class CodexModelContext: @unchecked Sendable {
                 for: request,
                 relationshipIsComplete: true
             ),
-            workspaceFilter: request.filter.workspace,
+            workspaceFilters: request.filter.workspaces,
             archivedScope: request.filter.archived
         )
         await removeChatsFromRegisteredResults(removedChats, excluding: excludedRegistration)
@@ -742,12 +744,12 @@ public final class CodexModelContext: @unchecked Sendable {
         let chats = await applyFetchedSnapshots(
             try await fetchAllThreadSnapshots(matching: request),
             archived: request.filter.archived == true,
-            scopedWorkspaceURL: request.filter.workspace,
+            scopedWorkspaceURL: request.filter.singleWorkspace,
             excluding: excludedRegistration
         )
         let workspaces = unique(chats.compactMap(\.workspace))
         let groups = unique(workspaces.compactMap(\.workspaceGroup))
-        let preservingGroupWorkspaces = request.filter.workspace != nil
+        let preservingGroupWorkspaces = request.filter.workspaces != nil
             || shouldPreserveExistingWorkspaceChats(
                 for: request,
                 relationshipIsComplete: true
@@ -758,7 +760,7 @@ public final class CodexModelContext: @unchecked Sendable {
                 for: request,
                 relationshipIsComplete: true
             ),
-            workspaceFilter: request.filter.workspace,
+            workspaceFilters: request.filter.workspaces,
             archivedScope: request.filter.archived
         )
         await removeChatsFromRegisteredResults(removedChats, excluding: excludedRegistration)
@@ -823,6 +825,8 @@ public final class CodexModelContext: @unchecked Sendable {
             modelProvider: snapshot.modelProvider,
             createdAt: snapshot.createdAt,
             updatedAt: snapshot.updatedAt,
+            recencyAt: snapshot.recencyAt,
+            status: snapshot.status,
             ephemeral: snapshot.ephemeral,
             turns: snapshot.turns,
             turnItemsAreAuthoritative: snapshot.turnItemsAreAuthoritative,
@@ -838,6 +842,8 @@ public final class CodexModelContext: @unchecked Sendable {
             isArchived: chat.isArchived,
             createdAt: chat.createdAt,
             updatedAt: chat.updatedAt,
+            recencyAt: chat.recencyAt,
+            status: chat.status,
             ephemeral: chat.ephemeral,
             workspaceID: chat.workspace?.id,
             workspaceGroupID: chat.workspace?.workspaceGroup?.id
@@ -962,7 +968,7 @@ public final class CodexModelContext: @unchecked Sendable {
                     for: request,
                     relationshipIsComplete: relationshipIsComplete
                 ),
-                workspaceFilter: request.filter.workspace,
+                workspaceFilters: request.filter.workspaces,
                 archivedScope: request.filter.archived
             )
             await removeChatsFromRegisteredResults(removedChats, excluding: excludedRegistration)
@@ -972,7 +978,7 @@ public final class CodexModelContext: @unchecked Sendable {
     private func syncWorkspaceChats(
         _ chats: [CodexChat],
         preservingExisting: Bool,
-        workspaceFilter: URL?,
+        workspaceFilters: [URL]?,
         archivedScope: Bool?
     ) -> [(chat: CodexChat, workspace: CodexWorkspace, group: CodexWorkspaceGroup?)] {
         var removedChats: [(
@@ -984,9 +990,9 @@ public final class CodexModelContext: @unchecked Sendable {
         let workspaces: [CodexWorkspace]
         if preservingExisting {
             workspaces = fetchedWorkspaces
-        } else if let workspaceFilter {
-            let filteredWorkspace = workspaceIfLoaded(for: workspaceFilter)
-            workspaces = unique((filteredWorkspace.map { [$0] } ?? []) + fetchedWorkspaces)
+        } else if let workspaceFilters {
+            let filteredWorkspaces = workspaceFilters.compactMap(workspaceIfLoaded(for:))
+            workspaces = unique(filteredWorkspaces + fetchedWorkspaces)
         } else {
             workspaces = Array(workspacesByID.values)
         }
@@ -1329,7 +1335,7 @@ public final class CodexModelContext: @unchecked Sendable {
         return CodexThreadQuery(
             archived: request.filter.archived,
             cursor: includePaging ? request.cursor : nil,
-            workspace: request.filter.workspace,
+            workspaces: request.filter.workspaces,
             limit: includePaging ? request.fetchLimit : nil,
             searchTerm: request.filter.searchTerm,
             modelProviders: request.filter.modelProviders,
@@ -1379,7 +1385,7 @@ public final class CodexModelContext: @unchecked Sendable {
             case .updatedAt:
                 compare(lhs.updatedAt, rhs.updatedAt, order: descriptor.order)
             case .recencyAt:
-                .orderedSame
+                compare(lhs.recencyAt, rhs.recencyAt, order: descriptor.order)
             }
         }
     }
@@ -1484,6 +1490,15 @@ extension CodexSortDescriptor {
         case .name:
             return nil
         }
+    }
+}
+
+extension CodexFetchFilter {
+    fileprivate var singleWorkspace: URL? {
+        guard let workspaces, workspaces.count == 1 else {
+            return nil
+        }
+        return workspaces[0]
     }
 }
 

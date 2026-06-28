@@ -476,8 +476,20 @@ extension AppServerAPI.Thread {
             case modelProvider
             case createdAt
             case updatedAt
+            case recencyAt
+            case status
             case ephemeral
             case turns
+        }
+
+        package struct Status: Codable, Equatable, Sendable {
+            package var type: String
+            package var activeFlags: [String]?
+
+            package init(type: String, activeFlags: [String]? = nil) {
+                self.type = type
+                self.activeFlags = activeFlags
+            }
         }
 
         package var id: String
@@ -487,6 +499,8 @@ extension AppServerAPI.Thread {
         package var modelProvider: String?
         package var createdAt: Int?
         package var updatedAt: Int?
+        package var recencyAt: Int?
+        package var status: Status?
         package var ephemeral: Bool?
         package var turns: [AppServerAPI.Turn.Payload]?
         package var presentFields: Set<Field>
@@ -499,6 +513,8 @@ extension AppServerAPI.Thread {
             case modelProvider
             case createdAt
             case updatedAt
+            case recencyAt
+            case status
             case ephemeral
             case turns
         }
@@ -511,6 +527,8 @@ extension AppServerAPI.Thread {
             modelProvider: String? = nil,
             createdAt: Int? = nil,
             updatedAt: Int? = nil,
+            recencyAt: Int? = nil,
+            status: Status? = nil,
             ephemeral: Bool? = nil,
             turns: [AppServerAPI.Turn.Payload]? = nil,
             presentFields: Set<Field>? = nil
@@ -522,6 +540,8 @@ extension AppServerAPI.Thread {
             self.modelProvider = modelProvider
             self.createdAt = createdAt
             self.updatedAt = updatedAt
+            self.recencyAt = recencyAt
+            self.status = status
             self.ephemeral = ephemeral
             self.turns = turns
             self.presentFields = presentFields ?? Self.presentFields(
@@ -531,6 +551,8 @@ extension AppServerAPI.Thread {
                 modelProvider: modelProvider,
                 createdAt: createdAt,
                 updatedAt: updatedAt,
+                recencyAt: recencyAt,
+                status: status,
                 ephemeral: ephemeral,
                 turns: turns
             )
@@ -545,6 +567,8 @@ extension AppServerAPI.Thread {
             modelProvider = try container.decodeIfPresent(String.self, forKey: .modelProvider)
             createdAt = try container.decodeIfPresent(Int.self, forKey: .createdAt)
             updatedAt = try container.decodeIfPresent(Int.self, forKey: .updatedAt)
+            recencyAt = try container.decodeIfPresent(Int.self, forKey: .recencyAt)
+            status = try container.decodeIfPresent(Status.self, forKey: .status)
             ephemeral = try container.decodeIfPresent(Bool.self, forKey: .ephemeral)
             turns = try container.decodeIfPresent([AppServerAPI.Turn.Payload].self, forKey: .turns)
             presentFields = Self.presentFields(from: container)
@@ -559,6 +583,8 @@ extension AppServerAPI.Thread {
             try encode(modelProvider, forKey: .modelProvider, into: &container)
             try encode(createdAt, forKey: .createdAt, into: &container)
             try encode(updatedAt, forKey: .updatedAt, into: &container)
+            try encode(recencyAt, forKey: .recencyAt, into: &container)
+            try encode(status, forKey: .status, into: &container)
             try encode(ephemeral, forKey: .ephemeral, into: &container)
             try encode(turns, forKey: .turns, into: &container)
         }
@@ -585,6 +611,8 @@ extension AppServerAPI.Thread {
             modelProvider: String?,
             createdAt: Int?,
             updatedAt: Int?,
+            recencyAt: Int?,
+            status: AppServerAPI.Thread.Snapshot.Status?,
             ephemeral: Bool?,
             turns: [AppServerAPI.Turn.Payload]?
         ) -> Set<Field> {
@@ -606,6 +634,12 @@ extension AppServerAPI.Thread {
             }
             if updatedAt != nil {
                 fields.insert(.updatedAt)
+            }
+            if recencyAt != nil {
+                fields.insert(.recencyAt)
+            }
+            if status != nil {
+                fields.insert(.status)
             }
             if ephemeral != nil {
                 fields.insert(.ephemeral)
@@ -647,6 +681,10 @@ private extension AppServerAPI.Thread.Snapshot.Field {
             self = .createdAt
         case .updatedAt:
             self = .updatedAt
+        case .recencyAt:
+            self = .recencyAt
+        case .status:
+            self = .status
         case .ephemeral:
             self = .ephemeral
         case .turns:
