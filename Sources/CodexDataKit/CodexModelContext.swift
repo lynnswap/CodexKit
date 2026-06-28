@@ -49,11 +49,17 @@ public final class CodexModelContext: @unchecked Sendable {
         var leaseCount = 0
         var setupTask: Task<Void, Error>?
         var eventTask: Task<Void, Never>?
+        var turnsUpgradeTask: Task<Void, Error>?
+        var eventThread: CodexThread?
+        var includesTurns = false
+        var isFinished = false
         var changeContinuations: [UUID: AsyncStream<CodexChatChange>.Continuation] = [:]
 
         func cancel() {
+            isFinished = true
             setupTask?.cancel()
             eventTask?.cancel()
+            turnsUpgradeTask?.cancel()
             finishChangeStreams()
         }
 
@@ -245,6 +251,10 @@ public final class CodexModelContext: @unchecked Sendable {
         let previousGroup = previousWorkspace?.workspaceGroup
         let snapshot = try await thread.read(includeTurns: includeTurns)
         let refreshedChat = apply(snapshot)
+        if includeTurns {
+            refreshedChat.resetLiveMergeState()
+        }
+        refreshedChat.syncPhaseAfterRefresh(includeTurns: includeTurns)
         activeChatObservationsByID[refreshedChat.id]?.yield([
             .snapshot(CodexChatSnapshot(chat: refreshedChat)),
         ])
@@ -267,6 +277,9 @@ public final class CodexModelContext: @unchecked Sendable {
         let activeObservation = activeObservation(for: chat, includeTurns: includeTurns)
         do {
             try await activeObservation.setupTask?.value
+            if includeTurns {
+                try await activeObservation.turnsUpgradeTask?.value
+            }
         } catch {
             releaseChatObservation(chat.id, observation: activeObservation)
             throw error
@@ -281,13 +294,27 @@ public final class CodexModelContext: @unchecked Sendable {
         resumedThread: CodexThread? = nil
     ) -> ActiveChatObservation {
         if let observation = activeChatObservationsByID[chat.id] {
-            observation.leaseCount += 1
-            return observation
+            if observation.isFinished {
+                activeChatObservationsByID.removeValue(forKey: chat.id)
+            } else {
+                observation.leaseCount += 1
+                if includeTurns {
+                    scheduleTurnsUpgrade(
+                        observation,
+                        for: chat,
+                        resumedThread: resumedThread
+                    )
+                }
+                return observation
+            }
         }
 
         let observation = ActiveChatObservation()
         observation.leaseCount = 1
         activeChatObservationsByID[chat.id] = observation
+        if includeTurns {
+            observation.includesTurns = true
+        }
         observation.setupTask = Task { @MainActor [weak self, weak chat, weak observation] in
             guard let self, let chat, let observation else {
                 return
@@ -300,6 +327,46 @@ public final class CodexModelContext: @unchecked Sendable {
             )
         }
         return observation
+    }
+
+    private func scheduleTurnsUpgrade(
+        _ observation: ActiveChatObservation,
+        for chat: CodexChat,
+        resumedThread: CodexThread? = nil
+    ) {
+        guard observation.includesTurns == false else {
+            return
+        }
+        if observation.turnsUpgradeTask != nil {
+            return
+        }
+        observation.turnsUpgradeTask = Task { @MainActor [weak self, weak chat, weak observation] in
+            guard let self, let chat, let observation else {
+                return
+            }
+            defer {
+                if observation.includesTurns == false {
+                    observation.turnsUpgradeTask = nil
+                }
+            }
+            try await observation.setupTask?.value
+            guard self.activeChatObservationsByID[chat.id] === observation,
+                  observation.isFinished == false,
+                  observation.includesTurns == false
+            else {
+                return
+            }
+            let thread: CodexThread
+            if let eventThread = observation.eventThread {
+                thread = eventThread
+            } else if let resumedThread {
+                thread = resumedThread
+            } else {
+                thread = try await self.appServer.resumeThread(chat.id)
+            }
+            try await self.refresh(chat, using: thread, includeTurns: true)
+            observation.includesTurns = true
+        }
     }
 
     private func startObservation(
@@ -317,11 +384,11 @@ public final class CodexModelContext: @unchecked Sendable {
             } else {
                 thread = try await appServer.resumeThread(chat.id)
             }
+            observation.eventThread = thread
             try Task.checkCancellation()
             try await refresh(chat, using: thread, includeTurns: includeTurns)
             try Task.checkCancellation()
-            chat.resetLiveMergeState()
-            chat.syncPhaseWithTurnsAfterRefresh()
+            observation.includesTurns = includeTurns
         } catch {
             chat.fail(with: error)
             discardChatObservation(chat.id, observation: observation)
@@ -370,10 +437,9 @@ public final class CodexModelContext: @unchecked Sendable {
         guard activeChatObservationsByID[chatID] === observation else {
             return
         }
+        observation.isFinished = true
         observation.eventTask = nil
-        if observation.leaseCount <= 0 {
-            activeChatObservationsByID.removeValue(forKey: chatID)
-        }
+        activeChatObservationsByID.removeValue(forKey: chatID)
     }
 
     private func discardChatObservation(
@@ -411,6 +477,9 @@ public final class CodexModelContext: @unchecked Sendable {
         )
         do {
             try await activeObservation.setupTask?.value
+            if includeTurns {
+                try await activeObservation.turnsUpgradeTask?.value
+            }
         } catch {
             releaseChatObservation(chat.id, observation: activeObservation)
             throw error

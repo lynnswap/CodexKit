@@ -3273,6 +3273,35 @@ struct CodexModelContextTests {
         #expect(params.includeTurns == false)
     }
 
+    @Test("metadata-only chat refresh derives phase from fresh thread status")
+    func metadataOnlyRefreshDerivesPhaseFromFreshThreadStatus() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-metadata-phase"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-metadata-phase",
+            status: .active(activeFlags: []),
+            turns: [.init(id: "turn-stale", status: .running)]
+        ))
+
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-metadata-phase"))
+        try await chat.refresh()
+        #expect(chat.phase == .loading)
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-metadata-phase"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-metadata-phase",
+            status: .idle
+        ))
+
+        try await chat.refresh(includeTurns: false)
+
+        #expect(chat.turn(id: "turn-stale")?.status == .running)
+        #expect(chat.phase == .loaded)
+        #expect(chat.status == .idle)
+    }
+
     @Test("server-only chat refresh re-sorts current results")
     func serverOnlyChatRefreshResortsCurrentResults() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -4010,6 +4039,148 @@ struct CodexModelContextTests {
         #expect(await runtime.transport.recordedRequests(method: "thread/resume").count == 2)
     }
 
+    @Test("chat observation upgrades shared leases to include turn snapshots")
+    func chatObservationUpgradesSharedLeaseToIncludeTurnSnapshots() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-upgrade"))
+        try await runtime.transport.enqueueThreadRead(.init(id: "thread-upgrade"))
+
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-upgrade"))
+        let metadataObservation = try await chat.observe(includeTurns: false)
+        defer {
+            metadataObservation.cancel()
+        }
+
+        #expect(chat.turnSnapshot(for: "turn-history") == nil)
+
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-upgrade",
+            turns: [
+                .init(
+                    id: "turn-history",
+                    status: .completed,
+                    items: [
+                        .init(
+                            id: "message-history",
+                            kind: .agentMessage,
+                            content: .message(.init(
+                                id: "message-history",
+                                role: .assistant,
+                                phase: .finalAnswer,
+                                text: "Loaded from upgrade"
+                            ))
+                        ),
+                    ]
+                ),
+            ]
+        ))
+
+        let turnObservation = try await chat.observe(includeTurns: true)
+        defer {
+            turnObservation.cancel()
+        }
+
+        let turnSnapshot = try #require(chat.turnSnapshot(for: "turn-history"))
+        #expect(turnSnapshot.items.map(\.text) == ["Loaded from upgrade"])
+        #expect(await runtime.transport.recordedRequests(method: "thread/resume").count == 1)
+        let readRequests = await runtime.transport.recordedRequests(method: "thread/read")
+        #expect(readRequests.count == 2)
+        let firstParams = try readRequests[0].decodeParams(ThreadReadParams.self)
+        let secondParams = try readRequests[1].decodeParams(ThreadReadParams.self)
+        #expect(firstParams.includeTurns == false)
+        #expect(secondParams.includeTurns == true)
+    }
+
+    @Test("finished chat observations are not reused")
+    func finishedChatObservationsAreNotReused() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-finished"))
+        try await runtime.transport.enqueueThreadRead(.init(id: "thread-finished"))
+
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-finished"))
+        let firstObservation = try await chat.observe()
+        defer {
+            firstObservation.cancel()
+        }
+
+        try await runtime.transport.emitServerNotification(
+            method: "thread/closed",
+            params: ThreadClosedParams(threadID: "thread-finished")
+        )
+        #expect(await eventually { chat.status == .notLoaded && chat.phase == .loaded })
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-finished"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-finished",
+            turns: [.init(id: "turn-restarted", status: .completed)]
+        ))
+
+        let restartedObservation = try await chat.observe()
+        defer {
+            restartedObservation.cancel()
+        }
+
+        #expect(chat.turnSnapshot(for: "turn-restarted") != nil)
+        #expect(await runtime.transport.recordedRequests(method: "thread/resume").count == 2)
+    }
+
+    @Test("chat observation keeps refreshed output snapshots idempotent with replayed deltas")
+    func chatObservationKeepsRefreshedOutputSnapshotsIdempotentWithReplayedDeltas() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.emitServerNotification(
+            method: "item/commandExecution/outputDelta",
+            params: OutputDeltaParams(
+                threadID: "thread-replay",
+                turnID: "turn-replay",
+                itemID: "command-replay",
+                delta: "Hel"
+            )
+        )
+        try await runtime.transport.emitServerNotification(
+            method: "item/commandExecution/outputDelta",
+            params: OutputDeltaParams(
+                threadID: "thread-replay",
+                turnID: "turn-replay",
+                itemID: "command-replay",
+                delta: "lo"
+            )
+        )
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-replay"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-replay",
+            turns: [
+                .init(
+                    id: "turn-replay",
+                    status: .running,
+                    items: [
+                        .init(
+                            id: "command-replay",
+                            kind: .commandExecution,
+                            content: .command(.init(command: "echo hello", output: "Hello"))
+                        ),
+                    ]
+                ),
+            ]
+        ))
+
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-replay"))
+        let observation = try await chat.observe()
+        defer {
+            observation.cancel()
+        }
+
+        try? await Task.sleep(for: .milliseconds(100))
+
+        #expect(chat.items.first { $0.id == "command-replay" }?.text == "Hello")
+        #expect(chat.items.filter { $0.id == "command-replay" }.count == 1)
+    }
+
     @Test("review identity observation resolves the active review thread chat")
     func reviewIdentityObservationResolvesActiveReviewThreadChat() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -4087,6 +4258,10 @@ struct CodexModelContextTests {
                 $0.id == "review-message" && $0.text == "Turn-only review"
             }
         })
+        let turn = try #require(observation.chat.turn(id: "turn-review"))
+        let turnSnapshot = try #require(observation.chat.turnSnapshot(for: "turn-review"))
+        #expect(turnSnapshot.turn === turn)
+        #expect(turnSnapshot.items.map(\.id) == ["review-message"])
     }
 
     @Test("duplicate chat observations share one live consumer")
@@ -4229,6 +4404,44 @@ struct CodexModelContextTests {
         #expect(updatedChange != nil)
     }
 
+    @Test("active chat refresh emits snapshots after phase reconciliation")
+    func activeChatRefreshEmitsSnapshotsAfterPhaseReconciliation() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-refresh-stream"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-refresh-stream",
+            turns: [.init(id: "turn-running", status: .running)]
+        ))
+
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-refresh-stream"))
+        let observation = try await chat.observe()
+        defer {
+            observation.cancel()
+        }
+        let changes = ChatChangeRecorder(stream: observation.changes)
+
+        _ = await changes.next()
+        #expect(chat.phase == .loading)
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-refresh-stream"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-refresh-stream",
+            status: .idle,
+            turns: []
+        ))
+
+        try await chat.refresh()
+
+        guard case .snapshot(let snapshot) = await changes.next() else {
+            Issue.record("Expected refresh snapshot change.")
+            return
+        }
+        #expect(snapshot.phase == .loaded)
+        #expect(chat.phase == .loaded)
+    }
+
     @Test("duplicate chat observations receive independent change streams")
     func duplicateChatObservationsReceiveIndependentChangeStreams() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -4330,6 +4543,39 @@ struct CodexModelContextTests {
         )
 
         #expect(await eventually { chat.phase == .failed("Tool failed") })
+    }
+
+    @Test("thread closed notifications clear active chat status")
+    func threadClosedNotificationsClearActiveChatStatus() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-closed-status"))
+        try await runtime.transport.enqueueThreadRead(.init(id: "thread-closed-status"))
+
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-closed-status"))
+        let observation = try await chat.observe()
+        defer {
+            observation.cancel()
+        }
+
+        try await runtime.transport.emitServerNotification(
+            method: "thread/status/changed",
+            params: ThreadStatusParams(threadID: "thread-closed-status", status: .init(type: "active"))
+        )
+        #expect(await eventually {
+            if case .active = chat.status {
+                return true
+            }
+            return false
+        })
+
+        try await runtime.transport.emitServerNotification(
+            method: "thread/closed",
+            params: ThreadClosedParams(threadID: "thread-closed-status")
+        )
+
+        #expect(await eventually { chat.status == .notLoaded && chat.phase == .loaded })
     }
 
     @Test("live item output deltas accumulate until replacement arrives")

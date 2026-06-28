@@ -311,7 +311,6 @@ public final class CodexChat: CodexObservableModel {
         lastErrorDescription = nil
         do {
             try await modelContext.refresh(self, includeTurns: includeTurns)
-            syncPhaseWithTurnsAfterRefresh()
         } catch {
             fail(with: error)
             throw error
@@ -509,12 +508,15 @@ public final class CodexChat: CodexObservableModel {
             fail(with: message)
         case .itemStarted(let item, let turnID),
              .itemCompleted(let item, let turnID):
+            insertRunningTurnIfMissing(turnID, into: &changes)
             changes.append(contentsOf: mergeItems([item], turnID: turnID))
             markRunningIfNeeded()
         case .itemUpdated(let item, let turnID):
+            insertRunningTurnIfMissing(turnID, into: &changes)
             changes.append(contentsOf: mergeItems([item], turnID: turnID, accumulatesOutputDeltas: true))
             markRunningIfNeeded()
         case .message(let message, let turnID):
+            insertRunningTurnIfMissing(turnID, into: &changes)
             let item = CodexThreadItem(
                 id: message.id,
                 kind: message.role == .user ? .userMessage : .agentMessage,
@@ -523,12 +525,15 @@ public final class CodexChat: CodexObservableModel {
             changes.append(contentsOf: mergeItems([item], turnID: turnID))
             markRunningIfNeeded()
         case .messageDelta(let delta, let turnID):
+            insertRunningTurnIfMissing(turnID, into: &changes)
             changes.append(contentsOf: merge(delta, turnID: turnID))
             markRunningIfNeeded()
         case .reasoningSummaryPartAdded(let part, let turnID):
+            insertRunningTurnIfMissing(turnID, into: &changes)
             changes.append(contentsOf: start(part, turnID: turnID))
             markRunningIfNeeded()
         case .reasoningDelta(let delta, let turnID):
+            insertRunningTurnIfMissing(turnID, into: &changes)
             changes.append(contentsOf: merge(delta, turnID: turnID))
             markRunningIfNeeded()
         case .tokenUsageUpdated(let usage, let turnID):
@@ -545,6 +550,7 @@ public final class CodexChat: CodexObservableModel {
                 markLoadedIfNotFailed()
             }
         case .closed:
+            status = .notLoaded
             markLoadedIfNotFailed()
         case .unknown:
             break
@@ -629,7 +635,6 @@ public final class CodexChat: CodexObservableModel {
             accumulatedText: accumulatedText,
             deltaText: delta
         )
-        liveMergeState.outputDeltaTextByItemKey[key] = mergedText
         existing.update(
             from: itemByReplacingOutput(
                 in: existing.threadItem,
@@ -639,6 +644,21 @@ public final class CodexChat: CodexObservableModel {
             turnID: key.turnID
         )
         return true
+    }
+
+    private func insertRunningTurnIfMissing(
+        _ turnID: CodexTurnID?,
+        into changes: inout [CodexChatChange]
+    ) {
+        guard let turnID, turns.contains(where: { $0.id == turnID }) == false else {
+            return
+        }
+        changes.appendIfPresent(upsertTurn(
+            id: turnID,
+            status: .running,
+            errorDescription: nil,
+            preservesExistingUsage: true
+        ))
     }
 
     private func outputDeltaText(from item: CodexThreadItem) -> String? {
@@ -875,7 +895,15 @@ public final class CodexChat: CodexObservableModel {
         }
     }
 
-    package func syncPhaseWithTurnsAfterRefresh() {
+    package func syncPhaseAfterRefresh(includeTurns: Bool) {
+        if includeTurns {
+            syncPhaseWithTurnsAfterRefresh()
+        } else {
+            syncPhaseWithStatusAfterMetadataRefresh()
+        }
+    }
+
+    private func syncPhaseWithTurnsAfterRefresh() {
         guard let latestTurn = turns.last else {
             phase = .loaded
             lastErrorDescription = nil
@@ -888,6 +916,17 @@ public final class CodexChat: CodexObservableModel {
         case .failed, .interrupted, .cancelled:
             fail(with: latestTurn.errorDescription ?? latestTurn.status?.rawValue ?? "Turn failed")
         case .completed, .unknown, .none:
+            phase = .loaded
+            lastErrorDescription = nil
+        }
+    }
+
+    private func syncPhaseWithStatusAfterMetadataRefresh() {
+        switch status {
+        case .active:
+            phase = .loading
+            lastErrorDescription = nil
+        case .notLoaded, .idle, .systemError, .unknown, .none:
             phase = .loaded
             lastErrorDescription = nil
         }
