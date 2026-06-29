@@ -467,6 +467,96 @@ public struct CodexFetchSection<Model: CodexObservableModel>: Identifiable {
     }
 }
 
+extension CodexFetchSection where Model == CodexChat {
+    public var workspaceGroupID: CodexWorkspaceGroupID? {
+        guard case .workspaceGroup(let id) = id else {
+            return nil
+        }
+        return id
+    }
+
+    public var workspaceID: CodexWorkspaceID? {
+        guard case .workspace(let id) = id else {
+            return nil
+        }
+        return id
+    }
+
+    @MainActor
+    public var workspaceGroup: CodexWorkspaceGroup? {
+        codexOnlyWorkspaceGroup(items.map { $0.workspace?.workspaceGroup })
+    }
+
+    @MainActor
+    public var workspaces: [CodexWorkspace] {
+        codexUniqueWorkspaces(items.compactMap(\.workspace))
+    }
+
+    @MainActor
+    public var uncategorizedChats: [CodexChat] {
+        items.filter { $0.workspace == nil }
+    }
+
+    @MainActor
+    public func chats(in workspaceID: CodexWorkspaceID) -> [CodexChat] {
+        items.filter { $0.workspace?.id == workspaceID }
+    }
+
+    @MainActor
+    public func chat(id: CodexThreadID) -> CodexChat? {
+        items.first { $0.id == id }
+    }
+}
+
+extension CodexFetchSection where Model == CodexWorkspace {
+    public var workspaceGroupID: CodexWorkspaceGroupID? {
+        guard case .workspaceGroup(let id) = id else {
+            return nil
+        }
+        return id
+    }
+
+    @MainActor
+    public var workspaceGroup: CodexWorkspaceGroup? {
+        codexOnlyWorkspaceGroup(items.map(\.workspaceGroup))
+    }
+
+    @MainActor
+    public var workspaces: [CodexWorkspace] {
+        codexUniqueWorkspaces(items)
+    }
+}
+
+@MainActor
+private func codexUniqueWorkspaces(_ workspaces: [CodexWorkspace]) -> [CodexWorkspace] {
+    var seen: Set<CodexWorkspaceID> = []
+    var result: [CodexWorkspace] = []
+    for workspace in workspaces where seen.insert(workspace.id).inserted {
+        result.append(workspace)
+    }
+    return result
+}
+
+@MainActor
+private func codexOnlyWorkspaceGroup(_ groups: [CodexWorkspaceGroup?]) -> CodexWorkspaceGroup? {
+    var result: CodexWorkspaceGroup?
+    var hasMissingGroup = false
+    for group in groups {
+        guard let group else {
+            hasMissingGroup = true
+            continue
+        }
+        guard let existing = result else {
+            result = group
+            continue
+        }
+        guard existing.id == group.id else {
+            return nil
+        }
+    }
+    return hasMissingGroup && result != nil ? nil : result
+}
+
 package struct CodexFetchPage<Model: CodexObservableModel> {
     package var items: [Model]
     package var nextCursor: String?

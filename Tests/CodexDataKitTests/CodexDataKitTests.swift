@@ -1305,6 +1305,9 @@ struct CodexModelContextTests {
         #expect(workspaceResults.sections.count == 1)
         #expect(workspaceSection.title == repo.lastPathComponent)
         #expect(workspaceSection.items.map(\.name).sorted() == ["App", "Tools"])
+        let workspaceGroup = try #require(workspaceSection.workspaceGroup)
+        #expect(workspaceSection.workspaceGroupID == workspaceGroup.id)
+        #expect(workspaceSection.workspaces.map(\.id) == workspaceSection.items.map(\.id))
 
         try await runtime.transport.enqueueThreadList(page)
 
@@ -1321,9 +1324,47 @@ struct CodexModelContextTests {
             chatResults.items.map(\.workspace?.workspaceGroup?.id).allSatisfy {
                 $0 == workspaceResults.items.first?.workspaceGroup?.id
             })
+        let appSection = try #require(chatResults.sections.first { $0.title == "App" })
+        let appWorkspace = try #require(appSection.workspaces.first)
+        #expect(appSection.workspaceID == appWorkspace.id)
+        #expect(appSection.workspaceGroup === workspaceGroup)
+        #expect(appSection.workspaces.map(\.name) == ["App"])
+        #expect(appSection.uncategorizedChats.isEmpty)
+        #expect(appSection.chats(in: appWorkspace.id).map(\.id.rawValue) == ["thread-app"])
+        #expect(appSection.chat(id: "thread-app")?.id.rawValue == "thread-app")
+        #expect(appSection.chat(id: "thread-tools")?.id.rawValue == nil)
         #expect(CodexSectionDescriptor<CodexWorkspace>.workspaceGroup == .init(\.workspaceGroupID))
         #expect(CodexSectionDescriptor<CodexChat>.workspace == .init(\.workspaceID))
         #expect(CodexSectionDescriptor<CodexChat>.workspaceGroup == .init(\.workspaceGroupID))
+    }
+
+    @Test("chat section convenience exposes uncategorized chats")
+    func chatSectionConvenienceExposesUncategorizedChats() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-app", workspace: workspaceURL, name: "App"),
+            .init(id: "thread-uncategorized", name: "Uncategorized"),
+        ]))
+
+        let results = context.fetchedResults(
+            for: CodexFetchRequest<CodexChat>(
+                sortDescriptors: [CodexSortDescriptor(\.title)]
+            ),
+            sectionedBy: .workspace
+        )
+        try await results.performFetch()
+
+        let section = try #require(results.sections.first { $0.uncategorizedChats.isEmpty == false })
+        #expect(section.workspaceGroupID == nil)
+        #expect(section.workspaceID == nil)
+        #expect(section.workspaceGroup == nil)
+        #expect(section.workspaces.isEmpty)
+        #expect(section.uncategorizedChats.map(\.id.rawValue) == ["thread-uncategorized"])
+        #expect(section.chats(in: .init(rawValue: workspaceURL.standardizedFileURL.path)).isEmpty)
+        #expect(section.chat(id: "thread-uncategorized")?.id.rawValue == "thread-uncategorized")
     }
 
     @Test("workspace fetch pagination is applied after workspace deduplication")
