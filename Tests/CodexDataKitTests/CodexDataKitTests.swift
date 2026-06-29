@@ -201,6 +201,36 @@ struct CodexModelContextTests {
         #expect(await runtime.transport.recordedRequests(method: "thread/read").count == 1)
     }
 
+    @Test("seeded app-server test runtime supports starting chats through DataKit")
+    func seededAppServerRuntimeSupportsStartingChatsThroughDataKit() async throws {
+        let workspaceURL = temporaryDirectory()
+        let runtime = try await CodexAppServerTestRuntime.start(threads: [
+            .init(id: "thread-existing", workspace: workspaceURL, name: "Existing")
+        ])
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        let workspaces = try await context.fetch(CodexFetchDescriptor<CodexWorkspace>.workspaces)
+        let workspace = try #require(workspaces.first)
+
+        let chat = try await workspace.startChat(.init(
+            options: .init(model: "gpt-test", modelProvider: "openai", ephemeral: true)
+        ))
+        let chats = try await context.fetch(CodexFetchDescriptor<CodexChat>.recentChats)
+
+        #expect(chats.first === chat)
+        #expect(chat.workspace === workspace)
+        #expect(chat.modelProvider == "openai")
+        #expect(chat.ephemeral == true)
+
+        let startRequest = try #require(
+            await runtime.transport.recordedRequests(method: "thread/start").first)
+        let params = try startRequest.decodeParams(ThreadStartParams.self)
+        #expect(params.cwd == workspaceURL.path)
+        #expect(params.model == "gpt-test")
+        #expect(params.modelProvider == "openai")
+        #expect(params.ephemeral == true)
+    }
+
     @Test("fetch requests are translated to app-server thread/list query params")
     func fetchRequestTranslatesToThreadListParams() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -4353,133 +4383,6 @@ struct CodexModelContextTests {
         #expect(chat.items.filter { $0.id == "command-replay" }.count == 1)
     }
 
-    @Test("review identity observation resolves the active review thread chat")
-    func reviewIdentityObservationResolvesActiveReviewThreadChat() async throws {
-        let runtime = try await CodexAppServerTestRuntime.start()
-        let context = CodexModelContainer(appServer: runtime.server).mainContext
-        let identity = CodexReviewIdentity(
-            threadID: "thread-source",
-            turnID: "turn-review",
-            reviewThreadID: "thread-review"
-        )
-
-        try await runtime.transport.enqueueThreadResume(.init(id: "thread-review"))
-        try await runtime.transport.enqueueThreadRead(.init(id: "thread-review"))
-
-        let observation = try await context.observe(identity)
-        defer {
-            observation.cancel()
-        }
-
-        #expect(observation.chat.id == "thread-review")
-        #expect(context.model(for: identity) === observation.chat)
-        #expect(await runtime.transport.recordedRequests(method: "thread/resume").count == 1)
-
-        try await runtime.transport.emitServerNotification(
-            method: "item/completed",
-            params: ThreadItemParams(
-                threadID: "thread-review",
-                turnID: "turn-review",
-                item: .init(
-                    id: "review-message",
-                    type: "agentMessage",
-                    text: "Review complete",
-                    phase: "final_answer"
-                )
-            )
-        )
-
-        #expect(await eventually {
-            observation.chat.items.contains {
-                $0.id == "review-message" && $0.text == "Review complete"
-            }
-        })
-    }
-
-    @Test("review identity observation seeds turn-only review notifications")
-    func reviewIdentityObservationSeedsTurnOnlyReviewNotifications() async throws {
-        let runtime = try await CodexAppServerTestRuntime.start()
-        let context = CodexModelContainer(appServer: runtime.server).mainContext
-        let identity = CodexReviewIdentity(
-            threadID: "thread-source",
-            turnID: "turn-review",
-            reviewThreadID: "thread-review"
-        )
-
-        try await runtime.transport.enqueueThreadResume(.init(id: "thread-review"))
-        try await runtime.transport.enqueueThreadRead(.init(id: "thread-review"))
-
-        let observation = try await context.observe(identity)
-        defer {
-            observation.cancel()
-        }
-        #expect(await runtime.transport.recordedRequests(method: "thread/resume").count == 1)
-
-        try await runtime.transport.emitServerNotification(
-            method: "item/agentMessage/delta",
-            params: TurnOnlyDeltaParams(
-                turnID: "turn-review",
-                itemID: "review-message",
-                delta: "Turn-only review",
-                phase: "final_answer"
-            )
-        )
-
-        #expect(await eventually {
-            observation.chat.items.contains {
-                $0.id == "review-message" && $0.text == "Turn-only review"
-            }
-        })
-        let turn = try #require(observation.chat.turn(id: "turn-review"))
-        let turnSnapshot = try #require(observation.chat.turnSnapshot(for: "turn-review"))
-        #expect(turnSnapshot.turn === turn)
-        #expect(turnSnapshot.items.map(\.id) == ["review-message"])
-    }
-
-    @Test("inline review session observation reopens previously closed event threads")
-    func inlineReviewSessionObservationReopensPreviouslyClosedEventThreads() async throws {
-        let runtime = try await CodexAppServerTestRuntime.start()
-        let context = CodexModelContainer(appServer: runtime.server).mainContext
-
-        try await runtime.transport.enqueueThreadResume(.init(id: "thread-inline-review"))
-        let thread = try await runtime.server.resumeThread("thread-inline-review")
-        try await runtime.transport.emitServerNotification(
-            method: "thread/closed",
-            params: ThreadClosedParams(threadID: "thread-inline-review")
-        )
-        var closedIterator = thread.events.makeAsyncIterator()
-        guard case .closed = try await closedIterator.next() else {
-            Issue.record("Expected closed event to seed terminal thread history.")
-            return
-        }
-
-        try await runtime.transport.enqueueReviewStart(turnID: "turn-inline-review")
-        let reviewSession = try await thread.startReview(target: .baseBranch("main"))
-        try await runtime.transport.enqueueThreadRead(.init(id: "thread-inline-review"))
-
-        let observation = try await context.observe(reviewSession)
-        defer {
-            observation.cancel()
-        }
-
-        try await runtime.transport.emitServerNotification(
-            method: "item/agentMessage/delta",
-            params: TurnDeltaParams(
-                threadID: "thread-inline-review",
-                turnID: "turn-inline-review",
-                itemID: "message-inline-review",
-                delta: "Inline review",
-                phase: "final_answer"
-            )
-        )
-
-        #expect(await eventually {
-            observation.chat.items.contains {
-                $0.id == "message-inline-review" && $0.text == "Inline review"
-            }
-        })
-    }
-
     @Test("duplicate chat observations share one live consumer")
     func duplicateChatObservationsShareOneLiveConsumer() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -5241,6 +5144,8 @@ private struct ThreadReadParams: Decodable, Sendable {
 private struct ThreadStartParams: Decodable, Sendable {
     var cwd: String?
     var model: String?
+    var modelProvider: String?
+    var ephemeral: Bool?
 }
 
 private struct ThreadItemParams: Encodable, Sendable {

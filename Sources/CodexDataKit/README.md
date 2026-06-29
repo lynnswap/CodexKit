@@ -156,11 +156,11 @@ for await change in observation.changes {
 
 `CodexChatTurnProjection` owns generic change folding, item identity, item order, and latest/explicit turn selection. App-specific rendering projections should stay outside CodexDataKit.
 
-For review UIs that persist app-server review identity, resolve and observe the active review thread without introducing a separate aggregate:
+When a higher-level package persists an app-specific operation identity, keep that identity outside CodexDataKit. Resolve it to the app-server thread ID at that layer, then observe the generic chat model:
 
 ```swift
-let observation = try await context.observe(reviewIdentity)
-let reviewChat = observation.chat
+let chat = context.model(for: operation.threadID)
+let observation = try await chat.observe()
 ```
 
 ## SwiftUI

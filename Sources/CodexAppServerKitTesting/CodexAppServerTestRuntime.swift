@@ -1,6 +1,95 @@
 import Foundation
 import CodexAppServerKit
 
+private actor CodexAppServerInMemoryThreadStore {
+    private var snapshotsByID: [String: CodexThreadSnapshot]
+    private var snapshotOrder: [String]
+    private let nextCursor: String?
+    private let backwardsCursor: String?
+
+    init(
+        threads: [CodexThreadSnapshot],
+        nextCursor: String?,
+        backwardsCursor: String?
+    ) {
+        self.snapshotsByID = Dictionary(uniqueKeysWithValues: threads.map { ($0.id.rawValue, $0) })
+        self.snapshotOrder = threads.map(\.id.rawValue)
+        self.nextCursor = nextCursor
+        self.backwardsCursor = backwardsCursor
+    }
+
+    func startThreadResponse(for params: Data) throws -> Data {
+        let request = try JSONDecoder().decode(AppServerAPI.Thread.Start.Params.self, from: params)
+        let threadID = request.threadID ?? "thread-\(UUID().uuidString)"
+        let now = Date()
+        let snapshot = CodexThreadSnapshot(
+            id: CodexThreadID(rawValue: threadID),
+            workspace: request.cwd.map(URL.init(fileURLWithPath:)),
+            modelProvider: request.modelProvider,
+            createdAt: now,
+            updatedAt: now,
+            recencyAt: now,
+            ephemeral: request.ephemeral
+        )
+        upsert(snapshot)
+        return try JSONEncoder().encode(
+            AppServerAPI.Thread.Start.Response(threadID: threadID, model: request.model)
+        )
+    }
+
+    func listThreadResponse(for params: Data) throws -> Data {
+        let request = try JSONDecoder().decode(AppServerAPI.Thread.List.Params.self, from: params)
+        let snapshots = snapshotOrder.compactMap { snapshotsByID[$0] }
+        let filteredThreads = CodexAppServerTestTransport.filteredThreadSnapshots(
+            snapshots,
+            for: request
+        )
+        return try JSONEncoder().encode(
+            AppServerAPI.Thread.List.Response(
+                data: filteredThreads.map(CodexAppServerTestTransport.apiSnapshot(from:)),
+                nextCursor: nextCursor,
+                backwardsCursor: backwardsCursor
+            ))
+    }
+
+    func resumeThreadResponse(for params: Data) throws -> Data {
+        let request = try JSONDecoder().decode(AppServerAPI.Thread.Resume.Params.self, from: params)
+        guard let threadID = request.threadID,
+            let thread = snapshotsByID[threadID]
+        else {
+            throw JSONRPC.Error.responseError(
+                code: -32004,
+                message: "No stubbed thread matches thread/resume."
+            )
+        }
+        return try JSONEncoder().encode(
+            AppServerAPI.Thread.Resume.Response(
+                thread: CodexAppServerTestTransport.apiSnapshot(from: thread),
+                model: thread.modelProvider
+            ))
+    }
+
+    func readThreadResponse(for params: Data) throws -> Data {
+        let request = try JSONDecoder().decode(AppServerAPI.Thread.Read.Params.self, from: params)
+        guard let thread = snapshotsByID[request.threadID] else {
+            throw JSONRPC.Error.responseError(
+                code: -32004,
+                message: "No stubbed thread matches thread/read."
+            )
+        }
+        return try JSONEncoder().encode(
+            AppServerAPI.Thread.Read.Response(
+                thread: CodexAppServerTestTransport.apiSnapshot(from: thread)
+            ))
+    }
+
+    private func upsert(_ snapshot: CodexThreadSnapshot) {
+        snapshotsByID[snapshot.id.rawValue] = snapshot
+        snapshotOrder.removeAll { $0 == snapshot.id.rawValue }
+        snapshotOrder.insert(snapshot.id.rawValue, at: 0)
+    }
+}
+
 /// A Codex app-server test runtime backed by an in-memory transport.
 ///
 /// This type does not launch `codex` or any external process. Tests enqueue
@@ -328,53 +417,23 @@ public actor CodexAppServerTestTransport {
         nextCursor: String? = nil,
         backwardsCursor: String? = nil
     ) throws {
-        let snapshotsByID = Dictionary(uniqueKeysWithValues: threads.map { ($0.id.rawValue, $0) })
+        let store = CodexAppServerInMemoryThreadStore(
+            threads: threads,
+            nextCursor: nextCursor,
+            backwardsCursor: backwardsCursor
+        )
 
+        handle(method: "thread/start") { params in
+            try await store.startThreadResponse(for: params)
+        }
         handle(method: "thread/list") { params in
-            let decoder = JSONDecoder()
-            let encoder = JSONEncoder()
-            let request = try decoder.decode(AppServerAPI.Thread.List.Params.self, from: params)
-            let filteredThreads = Self.filteredThreadSnapshots(threads, for: request)
-            return try encoder.encode(
-                AppServerAPI.Thread.List.Response(
-                    data: filteredThreads.map(Self.apiSnapshot(from:)),
-                    nextCursor: nextCursor,
-                    backwardsCursor: backwardsCursor
-                ))
+            try await store.listThreadResponse(for: params)
         }
-
         handle(method: "thread/resume") { params in
-            let decoder = JSONDecoder()
-            let encoder = JSONEncoder()
-            let request = try decoder.decode(AppServerAPI.Thread.Resume.Params.self, from: params)
-            guard let threadID = request.threadID,
-                let thread = snapshotsByID[threadID]
-            else {
-                throw JSONRPC.Error.responseError(
-                    code: -32004,
-                    message: "No stubbed thread matches thread/resume."
-                )
-            }
-            return try encoder.encode(
-                AppServerAPI.Thread.Resume.Response(
-                    thread: Self.apiSnapshot(from: thread),
-                    model: thread.modelProvider
-                ))
+            try await store.resumeThreadResponse(for: params)
         }
-
         handle(method: "thread/read") { params in
-            let decoder = JSONDecoder()
-            let encoder = JSONEncoder()
-            let request = try decoder.decode(AppServerAPI.Thread.Read.Params.self, from: params)
-            guard let thread = snapshotsByID[request.threadID] else {
-                throw JSONRPC.Error.responseError(
-                    code: -32004,
-                    message: "No stubbed thread matches thread/read."
-                )
-            }
-            return try encoder.encode(
-                AppServerAPI.Thread.Read.Response(thread: Self.apiSnapshot(from: thread))
-            )
+            try await store.readThreadResponse(for: params)
         }
     }
 
@@ -458,7 +517,7 @@ public actor CodexAppServerTestTransport {
         )
     }
 
-    private static func apiSnapshot(from snapshot: CodexThreadSnapshot) -> AppServerAPI.Thread.Snapshot {
+    fileprivate static func apiSnapshot(from snapshot: CodexThreadSnapshot) -> AppServerAPI.Thread.Snapshot {
         .init(
             id: snapshot.id.rawValue,
             cwd: snapshot.workspace?.path,
@@ -474,7 +533,7 @@ public actor CodexAppServerTestTransport {
         )
     }
 
-    private static func filteredThreadSnapshots(
+    fileprivate static func filteredThreadSnapshots(
         _ snapshots: [CodexThreadSnapshot],
         for request: AppServerAPI.Thread.List.Params
     ) -> [CodexThreadSnapshot] {

@@ -176,14 +176,6 @@ public final class CodexModelContext: @unchecked Sendable {
         chat(for: id)
     }
 
-    public func model(for reviewIdentity: CodexReviewIdentity) -> CodexChat {
-        chat(for: reviewIdentity.activeTurnThreadID)
-    }
-
-    public func model(for reviewSession: CodexReviewSession) -> CodexChat {
-        model(for: reviewSession.identity)
-    }
-
     public func model(for id: CodexWorkspaceID) -> CodexWorkspace? {
         workspacesByID[id]
     }
@@ -542,41 +534,6 @@ public final class CodexModelContext: @unchecked Sendable {
         }
         observation.cancel()
         activeChatObservationsByID.removeValue(forKey: chatID)
-    }
-
-    public func observe(
-        _ reviewIdentity: CodexReviewIdentity,
-        includeTurns: Bool = true
-    ) async throws -> CodexChatObservation {
-        let reviewSession = try await appServer.resumeReview(reviewIdentity)
-        return try await observe(reviewSession, includeTurns: includeTurns)
-    }
-
-    public func observe(
-        _ reviewSession: CodexReviewSession,
-        includeTurns: Bool = true
-    ) async throws -> CodexChatObservation {
-        let chat = model(for: reviewSession)
-        guard chat.modelContext === self else {
-            throw CodexModelContextError.modelIsDetached
-        }
-
-        let activeObservation = activeObservation(
-            for: chat,
-            includeTurns: includeTurns,
-            resumedThread: reviewSession.eventThread
-        )
-        do {
-            try await activeObservation.setupTask?.value
-            if includeTurns {
-                try await activeObservation.turnsUpgradeTask?.value
-            }
-        } catch {
-            releaseChatObservation(chat.id, observation: activeObservation)
-            throw error
-        }
-
-        return makeChatObservation(chat: chat, activeObservation: activeObservation)
     }
 
     private func makeChatObservation(
