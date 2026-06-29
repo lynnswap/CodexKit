@@ -176,11 +176,23 @@ public final class CodexModelContext: @unchecked Sendable {
         chat(for: id)
     }
 
+    public func registeredModel(for id: CodexThreadID) -> CodexChat? {
+        chatsByID[id]
+    }
+
     public func model(for id: CodexWorkspaceID) -> CodexWorkspace? {
         workspacesByID[id]
     }
 
+    public func registeredModel(for id: CodexWorkspaceID) -> CodexWorkspace? {
+        workspacesByID[id]
+    }
+
     public func model(for id: CodexWorkspaceGroupID) -> CodexWorkspaceGroup? {
+        workspaceGroupsByID[id]
+    }
+
+    public func registeredModel(for id: CodexWorkspaceGroupID) -> CodexWorkspaceGroup? {
         workspaceGroupsByID[id]
     }
 

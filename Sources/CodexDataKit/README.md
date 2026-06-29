@@ -80,6 +80,21 @@ if results.nextCursor != nil {
 }
 ```
 
+Use `registeredModel(for:)` when code needs only models that are already registered in
+the context. This lookup does not create placeholder chats and does not issue an
+app-server request.
+
+```swift
+if let chat = context.registeredModel(for: threadID) {
+    render(chat.title)
+}
+```
+
+`model(for: CodexThreadID)` remains the identity/placeholder API: it returns the
+registered chat when present, or registers a placeholder `CodexChat` for that ID.
+Workspace and workspace-group IDs also support `registeredModel(for:)` for symmetric
+context identity lookups.
+
 ## Sectioning
 
 Pass `sectionedBy` at the results/query boundary when a UI wants sidebar sections.

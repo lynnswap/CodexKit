@@ -170,6 +170,26 @@ struct CodexModelContextTests {
         #expect(await runtime.transport.recordedRequests(method: "thread/list").count == 2)
     }
 
+    @Test("registered chat lookup does not create placeholders")
+    func registeredChatLookupDoesNotCreatePlaceholders() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let threadID = CodexThreadID(rawValue: "thread-unloaded")
+
+        #expect(context.registeredModel(for: threadID) == nil)
+        #expect(await runtime.transport.recordedRequests(method: "thread/list").isEmpty)
+        #expect(await runtime.transport.recordedRequests(method: "thread/resume").isEmpty)
+        #expect(await runtime.transport.recordedRequests(method: "thread/read").isEmpty)
+
+        let placeholder = context.model(for: threadID)
+
+        #expect(placeholder.id == threadID)
+        #expect(context.registeredModel(for: threadID) === placeholder)
+        #expect(await runtime.transport.recordedRequests(method: "thread/list").isEmpty)
+        #expect(await runtime.transport.recordedRequests(method: "thread/resume").isEmpty)
+        #expect(await runtime.transport.recordedRequests(method: "thread/read").isEmpty)
+    }
+
     @Test("seeded app-server test runtime drives DataKit through public APIs")
     func seededAppServerRuntimeDrivesDataKitThroughPublicAPIs() async throws {
         let workspace = temporaryDirectory()
