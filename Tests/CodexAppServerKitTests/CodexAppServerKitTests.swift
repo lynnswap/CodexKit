@@ -2098,6 +2098,41 @@ struct CodexAppServerKitTests {
         #expect(currentGeneration.last == .closed)
     }
 
+    @Test func resumeThreadCapturesEventsReceivedDuringResume() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let gate = CodexAppServerTestGate()
+        await runtime.transport.holdNext(method: "thread/resume", gate: gate)
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-resume-events"))
+
+        let resumeTask = Task {
+            try await runtime.server.resumeThread("thread-resume-events")
+        }
+        await runtime.transport.waitForRequest(method: "thread/resume")
+        try await runtime.transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(
+                threadID: "thread-resume-events",
+                turnID: "turn-resume-events",
+                delta: "During resume"
+            )
+        )
+        await gate.open()
+
+        let thread = try await resumeTask.value
+        try await runtime.transport.emitServerNotification(
+            method: "thread/closed",
+            params: ThreadIDParams(threadID: "thread-resume-events")
+        )
+
+        let events = try await collect(thread.events)
+        #expect(events.contains { event in
+            if case .messageDelta(let delta, let turnID) = event {
+                return delta.text == "During resume" && turnID == "turn-resume-events"
+            }
+            return false
+        })
+    }
+
     @Test func turnEventStreamCancellationRemovesRouterSubscriber() async throws {
         let transport = CodexAppServerTestTransport()
         let client = AppServerClient(transport: transport)

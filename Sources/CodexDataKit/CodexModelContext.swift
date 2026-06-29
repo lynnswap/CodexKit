@@ -653,6 +653,13 @@ public final class CodexModelContext: @unchecked Sendable {
         return changes
     }
 
+    package func syncPhaseAfterSend(in chat: CodexChat) async {
+        guard let change = chat.syncPhaseWithTurnsAfterRefresh() else {
+            return
+        }
+        activeChatObservationsByID[chat.id]?.yield([change])
+    }
+
     @discardableResult
     package func apply(_ event: CodexThreadEvent, to chat: CodexChat) async -> [CodexChatChange] {
         let previousWorkspace = chat.workspace

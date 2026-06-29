@@ -333,7 +333,7 @@ public final class CodexChat: CodexObservableModel {
         lastErrorDescription = nil
         do {
             let response = try await modelContext.send(input, in: self)
-            syncPhaseWithTurnsAfterRefresh()
+            await modelContext.syncPhaseAfterSend(in: self)
             return response
         } catch {
             if input.options.transcriptErrorHandlingPolicy != .revertTranscript,
@@ -921,11 +921,13 @@ public final class CodexChat: CodexObservableModel {
         }
     }
 
-    private func syncPhaseWithTurnsAfterRefresh() {
+    @discardableResult
+    package func syncPhaseWithTurnsAfterRefresh() -> CodexChatChange? {
+        let previousPhase = phase
         guard let latestTurn = turns.last else {
             phase = .loaded
             lastErrorDescription = nil
-            return
+            return phase == previousPhase ? nil : .phaseChanged(phase)
         }
         switch latestTurn.status {
         case .running:
@@ -937,6 +939,7 @@ public final class CodexChat: CodexObservableModel {
             phase = .loaded
             lastErrorDescription = nil
         }
+        return phase == previousPhase ? nil : .phaseChanged(phase)
     }
 
     private func syncPhaseWithStatusAfterMetadataRefresh() {

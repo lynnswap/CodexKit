@@ -3885,6 +3885,45 @@ struct CodexModelContextTests {
         #expect(chat.transcript.finalAnswer == "Done")
     }
 
+    @Test("observed chat send emits a loaded phase change")
+    func observedChatSendEmitsLoadedPhaseChange() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-send-phase"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-send-phase",
+            turns: [.init(id: "turn-existing", status: .running)]
+        ))
+
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-send-phase"))
+        let observation = try await chat.observe()
+        defer {
+            observation.cancel()
+        }
+        let changes = ChatChangeRecorder(stream: observation.changes)
+        _ = await changes.next()
+        #expect(chat.phase == .loading)
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-send-phase"))
+        try await runtime.transport.enqueueTurnStart(turnID: "turn-send-phase", status: "running")
+        let sendTask = Task {
+            try await chat.send("hello")
+        }
+
+        await runtime.transport.waitForRequest(method: "turn/start")
+        try await runtime.transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(id: "turn-send-phase", status: "completed"))
+        )
+
+        _ = try await sendTask.value
+
+        let phaseChange = await changes.phaseChanged(.loaded)
+        #expect(phaseChange != nil)
+        #expect(chat.phase == .loaded)
+    }
+
     @Test("chat send with revert policy refreshes observed transcript after failure")
     func chatSendWithRevertPolicyRefreshesObservedTranscriptAfterFailure() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -5392,6 +5431,15 @@ private final class ChatChangeRecorder: @unchecked Sendable {
         await next { change in
             if case .itemTextAppended(let changeID, _, let changeDelta, _) = change {
                 return changeID == id && changeDelta == delta
+            }
+            return false
+        }
+    }
+
+    func phaseChanged(_ phase: CodexDataPhase) async -> CodexChatChange? {
+        await next { change in
+            if case .phaseChanged(let candidate) = change {
+                return candidate == phase
             }
             return false
         }
