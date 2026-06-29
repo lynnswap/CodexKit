@@ -329,15 +329,15 @@ struct CodexModelContextTests {
         #expect(params.sortKey == "updated_at")
     }
 
-    @Test("query key path sort convenience accepts comparable and optional comparable fields")
-    func queryKeyPathSortConvenienceAcceptsComparableAndOptionalComparableFields() {
+    @Test("query key path descriptors accept comparable and section fields")
+    func queryKeyPathDescriptorsAcceptComparableAndSectionFields() {
         let workspaceQuery = CodexQuery<CodexWorkspace>(sort: \.name)
         let chatQuery = CodexQuery<CodexChat>(sort: \.updatedAt, order: .reverse)
         let sectionedChatQuery = CodexQuery<CodexChat>(
             filter: .init(archived: false),
             sort: \.recencyAt,
             order: .reverse,
-            sectionBy: .workspaceGroup
+            sectionBy: CodexSectionDescriptor(\.workspaceGroupID)
         )
 
         #expect(workspaceQuery.wrappedValue.items.isEmpty)
@@ -606,7 +606,7 @@ struct CodexModelContextTests {
         let scopedResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>.chats(
             in: workspace,
             sortDescriptors: [CodexSortDescriptor(\.name)]
-        ), sectionedBy: .workspace)
+        ), sectionedBy: CodexSectionDescriptor(\.workspaceID))
         try await scopedResults.performFetch()
 
         try await runtime.transport.enqueueThreadList(.init(threads: [
@@ -954,7 +954,7 @@ struct CodexModelContextTests {
         ]))
         let sectionedResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
             sortDescriptors: [CodexSortDescriptor(\.name)]
-        ), sectionedBy: .workspace)
+        ), sectionedBy: CodexSectionDescriptor(\.workspaceID))
         try await sectionedResults.performFetch()
         let oldWorkspaceSectionID = CodexFetchSectionID.workspace(.init(rawValue: oldWorkspaceURL.standardizedFileURL
             .resolvingSymlinksInPath()
@@ -1011,7 +1011,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadList(initialPage)
         let sectionedNameResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
             sortDescriptors: [CodexSortDescriptor(\.name)]
-        ), sectionedBy: .workspace)
+        ), sectionedBy: CodexSectionDescriptor(\.workspaceID))
         try await sectionedNameResults.performFetch()
 
         try await runtime.transport.enqueueThreadList(.init(threads: [
@@ -1138,7 +1138,7 @@ struct CodexModelContextTests {
         ]))
         let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
             predicate: .init(sourceKinds: [.appServer])
-        ), sectionedBy: .workspace)
+        ), sectionedBy: CodexSectionDescriptor(\.workspaceID))
         try await results.performFetch()
         let chat = try #require(results.items.first)
         #expect(
@@ -1300,7 +1300,7 @@ struct CodexModelContextTests {
         #expect(results.items.map(\.id.rawValue) == ["thread-dated", "thread-undated"])
     }
 
-    @Test("workspace and chat fetches can be sectioned by workspace group or workspace")
+    @Test("workspace and chat fetches can be sectioned by key paths")
     func fetchesSupportWorkspaceSections() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         let context = CodexModelContainer(appServer: runtime.server).mainContext
@@ -1316,7 +1316,7 @@ struct CodexModelContextTests {
 
         let workspaceResults = context.fetchedResults(
             for: CodexFetchRequest<CodexWorkspace>.workspaces(),
-            sectionedBy: CodexSectionDescriptor(\CodexWorkspace.workspaceGroupID)
+            sectionedBy: CodexSectionDescriptor(\.workspaceGroupID)
         )
         try await workspaceResults.performFetch()
 
@@ -1335,7 +1335,7 @@ struct CodexModelContextTests {
             for: CodexFetchRequest<CodexChat>(
                 sortDescriptors: [CodexSortDescriptor(\.title)]
             ),
-            sectionedBy: CodexSectionDescriptor(\CodexChat.workspaceID)
+            sectionedBy: CodexSectionDescriptor(\.workspaceID)
         )
         try await chatResults.performFetch()
 
@@ -1353,13 +1353,10 @@ struct CodexModelContextTests {
         #expect(appSection.chats(in: appWorkspace.id).map(\.id.rawValue) == ["thread-app"])
         #expect(appSection.chat(id: "thread-app")?.id.rawValue == "thread-app")
         #expect(appSection.chat(id: "thread-tools")?.id.rawValue == nil)
-        #expect(CodexSectionDescriptor<CodexWorkspace>.workspaceGroup == .init(\.workspaceGroupID))
-        #expect(CodexSectionDescriptor<CodexChat>.workspace == .init(\.workspaceID))
-        #expect(CodexSectionDescriptor<CodexChat>.workspaceGroup == .init(\.workspaceGroupID))
     }
 
-    @Test("chat section convenience exposes uncategorized chats")
-    func chatSectionConvenienceExposesUncategorizedChats() async throws {
+    @Test("chat section exposes uncategorized chats")
+    func chatSectionExposesUncategorizedChats() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         let context = CodexModelContainer(appServer: runtime.server).mainContext
         let workspaceURL = temporaryDirectory()
@@ -1373,7 +1370,7 @@ struct CodexModelContextTests {
             for: CodexFetchRequest<CodexChat>(
                 sortDescriptors: [CodexSortDescriptor(\.title)]
             ),
-            sectionedBy: .workspace
+            sectionedBy: CodexSectionDescriptor(\.workspaceID)
         )
         try await results.performFetch()
 

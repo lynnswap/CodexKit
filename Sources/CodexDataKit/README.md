@@ -67,8 +67,7 @@ try await results.performFetch()
 
 Sort descriptors use the known key-path contract directly. A key path must map to a
 supported CodexDataKit model field; arbitrary key paths are not silently treated as
-app-server sorts. Section convenience helpers such as `.workspaceGroup` are still
-available for section descriptors.
+app-server sorts. Section descriptors follow the same key-path style.
 
 Fetches preserve object identity. If the same app-server thread appears in a later refresh, CodexDataKit mutates the existing `CodexChat` instance instead of replacing it.
 
