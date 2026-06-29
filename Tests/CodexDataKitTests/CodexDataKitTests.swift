@@ -4200,6 +4200,41 @@ struct CodexModelContextTests {
         })
     }
 
+    @Test("chat observation change streams finish when setup consumes terminal events")
+    func chatObservationChangeStreamsFinishWhenSetupConsumesTerminalEvents() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        let gate = CodexAppServerTestGate()
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-terminal-setup"))
+        await runtime.transport.holdNext(method: "thread/read", gate: gate)
+        try await runtime.transport.enqueueThreadRead(.init(id: "thread-terminal-setup"))
+
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-terminal-setup"))
+        let observeTask = Task {
+            try await chat.observe()
+        }
+
+        await runtime.transport.waitForRequest(method: "thread/read")
+        try await runtime.transport.emitServerNotification(
+            method: "thread/closed",
+            params: ThreadClosedParams(threadID: "thread-terminal-setup")
+        )
+        await gate.open()
+
+        let observation = try await observeTask.value
+        defer {
+            observation.cancel()
+        }
+        let changes = ChatChangeRecorder(stream: observation.changes)
+
+        guard case .snapshot = await changes.next() else {
+            Issue.record("Expected initial snapshot change.")
+            return
+        }
+        #expect(await eventually { changes.isFinished })
+    }
+
     @Test("chat observation keeps refreshed output snapshots idempotent with replayed deltas")
     func chatObservationKeepsRefreshedOutputSnapshotsIdempotentWithReplayedDeltas() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -5271,6 +5306,7 @@ private func eventually(
 private final class ChatChangeRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private var changes: [CodexChatChange] = []
+    private var streamFinished = false
     private var task: Task<Void, Never>?
 
     init(stream: AsyncStream<CodexChatChange>) {
@@ -5278,6 +5314,7 @@ private final class ChatChangeRecorder: @unchecked Sendable {
             for await change in stream {
                 self?.append(change)
             }
+            self?.markFinished()
         }
     }
 
@@ -5316,10 +5353,22 @@ private final class ChatChangeRecorder: @unchecked Sendable {
         }
     }
 
+    var isFinished: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return streamFinished
+    }
+
     private func append(_ change: CodexChatChange) {
         lock.lock()
         defer { lock.unlock() }
         changes.append(change)
+    }
+
+    private func markFinished() {
+        lock.lock()
+        defer { lock.unlock() }
+        streamFinished = true
     }
 
     private func popFirst(

@@ -92,8 +92,12 @@ public final class CodexModelContext: @unchecked Sendable {
         ) -> (id: UUID, stream: AsyncStream<CodexChatChange>) {
             let id = UUID()
             let pair = AsyncStream<CodexChatChange>.makeStream(bufferingPolicy: .unbounded)
-            changeContinuations[id] = pair.continuation
             pair.continuation.yield(.snapshot(initialSnapshot))
+            if isFinished {
+                pair.continuation.finish()
+            } else {
+                changeContinuations[id] = pair.continuation
+            }
             return (id, pair.stream)
         }
 
