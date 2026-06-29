@@ -185,7 +185,9 @@ public final class CodexModelContext: @unchecked Sendable {
     }
 
     public func refresh(_ group: CodexWorkspaceGroup) async throws {
-        let descriptor = CodexFetchDescriptor<CodexWorkspace>(sortBy: [.name()])
+        let descriptor = CodexFetchDescriptor<CodexWorkspace>(
+            sortBy: [CodexSortDescriptor(\.name)]
+        )
         let previousWorkspaces = group.workspaces
         let previousChats = group.workspaces.flatMap(\.chats)
         let snapshots = try await fetchAllThreadSnapshots(matching: descriptor)
@@ -1044,7 +1046,10 @@ public final class CodexModelContext: @unchecked Sendable {
             workspacesByID[id] = workspace
         }
         if group.workspaces.contains(where: { $0 === workspace }) == false {
-            group.setWorkspaces(sort(group.workspaces + [workspace], using: [.name()]))
+            group.setWorkspaces(sort(
+                group.workspaces + [workspace],
+                using: [CodexSortDescriptor(\.name)]
+            ))
         }
         return workspace
     }
@@ -1199,14 +1204,20 @@ public final class CodexModelContext: @unchecked Sendable {
                 let remainingWorkspaces = group.workspaces.filter {
                     fetchedIDs.contains($0.id) == false
                 }
-                group.setWorkspaces(sort(fetchedWorkspaces + remainingWorkspaces, using: [.name()]))
+                group.setWorkspaces(sort(
+                    fetchedWorkspaces + remainingWorkspaces,
+                    using: [CodexSortDescriptor(\.name)]
+                ))
             } else {
                 let fetchedIDs = Set(fetchedWorkspaces.map(\.id))
                 let preservedWorkspaces = group.workspaces.filter {
                     fetchedIDs.contains($0.id) == false
                         && containsOutOfScopeChat(in: $0, archivedScope: archivedScope)
                 }
-                group.setWorkspaces(sort(fetchedWorkspaces + preservedWorkspaces, using: [.name()]))
+                group.setWorkspaces(sort(
+                    fetchedWorkspaces + preservedWorkspaces,
+                    using: [CodexSortDescriptor(\.name)]
+                ))
             }
         }
     }

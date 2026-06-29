@@ -65,36 +65,6 @@ public struct CodexSortDescriptor<Model: CodexObservableModel>: Sendable, Hashab
     }
 }
 
-extension CodexSortDescriptor where Model == CodexWorkspaceGroup {
-    public static func name(_ order: CodexSortOrder = .forward) -> Self {
-        .init(key: .name, order: order)
-    }
-}
-
-extension CodexSortDescriptor where Model == CodexWorkspace {
-    public static func name(_ order: CodexSortOrder = .forward) -> Self {
-        .init(key: .name, order: order)
-    }
-}
-
-extension CodexSortDescriptor where Model == CodexChat {
-    public static func name(_ order: CodexSortOrder = .forward) -> Self {
-        .init(key: .name, order: order)
-    }
-
-    public static func createdAt(_ order: CodexSortOrder = .reverse) -> Self {
-        .init(key: .createdAt, order: order)
-    }
-
-    public static func updatedAt(_ order: CodexSortOrder = .reverse) -> Self {
-        .init(key: .updatedAt, order: order)
-    }
-
-    public static func recencyAt(_ order: CodexSortOrder = .reverse) -> Self {
-        .init(key: .recencyAt, order: order)
-    }
-}
-
 package enum CodexSectionKey: Sendable, Hashable {
     case workspaceGroup
     case workspace
@@ -385,32 +355,44 @@ public final class CodexFetchRequest<Model: CodexObservableModel>: @unchecked Se
 }
 
 extension CodexFetchDescriptor where Model == CodexWorkspaceGroup {
+    @MainActor
     public static var workspaceGroups: Self {
-        .init(sortBy: [.name()])
+        .init(sortBy: codexDefaultWorkspaceGroupSortDescriptors())
     }
 }
 
 extension CodexFetchDescriptor where Model == CodexWorkspace {
+    @MainActor
     public static var workspaces: Self {
-        .init(sortBy: [.name()])
+        .init(sortBy: codexDefaultWorkspaceSortDescriptors())
     }
 
+    @MainActor
     public static func workspaces(
-        sortBy: [CodexSortDescriptor<CodexWorkspace>] = [.name()]
+        sortBy: [CodexSortDescriptor<CodexWorkspace>] = codexDefaultWorkspaceSortDescriptors()
     ) -> Self {
         .init(sortBy: sortBy)
     }
 }
 
 extension CodexFetchDescriptor where Model == CodexChat {
+    @MainActor
     public static var recentChats: Self {
-        .init(sortBy: [.updatedAt(.reverse)])
+        .init(sortBy: codexDefaultChatSortDescriptors())
     }
 
     @MainActor
     public static func chats(
         in workspace: CodexWorkspace,
-        sortBy: [CodexSortDescriptor<CodexChat>] = [.updatedAt(.reverse)],
+        fetchLimit: Int? = nil
+    ) -> Self {
+        chats(in: workspace, sortBy: codexDefaultChatSortDescriptors(), fetchLimit: fetchLimit)
+    }
+
+    @MainActor
+    public static func chats(
+        in workspace: CodexWorkspace,
+        sortBy: [CodexSortDescriptor<CodexChat>],
         fetchLimit: Int? = nil
     ) -> Self {
         .init(
@@ -422,24 +404,29 @@ extension CodexFetchDescriptor where Model == CodexChat {
 }
 
 extension CodexFetchRequest where Model == CodexWorkspaceGroup {
+    @MainActor
     public static var workspaceGroups: Self {
         Self(.workspaceGroups)
     }
 }
 
 extension CodexFetchRequest where Model == CodexWorkspace {
+    @MainActor
     public static var workspaces: Self {
         Self(.workspaces)
     }
 
+    @MainActor
     public static func workspaces(
-        sortDescriptors: [CodexSortDescriptor<CodexWorkspace>] = [.name()]
+        sortDescriptors: [CodexSortDescriptor<CodexWorkspace>] =
+            codexDefaultWorkspaceSortDescriptors()
     ) -> Self {
         Self(.workspaces(sortBy: sortDescriptors))
     }
 }
 
 extension CodexFetchRequest where Model == CodexChat {
+    @MainActor
     public static var recentChats: Self {
         Self(.recentChats)
     }
@@ -447,7 +434,19 @@ extension CodexFetchRequest where Model == CodexChat {
     @MainActor
     public static func chats(
         in workspace: CodexWorkspace,
-        sortDescriptors: [CodexSortDescriptor<CodexChat>] = [.updatedAt(.reverse)],
+        fetchLimit: Int? = nil
+    ) -> Self {
+        chats(
+            in: workspace,
+            sortDescriptors: codexDefaultChatSortDescriptors(),
+            fetchLimit: fetchLimit
+        )
+    }
+
+    @MainActor
+    public static func chats(
+        in workspace: CodexWorkspace,
+        sortDescriptors: [CodexSortDescriptor<CodexChat>],
         fetchLimit: Int? = nil
     ) -> Self {
         Self(.chats(
@@ -456,6 +455,26 @@ extension CodexFetchRequest where Model == CodexChat {
             fetchLimit: fetchLimit
         ))
     }
+}
+
+@MainActor
+@usableFromInline
+func codexDefaultWorkspaceGroupSortDescriptors()
+    -> [CodexSortDescriptor<CodexWorkspaceGroup>]
+{
+    [CodexSortDescriptor(\.name)]
+}
+
+@MainActor
+@usableFromInline
+func codexDefaultWorkspaceSortDescriptors() -> [CodexSortDescriptor<CodexWorkspace>] {
+    [CodexSortDescriptor(\.name)]
+}
+
+@MainActor
+@usableFromInline
+func codexDefaultChatSortDescriptors() -> [CodexSortDescriptor<CodexChat>] {
+    [CodexSortDescriptor(\.updatedAt, order: .reverse)]
 }
 
 public enum CodexFetchSectionID: Sendable, Hashable, CustomStringConvertible {

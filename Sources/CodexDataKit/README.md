@@ -66,9 +66,10 @@ let results = context.fetchedResults(for: request)
 try await results.performFetch()
 ```
 
-Convenience helpers such as `.updatedAt(.reverse)` and `.workspaceGroup` are aliases over
-the same known key-path contract. A key path must map to a supported CodexDataKit model
-field; arbitrary key paths are not silently treated as app-server sorts.
+Sort descriptors use the known key-path contract directly. A key path must map to a
+supported CodexDataKit model field; arbitrary key paths are not silently treated as
+app-server sorts. Section convenience helpers such as `.workspaceGroup` are still
+available for section descriptors.
 
 Fetches preserve object identity. If the same app-server thread appears in a later refresh, CodexDataKit mutates the existing `CodexChat` instance instead of replacing it.
 

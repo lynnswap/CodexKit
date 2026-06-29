@@ -248,7 +248,7 @@ struct CodexModelContextTests {
                 sourceKinds: [.appServer, .subAgent],
                 useStateDBOnly: true
             ),
-            sortDescriptors: [.recencyAt(.reverse)],
+            sortDescriptors: [CodexSortDescriptor(\.recencyAt, order: .reverse)],
             fetchLimit: 25
         )
 
@@ -310,26 +310,6 @@ struct CodexModelContextTests {
         #expect(params.sortKey == "updated_at")
     }
 
-    @Test("sort convenience helpers are aliases for key path descriptors")
-    func sortConvenienceHelpersAreAliasesForKeyPathDescriptors() {
-        #expect(
-            CodexSortDescriptor<CodexWorkspaceGroup>.name()
-                == CodexSortDescriptor<CodexWorkspaceGroup>(\.name)
-        )
-        #expect(
-            CodexSortDescriptor<CodexWorkspace>.name(.reverse)
-                == CodexSortDescriptor<CodexWorkspace>(\.name, order: .reverse)
-        )
-        #expect(
-            CodexSortDescriptor<CodexChat>.updatedAt(.reverse)
-                == CodexSortDescriptor<CodexChat>(\.updatedAt, order: .reverse)
-        )
-        #expect(
-            CodexSortDescriptor<CodexChat>.recencyAt(.reverse)
-                == CodexSortDescriptor<CodexChat>(\.recencyAt, order: .reverse)
-        )
-    }
-
     @Test("fetched chat exposes app-server thread status and recency")
     func fetchedChatExposesThreadStatusAndRecency() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -363,7 +343,7 @@ struct CodexModelContextTests {
         ]))
 
         let request = CodexFetchRequest<CodexChat>(
-            sortDescriptors: [.name()],
+            sortDescriptors: [CodexSortDescriptor(\.name)],
             fetchLimit: 1,
             fetchOffset: 1
         )
@@ -388,7 +368,7 @@ struct CodexModelContextTests {
             .init(threads: [.init(id: "thread-alpha", workspace: workspace, name: "Alpha")]))
 
         let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            sortDescriptors: [.name()],
+            sortDescriptors: [CodexSortDescriptor(\.name)],
             fetchLimit: 1
         ))
         try await results.performFetch()
@@ -436,7 +416,7 @@ struct CodexModelContextTests {
 
         try await runtime.transport.enqueueThreadList(page)
         let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            sortDescriptors: [.name()],
+            sortDescriptors: [CodexSortDescriptor(\.name)],
             fetchLimit: 1
         ))
         try await results.performFetch()
@@ -461,7 +441,7 @@ struct CodexModelContextTests {
             .init(id: "thread-zulu", workspace: workspace, name: "Zulu"),
         ]))
         let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            sortDescriptors: [.name()],
+            sortDescriptors: [CodexSortDescriptor(\.name)],
             fetchLimit: 1
         ))
         try await results.performFetch()
@@ -487,7 +467,7 @@ struct CodexModelContextTests {
             .init(id: "thread-zulu", workspace: workspace, name: "Zulu"),
         ]))
         let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            sortDescriptors: [.name()],
+            sortDescriptors: [CodexSortDescriptor(\.name)],
             fetchLimit: 1
         ))
         try await results.performFetch()
@@ -519,7 +499,7 @@ struct CodexModelContextTests {
             .init(id: "thread-zulu", workspace: workspace, name: "Zulu"),
         ]))
         let allChats = try await context.fetch(CodexFetchRequest<CodexChat>(
-            sortDescriptors: [.name()]
+            sortDescriptors: [CodexSortDescriptor(\.name)]
         ))
         let fetchedWorkspace = try #require(allChats.first?.workspace)
         let staleChat = context.model(for: CodexThreadID(rawValue: "thread-zulu"))
@@ -530,7 +510,7 @@ struct CodexModelContextTests {
             .init(id: "thread-beta", workspace: workspace, name: "Beta"),
         ]))
         let firstPage = try await context.fetch(CodexFetchRequest<CodexChat>(
-            sortDescriptors: [.name()],
+            sortDescriptors: [CodexSortDescriptor(\.name)],
             fetchLimit: 1
         ))
 
@@ -554,7 +534,7 @@ struct CodexModelContextTests {
 
         try await runtime.transport.enqueueThreadList(initialPage)
         let chatResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            sortDescriptors: [.name()]
+            sortDescriptors: [CodexSortDescriptor(\.name)]
         ))
         try await chatResults.performFetch()
 
@@ -590,7 +570,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadList(initialPage)
         let scopedResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>.chats(
             in: workspace,
-            sortDescriptors: [.name()]
+            sortDescriptors: [CodexSortDescriptor(\.name)]
         ), sectionedBy: .workspace)
         try await scopedResults.performFetch()
 
@@ -686,7 +666,7 @@ struct CodexModelContextTests {
         ]))
 
         let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            sortDescriptors: [.name()]
+            sortDescriptors: [CodexSortDescriptor(\.name)]
         ))
         try await results.performFetch()
 
@@ -836,7 +816,7 @@ struct CodexModelContextTests {
         ]))
         let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
             predicate: .init(archived: false),
-            sortDescriptors: [.updatedAt(.reverse)]
+            sortDescriptors: [CodexSortDescriptor(\.updatedAt, order: .reverse)]
         ))
         try await results.performFetch()
         let fetchedWorkspace = try #require(results.items.first?.workspace)
@@ -938,7 +918,7 @@ struct CodexModelContextTests {
             .init(id: "thread-move", workspace: oldWorkspaceURL, name: "Move")
         ]))
         let sectionedResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            sortDescriptors: [.name()]
+            sortDescriptors: [CodexSortDescriptor(\.name)]
         ), sectionedBy: .workspace)
         try await sectionedResults.performFetch()
         let oldWorkspaceSectionID = CodexFetchSectionID.workspace(.init(rawValue: oldWorkspaceURL.standardizedFileURL
@@ -983,19 +963,19 @@ struct CodexModelContextTests {
 
         try await runtime.transport.enqueueThreadList(initialPage)
         let nameResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            sortDescriptors: [.name()]
+            sortDescriptors: [CodexSortDescriptor(\.name)]
         ))
         try await nameResults.performFetch()
 
         try await runtime.transport.enqueueThreadList(initialPage)
         let updatedResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            sortDescriptors: [.updatedAt(.reverse)]
+            sortDescriptors: [CodexSortDescriptor(\.updatedAt, order: .reverse)]
         ))
         try await updatedResults.performFetch()
 
         try await runtime.transport.enqueueThreadList(initialPage)
         let sectionedNameResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            sortDescriptors: [.name()]
+            sortDescriptors: [CodexSortDescriptor(\.name)]
         ), sectionedBy: .workspace)
         try await sectionedNameResults.performFetch()
 
@@ -1032,7 +1012,7 @@ struct CodexModelContextTests {
         ]))
         let archivedResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
             predicate: .init(archived: true),
-            sortDescriptors: [.updatedAt(.reverse)]
+            sortDescriptors: [CodexSortDescriptor(\.updatedAt, order: .reverse)]
         ))
         try await archivedResults.performFetch()
         let chat = try #require(archivedResults.items.first)
@@ -1073,7 +1053,7 @@ struct CodexModelContextTests {
         ]))
         let archivedResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
             predicate: .init(archived: true),
-            sortDescriptors: [.updatedAt(.reverse)]
+            sortDescriptors: [CodexSortDescriptor(\.updatedAt, order: .reverse)]
         ))
         try await archivedResults.performFetch()
 
@@ -1168,7 +1148,7 @@ struct CodexModelContextTests {
         ]))
 
         let results = context.fetchedResults(
-            for: CodexFetchRequest<CodexChat>(sortDescriptors: [.recencyAt(.reverse)])
+            for: CodexFetchRequest<CodexChat>(sortDescriptors: [CodexSortDescriptor(\.recencyAt, order: .reverse)])
         )
         try await results.performFetch()
 
@@ -1186,7 +1166,7 @@ struct CodexModelContextTests {
         ]))
 
         let results = context.fetchedResults(
-            for: CodexFetchRequest<CodexChat>(sortDescriptors: [.recencyAt(.reverse), .name()])
+            for: CodexFetchRequest<CodexChat>(sortDescriptors: [CodexSortDescriptor(\.recencyAt, order: .reverse), CodexSortDescriptor(\.name)])
         )
         try await results.performFetch()
 
@@ -1207,7 +1187,7 @@ struct CodexModelContextTests {
             .init(threads: [.init(id: "thread-alpha", name: "Alpha")]))
 
         let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            sortDescriptors: [.recencyAt(.reverse), .name()],
+            sortDescriptors: [CodexSortDescriptor(\.recencyAt, order: .reverse), CodexSortDescriptor(\.name)],
             fetchLimit: 1
         ))
         try await results.performFetch()
@@ -1256,7 +1236,7 @@ struct CodexModelContextTests {
         ]))
 
         let results = context.fetchedResults(
-            for: CodexFetchRequest<CodexChat>(sortDescriptors: [.name(), .recencyAt(.reverse)])
+            for: CodexFetchRequest<CodexChat>(sortDescriptors: [CodexSortDescriptor(\.name), CodexSortDescriptor(\.recencyAt, order: .reverse)])
         )
         try await results.performFetch()
 
@@ -1278,7 +1258,7 @@ struct CodexModelContextTests {
         ]))
 
         let results = context.fetchedResults(
-            for: CodexFetchRequest<CodexChat>(sortDescriptors: [.updatedAt(.reverse)])
+            for: CodexFetchRequest<CodexChat>(sortDescriptors: [CodexSortDescriptor(\.updatedAt, order: .reverse)])
         )
         try await results.performFetch()
 
@@ -1352,7 +1332,7 @@ struct CodexModelContextTests {
         ))
 
         let results = context.fetchedResults(for: CodexFetchRequest<CodexWorkspace>(
-            sortDescriptors: [.name()],
+            sortDescriptors: [CodexSortDescriptor(\.name)],
             fetchLimit: 2
         ))
         try await results.performFetch()
@@ -1377,7 +1357,7 @@ struct CodexModelContextTests {
             .init(id: "thread-zulu", workspace: thirdWorkspace, name: "Zulu"),
         ]))
         let results = context.fetchedResults(for: CodexFetchRequest<CodexWorkspace>(
-            sortDescriptors: [.name()],
+            sortDescriptors: [CodexSortDescriptor(\.name)],
             fetchLimit: 1
         ))
         try await results.performFetch()
@@ -1501,7 +1481,7 @@ struct CodexModelContextTests {
             .init(id: "thread-remaining", workspace: workspace, name: "Remaining"),
         ]))
         let results = context.fetchedResults(for: CodexFetchRequest<CodexWorkspace>(
-            sortDescriptors: [.name()],
+            sortDescriptors: [CodexSortDescriptor(\.name)],
             fetchLimit: 1
         ))
         try await results.performFetch()
@@ -1529,7 +1509,7 @@ struct CodexModelContextTests {
             .init(id: "thread-backfill", workspace: backfill, name: "Backfill"),
         ]))
         let results = context.fetchedResults(for: CodexFetchRequest<CodexWorkspace>(
-            sortDescriptors: [.name()],
+            sortDescriptors: [CodexSortDescriptor(\.name)],
             fetchLimit: 1
         ))
         try await results.performFetch()
@@ -1565,7 +1545,7 @@ struct CodexModelContextTests {
             .init(id: "thread-move", workspace: moving, name: "Move"),
         ]))
         let results = context.fetchedResults(for: CodexFetchRequest<CodexWorkspace>(
-            sortDescriptors: [.name()],
+            sortDescriptors: [CodexSortDescriptor(\.name)],
             fetchLimit: 1
         ))
         try await results.performFetch()
@@ -1605,7 +1585,7 @@ struct CodexModelContextTests {
             .init(id: "thread-move", workspace: moving, name: "Move"),
         ]))
         let results = context.fetchedResults(for: CodexFetchRequest<CodexWorkspaceGroup>(
-            sortDescriptors: [.name()],
+            sortDescriptors: [CodexSortDescriptor(\.name)],
             fetchLimit: 1
         ))
         try await results.performFetch()
@@ -1645,7 +1625,7 @@ struct CodexModelContextTests {
             .init(id: "thread-zulu", workspace: zulu, name: "Zulu"),
         ]))
         let results = context.fetchedResults(for: CodexFetchRequest<CodexWorkspaceGroup>(
-            sortDescriptors: [.name()],
+            sortDescriptors: [CodexSortDescriptor(\.name)],
             fetchLimit: 1
         ))
         try await results.performFetch()
@@ -1792,7 +1772,7 @@ struct CodexModelContextTests {
             nextCursor: "next"
         ))
         let cursorResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            sortDescriptors: [.updatedAt(.reverse)],
+            sortDescriptors: [CodexSortDescriptor(\.updatedAt, order: .reverse)],
             fetchLimit: 1
         ))
         try await cursorResults.performFetch()
@@ -2279,7 +2259,7 @@ struct CodexModelContextTests {
             nextCursor: "next"
         ))
         let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            sortDescriptors: [.updatedAt(.reverse)],
+            sortDescriptors: [CodexSortDescriptor(\.updatedAt, order: .reverse)],
             fetchLimit: 1
         ))
         try await results.performFetch()
@@ -2308,7 +2288,7 @@ struct CodexModelContextTests {
             nextCursor: "next"
         ))
         let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            sortDescriptors: [.updatedAt(.reverse)],
+            sortDescriptors: [CodexSortDescriptor(\.updatedAt, order: .reverse)],
             fetchLimit: 1
         ))
         try await results.performFetch()
@@ -2497,7 +2477,7 @@ struct CodexModelContextTests {
             nextCursor: "next"
         ))
         let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            sortDescriptors: [.updatedAt(.reverse)],
+            sortDescriptors: [CodexSortDescriptor(\.updatedAt, order: .reverse)],
             fetchLimit: 1
         ))
         try await results.performFetch()
@@ -2554,7 +2534,7 @@ struct CodexModelContextTests {
             nextCursor: "page-2"
         ))
         let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            sortDescriptors: [.updatedAt(.reverse)],
+            sortDescriptors: [CodexSortDescriptor(\.updatedAt, order: .reverse)],
             fetchLimit: 1
         ))
         try await results.performFetch()
@@ -2589,7 +2569,7 @@ struct CodexModelContextTests {
             .init(id: "thread-c", workspace: workspaceURL, name: "C"),
         ]))
         let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            sortDescriptors: [.name()],
+            sortDescriptors: [CodexSortDescriptor(\.name)],
             fetchLimit: 2
         ))
         try await results.performFetch()
@@ -2619,7 +2599,7 @@ struct CodexModelContextTests {
 
         try await runtime.transport.enqueueThreadList(.init(threads: threads))
         let firstPage = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            sortDescriptors: [.name()],
+            sortDescriptors: [CodexSortDescriptor(\.name)],
             fetchLimit: 2
         ))
         try await firstPage.performFetch()
@@ -2627,7 +2607,7 @@ struct CodexModelContextTests {
 
         try await runtime.transport.enqueueThreadList(.init(threads: threads))
         let offsetPage = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            sortDescriptors: [.name()],
+            sortDescriptors: [CodexSortDescriptor(\.name)],
             fetchLimit: 1,
             fetchOffset: 2
         ))
@@ -2656,7 +2636,7 @@ struct CodexModelContextTests {
 
         try await runtime.transport.enqueueThreadList(.init(threads: initialThreads))
         let firstPage = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            sortDescriptors: [.name()],
+            sortDescriptors: [CodexSortDescriptor(\.name)],
             fetchLimit: 2
         ))
         try await firstPage.performFetch()
@@ -2664,7 +2644,7 @@ struct CodexModelContextTests {
 
         try await runtime.transport.enqueueThreadList(.init(threads: initialThreads))
         let offsetPage = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            sortDescriptors: [.name()],
+            sortDescriptors: [CodexSortDescriptor(\.name)],
             fetchLimit: 2,
             fetchOffset: 2
         ))
@@ -2700,7 +2680,7 @@ struct CodexModelContextTests {
 
         try await runtime.transport.enqueueThreadList(.init(threads: initialThreads))
         var firstPage: CodexFetchedResults<CodexChat>? = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            sortDescriptors: [.name()],
+            sortDescriptors: [CodexSortDescriptor(\.name)],
             fetchLimit: 2
         ))
         try await firstPage?.performFetch()
@@ -2710,7 +2690,7 @@ struct CodexModelContextTests {
 
         try await runtime.transport.enqueueThreadList(.init(threads: initialThreads))
         let offsetPage = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            sortDescriptors: [.name()],
+            sortDescriptors: [CodexSortDescriptor(\.name)],
             fetchLimit: 2,
             fetchOffset: 2
         ))
@@ -2742,7 +2722,7 @@ struct CodexModelContextTests {
 
         try await runtime.transport.enqueueThreadList(.init(threads: initialThreads))
         let firstPage = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            sortDescriptors: [.name()],
+            sortDescriptors: [CodexSortDescriptor(\.name)],
             fetchLimit: 1
         ))
         try await firstPage.performFetch()
@@ -2750,7 +2730,7 @@ struct CodexModelContextTests {
 
         try await runtime.transport.enqueueThreadList(.init(threads: initialThreads))
         let offsetPage = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            sortDescriptors: [.name()],
+            sortDescriptors: [CodexSortDescriptor(\.name)],
             fetchLimit: 2,
             fetchOffset: 1
         ))
@@ -2949,7 +2929,7 @@ struct CodexModelContextTests {
             .init(id: "thread-existing", workspace: workspaceURL, name: "Existing")
         ]))
         let pagedResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            sortDescriptors: [.updatedAt(.reverse)],
+            sortDescriptors: [CodexSortDescriptor(\.updatedAt, order: .reverse)],
             fetchLimit: 1
         ))
         try await pagedResults.performFetch()
@@ -2992,7 +2972,7 @@ struct CodexModelContextTests {
             .init(id: "thread-existing", workspace: workspaceURL, name: "Existing")
         ]))
         let limitedResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            sortDescriptors: [.updatedAt(.reverse)],
+            sortDescriptors: [CodexSortDescriptor(\.updatedAt, order: .reverse)],
             fetchLimit: 2
         ))
         try await limitedResults.performFetch()
@@ -3023,7 +3003,7 @@ struct CodexModelContextTests {
             nextCursor: "next"
         ))
         let pagedResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            sortDescriptors: [.updatedAt(.reverse)],
+            sortDescriptors: [CodexSortDescriptor(\.updatedAt, order: .reverse)],
             fetchLimit: 1
         ))
         try await pagedResults.performFetch()
@@ -3052,7 +3032,7 @@ struct CodexModelContextTests {
             .init(id: "thread-beta", workspace: workspaceURL, name: "Beta"),
         ]))
         let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            sortDescriptors: [.name()],
+            sortDescriptors: [CodexSortDescriptor(\.name)],
             fetchLimit: 1
         ))
         try await results.performFetch()
@@ -3097,7 +3077,7 @@ struct CodexModelContextTests {
             nextCursor: "page-2"
         ))
         let pagedResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            sortDescriptors: [.updatedAt(.reverse)],
+            sortDescriptors: [CodexSortDescriptor(\.updatedAt, order: .reverse)],
             fetchLimit: 1
         ))
         try await pagedResults.performFetch()
@@ -3131,7 +3111,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadList(.init(threads: []))
         let archivedResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
             predicate: .init(archived: true),
-            sortDescriptors: [.updatedAt(.reverse)]
+            sortDescriptors: [CodexSortDescriptor(\.updatedAt, order: .reverse)]
         ))
         try await archivedResults.performFetch()
 
@@ -3184,7 +3164,7 @@ struct CodexModelContextTests {
         ]))
         let archivedResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
             predicate: .init(archived: true),
-            sortDescriptors: [.updatedAt(.reverse)]
+            sortDescriptors: [CodexSortDescriptor(\.updatedAt, order: .reverse)]
         ))
         try await archivedResults.performFetch()
         let chat = try #require(archivedResults.items.first)
@@ -3282,7 +3262,7 @@ struct CodexModelContextTests {
         ]))
         let archivedResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
             predicate: .init(archived: true),
-            sortDescriptors: [.updatedAt(.reverse)]
+            sortDescriptors: [CodexSortDescriptor(\.updatedAt, order: .reverse)]
         ))
         try await archivedResults.performFetch()
         let chat = try #require(archivedResults.items.first)
@@ -3414,7 +3394,7 @@ struct CodexModelContextTests {
         ]))
         let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
             predicate: .init(sourceKinds: [.appServer]),
-            sortDescriptors: [.name()]
+            sortDescriptors: [CodexSortDescriptor(\.name)]
         ))
         try await results.performFetch()
         let beta = try #require(results.items.first { $0.id.rawValue == "thread-beta" })
@@ -3532,7 +3512,7 @@ struct CodexModelContextTests {
             .init(id: "thread-beta", name: "Beta"),
         ]))
         let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            sortDescriptors: [.name()],
+            sortDescriptors: [CodexSortDescriptor(\.name)],
             fetchLimit: 1
         ))
         try await results.performFetch()
@@ -4984,7 +4964,7 @@ struct CodexModelContextTests {
             .init(id: "thread-beta", name: "Beta", updatedAt: secondUpdate),
         ]))
         let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            sortDescriptors: [.recencyAt(.reverse)]
+            sortDescriptors: [CodexSortDescriptor(\.recencyAt, order: .reverse)]
         ))
         try await results.performFetch()
         let alpha = try #require(results.items.first { $0.id.rawValue == "thread-alpha" })
@@ -5036,7 +5016,7 @@ struct CodexModelContextTests {
             nextCursor: "next"
         ))
         let pagedResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            sortDescriptors: [.updatedAt(.reverse)],
+            sortDescriptors: [CodexSortDescriptor(\.updatedAt, order: .reverse)],
             fetchLimit: 1
         ))
         try await pagedResults.performFetch()
