@@ -2021,6 +2021,36 @@ struct CodexAppServerKitTests {
         #expect(removed)
     }
 
+    @Test func liveThreadEventStreamFinishesWhenHistoryIsAlreadyTerminal() async throws {
+        let transport = CodexAppServerTestTransport()
+        let client = AppServerClient(transport: transport)
+        let router = CodexAppServerNotificationRouter(client: client)
+        await router.start()
+        await transport.waitForNotificationStreamCount(1)
+        try await transport.emitServerNotification(
+            method: "thread/closed",
+            params: ThreadIDParams(threadID: "thread-1")
+        )
+        let replayStream = await router.events(for: CodexThreadID(rawValue: "thread-1"))
+        let replayEvents = try await withTimeout {
+            try await collect(replayStream)
+        }
+        #expect(replayEvents.contains { event in
+            if case .closed = event {
+                return true
+            }
+            return false
+        })
+
+        let stream = await router.liveEvents(for: CodexThreadID(rawValue: "thread-1"))
+        #expect(await router.threadSubscriberCountForTesting(for: "thread-1") == 0)
+
+        let events = try await withTimeout {
+            try await collect(stream)
+        }
+        #expect(events.isEmpty)
+    }
+
     @Test func turnEventStreamCancellationRemovesRouterSubscriber() async throws {
         let transport = CodexAppServerTestTransport()
         let client = AppServerClient(transport: transport)

@@ -3885,6 +3885,63 @@ struct CodexModelContextTests {
         #expect(chat.transcript.finalAnswer == "Done")
     }
 
+    @Test("chat send with revert policy refreshes observed transcript after failure")
+    func chatSendWithRevertPolicyRefreshesObservedTranscriptAfterFailure() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-revert"))
+        try await runtime.transport.enqueueThreadRead(.init(id: "thread-revert", turns: []))
+
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-revert"))
+        let observation = try await chat.observe()
+        defer {
+            observation.cancel()
+        }
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-revert"))
+        try await runtime.transport.enqueueTurnStart(turnID: "turn-revert", status: "running")
+        try await runtime.transport.enqueueEmpty(for: "thread/rollback")
+        try await runtime.transport.enqueueThreadRead(.init(id: "thread-revert", turns: []))
+
+        let sendTask = Task {
+            try await chat.send(
+                "hello",
+                options: .init(transcriptErrorHandlingPolicy: .revertTranscript)
+            )
+        }
+
+        await runtime.transport.waitForRequest(method: "turn/start")
+        try await runtime.transport.emitServerNotification(
+            method: "item/completed",
+            params: ThreadItemParams(
+                threadID: "thread-revert",
+                turnID: "turn-revert",
+                item: .init(
+                    id: "message-revert",
+                    type: "agentMessage",
+                    text: "Failed output",
+                    phase: "final_answer"
+                )
+            )
+        )
+        try await runtime.transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(id: "turn-revert", status: "failed"))
+        )
+
+        do {
+            _ = try await sendTask.value
+            Issue.record("Expected failed send to throw.")
+        } catch {
+        }
+
+        #expect(await runtime.transport.recordedRequests(method: "thread/rollback").count == 1)
+        #expect(await runtime.transport.recordedRequests(method: "thread/read").count == 2)
+        #expect(chat.items.isEmpty)
+        #expect(chat.turns.isEmpty)
+    }
+
     @Test("chat observation refreshes a snapshot and applies live events in place")
     func chatObservationRefreshesSnapshotAndAppliesLiveEventsInPlace() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -4455,6 +4512,59 @@ struct CodexModelContextTests {
         }
         #expect(snapshot.phase == .loaded)
         #expect(chat.phase == .loaded)
+    }
+
+    @Test("active chat refresh applies buffered live events after read failure")
+    func activeChatRefreshAppliesBufferedLiveEventsAfterReadFailure() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-refresh-failure"))
+        try await runtime.transport.enqueueThreadRead(.init(id: "thread-refresh-failure"))
+
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-refresh-failure"))
+        let observation = try await chat.observe()
+        defer {
+            observation.cancel()
+        }
+        let changes = ChatChangeRecorder(stream: observation.changes)
+        _ = await changes.next()
+
+        let gate = CodexAppServerTestGate()
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-refresh-failure"))
+        await runtime.transport.holdNext(method: "thread/read", gate: gate)
+        await runtime.transport.enqueueFailure(
+            code: -32000,
+            message: "read failed",
+            for: "thread/read"
+        )
+
+        let refreshTask = Task {
+            try await chat.refresh()
+        }
+
+        await runtime.transport.waitForRequest(method: "thread/read", count: 2)
+        try await runtime.transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(
+                threadID: "thread-refresh-failure",
+                turnID: "turn-buffered",
+                itemID: "message-buffered",
+                delta: "Buffered",
+                phase: "final_answer"
+            )
+        )
+        await gate.open()
+
+        do {
+            _ = try await refreshTask.value
+            Issue.record("Expected refresh to throw.")
+        } catch {
+        }
+
+        let inserted = await changes.itemInserted(id: "message-buffered", text: "Buffered")
+        #expect(inserted != nil)
+        #expect(chat.items.first { $0.id == "message-buffered" }?.text == "Buffered")
     }
 
     @Test("duplicate chat observations receive independent change streams")

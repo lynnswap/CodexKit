@@ -374,6 +374,7 @@ public actor CodexAppServer {
                 threadID: id.rawValue,
                 params: threadStartParams(options: options)
             ))
+        await router.reopenThread(id)
         return thread(from: response.thread, model: response.model ?? options.model)
     }
 

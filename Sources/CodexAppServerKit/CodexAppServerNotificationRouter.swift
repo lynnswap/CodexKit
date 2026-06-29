@@ -132,6 +132,10 @@ package actor CodexAppServerNotificationRouter {
         threadSubscribersByThreadID[threadID]?.count ?? 0
     }
 
+    package func reopenThread(_ threadID: CodexThreadID) {
+        threadHistoryByThreadID[threadID]?.removeAll(where: Self.isTerminalThreadEvent)
+    }
+
     private func route(_ notification: JSONRPC.Notification) {
         let reviewNotification = try? AppServerReviewNotification(
             method: notification.method,
@@ -223,10 +227,10 @@ package actor CodexAppServerNotificationRouter {
             for event in history {
                 continuation.yield(event)
             }
-            if history.contains(where: Self.isTerminalThreadEvent) {
-                continuation.finish()
-                return
-            }
+        }
+        if history.contains(where: Self.isTerminalThreadEvent) {
+            continuation.finish()
+            return
         }
         threadSubscribersByThreadID[threadID, default: [:]][subscriptionID] = .init(
             continuation: continuation)

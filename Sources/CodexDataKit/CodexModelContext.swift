@@ -62,7 +62,7 @@ public final class CodexModelContext: @unchecked Sendable {
             setupTask?.cancel()
             eventTask?.cancel()
             turnsUpgradeTask?.cancel()
-            bufferedEvents.removeAll(keepingCapacity: true)
+            discardBufferedEvents()
             finishChangeStreams()
         }
 
@@ -269,7 +269,8 @@ public final class CodexModelContext: @unchecked Sendable {
     private func refresh(
         _ chat: CodexChat,
         using thread: CodexThread,
-        includeTurns: Bool
+        includeTurns: Bool,
+        replaysBufferedEvents: Bool = true
     ) async throws {
         let previousWorkspace = chat.workspace
         let previousGroup = previousWorkspace?.workspaceGroup
@@ -279,7 +280,11 @@ public final class CodexModelContext: @unchecked Sendable {
         do {
             snapshot = try await thread.read(includeTurns: includeTurns)
         } catch {
-            observation?.discardBufferedEvents()
+            if replaysBufferedEvents {
+                await flushBufferedEvents(from: observation, to: chat)
+            } else {
+                observation?.discardBufferedEvents()
+            }
             throw error
         }
         let refreshedChat = apply(snapshot)
@@ -288,10 +293,10 @@ public final class CodexModelContext: @unchecked Sendable {
         }
         refreshedChat.syncPhaseAfterRefresh(includeTurns: includeTurns)
         observation?.yield([.snapshot(CodexChatSnapshot(chat: refreshedChat))])
-        let bufferedEvents = observation?.finishBufferingEvents() ?? []
-        for event in bufferedEvents {
-            let changes = await apply(event, to: refreshedChat)
-            observation?.yield(changes)
+        if replaysBufferedEvents {
+            await flushBufferedEvents(from: observation, to: refreshedChat)
+        } else {
+            observation?.discardBufferedEvents()
         }
         await revalidateChatInRegisteredResults(
             refreshedChat,
@@ -299,6 +304,17 @@ public final class CodexModelContext: @unchecked Sendable {
             previousGroup: previousGroup,
             archived: refreshedChat.isArchived
         )
+    }
+
+    private func flushBufferedEvents(
+        from observation: ActiveChatObservation?,
+        to chat: CodexChat
+    ) async {
+        let bufferedEvents = observation?.finishBufferingEvents() ?? []
+        for event in bufferedEvents {
+            let changes = await apply(event, to: chat)
+            observation?.yield(changes)
+        }
     }
 
     public func observe(
@@ -593,9 +609,21 @@ public final class CodexModelContext: @unchecked Sendable {
         in chat: CodexChat
     ) async throws -> CodexResponse {
         let thread = try await appServer.resumeThread(chat.id)
-        let response = try await thread.respond(to: input.prompt, options: input.options)
-        await apply(response, to: chat)
-        return response
+        do {
+            let response = try await thread.respond(to: input.prompt, options: input.options)
+            await apply(response, to: chat)
+            return response
+        } catch {
+            if input.options.transcriptErrorHandlingPolicy == .revertTranscript {
+                try? await refresh(
+                    chat,
+                    using: thread,
+                    includeTurns: true,
+                    replaysBufferedEvents: false
+                )
+            }
+            throw error
+        }
     }
 
     @discardableResult
