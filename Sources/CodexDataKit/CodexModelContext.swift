@@ -441,6 +441,7 @@ public final class CodexModelContext: @unchecked Sendable {
             }
             observation.eventThread = thread
             try Task.checkCancellation()
+            await thread.reopenLiveEventStream()
             observation.beginBufferingEvents()
             await startEventTask(observation, for: chat, thread: thread)
             try await refresh(chat, using: thread, includeTurns: includeTurns)

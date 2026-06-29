@@ -4371,6 +4371,50 @@ struct CodexModelContextTests {
         #expect(turnSnapshot.items.map(\.id) == ["review-message"])
     }
 
+    @Test("inline review session observation reopens previously closed event threads")
+    func inlineReviewSessionObservationReopensPreviouslyClosedEventThreads() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-inline-review"))
+        let thread = try await runtime.server.resumeThread("thread-inline-review")
+        try await runtime.transport.emitServerNotification(
+            method: "thread/closed",
+            params: ThreadClosedParams(threadID: "thread-inline-review")
+        )
+        var closedIterator = thread.events.makeAsyncIterator()
+        guard case .closed = try await closedIterator.next() else {
+            Issue.record("Expected closed event to seed terminal thread history.")
+            return
+        }
+
+        try await runtime.transport.enqueueReviewStart(turnID: "turn-inline-review")
+        let reviewSession = try await thread.startReview(target: .baseBranch("main"))
+        try await runtime.transport.enqueueThreadRead(.init(id: "thread-inline-review"))
+
+        let observation = try await context.observe(reviewSession)
+        defer {
+            observation.cancel()
+        }
+
+        try await runtime.transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(
+                threadID: "thread-inline-review",
+                turnID: "turn-inline-review",
+                itemID: "message-inline-review",
+                delta: "Inline review",
+                phase: "final_answer"
+            )
+        )
+
+        #expect(await eventually {
+            observation.chat.items.contains {
+                $0.id == "message-inline-review" && $0.text == "Inline review"
+            }
+        })
+    }
+
     @Test("duplicate chat observations share one live consumer")
     func duplicateChatObservationsShareOneLiveConsumer() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()

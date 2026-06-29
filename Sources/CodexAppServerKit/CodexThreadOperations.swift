@@ -31,6 +31,10 @@ extension CodexThread {
         await router.liveEvents(for: id)
     }
 
+    package func reopenLiveEventStream() async {
+        await router.reopenThread(id)
+    }
+
     /// Agent messages emitted by this thread.
     ///
     /// This sequence is derived from `events` and is useful when callers only
