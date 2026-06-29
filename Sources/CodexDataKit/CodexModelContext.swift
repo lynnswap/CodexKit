@@ -139,19 +139,37 @@ public final class CodexModelContext: @unchecked Sendable {
     }
 
     public func fetch<Model: CodexObservableModel>(
-        _ request: CodexFetchRequest<Model>
+        _ descriptor: CodexFetchDescriptor<Model>
     ) async throws -> [Model] {
-        let page = try await fetchPage(request)
-        await syncLoadedRelationships(from: page, request: request)
+        let page = try await fetchPage(descriptor)
+        await syncLoadedRelationships(from: page, descriptor: descriptor)
         return page.items
     }
 
+    public func fetch<Model: CodexObservableModel>(
+        _ request: CodexFetchRequest<Model>
+    ) async throws -> [Model] {
+        try await fetch(request.fetchDescriptor)
+    }
+
     public func fetchedResults<Model: CodexObservableModel>(
-        for request: CodexFetchRequest<Model>
+        for descriptor: CodexFetchDescriptor<Model>,
+        sectionedBy sectionBy: CodexSectionDescriptor<Model>? = nil
     ) -> CodexFetchedResults<Model> {
-        let results = CodexFetchedResults(modelContext: self, request: request)
+        let results = CodexFetchedResults(
+            modelContext: self,
+            fetchDescriptor: descriptor,
+            sectionBy: sectionBy
+        )
         register(results)
         return results
+    }
+
+    public func fetchedResults<Model: CodexObservableModel>(
+        for request: CodexFetchRequest<Model>,
+        sectionedBy sectionBy: CodexSectionDescriptor<Model>? = nil
+    ) -> CodexFetchedResults<Model> {
+        fetchedResults(for: request.fetchDescriptor, sectionedBy: sectionBy)
     }
 
     public func model(for id: CodexThreadID) -> CodexChat {
@@ -175,17 +193,14 @@ public final class CodexModelContext: @unchecked Sendable {
     }
 
     public func refresh(_ group: CodexWorkspaceGroup) async throws {
-        let request = CodexFetchRequest<CodexWorkspace>(
-            sortDescriptors: [.name()],
-            sectionDescriptor: .workspaceGroup
-        )
+        let descriptor = CodexFetchDescriptor<CodexWorkspace>(sortBy: [.name()])
         let previousWorkspaces = group.workspaces
         let previousChats = group.workspaces.flatMap(\.chats)
-        let snapshots = try await fetchAllThreadSnapshots(matching: request)
+        let snapshots = try await fetchAllThreadSnapshots(matching: descriptor)
         let fetchedChats = await applyFetchedSnapshots(
             snapshots,
-            archived: request.filter.archived == true,
-            scopedWorkspaceURL: request.filter.singleWorkspace
+            archived: descriptor.predicate.archived == true,
+            scopedWorkspaceURL: descriptor.predicate.singleWorkspace
         )
         let fetchedChatIDs = Set(fetchedChats.map(\.id))
         let chats = fetchedChats.filter { $0.workspace?.workspaceGroup?.id == group.id }
@@ -196,7 +211,7 @@ public final class CodexModelContext: @unchecked Sendable {
             let fetchedIDs = Set(fetchedWorkspaceChats.map(\.id))
             let preservedChats = previousWorkspaceChats.filter {
                 fetchedIDs.contains($0.id) == false
-                    && shouldPreserve($0, outside: request.filter.archived)
+                    && shouldPreserve($0, outside: descriptor.predicate.archived)
             }
             let currentChats = fetchedWorkspaceChats + preservedChats
             workspace.setChats(currentChats)
@@ -205,7 +220,7 @@ public final class CodexModelContext: @unchecked Sendable {
                 previousWorkspaceChats,
                 from: workspace,
                 keeping: currentChats,
-                archivedScope: request.filter.archived
+                archivedScope: descriptor.predicate.archived
             )
         }
         let previousWorkspacesStillInGroup = previousWorkspaces.filter {
@@ -215,39 +230,39 @@ public final class CodexModelContext: @unchecked Sendable {
         let refreshedWorkspaceIDs = Set(refreshedWorkspaces.map(\.id))
         let preservedWorkspaces = previousWorkspacesStillInGroup.filter {
             refreshedWorkspaceIDs.contains($0.id) == false
-                && containsOutOfScopeChat(in: $0, archivedScope: request.filter.archived)
+                && containsOutOfScopeChat(in: $0, archivedScope: descriptor.predicate.archived)
         }
-        group.setWorkspaces(sort(refreshedWorkspaces + preservedWorkspaces, using: request.sortDescriptors))
+        group.setWorkspaces(sort(refreshedWorkspaces + preservedWorkspaces, using: descriptor.sortBy))
         let currentChatIDs = Set(group.workspaces.flatMap(\.chats).map(\.id))
         let removedChats = previousChats.filter {
             currentChatIDs.contains($0.id) == false
                 && fetchedChatIDs.contains($0.id) == false
-                && isInRefreshedScope($0, archivedScope: request.filter.archived)
+                && isInRefreshedScope($0, archivedScope: descriptor.predicate.archived)
         }
         await refreshWorkspaceGroupInRegisteredResults(
             group,
-            archived: request.filter.archived == true,
+            archived: descriptor.predicate.archived == true,
             removedChats: removedChats
         )
     }
 
     public func refresh(_ workspace: CodexWorkspace) async throws {
-        let request = CodexFetchRequest<CodexChat>.chats(in: workspace)
+        let descriptor = CodexFetchDescriptor<CodexChat>.chats(in: workspace)
         let previousChats = workspace.chats
-        let snapshots = try await fetchAllThreadSnapshots(matching: request)
+        let snapshots = try await fetchAllThreadSnapshots(matching: descriptor)
         let fetchedChats = await applyFetchedSnapshots(
             snapshots,
-            archived: request.filter.archived == true,
-            scopedWorkspaceURL: request.filter.singleWorkspace
+            archived: descriptor.predicate.archived == true,
+            scopedWorkspaceURL: descriptor.predicate.singleWorkspace
         )
         let chats = sort(
             fetchedChats,
-            using: request.sortDescriptors
+            using: descriptor.sortBy
         )
         let refreshedIDs = Set(chats.map(\.id))
         let preservedChats = previousChats.filter {
             refreshedIDs.contains($0.id) == false
-                && shouldPreserve($0, outside: request.filter.archived)
+                && shouldPreserve($0, outside: descriptor.predicate.archived)
         }
         let currentChats = chats + preservedChats
         workspace.setChats(currentChats)
@@ -256,11 +271,11 @@ public final class CodexModelContext: @unchecked Sendable {
             previousChats,
             from: workspace,
             keeping: currentChats,
-            archivedScope: request.filter.archived
+            archivedScope: descriptor.predicate.archived
         )
         await refreshWorkspaceInRegisteredResults(
             workspace,
-            archived: request.filter.archived == true,
+            archived: descriptor.predicate.archived == true,
             removedChats: removedChats
         )
     }
@@ -724,12 +739,12 @@ public final class CodexModelContext: @unchecked Sendable {
     }
 
     package func fetchPage<Model: CodexObservableModel>(
-        _ request: CodexFetchRequest<Model>,
+        _ descriptor: CodexFetchDescriptor<Model>,
         excluding excludedRegistration: (any CodexFetchedResultsRegistration)? = nil
     ) async throws -> CodexFetchPage<Model> {
         if Model.self == CodexChat.self {
             let page = try await fetchChatPage(
-                request as! CodexFetchRequest<CodexChat>,
+                descriptor as! CodexFetchDescriptor<CodexChat>,
                 excluding: excludedRegistration
             )
             return CodexFetchPage(
@@ -742,7 +757,7 @@ public final class CodexModelContext: @unchecked Sendable {
         }
         if Model.self == CodexWorkspace.self {
             let page = try await fetchWorkspacePage(
-                request as! CodexFetchRequest<CodexWorkspace>,
+                descriptor as! CodexFetchDescriptor<CodexWorkspace>,
                 excluding: excludedRegistration
             )
             return CodexFetchPage(
@@ -755,7 +770,7 @@ public final class CodexModelContext: @unchecked Sendable {
         }
         if Model.self == CodexWorkspaceGroup.self {
             let page = try await fetchWorkspaceGroupPage(
-                request as! CodexFetchRequest<CodexWorkspaceGroup>,
+                descriptor as! CodexFetchDescriptor<CodexWorkspaceGroup>,
                 excluding: excludedRegistration
             )
             return CodexFetchPage(
@@ -771,18 +786,18 @@ public final class CodexModelContext: @unchecked Sendable {
 
     package func sections<Model: CodexObservableModel>(
         for items: [Model],
-        descriptor: CodexSectionDescriptor<Model>?
+        sectionBy: CodexSectionDescriptor<Model>?
     ) -> [CodexFetchSection<Model>] {
         guard items.isEmpty == false else {
             return []
         }
-        guard let descriptor else {
-            return [CodexFetchSection(id: "default", title: nil, items: items)]
+        guard let sectionBy else {
+            return [CodexFetchSection(id: .default, title: nil, items: items)]
         }
 
-        var grouped: [(id: String, title: String, items: [Model])] = []
+        var grouped: [(id: CodexFetchSectionID, title: String, items: [Model])] = []
         for item in items {
-            let section = sectionIdentity(for: item, descriptor: descriptor)
+            let section = sectionIdentity(for: item, descriptor: sectionBy)
             if let index = grouped.firstIndex(where: { $0.id == section.id }) {
                 grouped[index].items.append(item)
             } else {
@@ -796,21 +811,21 @@ public final class CodexModelContext: @unchecked Sendable {
 
     package func sortedItems<Model: CodexObservableModel>(
         _ items: [Model],
-        for request: CodexFetchRequest<Model>
+        for descriptor: CodexFetchDescriptor<Model>
     ) -> [Model] {
         if Model.self == CodexChat.self {
-            let request = request as! CodexFetchRequest<CodexChat>
-            return sort(items as! [CodexChat], using: request.sortDescriptors).map { $0 as! Model }
+            let descriptor = descriptor as! CodexFetchDescriptor<CodexChat>
+            return sort(items as! [CodexChat], using: descriptor.sortBy).map { $0 as! Model }
         }
         if Model.self == CodexWorkspace.self {
-            let request = request as! CodexFetchRequest<CodexWorkspace>
-            return sort(items as! [CodexWorkspace], using: request.sortDescriptors).map {
+            let descriptor = descriptor as! CodexFetchDescriptor<CodexWorkspace>
+            return sort(items as! [CodexWorkspace], using: descriptor.sortBy).map {
                 $0 as! Model
             }
         }
         if Model.self == CodexWorkspaceGroup.self {
-            let request = request as! CodexFetchRequest<CodexWorkspaceGroup>
-            return sort(items as! [CodexWorkspaceGroup], using: request.sortDescriptors).map {
+            let descriptor = descriptor as! CodexFetchDescriptor<CodexWorkspaceGroup>
+            return sort(items as! [CodexWorkspaceGroup], using: descriptor.sortBy).map {
                 $0 as! Model
             }
         }
@@ -825,23 +840,23 @@ public final class CodexModelContext: @unchecked Sendable {
     }
 
     private func fetchChatPage(
-        _ request: CodexFetchRequest<CodexChat>,
+        _ descriptor: CodexFetchDescriptor<CodexChat>,
         excluding excludedRegistration: (any CodexFetchedResultsRegistration)? = nil
     ) async throws
         -> CodexFetchPage<CodexChat>
     {
-        if canUseServerOrderedPages(for: request) == false {
+        if canUseServerOrderedPages(for: descriptor) == false {
             let fetchedChats = await applyFetchedSnapshots(
-                try await fetchAllThreadSnapshots(matching: request),
-                archived: request.filter.archived == true,
-                scopedWorkspaceURL: request.filter.singleWorkspace,
+                try await fetchAllThreadSnapshots(matching: descriptor),
+                archived: descriptor.predicate.archived == true,
+                scopedWorkspaceURL: descriptor.predicate.singleWorkspace,
                 excluding: excludedRegistration
             )
             let chats = sort(
                 fetchedChats,
-                using: request.sortDescriptors
+                using: descriptor.sortBy
             )
-            let page = localPage(chats, for: request)
+            let page = localPage(chats, for: descriptor)
             return CodexFetchPage(
                 items: page.items,
                 nextCursor: page.nextCursor,
@@ -851,16 +866,16 @@ public final class CodexModelContext: @unchecked Sendable {
             )
         }
 
-        let page = try await appServer.listThreads(threadQuery(from: request))
+        let page = try await appServer.listThreads(threadQuery(from: descriptor))
         let fetchedChats = await applyFetchedSnapshots(
             page.threads,
-            archived: request.filter.archived == true,
-            scopedWorkspaceURL: request.filter.singleWorkspace,
+            archived: descriptor.predicate.archived == true,
+            scopedWorkspaceURL: descriptor.predicate.singleWorkspace,
             excluding: excludedRegistration
         )
         let chats = sort(
             fetchedChats,
-            using: request.sortDescriptors
+            using: descriptor.sortBy
         )
         return CodexFetchPage(
             items: chats,
@@ -870,28 +885,28 @@ public final class CodexModelContext: @unchecked Sendable {
     }
 
     private func fetchWorkspacePage(
-        _ request: CodexFetchRequest<CodexWorkspace>,
+        _ descriptor: CodexFetchDescriptor<CodexWorkspace>,
         excluding excludedRegistration: (any CodexFetchedResultsRegistration)? = nil
     ) async throws -> CodexFetchPage<CodexWorkspace> {
         let chats = await applyFetchedSnapshots(
-            try await fetchAllThreadSnapshots(matching: request),
-            archived: request.filter.archived == true,
-            scopedWorkspaceURL: request.filter.singleWorkspace,
+            try await fetchAllThreadSnapshots(matching: descriptor),
+            archived: descriptor.predicate.archived == true,
+            scopedWorkspaceURL: descriptor.predicate.singleWorkspace,
             excluding: excludedRegistration
         )
         let workspaces = unique(chats.compactMap(\.workspace))
         let removedChats = syncWorkspaceChats(
             chats,
             preservingExisting: shouldPreserveExistingWorkspaceChats(
-                for: request,
+                for: descriptor,
                 relationshipIsComplete: true
             ),
-            workspaceFilters: request.filter.workspaces,
-            archivedScope: request.filter.archived
+            workspaceFilters: descriptor.predicate.workspaces,
+            archivedScope: descriptor.predicate.archived
         )
         await removeChatsFromRegisteredResults(removedChats, excluding: excludedRegistration)
-        let sortedWorkspaces = sort(workspaces, using: request.sortDescriptors)
-        let page = localPage(sortedWorkspaces, for: request)
+        let sortedWorkspaces = sort(workspaces, using: descriptor.sortBy)
+        let page = localPage(sortedWorkspaces, for: descriptor)
         return CodexFetchPage(
             items: page.items,
             nextCursor: page.nextCursor,
@@ -902,39 +917,39 @@ public final class CodexModelContext: @unchecked Sendable {
     }
 
     private func fetchWorkspaceGroupPage(
-        _ request: CodexFetchRequest<CodexWorkspaceGroup>,
+        _ descriptor: CodexFetchDescriptor<CodexWorkspaceGroup>,
         excluding excludedRegistration: (any CodexFetchedResultsRegistration)? = nil
     ) async throws -> CodexFetchPage<CodexWorkspaceGroup> {
         let chats = await applyFetchedSnapshots(
-            try await fetchAllThreadSnapshots(matching: request),
-            archived: request.filter.archived == true,
-            scopedWorkspaceURL: request.filter.singleWorkspace,
+            try await fetchAllThreadSnapshots(matching: descriptor),
+            archived: descriptor.predicate.archived == true,
+            scopedWorkspaceURL: descriptor.predicate.singleWorkspace,
             excluding: excludedRegistration
         )
         let workspaces = unique(chats.compactMap(\.workspace))
         let groups = unique(workspaces.compactMap(\.workspaceGroup))
-        let preservingGroupWorkspaces = request.filter.workspaces != nil
+        let preservingGroupWorkspaces = descriptor.predicate.workspaces != nil
             || shouldPreserveExistingWorkspaceChats(
-                for: request,
+                for: descriptor,
                 relationshipIsComplete: true
             )
         let removedChats = syncWorkspaceChats(
             chats,
             preservingExisting: shouldPreserveExistingWorkspaceChats(
-                for: request,
+                for: descriptor,
                 relationshipIsComplete: true
             ),
-            workspaceFilters: request.filter.workspaces,
-            archivedScope: request.filter.archived
+            workspaceFilters: descriptor.predicate.workspaces,
+            archivedScope: descriptor.predicate.archived
         )
         await removeChatsFromRegisteredResults(removedChats, excluding: excludedRegistration)
         syncGroupWorkspaces(
             workspaces,
             preservingExisting: preservingGroupWorkspaces,
-            archivedScope: request.filter.archived
+            archivedScope: descriptor.predicate.archived
         )
-        let sortedGroups = sort(groups, using: request.sortDescriptors)
-        let page = localPage(sortedGroups, for: request)
+        let sortedGroups = sort(groups, using: descriptor.sortBy)
+        let page = localPage(sortedGroups, for: descriptor)
         return CodexFetchPage(
             items: page.items,
             nextCursor: page.nextCursor,
@@ -1104,16 +1119,16 @@ public final class CodexModelContext: @unchecked Sendable {
 
     package func syncLoadedRelationships<Model: CodexObservableModel>(
         from page: CodexFetchPage<Model>,
-        request: CodexFetchRequest<Model>,
+        descriptor: CodexFetchDescriptor<Model>,
         loadedItems: [Model]? = nil,
         excluding excludedRegistration: (any CodexFetchedResultsRegistration)? = nil
     ) async {
         let relationshipItems = page.relationshipItems ?? loadedItems ?? page.items
         let relationshipIsComplete = page.relationshipIsComplete
-            ?? (page.nextCursor == nil && request.cursor == nil)
+            ?? (page.nextCursor == nil && descriptor.cursor == nil)
         await syncLoadedRelationships(
             relationshipItems,
-            request: request,
+            descriptor: descriptor,
             relationshipIsComplete: relationshipIsComplete,
             excluding: excludedRegistration
         )
@@ -1121,7 +1136,7 @@ public final class CodexModelContext: @unchecked Sendable {
 
     private func syncLoadedRelationships<Model: CodexObservableModel>(
         _ items: [Model],
-        request: CodexFetchRequest<Model>,
+        descriptor: CodexFetchDescriptor<Model>,
         relationshipIsComplete: Bool,
         excluding excludedRegistration: (any CodexFetchedResultsRegistration)? = nil
     ) async {
@@ -1129,11 +1144,11 @@ public final class CodexModelContext: @unchecked Sendable {
             let removedChats = syncWorkspaceChats(
                 chats,
                 preservingExisting: shouldPreserveExistingWorkspaceChats(
-                    for: request,
+                    for: descriptor,
                     relationshipIsComplete: relationshipIsComplete
                 ),
-                workspaceFilters: request.filter.workspaces,
-                archivedScope: request.filter.archived
+                workspaceFilters: descriptor.predicate.workspaces,
+                archivedScope: descriptor.predicate.archived
             )
             await removeChatsFromRegisteredResults(removedChats, excluding: excludedRegistration)
         }
@@ -1269,15 +1284,15 @@ public final class CodexModelContext: @unchecked Sendable {
     }
 
     private func shouldPreserveExistingWorkspaceChats<Model: CodexObservableModel>(
-        for request: CodexFetchRequest<Model>,
+        for descriptor: CodexFetchDescriptor<Model>,
         relationshipIsComplete: Bool
     ) -> Bool {
         (Model.self == CodexChat.self
             && relationshipIsComplete == false)
-            || request.filter.searchTerm?.isEmpty == false
-            || request.filter.modelProviders?.isEmpty == false
-            || request.filter.sourceKinds != nil
-            || request.filter.useStateDBOnly != nil
+            || descriptor.predicate.searchTerm?.isEmpty == false
+            || descriptor.predicate.modelProviders?.isEmpty == false
+            || descriptor.predicate.sourceKinds != nil
+            || descriptor.predicate.useStateDBOnly != nil
     }
 
     private func workspaceIfLoaded(for url: URL) -> CodexWorkspace? {
@@ -1408,9 +1423,9 @@ public final class CodexModelContext: @unchecked Sendable {
     }
 
     private func fetchAllThreadSnapshots<Model: CodexObservableModel>(
-        matching request: CodexFetchRequest<Model>
+        matching descriptor: CodexFetchDescriptor<Model>
     ) async throws -> [CodexThreadSnapshot] {
-        var query = threadQuery(from: request, includePaging: false)
+        var query = threadQuery(from: descriptor, includePaging: false)
         var threads: [CodexThreadSnapshot] = []
         var cursor: String?
 
@@ -1426,10 +1441,14 @@ public final class CodexModelContext: @unchecked Sendable {
 
     private func localPage<Model: CodexObservableModel>(
         _ items: [Model],
-        for request: CodexFetchRequest<Model>
+        for descriptor: CodexFetchDescriptor<Model>
     ) -> CodexFetchPage<Model> {
-        let start = min(localCursorOffset(from: request.cursor), items.count)
-        guard let limit = request.fetchLimit else {
+        let offset =
+            descriptor.cursor == nil
+            ? descriptor.fetchOffset
+            : localCursorOffset(from: descriptor.cursor)
+        let start = min(offset, items.count)
+        guard let limit = descriptor.fetchLimit else {
             return CodexFetchPage(
                 items: Array(items[start..<items.endIndex]),
                 nextCursor: nil,
@@ -1450,18 +1469,21 @@ public final class CodexModelContext: @unchecked Sendable {
     }
 
     private func canUseServerOrderedPages<Model: CodexObservableModel>(
-        for request: CodexFetchRequest<Model>
+        for descriptor: CodexFetchDescriptor<Model>
     ) -> Bool {
-        if request.cursor?.hasPrefix(Self.localCursorPrefix) == true {
+        if descriptor.fetchOffset > 0 {
             return false
         }
-        guard let primarySort = request.sortDescriptors.first else {
+        if descriptor.cursor?.hasPrefix(Self.localCursorPrefix) == true {
+            return false
+        }
+        guard let primarySort = descriptor.sortBy.first else {
             return true
         }
         if primarySort.key == .recencyAt {
             return true
         }
-        return request.sortDescriptors.count == 1 && primarySort.threadSortKey != nil
+        return descriptor.sortBy.count == 1 && primarySort.threadSortKey != nil
     }
 
     package func localCursor(for offset: Int) -> String {
@@ -1483,13 +1505,13 @@ public final class CodexModelContext: @unchecked Sendable {
     }
 
     private func threadQuery<Model: CodexObservableModel>(
-        from request: CodexFetchRequest<Model>,
+        from descriptor: CodexFetchDescriptor<Model>,
         includePaging: Bool = true
     )
         -> CodexThreadQuery
     {
-        let serverSort = request.sortDescriptors.first { descriptor in
-            switch descriptor.key {
+        let serverSort = descriptor.sortBy.first { sortDescriptor in
+            switch sortDescriptor.key {
             case .createdAt, .updatedAt, .recencyAt:
                 return true
             case .name:
@@ -1497,37 +1519,37 @@ public final class CodexModelContext: @unchecked Sendable {
             }
         }
         return CodexThreadQuery(
-            archived: request.filter.archived,
-            cursor: includePaging ? request.cursor : nil,
-            workspaces: request.filter.workspaces,
-            limit: includePaging ? request.fetchLimit : nil,
-            searchTerm: request.filter.searchTerm,
-            modelProviders: request.filter.modelProviders,
+            archived: descriptor.predicate.archived,
+            cursor: includePaging ? descriptor.cursor : nil,
+            workspaces: descriptor.predicate.workspaces,
+            limit: includePaging ? descriptor.fetchLimit : nil,
+            searchTerm: descriptor.predicate.searchTerm,
+            modelProviders: descriptor.predicate.modelProviders,
             sortDirection: serverSort?.order.threadSortDirection,
             sortKey: serverSort?.threadSortKey,
-            sourceKinds: request.filter.sourceKinds,
-            useStateDBOnly: request.filter.useStateDBOnly
+            sourceKinds: descriptor.predicate.sourceKinds,
+            useStateDBOnly: descriptor.predicate.useStateDBOnly
         )
     }
 
     private func sectionIdentity<Model: CodexObservableModel>(
         for item: Model,
         descriptor: CodexSectionDescriptor<Model>
-    ) -> (id: String, title: String) {
+    ) -> (id: CodexFetchSectionID, title: String) {
         switch descriptor.key {
         case .workspace:
             if let chat = item as? CodexChat, let workspace = chat.workspace {
-                return (workspace.id.rawValue, workspace.name)
+                return (.workspace(workspace.id), workspace.name)
             }
         case .workspaceGroup:
             if let workspace = item as? CodexWorkspace, let group = workspace.workspaceGroup {
-                return (group.id.rawValue, group.name)
+                return (.workspaceGroup(group.id), group.name)
             }
             if let chat = item as? CodexChat, let group = chat.workspace?.workspaceGroup {
-                return (group.id.rawValue, group.name)
+                return (.workspaceGroup(group.id), group.name)
             }
         }
-        return ("unknown", "Unknown")
+        return (.unknown("unknown"), "Unknown")
     }
 
     private func sort(_ chats: [CodexChat], using descriptors: [CodexSortDescriptor<CodexChat>])
@@ -1657,7 +1679,7 @@ extension CodexSortDescriptor {
     }
 }
 
-extension CodexFetchFilter {
+extension CodexFetchPredicate {
     fileprivate var singleWorkspace: URL? {
         guard let workspaces, workspaces.count == 1 else {
             return nil

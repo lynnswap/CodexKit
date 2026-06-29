@@ -60,10 +60,38 @@ public struct CodexQueryResults<Model: CodexObservableModel>: RandomAccessCollec
 public struct CodexQuery<Model: CodexObservableModel>: @preconcurrency DynamicProperty {
     @Environment(\.codexModelContext) private var modelContext
     @State private var fetchedResults: CodexFetchedResults<Model>?
-    private let request: CodexFetchRequest<Model>
+    private let fetchDescriptor: CodexFetchDescriptor<Model>
+    private let sectionBy: CodexSectionDescriptor<Model>?
 
-    public init(_ request: CodexFetchRequest<Model>) {
-        self.request = request
+    public init(
+        _ descriptor: CodexFetchDescriptor<Model> = .init(),
+        animation _: Animation? = nil,
+        sectionBy: CodexSectionDescriptor<Model>? = nil
+    ) {
+        self.fetchDescriptor = descriptor
+        self.sectionBy = sectionBy
+    }
+
+    public init(
+        filter: CodexFetchPredicate<Model>? = nil,
+        sort: [CodexSortDescriptor<Model>] = [],
+        animation _: Animation? = nil,
+        sectionBy: CodexSectionDescriptor<Model>? = nil
+    ) {
+        self.fetchDescriptor = CodexFetchDescriptor(
+            predicate: filter ?? .init(),
+            sortBy: sort
+        )
+        self.sectionBy = sectionBy
+    }
+
+    public init(
+        fetchRequest request: CodexFetchRequest<Model>,
+        animation _: Animation? = nil,
+        sectionBy: CodexSectionDescriptor<Model>? = nil
+    ) {
+        self.fetchDescriptor = request.fetchDescriptor
+        self.sectionBy = sectionBy
     }
 
     public var wrappedValue: CodexQueryResults<Model> {
@@ -86,11 +114,12 @@ public struct CodexQuery<Model: CodexObservableModel>: @preconcurrency DynamicPr
 
         if let fetchedResults,
            fetchedResults.modelContext === modelContext,
-           fetchedResults.request == request {
+           fetchedResults.fetchDescriptor == fetchDescriptor,
+           fetchedResults.sectionBy == sectionBy {
             return
         }
 
-        let results = modelContext.fetchedResults(for: request)
+        let results = modelContext.fetchedResults(for: fetchDescriptor, sectionedBy: sectionBy)
         fetchedResults = results
         Task {
             try? await results.performFetch()

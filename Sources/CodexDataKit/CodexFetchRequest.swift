@@ -92,7 +92,7 @@ extension CodexSectionDescriptor where Model == CodexChat {
     }
 }
 
-public struct CodexFetchFilter<Model: CodexObservableModel>: Sendable, Hashable {
+public struct CodexFetchPredicate<Model: CodexObservableModel>: Sendable, Hashable {
     public var archived: Bool?
     public var workspaces: [URL]? {
         didSet {
@@ -151,74 +151,182 @@ public struct CodexFetchFilter<Model: CodexObservableModel>: Sendable, Hashable 
     }
 }
 
-public struct CodexFetchRequest<Model: CodexObservableModel>: Sendable, Hashable {
-    public var filter: CodexFetchFilter<Model>
-    public var sortDescriptors: [CodexSortDescriptor<Model>]
-    public var sectionDescriptor: CodexSectionDescriptor<Model>?
+public struct CodexFetchDescriptor<Model: CodexObservableModel>: Sendable, Hashable {
+    public var predicate: CodexFetchPredicate<Model>
+    public var sortBy: [CodexSortDescriptor<Model>]
     public var fetchLimit: Int?
-    public var cursor: String?
+    public var fetchOffset: Int
+    package var cursor: String?
 
     public init(
-        filter: CodexFetchFilter<Model> = .init(),
-        sortDescriptors: [CodexSortDescriptor<Model>] = [],
-        sectionDescriptor: CodexSectionDescriptor<Model>? = nil,
+        predicate: CodexFetchPredicate<Model> = .init(),
+        sortBy: [CodexSortDescriptor<Model>] = [],
         fetchLimit: Int? = nil,
-        cursor: String? = nil
+        fetchOffset: Int = 0
     ) {
-        self.filter = filter
-        self.sortDescriptors = sortDescriptors
-        self.sectionDescriptor = sectionDescriptor
+        self.predicate = predicate
+        self.sortBy = sortBy
         self.fetchLimit = fetchLimit
-        self.cursor = cursor
+        self.fetchOffset = max(0, fetchOffset)
+        self.cursor = nil
+    }
+}
+
+public final class CodexFetchRequest<Model: CodexObservableModel>: @unchecked Sendable {
+    public var predicate: CodexFetchPredicate<Model>
+    public var sortDescriptors: [CodexSortDescriptor<Model>]
+    public var fetchLimit: Int?
+    public var fetchOffset: Int
+    package var cursor: String?
+
+    public var fetchDescriptor: CodexFetchDescriptor<Model> {
+        get {
+            var descriptor = CodexFetchDescriptor(
+                predicate: predicate,
+                sortBy: sortDescriptors,
+                fetchLimit: fetchLimit,
+                fetchOffset: fetchOffset
+            )
+            descriptor.cursor = cursor
+            return descriptor
+        }
+        set {
+            predicate = newValue.predicate
+            sortDescriptors = newValue.sortBy
+            fetchLimit = newValue.fetchLimit
+            fetchOffset = newValue.fetchOffset
+            cursor = newValue.cursor
+        }
+    }
+
+    public init(
+        predicate: CodexFetchPredicate<Model> = .init(),
+        sortDescriptors: [CodexSortDescriptor<Model>] = [],
+        fetchLimit: Int? = nil,
+        fetchOffset: Int = 0
+    ) {
+        self.predicate = predicate
+        self.sortDescriptors = sortDescriptors
+        self.fetchLimit = fetchLimit
+        self.fetchOffset = max(0, fetchOffset)
+        self.cursor = nil
+    }
+
+    public convenience init(_ descriptor: CodexFetchDescriptor<Model>) {
+        self.init(
+            predicate: descriptor.predicate,
+            sortDescriptors: descriptor.sortBy,
+            fetchLimit: descriptor.fetchLimit,
+            fetchOffset: descriptor.fetchOffset
+        )
+        self.cursor = descriptor.cursor
+    }
+
+    package func copy() -> CodexFetchRequest<Model> {
+        CodexFetchRequest(fetchDescriptor)
+    }
+}
+
+extension CodexFetchDescriptor where Model == CodexWorkspaceGroup {
+    public static var workspaceGroups: Self {
+        .init(sortBy: [.name()])
+    }
+}
+
+extension CodexFetchDescriptor where Model == CodexWorkspace {
+    public static var workspaces: Self {
+        .init(sortBy: [.name()])
+    }
+
+    public static func workspaces(
+        sortBy: [CodexSortDescriptor<CodexWorkspace>] = [.name()]
+    ) -> Self {
+        .init(sortBy: sortBy)
+    }
+}
+
+extension CodexFetchDescriptor where Model == CodexChat {
+    public static var recentChats: Self {
+        .init(sortBy: [.updatedAt(.reverse)])
+    }
+
+    @MainActor
+    public static func chats(
+        in workspace: CodexWorkspace,
+        sortBy: [CodexSortDescriptor<CodexChat>] = [.updatedAt(.reverse)],
+        fetchLimit: Int? = nil
+    ) -> Self {
+        .init(
+            predicate: .init(workspace: workspace.url),
+            sortBy: sortBy,
+            fetchLimit: fetchLimit
+        )
     }
 }
 
 extension CodexFetchRequest where Model == CodexWorkspaceGroup {
     public static var workspaceGroups: Self {
-        .init(sortDescriptors: [.name()])
+        Self(.workspaceGroups)
     }
 }
 
 extension CodexFetchRequest where Model == CodexWorkspace {
     public static var workspaces: Self {
-        .init(sortDescriptors: [.name()])
+        Self(.workspaces)
     }
 
     public static func workspaces(
-        sectionedBy sectionDescriptor: CodexSectionDescriptor<CodexWorkspace>? = nil,
         sortDescriptors: [CodexSortDescriptor<CodexWorkspace>] = [.name()]
     ) -> Self {
-        .init(sortDescriptors: sortDescriptors, sectionDescriptor: sectionDescriptor)
+        Self(.workspaces(sortBy: sortDescriptors))
     }
 }
 
 extension CodexFetchRequest where Model == CodexChat {
     public static var recentChats: Self {
-        .init(sortDescriptors: [.updatedAt(.reverse)])
+        Self(.recentChats)
     }
 
     @MainActor
     public static func chats(
         in workspace: CodexWorkspace,
         sortDescriptors: [CodexSortDescriptor<CodexChat>] = [.updatedAt(.reverse)],
-        sectionDescriptor: CodexSectionDescriptor<CodexChat>? = nil,
         fetchLimit: Int? = nil
     ) -> Self {
-        .init(
-            filter: .init(workspace: workspace.url),
-            sortDescriptors: sortDescriptors,
-            sectionDescriptor: sectionDescriptor,
+        Self(.chats(
+            in: workspace,
+            sortBy: sortDescriptors,
             fetchLimit: fetchLimit
-        )
+        ))
+    }
+}
+
+public enum CodexFetchSectionID: Sendable, Hashable, CustomStringConvertible {
+    case `default`
+    case workspaceGroup(CodexWorkspaceGroupID)
+    case workspace(CodexWorkspaceID)
+    case unknown(String)
+
+    public var description: String {
+        switch self {
+        case .default:
+            "default"
+        case .workspaceGroup(let id):
+            id.rawValue
+        case .workspace(let id):
+            id.rawValue
+        case .unknown(let rawValue):
+            rawValue
+        }
     }
 }
 
 public struct CodexFetchSection<Model: CodexObservableModel>: Identifiable {
-    public var id: String
+    public var id: CodexFetchSectionID
     public var title: String?
     public var items: [Model]
 
-    public init(id: String, title: String?, items: [Model]) {
+    public init(id: CodexFetchSectionID, title: String?, items: [Model]) {
         self.id = id
         self.title = title
         self.items = items
@@ -262,7 +370,8 @@ package protocol CodexFetchedResultsRegistration: AnyObject {
 @Observable
 public final class CodexFetchedResults<Model: CodexObservableModel> {
     public let modelContext: CodexModelContext
-    public private(set) var request: CodexFetchRequest<Model>
+    public private(set) var fetchDescriptor: CodexFetchDescriptor<Model>
+    public private(set) var sectionBy: CodexSectionDescriptor<Model>?
     public private(set) var items: [Model] = []
     public private(set) var sections: [CodexFetchSection<Model>] = []
     public private(set) var nextCursor: String?
@@ -272,14 +381,16 @@ public final class CodexFetchedResults<Model: CodexObservableModel> {
 
     package init(
         modelContext: CodexModelContext,
-        request: CodexFetchRequest<Model>
+        fetchDescriptor: CodexFetchDescriptor<Model>,
+        sectionBy: CodexSectionDescriptor<Model>?
     ) {
         self.modelContext = modelContext
-        self.request = request
+        self.fetchDescriptor = fetchDescriptor
+        self.sectionBy = sectionBy
     }
 
     public func performFetch() async throws {
-        try await load(request, appending: false)
+        try await load(fetchDescriptor, appending: false)
     }
 
     public func refresh() async throws {
@@ -290,27 +401,27 @@ public final class CodexFetchedResults<Model: CodexObservableModel> {
         guard let nextCursor else {
             return
         }
-        var request = request
-        request.cursor = nextCursor
-        try await load(request, appending: true)
+        var descriptor = fetchDescriptor
+        descriptor.cursor = nextCursor
+        try await load(descriptor, appending: true)
     }
 
-    private func load(_ request: CodexFetchRequest<Model>, appending: Bool) async throws {
+    private func load(_ descriptor: CodexFetchDescriptor<Model>, appending: Bool) async throws {
         phase = .loading
         lastErrorDescription = nil
         let previousBackwardsCursor = backwardsCursor
         do {
-            let page = try await modelContext.fetchPage(request, excluding: self)
+            let page = try await modelContext.fetchPage(descriptor, excluding: self)
             let newItems = loadedItems(from: page, appending: appending)
             items = newItems
-            let relationshipRequest = appending ? self.request : request
+            let relationshipDescriptor = appending ? fetchDescriptor : descriptor
             await modelContext.syncLoadedRelationships(
                 from: page,
-                request: relationshipRequest,
+                descriptor: relationshipDescriptor,
                 loadedItems: newItems,
                 excluding: self
             )
-            sections = modelContext.sections(for: newItems, descriptor: request.sectionDescriptor)
+            sections = modelContext.sections(for: newItems, sectionBy: sectionBy)
             nextCursor = page.nextCursor
             backwardsCursor = appending ? previousBackwardsCursor : page.backwardsCursor
             phase = .loaded
@@ -331,7 +442,8 @@ public final class CodexFetchedResults<Model: CodexObservableModel> {
         }
         if page.relationshipIsComplete == true, let authoritativeItems = page.relationshipItems {
             let start = min(
-                modelContext.localCursorOffset(from: request.cursor),
+                modelContext.localCursorOffset(from: fetchDescriptor.cursor)
+                    + fetchDescriptor.fetchOffset,
                 authoritativeItems.count
             )
             let end = min(start + items.count + page.items.count, authoritativeItems.count)
@@ -421,12 +533,18 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         group: CodexWorkspaceGroup?
     ) async {
         let originalCount = applyLocalRemoval(of: chat, workspace: workspace, group: group)
+        if fetchDescriptor.fetchOffset > 0 {
+            await refreshAfterMutation()
+            return
+        }
         if requiresServerRefreshAfterMutation {
             await refreshAfterMutation()
             return
         }
         guard items.count != originalCount else {
-            if modelContext.localCursorOffset(from: request.cursor) > 0 {
+            if modelContext.localCursorOffset(from: fetchDescriptor.cursor) > 0
+                || fetchDescriptor.fetchOffset > 0
+            {
                 await refreshAfterMutation()
             }
             return
@@ -531,7 +649,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             nextItems.insert(model, at: 0)
             insertedModel = true
         }
-        let sortedItems = modelContext.sortedItems(nextItems, for: request)
+        let sortedItems = modelContext.sortedItems(nextItems, for: fetchDescriptor)
         let windowItems = loadedWindowItems(
             sortedItems,
             insertedModel: insertedModel
@@ -541,21 +659,22 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             nextCursor == nil,
             sortedItems.count > windowItems.count
         {
-            let cursorOffset = modelContext.localCursorOffset(from: request.cursor) + windowItems.count
+            let cursorOffset =
+                modelContext.localCursorOffset(from: fetchDescriptor.cursor) + windowItems.count
             nextCursor = modelContext.localCursor(for: cursorOffset)
         }
-        sections = modelContext.sections(for: items, descriptor: request.sectionDescriptor)
+        sections = modelContext.sections(for: items, sectionBy: sectionBy)
         return true
     }
 
     private var canInsertLiveModel: Bool {
         canEvaluateFilterLocally
-            && request.cursor == nil
+            && fetchDescriptor.cursor == nil
             && nextCursor == nil
     }
 
     private func loadedWindowItems(_ models: [Model], insertedModel: Bool) -> [Model] {
-        guard let fetchLimit = request.fetchLimit else {
+        guard let fetchLimit = fetchDescriptor.fetchLimit else {
             return models
         }
         let loadedCount = items.count
@@ -581,15 +700,15 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
     }
 
     private var membershipRequiresServerRefresh: Bool {
-        request.filter.searchTerm?.isEmpty == false
-            || request.filter.modelProviders?.isEmpty == false
-            || request.filter.sourceKinds != nil
-            || request.filter.useStateDBOnly != nil
+        fetchDescriptor.predicate.searchTerm?.isEmpty == false
+            || fetchDescriptor.predicate.modelProviders?.isEmpty == false
+            || fetchDescriptor.predicate.sourceKinds != nil
+            || fetchDescriptor.predicate.useStateDBOnly != nil
     }
 
     private var usesServerOwnedOrdering: Bool {
-        request.sortDescriptors.first?.key == .recencyAt
-            || (Model.self == CodexChat.self && request.sortDescriptors.isEmpty)
+        fetchDescriptor.sortBy.first?.key == .recencyAt
+            || (Model.self == CodexChat.self && fetchDescriptor.sortBy.isEmpty)
     }
 
     private func backfillAfterLocalRemovalIfNeeded(originalCount: Int) async {
@@ -597,12 +716,12 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         guard missingCount > 0, shouldRefreshAfterLocalRemoval else {
             return
         }
-        let backfillOffset = modelContext.localCursorOffset(from: request.cursor) + items.count
-        var request = request
-        request.cursor = modelContext.backfillCursor(after: backfillOffset, currentCursor: nextCursor)
-        request.fetchLimit = missingCount
+        let backfillOffset = modelContext.localCursorOffset(from: fetchDescriptor.cursor) + items.count
+        var descriptor = fetchDescriptor
+        descriptor.cursor = modelContext.backfillCursor(after: backfillOffset, currentCursor: nextCursor)
+        descriptor.fetchLimit = missingCount
         do {
-            try await load(request, appending: true)
+            try await load(descriptor, appending: true)
         } catch {
             // load records the failed phase; the server mutation has already succeeded.
         }
@@ -620,7 +739,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         _ changes: [CodexFetchedChatRevalidation]
     ) async -> Bool {
         guard Model.self == CodexChat.self,
-            (nextCursor != nil || request.cursor != nil),
+            (nextCursor != nil || fetchDescriptor.cursor != nil || fetchDescriptor.fetchOffset > 0),
             changes.contains(where: { shouldInclude($0.chat, archived: $0.archived) })
         else {
             return false
@@ -635,7 +754,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
     }
 
     private func shouldInclude(_ chat: CodexChat, archived: Bool) -> Bool {
-        switch request.filter.archived {
+        switch fetchDescriptor.predicate.archived {
         case .some(let expectedArchived):
             guard expectedArchived == archived else {
                 return false
@@ -646,7 +765,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             }
         }
 
-        if let workspaces = request.filter.workspaces {
+        if let workspaces = fetchDescriptor.predicate.workspaces {
             guard let chatWorkspace = chat.workspace,
                 workspaces.contains(where: {
                     Self.standardizedPath(chatWorkspace.url) == Self.standardizedPath($0)
@@ -656,7 +775,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             }
         }
 
-        if let searchTerm = request.filter.searchTerm, searchTerm.isEmpty == false {
+        if let searchTerm = fetchDescriptor.predicate.searchTerm, searchTerm.isEmpty == false {
             let searchableText = [
                 chat.name,
                 chat.preview,
@@ -672,7 +791,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             }
         }
 
-        if let modelProviders = request.filter.modelProviders,
+        if let modelProviders = fetchDescriptor.predicate.modelProviders,
             modelProviders.isEmpty == false
         {
             guard let modelProvider = chat.modelProvider,
@@ -820,7 +939,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         }
         if filteredItems.count != items.count {
             items = filteredItems
-            sections = modelContext.sections(for: filteredItems, descriptor: request.sectionDescriptor)
+            sections = modelContext.sections(for: filteredItems, sectionBy: sectionBy)
         }
         return originalCount
     }
@@ -840,8 +959,8 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
                 )
             }
         }
-        items = modelContext.sortedItems(filteredItems, for: request)
-        sections = modelContext.sections(for: items, descriptor: request.sectionDescriptor)
+        items = modelContext.sortedItems(filteredItems, for: fetchDescriptor)
+        sections = modelContext.sections(for: items, sectionBy: sectionBy)
         return originalCount
     }
 
@@ -851,12 +970,12 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         keeping shouldKeep: (Model) -> Bool
     ) -> Bool {
         guard requestMatchesArchiveScope(archived) else {
-            sections = modelContext.sections(for: items, descriptor: request.sectionDescriptor)
+            sections = modelContext.sections(for: items, sectionBy: sectionBy)
             return false
         }
         let filteredItems = items.filter(shouldKeep)
         items = filteredItems
-        sections = modelContext.sections(for: filteredItems, descriptor: request.sectionDescriptor)
+        sections = modelContext.sections(for: filteredItems, sectionBy: sectionBy)
         return true
     }
 
@@ -896,11 +1015,11 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
     }
 
     private func requestMatchesArchiveScope(_ archived: Bool) -> Bool {
-        (request.filter.archived ?? false) == archived
+        (fetchDescriptor.predicate.archived ?? false) == archived
     }
 
     private func requestIsScoped(to workspace: CodexWorkspace) -> Bool {
-        guard let filterWorkspaces = request.filter.workspaces else {
+        guard let filterWorkspaces = fetchDescriptor.predicate.workspaces else {
             return false
         }
         return filterWorkspaces.contains {

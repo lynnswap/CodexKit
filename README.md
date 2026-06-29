@@ -73,18 +73,18 @@ import Foundation
 let container = try await CodexModelContainer()
 let context = container.mainContext
 
-let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>.recentChats)
+let results = context.fetchedResults(for: CodexFetchDescriptor<CodexChat>.recentChats)
 try await results.performFetch()
 
 for chat in results.items {
     print(chat.title)
 }
 
-let workspace = try await context.fetch(CodexFetchRequest<CodexWorkspace>.workspaces).first
+let workspace = try await context.fetch(CodexFetchDescriptor<CodexWorkspace>.workspaces).first
 let chat = try await workspace?.startChat()
 try await chat?.send("Summarize this project.")
 ```
 
-Render from `CodexWorkspaceGroup`, `CodexWorkspace`, and `CodexChat` observable model objects. Use `CodexFetchRequest` / `CodexFetchedResults` for CoreData-like fetches, or `@CodexQuery` for SwiftUI views.
+Render from `CodexWorkspaceGroup`, `CodexWorkspace`, and `CodexChat` observable model objects. Use `CodexFetchDescriptor` for SwiftData-style value fetches, `CodexFetchRequest` for CoreData-like mutable requests, or `@CodexQuery` for SwiftUI views.
 
 For model containers, fetch requests, sectioning, SwiftUI queries, and ownership guidance, see [Sources/CodexDataKit/README.md](Sources/CodexDataKit/README.md).

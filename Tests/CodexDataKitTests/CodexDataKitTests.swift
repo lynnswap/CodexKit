@@ -170,6 +170,37 @@ struct CodexModelContextTests {
         #expect(await runtime.transport.recordedRequests(method: "thread/list").count == 2)
     }
 
+    @Test("seeded app-server test runtime drives DataKit through public APIs")
+    func seededAppServerRuntimeDrivesDataKitThroughPublicAPIs() async throws {
+        let workspace = temporaryDirectory()
+        let runtime = try await CodexAppServerTestRuntime.start(threads: [
+            .init(
+                id: "thread-seeded",
+                workspace: workspace,
+                name: "Seeded review",
+                preview: "Loaded from fake app-server",
+                modelProvider: "gpt-test",
+                updatedAt: Date(timeIntervalSince1970: 1_000)
+            )
+        ])
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        let results = context.fetchedResults(for: CodexFetchDescriptor<CodexChat>.recentChats)
+        try await results.performFetch()
+
+        let chat = try #require(results.items.first)
+        #expect(chat.title == "Seeded review")
+        #expect(chat.preview == "Loaded from fake app-server")
+        #expect(chat.modelProvider == "gpt-test")
+        #expect(chat.workspace?.url == workspace)
+
+        try await chat.refresh(includeTurns: false)
+        #expect(chat.title == "Seeded review")
+        #expect(await runtime.transport.recordedRequests(method: "thread/list").count == 1)
+        #expect(await runtime.transport.recordedRequests(method: "thread/resume").count == 1)
+        #expect(await runtime.transport.recordedRequests(method: "thread/read").count == 1)
+    }
+
     @Test("fetch requests are translated to app-server thread/list query params")
     func fetchRequestTranslatesToThreadListParams() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -179,7 +210,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadList(.init(threads: []))
 
         let request = CodexFetchRequest<CodexChat>(
-            filter: .init(
+            predicate: .init(
                 archived: true,
                 workspace: workspace,
                 searchTerm: "needle",
@@ -188,8 +219,7 @@ struct CodexModelContextTests {
                 useStateDBOnly: true
             ),
             sortDescriptors: [.recencyAt(.reverse)],
-            fetchLimit: 25,
-            cursor: "cursor-1"
+            fetchLimit: 25
         )
 
         _ = try await context.fetch(request)
@@ -198,7 +228,7 @@ struct CodexModelContextTests {
             await runtime.transport.recordedRequests(method: "thread/list").first)
         let params = try recorded.decodeParams(ThreadListParams.self)
         #expect(params.archived == true)
-        #expect(params.cursor == "cursor-1")
+        #expect(params.cursor == nil)
         #expect(params.cwd == .paths([workspace.path]))
         #expect(params.limit == 25)
         #expect(params.searchTerm == "needle")
@@ -219,7 +249,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadList(.init(threads: []))
 
         _ = try await context.fetch(CodexFetchRequest<CodexChat>(
-            filter: .init(workspaces: [app, tools])
+            predicate: .init(workspaces: [app, tools])
         ))
 
         let recorded = try #require(
@@ -250,24 +280,25 @@ struct CodexModelContextTests {
         #expect(chat.status == .active(activeFlags: [.waitingOnUserInput]))
     }
 
-    @Test("fetched results preserve configured cursor on initial fetch")
-    func fetchedResultsPreserveConfiguredCursorOnInitialFetch() async throws {
+    @Test("fetched results apply configured fetch offset on initial fetch")
+    func fetchedResultsApplyConfiguredFetchOffsetOnInitialFetch() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         let context = CodexModelContainer(appServer: runtime.server).mainContext
 
-        try await runtime.transport.enqueueThreadList(.init(threads: []))
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-a", name: "A"),
+            .init(id: "thread-b", name: "B"),
+        ]))
 
         let request = CodexFetchRequest<CodexChat>(
-            sortDescriptors: [.updatedAt(.reverse)],
-            cursor: "cursor-1"
+            sortDescriptors: [.name()],
+            fetchLimit: 1,
+            fetchOffset: 1
         )
         let results = context.fetchedResults(for: request)
         try await results.performFetch()
 
-        let recorded = try #require(
-            await runtime.transport.recordedRequests(method: "thread/list").first)
-        let params = try recorded.decodeParams(ThreadListParams.self)
-        #expect(params.cursor == "cursor-1")
+        #expect(results.items.map(\.title) == ["B"])
     }
 
     @Test("name-sorted chat pages are sliced after local sorting")
@@ -487,9 +518,8 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadList(initialPage)
         let scopedResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>.chats(
             in: workspace,
-            sortDescriptors: [.name()],
-            sectionDescriptor: .workspace
-        ))
+            sortDescriptors: [.name()]
+        ), sectionedBy: .workspace)
         try await scopedResults.performFetch()
 
         try await runtime.transport.enqueueThreadList(.init(threads: [
@@ -603,15 +633,14 @@ struct CodexModelContextTests {
             .init(id: "thread-keep", workspace: workspace, name: "Keep"),
             .init(id: "thread-match", workspace: workspace, name: "Match"),
         ]))
-        let allResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>.recentChats)
-        try await allResults.performFetch()
-        let fetchedWorkspace = try #require(allResults.items.first?.workspace)
+        let allChats = try await context.fetch(CodexFetchRequest<CodexChat>.recentChats)
+        let fetchedWorkspace = try #require(allChats.first?.workspace)
 
         try await runtime.transport.enqueueThreadList(.init(threads: [
             .init(id: "thread-match", workspace: workspace, name: "Match")
         ]))
         let filteredResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            filter: .init(searchTerm: "Match")
+            predicate: .init(searchTerm: "Match")
         ))
         try await filteredResults.performFetch()
 
@@ -629,7 +658,7 @@ struct CodexModelContextTests {
             .init(id: "thread-remaining", workspace: workspace, name: "Remaining"),
         ]))
         let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            filter: .init(searchTerm: "")
+            predicate: .init(searchTerm: "")
         ))
         try await results.performFetch()
         let fetchedWorkspace = try #require(results.items.first?.workspace)
@@ -657,7 +686,7 @@ struct CodexModelContextTests {
             .init(id: "thread-remaining", workspace: workspace, name: "Remaining"),
         ]))
         let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            filter: .init(sourceKinds: [])
+            predicate: .init(sourceKinds: [])
         ))
         try await results.performFetch()
         let fetchedWorkspace = try #require(results.items.first?.workspace)
@@ -692,7 +721,7 @@ struct CodexModelContextTests {
             .init(id: "thread-match", workspace: workspace, name: "Match")
         ]))
         let filteredResults = context.fetchedResults(for: CodexFetchRequest<CodexWorkspace>(
-            filter: .init(searchTerm: "Match")
+            predicate: .init(searchTerm: "Match")
         ))
         try await filteredResults.performFetch()
 
@@ -734,7 +763,7 @@ struct CodexModelContextTests {
             .init(id: "thread-remaining", workspace: workspace, name: "Remaining"),
         ]))
         let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            filter: .init(archived: false),
+            predicate: .init(archived: false),
             sortDescriptors: [.updatedAt(.reverse)]
         ))
         try await results.performFetch()
@@ -837,22 +866,21 @@ struct CodexModelContextTests {
             .init(id: "thread-move", workspace: oldWorkspaceURL, name: "Move")
         ]))
         let sectionedResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            sortDescriptors: [.name()],
-            sectionDescriptor: .workspace
-        ))
+            sortDescriptors: [.name()]
+        ), sectionedBy: .workspace)
         try await sectionedResults.performFetch()
-        let oldWorkspaceSectionID = oldWorkspaceURL.standardizedFileURL
+        let oldWorkspaceSectionID = CodexFetchSectionID.workspace(.init(rawValue: oldWorkspaceURL.standardizedFileURL
             .resolvingSymlinksInPath()
-            .path
+            .path))
         #expect(sectionedResults.sections.first?.id == oldWorkspaceSectionID)
 
         try await runtime.transport.enqueueThreadList(.init(threads: [
             .init(id: "thread-move", workspace: newWorkspaceURL, name: "Move")
         ]))
         let fetchedChats = try await context.fetch(CodexFetchRequest<CodexChat>.recentChats)
-        let newWorkspaceSectionID = newWorkspaceURL.standardizedFileURL
+        let newWorkspaceSectionID = CodexFetchSectionID.workspace(.init(rawValue: newWorkspaceURL.standardizedFileURL
             .resolvingSymlinksInPath()
-            .path
+            .path))
 
         #expect(fetchedChats.first === chat)
         #expect(chat.workspace?.url == newWorkspaceURL)
@@ -895,9 +923,8 @@ struct CodexModelContextTests {
 
         try await runtime.transport.enqueueThreadList(initialPage)
         let sectionedNameResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            sortDescriptors: [.name()],
-            sectionDescriptor: .workspace
-        ))
+            sortDescriptors: [.name()]
+        ), sectionedBy: .workspace)
         try await sectionedNameResults.performFetch()
 
         try await runtime.transport.enqueueThreadList(.init(threads: [
@@ -932,7 +959,7 @@ struct CodexModelContextTests {
             .init(id: "thread-archived", workspace: workspaceURL, name: "Archived")
         ]))
         let archivedResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            filter: .init(archived: true),
+            predicate: .init(archived: true),
             sortDescriptors: [.updatedAt(.reverse)]
         ))
         try await archivedResults.performFetch()
@@ -973,7 +1000,7 @@ struct CodexModelContextTests {
             .init(id: "thread-archive", workspace: workspaceURL, name: "Archive")
         ]))
         let archivedResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            filter: .init(archived: true),
+            predicate: .init(archived: true),
             sortDescriptors: [.updatedAt(.reverse)]
         ))
         try await archivedResults.performFetch()
@@ -993,7 +1020,7 @@ struct CodexModelContextTests {
             .init(id: "thread-source", workspace: workspaceURL, name: "Source")
         ]))
         let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            filter: .init(sourceKinds: [.appServer])
+            predicate: .init(sourceKinds: [.appServer])
         ))
         try await results.performFetch()
         let chat = try #require(results.items.first)
@@ -1023,14 +1050,13 @@ struct CodexModelContextTests {
             .init(id: "thread-source", workspace: oldWorkspaceURL, name: "Source")
         ]))
         let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            filter: .init(sourceKinds: [.appServer]),
-            sectionDescriptor: .workspace
-        ))
+            predicate: .init(sourceKinds: [.appServer])
+        ), sectionedBy: .workspace)
         try await results.performFetch()
         let chat = try #require(results.items.first)
         #expect(
-            results.sections.first?.id == oldWorkspaceURL.standardizedFileURL
-                .resolvingSymlinksInPath().path
+            results.sections.first?.id == .workspace(.init(rawValue: oldWorkspaceURL.standardizedFileURL
+                .resolvingSymlinksInPath().path))
         )
 
         try await runtime.transport.enqueueThreadResume(.init(id: "thread-source"))
@@ -1046,8 +1072,8 @@ struct CodexModelContextTests {
 
         #expect(results.items.first === chat)
         #expect(
-            results.sections.first?.id == newWorkspaceURL.standardizedFileURL
-                .resolvingSymlinksInPath().path
+            results.sections.first?.id == .workspace(.init(rawValue: newWorkspaceURL.standardizedFileURL
+                .resolvingSymlinksInPath().path))
         )
     }
 
@@ -1202,9 +1228,9 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadList(page)
 
         let workspaceResults = context.fetchedResults(
-            for: CodexFetchRequest<CodexWorkspace>.workspaces(
-                sectionedBy: .workspaceGroup
-            ))
+            for: CodexFetchRequest<CodexWorkspace>.workspaces(),
+            sectionedBy: .workspaceGroup
+        )
         try await workspaceResults.performFetch()
 
         let workspaceSection = try #require(workspaceResults.sections.first)
@@ -1217,9 +1243,10 @@ struct CodexModelContextTests {
 
         let chatResults = context.fetchedResults(
             for: CodexFetchRequest<CodexChat>(
-                sortDescriptors: [.name()],
-                sectionDescriptor: .workspace
-            ))
+                sortDescriptors: [.name()]
+            ),
+            sectionedBy: .workspace
+        )
         try await chatResults.performFetch()
 
         #expect(chatResults.sections.compactMap(\.title).sorted() == ["App", "Tools"])
@@ -1647,7 +1674,7 @@ struct CodexModelContextTests {
             .init(id: "thread-archived", workspace: workspace, name: "Archived")
         ]))
         let archivedResults = context.fetchedResults(for: CodexFetchRequest<CodexWorkspace>(
-            filter: .init(archived: true)
+            predicate: .init(archived: true)
         ))
         try await archivedResults.performFetch()
         let fetchedWorkspace = try #require(archivedResults.items.first)
@@ -1669,8 +1696,8 @@ struct CodexModelContextTests {
         } == true)
     }
 
-    @Test("cursor-started chat fetches never mark workspace relationships complete")
-    func cursorStartedChatFetchesNeverMarkWorkspaceRelationshipsComplete() async throws {
+    @Test("paged chat fetches append loaded workspace relationships")
+    func pagedChatFetchesAppendLoadedWorkspaceRelationships() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         let context = CodexModelContainer(appServer: runtime.server).mainContext
         let workspace = temporaryDirectory()
@@ -1691,7 +1718,7 @@ struct CodexModelContextTests {
         ))
         let cursorResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
             sortDescriptors: [.updatedAt(.reverse)],
-            cursor: "cursor"
+            fetchLimit: 1
         ))
         try await cursorResults.performFetch()
 
@@ -1701,7 +1728,6 @@ struct CodexModelContextTests {
         try await cursorResults.loadNextPage()
 
         #expect(Set(fetchedWorkspace.chats.map(\.id.rawValue)) == [
-            "thread-before",
             "thread-middle",
             "thread-after",
         ])
@@ -1824,7 +1850,7 @@ struct CodexModelContextTests {
             .init(id: "thread-archived", workspace: archived, name: "Archived")
         ]))
         let archivedResults = context.fetchedResults(for: CodexFetchRequest<CodexWorkspaceGroup>(
-            filter: .init(archived: true)
+            predicate: .init(archived: true)
         ))
         try await archivedResults.performFetch()
         let group = try #require(archivedResults.items.first)
@@ -1849,7 +1875,7 @@ struct CodexModelContextTests {
             .init(id: "thread-archived", workspace: archived, name: "Archived")
         ]))
         let archivedResults = context.fetchedResults(for: CodexFetchRequest<CodexWorkspaceGroup>(
-            filter: .init(archived: true)
+            predicate: .init(archived: true)
         ))
         try await archivedResults.performFetch()
         let group = try #require(archivedResults.items.first)
@@ -1885,7 +1911,7 @@ struct CodexModelContextTests {
             .init(id: "thread-app", workspace: app, name: "App")
         ]))
         let scopedGroups = context.fetchedResults(for: CodexFetchRequest<CodexWorkspaceGroup>(
-            filter: .init(workspace: app)
+            predicate: .init(workspace: app)
         ))
         try await scopedGroups.performFetch()
 
@@ -2048,7 +2074,7 @@ struct CodexModelContextTests {
             .init(id: "thread-archived", workspace: workspaceURL, name: "Archived")
         ]))
         let archivedResults = context.fetchedResults(for: CodexFetchRequest<CodexWorkspace>(
-            filter: .init(archived: true)
+            predicate: .init(archived: true)
         ))
         try await archivedResults.performFetch()
         let workspace = try #require(archivedResults.items.first)
@@ -2074,7 +2100,7 @@ struct CodexModelContextTests {
             .init(id: "thread-match", workspace: workspaceURL, name: "Match")
         ]))
         let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            filter: .init(searchTerm: "Match")
+            predicate: .init(searchTerm: "Match")
         ))
         try await results.performFetch()
         let workspace = try #require(results.items.first?.workspace)
@@ -2099,7 +2125,7 @@ struct CodexModelContextTests {
             .init(id: "thread-search", workspace: workspaceURL, name: "Untitled")
         ]))
         let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            filter: .init(searchTerm: "needle")
+            predicate: .init(searchTerm: "needle")
         ))
         try await results.performFetch()
         let chat = try #require(results.items.first)
@@ -2127,7 +2153,7 @@ struct CodexModelContextTests {
             .init(id: "thread-remove", workspace: workspaceURL, name: "Remove")
         ]))
         let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            filter: .init(sourceKinds: [.appServer])
+            predicate: .init(sourceKinds: [.appServer])
         ))
         try await results.performFetch()
         let chat = try #require(results.items.first)
@@ -2240,7 +2266,7 @@ struct CodexModelContextTests {
             .init(id: "thread-match", workspace: workspaceURL, name: "Match")
         ]))
         let filteredResults = context.fetchedResults(for: CodexFetchRequest<CodexWorkspace>(
-            filter: .init(searchTerm: "Match")
+            predicate: .init(searchTerm: "Match")
         ))
         try await filteredResults.performFetch()
         #expect(filteredResults.items.isEmpty == false)
@@ -2323,7 +2349,7 @@ struct CodexModelContextTests {
             .init(id: "thread-delete", name: "Delete")
         ]))
         let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            filter: .init(sourceKinds: [.appServer])
+            predicate: .init(sourceKinds: [.appServer])
         ))
         try await results.performFetch()
         let chat = try #require(results.items.first)
@@ -2357,7 +2383,7 @@ struct CodexModelContextTests {
             .init(id: "thread-remaining", workspace: workspaceURL, name: "Remaining"),
         ]))
         let workspaceResults = context.fetchedResults(for: CodexFetchRequest<CodexWorkspace>(
-            filter: .init(sourceKinds: [.appServer])
+            predicate: .init(sourceKinds: [.appServer])
         ))
         try await workspaceResults.performFetch()
 
@@ -2366,7 +2392,7 @@ struct CodexModelContextTests {
             .init(id: "thread-remaining", workspace: workspaceURL, name: "Remaining"),
         ]))
         let groupResults = context.fetchedResults(for: CodexFetchRequest<CodexWorkspaceGroup>(
-            filter: .init(sourceKinds: [.appServer])
+            predicate: .init(sourceKinds: [.appServer])
         ))
         try await groupResults.performFetch()
 
@@ -2522,13 +2548,13 @@ struct CodexModelContextTests {
             fetchLimit: 2
         ))
         try await firstPage.performFetch()
-        let cursor = try #require(firstPage.nextCursor)
+        _ = try #require(firstPage.nextCursor)
 
         try await runtime.transport.enqueueThreadList(.init(threads: threads))
         let offsetPage = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
             sortDescriptors: [.name()],
             fetchLimit: 1,
-            cursor: cursor
+            fetchOffset: 2
         ))
         try await offsetPage.performFetch()
         #expect(offsetPage.items.map(\.title) == ["C"])
@@ -2559,13 +2585,13 @@ struct CodexModelContextTests {
             fetchLimit: 2
         ))
         try await firstPage.performFetch()
-        let cursor = try #require(firstPage.nextCursor)
+        _ = try #require(firstPage.nextCursor)
 
         try await runtime.transport.enqueueThreadList(.init(threads: initialThreads))
         let offsetPage = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
             sortDescriptors: [.name()],
             fetchLimit: 2,
-            cursor: cursor
+            fetchOffset: 2
         ))
         try await offsetPage.performFetch()
         let deletedChat = try #require(offsetPage.items.first)
@@ -2603,7 +2629,7 @@ struct CodexModelContextTests {
             fetchLimit: 2
         ))
         try await firstPage?.performFetch()
-        let cursor = try #require(firstPage?.nextCursor)
+        _ = try #require(firstPage?.nextCursor)
         let deletedChat = context.model(for: CodexThreadID(rawValue: "thread-a"))
         firstPage = nil
 
@@ -2611,7 +2637,7 @@ struct CodexModelContextTests {
         let offsetPage = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
             sortDescriptors: [.name()],
             fetchLimit: 2,
-            cursor: cursor
+            fetchOffset: 2
         ))
         try await offsetPage.performFetch()
         #expect(offsetPage.items.map(\.title) == ["C", "D"])
@@ -2645,13 +2671,13 @@ struct CodexModelContextTests {
             fetchLimit: 1
         ))
         try await firstPage.performFetch()
-        let cursor = try #require(firstPage.nextCursor)
+        _ = try #require(firstPage.nextCursor)
 
         try await runtime.transport.enqueueThreadList(.init(threads: initialThreads))
         let offsetPage = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
             sortDescriptors: [.name()],
             fetchLimit: 2,
-            cursor: cursor
+            fetchOffset: 1
         ))
         try await offsetPage.performFetch()
         let movingChat = try #require(offsetPage.items.first)
@@ -2720,7 +2746,7 @@ struct CodexModelContextTests {
 
         try await runtime.transport.enqueueThreadList(.init(threads: []))
         let providerResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            filter: .init(modelProviders: ["openai"])
+            predicate: .init(modelProviders: ["openai"])
         ))
         try await providerResults.performFetch()
 
@@ -2756,7 +2782,7 @@ struct CodexModelContextTests {
 
         try await runtime.transport.enqueueThreadList(.init(threads: []))
         let providerResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            filter: .init(modelProviders: ["openai"])
+            predicate: .init(modelProviders: ["openai"])
         ))
         try await providerResults.performFetch()
 
@@ -2790,7 +2816,7 @@ struct CodexModelContextTests {
 
         try await runtime.transport.enqueueThreadList(.init(threads: []))
         let serverResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            filter: .init(sourceKinds: [.appServer])
+            predicate: .init(sourceKinds: [.appServer])
         ))
         try await serverResults.performFetch()
 
@@ -2812,7 +2838,7 @@ struct CodexModelContextTests {
             .init(id: "thread-any-provider", name: "Before")
         ]))
         let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            filter: .init(modelProviders: [])
+            predicate: .init(modelProviders: [])
         ))
         try await results.performFetch()
         let chat = try #require(results.items.first)
@@ -3029,7 +3055,7 @@ struct CodexModelContextTests {
 
         try await runtime.transport.enqueueThreadList(.init(threads: []))
         let archivedResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            filter: .init(archived: true),
+            predicate: .init(archived: true),
             sortDescriptors: [.updatedAt(.reverse)]
         ))
         try await archivedResults.performFetch()
@@ -3058,7 +3084,7 @@ struct CodexModelContextTests {
             .init(id: "thread-archive", workspace: workspaceURL, name: "Archive")
         ]))
         let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            filter: .init(sourceKinds: [.appServer])
+            predicate: .init(sourceKinds: [.appServer])
         ))
         try await results.performFetch()
         let chat = try #require(results.items.first)
@@ -3082,7 +3108,7 @@ struct CodexModelContextTests {
             .init(id: "thread-unarchive", workspace: workspaceURL, name: "Archived")
         ]))
         let archivedResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            filter: .init(archived: true),
+            predicate: .init(archived: true),
             sortDescriptors: [.updatedAt(.reverse)]
         ))
         try await archivedResults.performFetch()
@@ -3116,7 +3142,7 @@ struct CodexModelContextTests {
             .init(id: "thread-unarchive", workspace: workspaceURL, name: "Archived")
         ]))
         let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            filter: .init(archived: true, sourceKinds: [.appServer])
+            predicate: .init(archived: true, sourceKinds: [.appServer])
         ))
         try await results.performFetch()
         let chat = try #require(results.items.first)
@@ -3144,13 +3170,13 @@ struct CodexModelContextTests {
 
         try await runtime.transport.enqueueThreadList(.init(threads: []))
         let archivedWorkspaceResults = context.fetchedResults(for: CodexFetchRequest<CodexWorkspace>(
-            filter: .init(archived: true)
+            predicate: .init(archived: true)
         ))
         try await archivedWorkspaceResults.performFetch()
 
         try await runtime.transport.enqueueThreadList(.init(threads: []))
         let archivedGroupResults = context.fetchedResults(for: CodexFetchRequest<CodexWorkspaceGroup>(
-            filter: .init(archived: true)
+            predicate: .init(archived: true)
         ))
         try await archivedGroupResults.performFetch()
 
@@ -3180,7 +3206,7 @@ struct CodexModelContextTests {
             .init(id: "thread-archived", workspace: workspaceURL, name: "Archived")
         ]))
         let archivedResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            filter: .init(archived: true),
+            predicate: .init(archived: true),
             sortDescriptors: [.updatedAt(.reverse)]
         ))
         try await archivedResults.performFetch()
@@ -3204,7 +3230,7 @@ struct CodexModelContextTests {
 
         try await runtime.transport.enqueueThreadList(.init(threads: []))
         let archivedResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            filter: .init(archived: true, sourceKinds: [.appServer])
+            predicate: .init(archived: true, sourceKinds: [.appServer])
         ))
         try await archivedResults.performFetch()
 
@@ -3312,7 +3338,7 @@ struct CodexModelContextTests {
             .init(id: "thread-alpha", name: "Alpha"),
         ]))
         let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            filter: .init(sourceKinds: [.appServer]),
+            predicate: .init(sourceKinds: [.appServer]),
             sortDescriptors: [.name()]
         ))
         try await results.performFetch()
@@ -3341,7 +3367,7 @@ struct CodexModelContextTests {
             .init(id: "thread-move", workspace: app, name: "Move")
         ]))
         let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            filter: .init(workspace: app, sourceKinds: [.appServer])
+            predicate: .init(workspace: app, sourceKinds: [.appServer])
         ))
         try await results.performFetch()
         let chat = try #require(results.items.first)
@@ -3367,7 +3393,7 @@ struct CodexModelContextTests {
             .init(id: "thread-search", name: "Untitled")
         ]))
         let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            filter: .init(searchTerm: "needle")
+            predicate: .init(searchTerm: "needle")
         ))
         try await results.performFetch()
         let chat = try #require(results.items.first)
@@ -3400,7 +3426,7 @@ struct CodexModelContextTests {
             .init(id: "thread-second", name: "Second"),
         ]))
         let searchResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-            filter: .init(searchTerm: "needle")
+            predicate: .init(searchTerm: "needle")
         ))
         try await searchResults.performFetch()
 

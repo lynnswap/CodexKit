@@ -8,8 +8,9 @@ Use this package when app or UI code needs workspace group, workspace, and chat 
 
 - `CodexModelContainer`: Owns the `CodexAppServer` and vends the main `CodexModelContext`.
 - `CodexModelContext`: Fetches models, preserves model identity, and performs app-server actions for attached models.
-- `CodexFetchRequest`: Describes filters, sort descriptors, sectioning, paging, and the model type to fetch.
-- `CodexFetchedResults`: Observable CoreData-style fetch results with items, sections, cursors, loading phase, and errors.
+- `CodexFetchDescriptor`: SwiftData-style value description of predicate, sort order, limit, and offset.
+- `CodexFetchRequest`: CoreData-style mutable request object for predicate, sort descriptors, limit, and offset.
+- `CodexFetchedResults`: Observable CoreData-style fetch results with items, optional sections, cursors, loading phase, and errors.
 - `CodexWorkspaceGroup`, `CodexWorkspace`, `CodexChat`: Observable model objects attached to a model context.
 - `CodexQuery`: A SwiftUI `DynamicProperty` wrapper around `CodexFetchedResults`.
 - `CodexDataPhase`: A small data-loading state enum with `idle`, `loading`, `loaded`, and `failed`.
@@ -22,7 +23,7 @@ import CodexDataKit
 let container = try await CodexModelContainer()
 let context = container.mainContext
 
-let chats = context.fetchedResults(for: CodexFetchRequest<CodexChat>.recentChats)
+let chats = context.fetchedResults(for: CodexFetchDescriptor<CodexChat>.recentChats)
 try await chats.performFetch()
 
 for chat in chats.items {
@@ -32,19 +33,30 @@ for chat in chats.items {
 
 ## Fetching
 
-`CodexFetchRequest` is the CoreData-like API. The request type decides which model is returned.
+Use `CodexFetchDescriptor` when you want SwiftData-style value configuration:
 
 ```swift
-let request = CodexFetchRequest<CodexChat>(
-    filter: .init(
+let descriptor = CodexFetchDescriptor<CodexChat>(
+    predicate: .init(
         archived: false,
         workspace: workspaceURL,
         searchTerm: "review"
     ),
-    sortDescriptors: [.recencyAt(.reverse)],
-    sectionDescriptor: .workspaceGroup,
+    sortBy: [.recencyAt(.reverse)],
     fetchLimit: 50
 )
+
+let results = context.fetchedResults(for: descriptor, sectionedBy: .workspaceGroup)
+try await results.performFetch()
+```
+
+Use `CodexFetchRequest` when request construction reads better as a mutable CoreData-like object:
+
+```swift
+let request = CodexFetchRequest<CodexChat>()
+request.predicate = .init(workspace: workspaceURL)
+request.sortDescriptors = [.updatedAt(.reverse)]
+request.fetchLimit = 100
 
 let results = context.fetchedResults(for: request)
 try await results.performFetch()
@@ -62,27 +74,28 @@ if results.nextCursor != nil {
 
 ## Sectioning
 
-Use `sectionDescriptor` when a UI wants sidebar sections.
+Pass `sectionedBy` at the results/query boundary when a UI wants sidebar sections.
 
 ```swift
-let workspaces = context.fetchedResults(for: CodexFetchRequest<CodexWorkspace>.workspaces(
+let workspaces = context.fetchedResults(
+    for: CodexFetchDescriptor<CodexWorkspace>.workspaces,
     sectionedBy: .workspaceGroup
-))
+)
 
-let chats = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
-    sortDescriptors: [.updatedAt(.reverse)],
-    sectionDescriptor: .workspace
-))
+let chats = context.fetchedResults(
+    for: CodexFetchDescriptor<CodexChat>(sortBy: [.updatedAt(.reverse)]),
+    sectionedBy: .workspace
+)
 ```
 
-Passing no section descriptor gives a single unsectioned result, matching CoreData's optional `sectionNameKeyPath` shape.
+Passing no section descriptor gives a single unsectioned result. Section identifiers stay typed as `CodexFetchSectionID`, so workspace and workspace-group sections can be used directly in UI selection state.
 
 ## Models
 
 Models are context-attached observable objects:
 
 ```swift
-let workspace = try await context.fetch(CodexFetchRequest<CodexWorkspace>.workspaces).first
+let workspace = try await context.fetch(CodexFetchDescriptor<CodexWorkspace>.workspaces).first
 let chat = try await workspace?.startChat()
 try await chat?.send("Explain the latest diff.")
 ```
@@ -159,10 +172,10 @@ import SwiftUI
 import CodexDataKit
 
 struct Sidebar: View {
-    @CodexQuery(CodexFetchRequest<CodexChat>(
-        sortDescriptors: [.updatedAt(.reverse)],
-        sectionDescriptor: .workspaceGroup
-    ))
+    @CodexQuery(
+        CodexFetchDescriptor<CodexChat>(sortBy: [.updatedAt(.reverse)]),
+        sectionBy: .workspaceGroup
+    )
     private var chats
 
     var body: some View {
@@ -193,13 +206,12 @@ import Testing
 
 @MainActor
 @Test func loadsChats() async throws {
-    let runtime = try await CodexAppServerTestRuntime.start()
-    try await runtime.transport.enqueueThreadList(.init(threads: [
+    let runtime = try await CodexAppServerTestRuntime.start(threads: [
         .init(id: "thread-1", name: "First")
-    ]))
+    ])
 
     let context = CodexModelContainer(appServer: runtime.server).mainContext
-    let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>.recentChats)
+    let results = context.fetchedResults(for: CodexFetchDescriptor<CodexChat>.recentChats)
     try await results.performFetch()
 
     #expect(results.items.first?.title == "First")

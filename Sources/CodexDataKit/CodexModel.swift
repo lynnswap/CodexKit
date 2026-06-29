@@ -782,7 +782,7 @@ public final class CodexChat: CodexObservableModel {
     }
 
     private func merge(_ delta: CodexReasoningDelta, turnID: CodexTurnID?) -> [CodexChatChange] {
-        let key = ItemKey(id: delta.id, turnID: turnID)
+        let key = reasoningMergeKey(for: delta, turnID: turnID)
         let previousAccumulatedText = liveMergeState.reasoningDeltaTextByItemKey[key] ?? ""
         let accumulatedText = previousAccumulatedText + delta.delta
 
@@ -809,8 +809,16 @@ public final class CodexChat: CodexObservableModel {
             reasoning = .init(content: merge.text)
         }
         return mergeItems([
-            .init(id: delta.id, kind: .reasoning, content: .reasoning(reasoning)),
+            .init(id: key.id, kind: .reasoning, content: .reasoning(reasoning)),
         ], turnID: turnID)
+    }
+
+    private func reasoningMergeKey(for delta: CodexReasoningDelta, turnID: CodexTurnID?) -> ItemKey {
+        let parentKey = ItemKey(id: delta.part.itemID, turnID: turnID)
+        if item(for: parentKey)?.reasoning != nil {
+            return parentKey
+        }
+        return ItemKey(id: delta.id, turnID: turnID)
     }
 
     private func mergedDeltaText(
