@@ -16,9 +16,15 @@ package actor CodexAppServerNotificationRouter {
     private var reviewThreadIDs: Set<CodexThreadID> = []
     private var turnHistoryByTurnID: [CodexTurnID: [CodexTurnEvent]] = [:]
     private var threadHistoryByThreadID: [CodexThreadID: [CodexThreadEvent]] = [:]
+    private var threadGenerationStartIndexByThreadID: [CodexThreadID: Int] = [:]
     private var turnSubscribersByTurnID: [CodexTurnID: [UUID: Subscriber<CodexTurnEvent>]] = [:]
     private var threadSubscribersByThreadID: [CodexThreadID: [UUID: Subscriber<CodexThreadEvent>]] =
         [:]
+
+    private enum ThreadEventReplayPolicy {
+        case currentGeneration
+        case none
+    }
     private let decoder = JSONDecoder()
 
     package init(client: AppServerClient) {
@@ -56,18 +62,24 @@ package actor CodexAppServerNotificationRouter {
     package func events(for threadID: CodexThreadID) -> AsyncThrowingStream<
         CodexThreadEvent, Error
     > {
-        threadEventStream(for: threadID, replaysHistory: true)
+        threadEventStream(for: threadID, replayPolicy: .currentGeneration)
     }
 
     package func liveEvents(for threadID: CodexThreadID) -> AsyncThrowingStream<
         CodexThreadEvent, Error
     > {
-        threadEventStream(for: threadID, replaysHistory: false)
+        threadEventStream(for: threadID, replayPolicy: .none)
+    }
+
+    package func observationEvents(for threadID: CodexThreadID) -> AsyncThrowingStream<
+        CodexThreadEvent, Error
+    > {
+        threadEventStream(for: threadID, replayPolicy: .currentGeneration)
     }
 
     private func threadEventStream(
         for threadID: CodexThreadID,
-        replaysHistory: Bool
+        replayPolicy: ThreadEventReplayPolicy
     ) -> AsyncThrowingStream<CodexThreadEvent, Error> {
         let (stream, continuation) = AsyncThrowingStream<CodexThreadEvent, Error>.makeStream(
             bufferingPolicy: .unbounded
@@ -80,7 +92,7 @@ package actor CodexAppServerNotificationRouter {
             subscriptionID,
             threadID: threadID,
             continuation: continuation,
-            replaysHistory: replaysHistory
+            replayPolicy: replayPolicy
         )
         return stream
     }
@@ -132,8 +144,8 @@ package actor CodexAppServerNotificationRouter {
         threadSubscribersByThreadID[threadID]?.count ?? 0
     }
 
-    package func reopenThread(_ threadID: CodexThreadID) {
-        threadHistoryByThreadID[threadID]?.removeAll(where: Self.isTerminalThreadEvent)
+    package func beginThreadEventGeneration(_ threadID: CodexThreadID) {
+        threadGenerationStartIndexByThreadID[threadID] = threadHistoryByThreadID[threadID]?.count ?? 0
     }
 
     private func route(_ notification: JSONRPC.Notification) {
@@ -220,20 +232,63 @@ package actor CodexAppServerNotificationRouter {
         _ subscriptionID: UUID,
         threadID: CodexThreadID,
         continuation: AsyncThrowingStream<CodexThreadEvent, Error>.Continuation,
-        replaysHistory: Bool = true
+        replayPolicy: ThreadEventReplayPolicy = .currentGeneration
     ) {
         let history = threadHistoryByThreadID[threadID] ?? []
-        if replaysHistory {
-            for event in history {
-                continuation.yield(event)
-            }
+        let replayedHistory: ArraySlice<CodexThreadEvent>
+        switch replayPolicy {
+        case .currentGeneration:
+            replayedHistory = currentGenerationEvents(in: history, threadID: threadID)
+        case .none:
+            replayedHistory = []
         }
-        if history.contains(where: Self.isTerminalThreadEvent) {
+        for event in replayedHistory {
+            continuation.yield(event)
+        }
+        let currentGeneration = currentGenerationEvents(in: history, threadID: threadID)
+        let shouldFinish: Bool
+        switch replayPolicy {
+        case .currentGeneration:
+            shouldFinish = currentGeneration.last.map(Self.isTerminalThreadEvent) ?? false
+        case .none:
+            shouldFinish = currentGeneration.last.map(Self.isTerminalThreadEvent) ?? false
+        }
+        if shouldFinish {
             continuation.finish()
             return
         }
         threadSubscribersByThreadID[threadID, default: [:]][subscriptionID] = .init(
             continuation: continuation)
+    }
+
+    private func currentGenerationEvents(
+        in history: [CodexThreadEvent],
+        threadID: CodexThreadID
+    ) -> ArraySlice<CodexThreadEvent> {
+        if let generationStart = threadGenerationStartIndexByThreadID[threadID] {
+            let clampedStart = min(generationStart, history.count)
+            return history[clampedStart...]
+        }
+        return Self.inferredCurrentGenerationEvents(in: history)
+    }
+
+    private nonisolated static func inferredCurrentGenerationEvents(
+        in history: [CodexThreadEvent]
+    ) -> ArraySlice<CodexThreadEvent> {
+        guard let lastIndex = history.indices.last else {
+            return history[...]
+        }
+        if isTerminalThreadEvent(history[lastIndex]) {
+            let precedingHistory = history[..<lastIndex]
+            if let previousTerminalIndex = precedingHistory.lastIndex(where: isTerminalThreadEvent) {
+                return history[history.index(after: previousTerminalIndex)...]
+            }
+            return history[...]
+        }
+        if let terminalIndex = history.lastIndex(where: isTerminalThreadEvent) {
+            return history[history.index(after: terminalIndex)...]
+        }
+        return history[...]
     }
 
     private nonisolated static func isTerminalTurnEvent(_ event: CodexTurnEvent) -> Bool {

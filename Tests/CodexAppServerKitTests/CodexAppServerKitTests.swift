@@ -2051,6 +2051,53 @@ struct CodexAppServerKitTests {
         #expect(events.isEmpty)
     }
 
+    @Test func threadEventStreamsReplayOnlyCurrentGenerationAfterNewGenerationStarts() async throws {
+        let transport = CodexAppServerTestTransport()
+        let client = AppServerClient(transport: transport)
+        let router = CodexAppServerNotificationRouter(client: client)
+        await router.start()
+        await transport.waitForNotificationStreamCount(1)
+        try await transport.emitServerNotification(
+            method: "thread/closed",
+            params: ThreadIDParams(threadID: "thread-1")
+        )
+        let firstGeneration = try await withTimeout {
+            try await collect(await router.events(for: CodexThreadID(rawValue: "thread-1")))
+        }
+        #expect(firstGeneration.contains { event in
+            if case .closed = event {
+                return true
+            }
+            return false
+        })
+
+        await router.beginThreadEventGeneration("thread-1")
+        try await transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(
+                threadID: "thread-1",
+                turnID: "turn-2",
+                delta: "Current"
+            )
+        )
+        try await transport.emitServerNotification(
+            method: "thread/closed",
+            params: ThreadIDParams(threadID: "thread-1")
+        )
+
+        let currentGeneration = try await withTimeout {
+            try await collect(await router.observationEvents(for: "thread-1"))
+        }
+        #expect(currentGeneration.count == 2)
+        #expect(currentGeneration.contains { event in
+            if case .messageDelta(let delta, let turnID) = event {
+                return delta.text == "Current" && turnID == "turn-2"
+            }
+            return false
+        })
+        #expect(currentGeneration.last == .closed)
+    }
+
     @Test func turnEventStreamCancellationRemovesRouterSubscriber() async throws {
         let transport = CodexAppServerTestTransport()
         let client = AppServerClient(transport: transport)

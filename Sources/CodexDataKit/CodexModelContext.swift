@@ -441,7 +441,7 @@ public final class CodexModelContext: @unchecked Sendable {
             }
             observation.eventThread = thread
             try Task.checkCancellation()
-            await thread.reopenLiveEventStream()
+            await thread.beginEventGeneration()
             observation.beginBufferingEvents()
             await startEventTask(observation, for: chat, thread: thread)
             try await refresh(chat, using: thread, includeTurns: includeTurns)
@@ -465,7 +465,7 @@ public final class CodexModelContext: @unchecked Sendable {
                     ready.resume()
                     return
                 }
-                let events = await thread.makeLiveEventStream()
+                let events = await thread.makeCurrentGenerationEventStream()
                 ready.resume()
                 do {
                     for try await event in events {
