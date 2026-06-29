@@ -197,37 +197,6 @@ public struct CodexFetchDescriptor<Model: CodexObservableModel>: Sendable, Hasha
         self.cursor = nil
     }
 
-    @MainActor
-    public init<Value: Comparable>(
-        predicate: CodexFetchPredicate<Model> = .init(),
-        sort keyPath: KeyPath<Model, Value>,
-        order: CodexSortOrder = .forward,
-        fetchLimit: Int? = nil,
-        fetchOffset: Int = 0
-    ) {
-        self.init(
-            predicate: predicate,
-            sortBy: [CodexSortDescriptor(keyPath, order: order)],
-            fetchLimit: fetchLimit,
-            fetchOffset: fetchOffset
-        )
-    }
-
-    @MainActor
-    public init<Value: Comparable>(
-        predicate: CodexFetchPredicate<Model> = .init(),
-        sort keyPath: KeyPath<Model, Value?>,
-        order: CodexSortOrder = .forward,
-        fetchLimit: Int? = nil,
-        fetchOffset: Int = 0
-    ) {
-        self.init(
-            predicate: predicate,
-            sortBy: [CodexSortDescriptor(keyPath, order: order)],
-            fetchLimit: fetchLimit,
-            fetchOffset: fetchOffset
-        )
-    }
 }
 
 private enum CodexKnownKeyPaths {

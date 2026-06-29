@@ -296,8 +296,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadList(.init(threads: []))
 
         let descriptor = CodexFetchDescriptor<CodexChat>(
-            sort: \.updatedAt,
-            order: .reverse,
+            sortBy: [CodexSortDescriptor(\.updatedAt, order: .reverse)],
             fetchLimit: 25
         )
         _ = try await context.fetch(descriptor)

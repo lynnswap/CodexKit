@@ -74,7 +74,9 @@ let container = try await CodexModelContainer()
 let context = container.mainContext
 
 let results = context.fetchedResults(
-    for: CodexFetchDescriptor<CodexChat>(sort: \.updatedAt, order: .reverse)
+    for: CodexFetchDescriptor<CodexChat>(
+        sortBy: [CodexSortDescriptor(\.updatedAt, order: .reverse)]
+    )
 )
 try await results.performFetch()
 

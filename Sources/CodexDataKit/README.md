@@ -42,8 +42,7 @@ let descriptor = CodexFetchDescriptor<CodexChat>(
         workspace: workspaceURL,
         searchTerm: "review"
     ),
-    sort: \.recencyAt,
-    order: .reverse,
+    sortBy: [CodexSortDescriptor(\.recencyAt, order: .reverse)],
     fetchLimit: 50
 )
 
@@ -92,7 +91,9 @@ let workspaces = context.fetchedResults(
 )
 
 let chats = context.fetchedResults(
-    for: CodexFetchDescriptor<CodexChat>(sort: \.updatedAt, order: .reverse),
+    for: CodexFetchDescriptor<CodexChat>(
+        sortBy: [CodexSortDescriptor(\.updatedAt, order: .reverse)]
+    ),
     sectionedBy: CodexSectionDescriptor(\CodexChat.workspaceID)
 )
 ```
@@ -182,7 +183,9 @@ import CodexDataKit
 
 struct Sidebar: View {
     @CodexQuery(
-        CodexFetchDescriptor<CodexChat>(sort: \.updatedAt, order: .reverse),
+        CodexFetchDescriptor<CodexChat>(
+            sortBy: [CodexSortDescriptor(\.updatedAt, order: .reverse)]
+        ),
         sectionBy: CodexSectionDescriptor(\CodexChat.workspaceGroupID)
     )
     private var chats
