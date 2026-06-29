@@ -183,9 +183,8 @@ import CodexDataKit
 
 struct Sidebar: View {
     @CodexQuery(
-        CodexFetchDescriptor<CodexChat>(
-            sortBy: [CodexSortDescriptor(\.updatedAt, order: .reverse)]
-        ),
+        sort: \.updatedAt,
+        order: .reverse,
         sectionBy: CodexSectionDescriptor(\CodexChat.workspaceGroupID)
     )
     private var chats

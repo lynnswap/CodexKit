@@ -85,6 +85,36 @@ public struct CodexQuery<Model: CodexObservableModel>: @preconcurrency DynamicPr
         self.sectionBy = sectionBy
     }
 
+    public init<Value: Comparable>(
+        filter: CodexFetchPredicate<Model>? = nil,
+        sort keyPath: KeyPath<Model, Value>,
+        order: CodexSortOrder = .forward,
+        animation: Animation? = nil,
+        sectionBy: CodexSectionDescriptor<Model>? = nil
+    ) {
+        self.init(
+            filter: filter,
+            sort: [CodexSortDescriptor(keyPath, order: order)],
+            animation: animation,
+            sectionBy: sectionBy
+        )
+    }
+
+    public init<Value: Comparable>(
+        filter: CodexFetchPredicate<Model>? = nil,
+        sort keyPath: KeyPath<Model, Value?>,
+        order: CodexSortOrder = .forward,
+        animation: Animation? = nil,
+        sectionBy: CodexSectionDescriptor<Model>? = nil
+    ) {
+        self.init(
+            filter: filter,
+            sort: [CodexSortDescriptor(keyPath, order: order)],
+            animation: animation,
+            sectionBy: sectionBy
+        )
+    }
+
     public init(
         fetchRequest request: CodexFetchRequest<Model>,
         animation _: Animation? = nil,

@@ -309,6 +309,22 @@ struct CodexModelContextTests {
         #expect(params.sortKey == "updated_at")
     }
 
+    @Test("query key path sort convenience accepts comparable and optional comparable fields")
+    func queryKeyPathSortConvenienceAcceptsComparableAndOptionalComparableFields() {
+        let workspaceQuery = CodexQuery<CodexWorkspace>(sort: \.name)
+        let chatQuery = CodexQuery<CodexChat>(sort: \.updatedAt, order: .reverse)
+        let sectionedChatQuery = CodexQuery<CodexChat>(
+            filter: .init(archived: false),
+            sort: \.recencyAt,
+            order: .reverse,
+            sectionBy: .workspaceGroup
+        )
+
+        #expect(workspaceQuery.wrappedValue.items.isEmpty)
+        #expect(chatQuery.wrappedValue.items.isEmpty)
+        #expect(sectionedChatQuery.wrappedValue.items.isEmpty)
+    }
+
     @Test("fetched chat exposes app-server thread status and recency")
     func fetchedChatExposesThreadStatusAndRecency() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
