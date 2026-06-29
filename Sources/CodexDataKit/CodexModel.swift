@@ -135,6 +135,10 @@ public final class CodexWorkspace: CodexObservableModel {
 
     public private(set) weak var workspaceGroup: CodexWorkspaceGroup?
 
+    public var workspaceGroupID: CodexWorkspaceGroupID? {
+        workspaceGroup?.id
+    }
+
     @ObservationIgnored
     public private(set) weak var modelContext: CodexModelContext?
 
@@ -214,6 +218,14 @@ public final class CodexChat: CodexObservableModel {
     public var lastErrorDescription: String?
 
     public private(set) weak var workspace: CodexWorkspace?
+
+    public var workspaceID: CodexWorkspaceID? {
+        workspace?.id
+    }
+
+    public var workspaceGroupID: CodexWorkspaceGroupID? {
+        workspace?.workspaceGroupID
+    }
 
     @ObservationIgnored
     private var liveMergeState = LiveMergeState()

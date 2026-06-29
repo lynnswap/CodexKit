@@ -31,6 +31,38 @@ public struct CodexSortDescriptor<Model: CodexObservableModel>: Sendable, Hashab
         self.key = key
         self.order = order
     }
+
+    @MainActor
+    public init<Value: Comparable>(
+        _ keyPath: KeyPath<Model, Value>,
+        order: CodexSortOrder = .forward
+    ) {
+        self.init(
+            key: Self.requireKnownSortKey(for: keyPath),
+            order: order
+        )
+    }
+
+    @MainActor
+    public init<Value: Comparable>(
+        _ keyPath: KeyPath<Model, Value?>,
+        order: CodexSortOrder = .forward
+    ) {
+        self.init(
+            key: Self.requireKnownSortKey(for: keyPath),
+            order: order
+        )
+    }
+
+    @MainActor
+    private static func requireKnownSortKey(for keyPath: AnyKeyPath) -> CodexSortKey {
+        guard let key = CodexKnownKeyPaths.sortKey(for: Model.self, keyPath: keyPath) else {
+            preconditionFailure(
+                "CodexSortDescriptor does not support sorting \(Model.self) by key path \(keyPath)."
+            )
+        }
+        return key
+    }
 }
 
 extension CodexSortDescriptor where Model == CodexWorkspaceGroup {
@@ -73,6 +105,30 @@ public struct CodexSectionDescriptor<Model: CodexObservableModel>: Sendable, Has
 
     package init(key: CodexSectionKey) {
         self.key = key
+    }
+
+    @MainActor
+    public init<SectionIdentifier: Hashable & Sendable>(
+        _ keyPath: KeyPath<Model, SectionIdentifier>
+    ) {
+        self.init(key: Self.requireKnownSectionKey(for: keyPath))
+    }
+
+    @MainActor
+    public init<SectionIdentifier: Hashable & Sendable>(
+        _ keyPath: KeyPath<Model, SectionIdentifier?>
+    ) {
+        self.init(key: Self.requireKnownSectionKey(for: keyPath))
+    }
+
+    @MainActor
+    private static func requireKnownSectionKey(for keyPath: AnyKeyPath) -> CodexSectionKey {
+        guard let key = CodexKnownKeyPaths.sectionKey(for: Model.self, keyPath: keyPath) else {
+            preconditionFailure(
+                "CodexSectionDescriptor does not support sectioning \(Model.self) by key path \(keyPath)."
+            )
+        }
+        return key
     }
 }
 
@@ -169,6 +225,107 @@ public struct CodexFetchDescriptor<Model: CodexObservableModel>: Sendable, Hasha
         self.fetchLimit = fetchLimit
         self.fetchOffset = max(0, fetchOffset)
         self.cursor = nil
+    }
+
+    @MainActor
+    public init<Value: Comparable>(
+        predicate: CodexFetchPredicate<Model> = .init(),
+        sort keyPath: KeyPath<Model, Value>,
+        order: CodexSortOrder = .forward,
+        fetchLimit: Int? = nil,
+        fetchOffset: Int = 0
+    ) {
+        self.init(
+            predicate: predicate,
+            sortBy: [CodexSortDescriptor(keyPath, order: order)],
+            fetchLimit: fetchLimit,
+            fetchOffset: fetchOffset
+        )
+    }
+
+    @MainActor
+    public init<Value: Comparable>(
+        predicate: CodexFetchPredicate<Model> = .init(),
+        sort keyPath: KeyPath<Model, Value?>,
+        order: CodexSortOrder = .forward,
+        fetchLimit: Int? = nil,
+        fetchOffset: Int = 0
+    ) {
+        self.init(
+            predicate: predicate,
+            sortBy: [CodexSortDescriptor(keyPath, order: order)],
+            fetchLimit: fetchLimit,
+            fetchOffset: fetchOffset
+        )
+    }
+}
+
+private enum CodexKnownKeyPaths {
+    @MainActor
+    static func sortKey<Model: CodexObservableModel>(
+        for _: Model.Type,
+        keyPath: AnyKeyPath
+    ) -> CodexSortKey? {
+        if Model.self == CodexWorkspaceGroup.self {
+            return sortKeyForWorkspaceGroup(keyPath)
+        }
+        if Model.self == CodexWorkspace.self {
+            return sortKeyForWorkspace(keyPath)
+        }
+        if Model.self == CodexChat.self {
+            return sortKeyForChat(keyPath)
+        }
+        return nil
+    }
+
+    @MainActor
+    static func sectionKey<Model: CodexObservableModel>(
+        for _: Model.Type,
+        keyPath: AnyKeyPath
+    ) -> CodexSectionKey? {
+        if Model.self == CodexWorkspace.self {
+            return keyPath == (\CodexWorkspace.workspaceGroupID as AnyKeyPath)
+                ? .workspaceGroup
+                : nil
+        }
+        if Model.self == CodexChat.self {
+            if keyPath == (\CodexChat.workspaceGroupID as AnyKeyPath) {
+                return .workspaceGroup
+            }
+            if keyPath == (\CodexChat.workspaceID as AnyKeyPath) {
+                return .workspace
+            }
+        }
+        return nil
+    }
+
+    @MainActor
+    private static func sortKeyForWorkspaceGroup(_ keyPath: AnyKeyPath) -> CodexSortKey? {
+        keyPath == (\CodexWorkspaceGroup.name as AnyKeyPath) ? .name : nil
+    }
+
+    @MainActor
+    private static func sortKeyForWorkspace(_ keyPath: AnyKeyPath) -> CodexSortKey? {
+        keyPath == (\CodexWorkspace.name as AnyKeyPath) ? .name : nil
+    }
+
+    @MainActor
+    private static func sortKeyForChat(_ keyPath: AnyKeyPath) -> CodexSortKey? {
+        if keyPath == (\CodexChat.title as AnyKeyPath)
+            || keyPath == (\CodexChat.name as AnyKeyPath)
+        {
+            return .name
+        }
+        if keyPath == (\CodexChat.createdAt as AnyKeyPath) {
+            return .createdAt
+        }
+        if keyPath == (\CodexChat.updatedAt as AnyKeyPath) {
+            return .updatedAt
+        }
+        if keyPath == (\CodexChat.recencyAt as AnyKeyPath) {
+            return .recencyAt
+        }
+        return nil
     }
 }
 

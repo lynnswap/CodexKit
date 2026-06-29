@@ -73,7 +73,9 @@ import Foundation
 let container = try await CodexModelContainer()
 let context = container.mainContext
 
-let results = context.fetchedResults(for: CodexFetchDescriptor<CodexChat>.recentChats)
+let results = context.fetchedResults(
+    for: CodexFetchDescriptor<CodexChat>(sort: \.updatedAt, order: .reverse)
+)
 try await results.performFetch()
 
 for chat in results.items {

@@ -42,11 +42,15 @@ let descriptor = CodexFetchDescriptor<CodexChat>(
         workspace: workspaceURL,
         searchTerm: "review"
     ),
-    sortBy: [.recencyAt(.reverse)],
+    sort: \.recencyAt,
+    order: .reverse,
     fetchLimit: 50
 )
 
-let results = context.fetchedResults(for: descriptor, sectionedBy: .workspaceGroup)
+let results = context.fetchedResults(
+    for: descriptor,
+    sectionedBy: CodexSectionDescriptor(\CodexChat.workspaceGroupID)
+)
 try await results.performFetch()
 ```
 
@@ -55,12 +59,16 @@ Use `CodexFetchRequest` when request construction reads better as a mutable Core
 ```swift
 let request = CodexFetchRequest<CodexChat>()
 request.predicate = .init(workspace: workspaceURL)
-request.sortDescriptors = [.updatedAt(.reverse)]
+request.sortDescriptors = [CodexSortDescriptor(\.updatedAt, order: .reverse)]
 request.fetchLimit = 100
 
 let results = context.fetchedResults(for: request)
 try await results.performFetch()
 ```
+
+Convenience helpers such as `.updatedAt(.reverse)` and `.workspaceGroup` are aliases over
+the same known key-path contract. A key path must map to a supported CodexDataKit model
+field; arbitrary key paths are not silently treated as app-server sorts.
 
 Fetches preserve object identity. If the same app-server thread appears in a later refresh, CodexDataKit mutates the existing `CodexChat` instance instead of replacing it.
 
@@ -79,12 +87,12 @@ Pass `sectionedBy` at the results/query boundary when a UI wants sidebar section
 ```swift
 let workspaces = context.fetchedResults(
     for: CodexFetchDescriptor<CodexWorkspace>.workspaces,
-    sectionedBy: .workspaceGroup
+    sectionedBy: CodexSectionDescriptor(\CodexWorkspace.workspaceGroupID)
 )
 
 let chats = context.fetchedResults(
-    for: CodexFetchDescriptor<CodexChat>(sortBy: [.updatedAt(.reverse)]),
-    sectionedBy: .workspace
+    for: CodexFetchDescriptor<CodexChat>(sort: \.updatedAt, order: .reverse),
+    sectionedBy: CodexSectionDescriptor(\CodexChat.workspaceID)
 )
 ```
 
@@ -173,8 +181,8 @@ import CodexDataKit
 
 struct Sidebar: View {
     @CodexQuery(
-        CodexFetchDescriptor<CodexChat>(sortBy: [.updatedAt(.reverse)]),
-        sectionBy: .workspaceGroup
+        CodexFetchDescriptor<CodexChat>(sort: \.updatedAt, order: .reverse),
+        sectionBy: CodexSectionDescriptor(\CodexChat.workspaceGroupID)
     )
     private var chats
 

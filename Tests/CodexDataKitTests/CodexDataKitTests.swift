@@ -288,6 +288,48 @@ struct CodexModelContextTests {
         #expect(params.cwd == .paths([app.path, tools.path]))
     }
 
+    @Test("key path sort descriptors translate known chat dates to thread list params")
+    func keyPathSortDescriptorsTranslateKnownChatDatesToThreadListParams() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadList(.init(threads: []))
+
+        let descriptor = CodexFetchDescriptor<CodexChat>(
+            sort: \.updatedAt,
+            order: .reverse,
+            fetchLimit: 25
+        )
+        _ = try await context.fetch(descriptor)
+
+        let recorded = try #require(
+            await runtime.transport.recordedRequests(method: "thread/list").first)
+        let params = try recorded.decodeParams(ThreadListParams.self)
+        #expect(params.limit == 25)
+        #expect(params.sortDirection == "desc")
+        #expect(params.sortKey == "updated_at")
+    }
+
+    @Test("sort convenience helpers are aliases for key path descriptors")
+    func sortConvenienceHelpersAreAliasesForKeyPathDescriptors() {
+        #expect(
+            CodexSortDescriptor<CodexWorkspaceGroup>.name()
+                == CodexSortDescriptor<CodexWorkspaceGroup>(\.name)
+        )
+        #expect(
+            CodexSortDescriptor<CodexWorkspace>.name(.reverse)
+                == CodexSortDescriptor<CodexWorkspace>(\.name, order: .reverse)
+        )
+        #expect(
+            CodexSortDescriptor<CodexChat>.updatedAt(.reverse)
+                == CodexSortDescriptor<CodexChat>(\.updatedAt, order: .reverse)
+        )
+        #expect(
+            CodexSortDescriptor<CodexChat>.recencyAt(.reverse)
+                == CodexSortDescriptor<CodexChat>(\.recencyAt, order: .reverse)
+        )
+    }
+
     @Test("fetched chat exposes app-server thread status and recency")
     func fetchedChatExposesThreadStatusAndRecency() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -1259,7 +1301,7 @@ struct CodexModelContextTests {
 
         let workspaceResults = context.fetchedResults(
             for: CodexFetchRequest<CodexWorkspace>.workspaces(),
-            sectionedBy: .workspaceGroup
+            sectionedBy: CodexSectionDescriptor(\CodexWorkspace.workspaceGroupID)
         )
         try await workspaceResults.performFetch()
 
@@ -1273,9 +1315,9 @@ struct CodexModelContextTests {
 
         let chatResults = context.fetchedResults(
             for: CodexFetchRequest<CodexChat>(
-                sortDescriptors: [.name()]
+                sortDescriptors: [CodexSortDescriptor(\.title)]
             ),
-            sectionedBy: .workspace
+            sectionedBy: CodexSectionDescriptor(\CodexChat.workspaceID)
         )
         try await chatResults.performFetch()
 
@@ -1284,6 +1326,9 @@ struct CodexModelContextTests {
             chatResults.items.map(\.workspace?.workspaceGroup?.id).allSatisfy {
                 $0 == workspaceResults.items.first?.workspaceGroup?.id
             })
+        #expect(CodexSectionDescriptor<CodexWorkspace>.workspaceGroup == .init(\.workspaceGroupID))
+        #expect(CodexSectionDescriptor<CodexChat>.workspace == .init(\.workspaceID))
+        #expect(CodexSectionDescriptor<CodexChat>.workspaceGroup == .init(\.workspaceGroupID))
     }
 
     @Test("workspace fetch pagination is applied after workspace deduplication")
