@@ -749,6 +749,75 @@ struct CodexAppServerKitTests {
         #expect(snapshot.hasField(.turns))
     }
 
+    @Test func threadStoreDrivesRuntimeThreadStubsAfterStart() async throws {
+        let workspace = URL(fileURLWithPath: "/tmp/project", isDirectory: true)
+        let initial = CodexThreadSnapshot(
+            id: "thread-a",
+            workspace: workspace,
+            name: "A",
+            modelProvider: "openai"
+        )
+        let store = CodexAppServerTestThreadStore(
+            threads: [initial],
+            nextCursor: "next",
+            backwardsCursor: "back"
+        )
+        let runtime = try await CodexAppServerTestRuntime.start(threadStore: store)
+
+        let firstPage = try await runtime.server.listThreads()
+        #expect(firstPage.threads == [initial])
+        #expect(firstPage.nextCursor == "next")
+        #expect(firstPage.backwardsCursor == "back")
+
+        let updated = CodexThreadSnapshot(
+            id: "thread-b",
+            workspace: workspace,
+            name: "B",
+            preview: "Updated",
+            modelProvider: "openai",
+            turns: [CodexTurnSnapshot(id: "turn-b", status: .completed)]
+        )
+        await store.upsert(updated)
+
+        #expect(await store.snapshot(id: "thread-b") == updated)
+        #expect(await store.snapshots().map(\.id.rawValue) == ["thread-b", "thread-a"])
+
+        let secondPage = try await runtime.server.listThreads()
+        #expect(secondPage.threads == [updated, initial])
+
+        let resumed = try await runtime.server.resumeThread("thread-b")
+        let read = try await resumed.read(includeTurns: true)
+        #expect(read == updated)
+
+        await store.remove(id: "thread-a")
+        let removedPage = try await runtime.server.listThreads()
+        #expect(removedPage.threads == [updated])
+
+        let startedWorkspace = URL(fileURLWithPath: "/tmp/started", isDirectory: true)
+        let started = try await runtime.server.startThread(
+            in: startedWorkspace,
+            options: .init(model: "gpt-5", modelProvider: "openai", ephemeral: true)
+        )
+        let startedSnapshot = try #require(await store.snapshot(id: started.id))
+        #expect(startedSnapshot.workspace == startedWorkspace)
+        #expect(startedSnapshot.modelProvider == "openai")
+        #expect(startedSnapshot.ephemeral == true)
+        #expect(started.model == "gpt-5")
+    }
+
+    @Test func transportStubThreadsAcceptsMutableThreadStore() async throws {
+        let store = CodexAppServerTestThreadStore()
+        let transport = CodexAppServerTestTransport()
+        try await transport.stubThreads(store)
+        let runtime = try await CodexAppServerTestRuntime.start(transport: transport)
+
+        let snapshot = CodexThreadSnapshot(id: "thread-transport", name: "Transport")
+        await store.upsert(snapshot)
+
+        let page = try await runtime.server.listThreads()
+        #expect(page.threads == [snapshot])
+    }
+
     @Test func appServerArchiveThreadSerializesThreadID() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueueEmpty(for: "thread/archive")

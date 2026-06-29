@@ -1,21 +1,51 @@
 import Foundation
 import CodexAppServerKit
 
-private actor CodexAppServerInMemoryThreadStore {
+/// An in-memory store for app-server thread snapshots used by test stubs.
+///
+/// Use this store when tests or previews need to mutate the same authoritative
+/// snapshots that back `thread/list`, `thread/read`, `thread/resume`, and
+/// `thread/start` in ``CodexAppServerTestTransport``.
+public actor CodexAppServerTestThreadStore {
     private var snapshotsByID: [String: CodexThreadSnapshot]
     private var snapshotOrder: [String]
     private let nextCursor: String?
     private let backwardsCursor: String?
 
-    init(
-        threads: [CodexThreadSnapshot],
-        nextCursor: String?,
-        backwardsCursor: String?
+    /// Creates an in-memory thread snapshot store.
+    public init(
+        threads: [CodexThreadSnapshot] = [],
+        nextCursor: String? = nil,
+        backwardsCursor: String? = nil
     ) {
         self.snapshotsByID = Dictionary(uniqueKeysWithValues: threads.map { ($0.id.rawValue, $0) })
         self.snapshotOrder = threads.map(\.id.rawValue)
         self.nextCursor = nextCursor
         self.backwardsCursor = backwardsCursor
+    }
+
+    /// Returns the stored snapshot for `id`.
+    public func snapshot(id: CodexThreadID) -> CodexThreadSnapshot? {
+        snapshotsByID[id.rawValue]
+    }
+
+    /// Returns all stored snapshots in the order returned by `thread/list`.
+    public func snapshots() -> [CodexThreadSnapshot] {
+        snapshotOrder.compactMap { snapshotsByID[$0] }
+    }
+
+    /// Inserts or replaces a stored snapshot and moves it to the front of list results.
+    public func upsert(_ snapshot: CodexThreadSnapshot) {
+        snapshotsByID[snapshot.id.rawValue] = snapshot
+        snapshotOrder.removeAll { $0 == snapshot.id.rawValue }
+        snapshotOrder.insert(snapshot.id.rawValue, at: 0)
+    }
+
+    /// Removes and returns the stored snapshot for `id`, if one exists.
+    @discardableResult
+    public func remove(id: CodexThreadID) -> CodexThreadSnapshot? {
+        snapshotOrder.removeAll { $0 == id.rawValue }
+        return snapshotsByID.removeValue(forKey: id.rawValue)
     }
 
     func startThreadResponse(for params: Data) throws -> Data {
@@ -24,7 +54,7 @@ private actor CodexAppServerInMemoryThreadStore {
         let now = Date()
         let snapshot = CodexThreadSnapshot(
             id: CodexThreadID(rawValue: threadID),
-            workspace: request.cwd.map(URL.init(fileURLWithPath:)),
+            workspace: request.cwd.map { URL(fileURLWithPath: $0, isDirectory: true) },
             modelProvider: request.modelProvider,
             createdAt: now,
             updatedAt: now,
@@ -82,12 +112,6 @@ private actor CodexAppServerInMemoryThreadStore {
                 thread: CodexAppServerTestTransport.apiSnapshot(from: thread)
             ))
     }
-
-    private func upsert(_ snapshot: CodexThreadSnapshot) {
-        snapshotsByID[snapshot.id.rawValue] = snapshot
-        snapshotOrder.removeAll { $0 == snapshot.id.rawValue }
-        snapshotOrder.insert(snapshot.id.rawValue, at: 0)
-    }
 }
 
 /// A Codex app-server test runtime backed by an in-memory transport.
@@ -128,6 +152,30 @@ public struct CodexAppServerTestRuntime: Sendable {
         return .init(server: server, transport: transport)
     }
 
+    /// Creates a test runtime whose app-server thread APIs are backed by a mutable store.
+    ///
+    /// The returned runtime still exercises the public ``CodexAppServer`` API,
+    /// while callers can mutate `threadStore` after startup:
+    ///
+    /// ```swift
+    /// let store = CodexAppServerTestThreadStore(threads: threads)
+    /// let runtime = try await CodexAppServerTestRuntime.start(threadStore: store)
+    /// await store.upsert(updatedThread)
+    /// ```
+    public static func start(
+        threadStore: CodexAppServerTestThreadStore,
+        transport: CodexAppServerTestTransport = CodexAppServerTestTransport(),
+        codexHome: String? = nil,
+        userAgent: String? = nil
+    ) async throws -> CodexAppServerTestRuntime {
+        try await transport.stubThreads(threadStore)
+        return try await start(
+            transport: transport,
+            codexHome: codexHome,
+            userAgent: userAgent
+        )
+    }
+
     /// Creates a test runtime whose app-server thread APIs are backed by in-memory snapshots.
     ///
     /// The returned runtime still exercises the public ``CodexAppServer`` API.
@@ -145,12 +193,13 @@ public struct CodexAppServerTestRuntime: Sendable {
         codexHome: String? = nil,
         userAgent: String? = nil
     ) async throws -> CodexAppServerTestRuntime {
-        try await transport.stubThreads(
-            threads,
+        let threadStore = CodexAppServerTestThreadStore(
+            threads: threads,
             nextCursor: nextCursor,
             backwardsCursor: backwardsCursor
         )
         return try await start(
+            threadStore: threadStore,
             transport: transport,
             codexHome: codexHome,
             userAgent: userAgent
@@ -408,7 +457,7 @@ public actor CodexAppServerTestTransport {
         )
     }
 
-    /// Stubs thread list, resume, and read requests from in-memory thread snapshots.
+    /// Stubs thread start, list, resume, and read requests from in-memory thread snapshots.
     ///
     /// This is useful for UI previews and tests that should exercise the same
     /// app-server/DataKit path repeatedly without launching a real app-server.
@@ -417,12 +466,19 @@ public actor CodexAppServerTestTransport {
         nextCursor: String? = nil,
         backwardsCursor: String? = nil
     ) throws {
-        let store = CodexAppServerInMemoryThreadStore(
+        let store = CodexAppServerTestThreadStore(
             threads: threads,
             nextCursor: nextCursor,
             backwardsCursor: backwardsCursor
         )
+        try stubThreads(store)
+    }
 
+    /// Stubs thread requests from an in-memory store that callers can mutate later.
+    ///
+    /// The store remains the authoritative source for `thread/list`,
+    /// `thread/read`, `thread/resume`, and `thread/start` responses.
+    public func stubThreads(_ store: CodexAppServerTestThreadStore) throws {
         handle(method: "thread/start") { params in
             try await store.startThreadResponse(for: params)
         }
