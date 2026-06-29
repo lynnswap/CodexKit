@@ -355,19 +355,16 @@ public final class CodexFetchRequest<Model: CodexObservableModel>: @unchecked Se
 }
 
 extension CodexFetchDescriptor where Model == CodexWorkspaceGroup {
-    @MainActor
     public static var workspaceGroups: Self {
         .init(sortBy: codexDefaultWorkspaceGroupSortDescriptors())
     }
 }
 
 extension CodexFetchDescriptor where Model == CodexWorkspace {
-    @MainActor
     public static var workspaces: Self {
         .init(sortBy: codexDefaultWorkspaceSortDescriptors())
     }
 
-    @MainActor
     public static func workspaces(
         sortBy: [CodexSortDescriptor<CodexWorkspace>] = codexDefaultWorkspaceSortDescriptors()
     ) -> Self {
@@ -376,7 +373,6 @@ extension CodexFetchDescriptor where Model == CodexWorkspace {
 }
 
 extension CodexFetchDescriptor where Model == CodexChat {
-    @MainActor
     public static var recentChats: Self {
         .init(sortBy: codexDefaultChatSortDescriptors())
     }
@@ -404,19 +400,16 @@ extension CodexFetchDescriptor where Model == CodexChat {
 }
 
 extension CodexFetchRequest where Model == CodexWorkspaceGroup {
-    @MainActor
     public static var workspaceGroups: Self {
         Self(.workspaceGroups)
     }
 }
 
 extension CodexFetchRequest where Model == CodexWorkspace {
-    @MainActor
     public static var workspaces: Self {
         Self(.workspaces)
     }
 
-    @MainActor
     public static func workspaces(
         sortDescriptors: [CodexSortDescriptor<CodexWorkspace>] =
             codexDefaultWorkspaceSortDescriptors()
@@ -426,7 +419,6 @@ extension CodexFetchRequest where Model == CodexWorkspace {
 }
 
 extension CodexFetchRequest where Model == CodexChat {
-    @MainActor
     public static var recentChats: Self {
         Self(.recentChats)
     }
@@ -457,24 +449,21 @@ extension CodexFetchRequest where Model == CodexChat {
     }
 }
 
-@MainActor
 @usableFromInline
 func codexDefaultWorkspaceGroupSortDescriptors()
     -> [CodexSortDescriptor<CodexWorkspaceGroup>]
 {
-    [CodexSortDescriptor(\.name)]
+    [CodexSortDescriptor(key: .name, order: .forward)]
 }
 
-@MainActor
 @usableFromInline
 func codexDefaultWorkspaceSortDescriptors() -> [CodexSortDescriptor<CodexWorkspace>] {
-    [CodexSortDescriptor(\.name)]
+    [CodexSortDescriptor(key: .name, order: .forward)]
 }
 
-@MainActor
 @usableFromInline
 func codexDefaultChatSortDescriptors() -> [CodexSortDescriptor<CodexChat>] {
-    [CodexSortDescriptor(\.updatedAt, order: .reverse)]
+    [CodexSortDescriptor(key: .updatedAt, order: .reverse)]
 }
 
 public enum CodexFetchSectionID: Sendable, Hashable, CustomStringConvertible {
