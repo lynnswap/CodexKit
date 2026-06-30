@@ -1258,14 +1258,32 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         let filteredItems = items.filter {
             shouldKeep($0, afterRemoving: chat, workspace: workspace, group: group)
         }
-        if filteredItems.count != items.count {
+        let updatedItemIDs = updatedItemIDsAfterRemoval(
+            of: chat,
+            workspace: workspace,
+            group: group
+        )
+        if filteredItems.count != items.count || updatedItemIDs.isEmpty == false {
             updateItemsAndSections(
                 items: filteredItems,
                 sections: modelContext.sections(for: filteredItems, sectionBy: sectionBy),
-                reason: reason
+                reason: reason,
+                updatedItemIDs: updatedItemIDs
             )
         }
         return originalCount
+    }
+
+    private func updatedItemIDsAfterRemoval(
+        of chat: CodexChat,
+        workspace: CodexWorkspace?,
+        group: CodexWorkspaceGroup?
+    ) -> Set<Model.ID> {
+        var ids: Set<Model.ID> = []
+        insertUpdatedItemID(chat, into: &ids)
+        insertUpdatedItemID(workspace, into: &ids)
+        insertUpdatedItemID(group, into: &ids)
+        return ids
     }
 
     @discardableResult

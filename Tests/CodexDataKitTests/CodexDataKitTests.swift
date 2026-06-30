@@ -502,6 +502,39 @@ struct CodexModelContextTests {
         #expect(controller.sections.isEmpty)
     }
 
+    @Test("workspace controller reloads stable rows after chat deletion")
+    func workspaceControllerReloadsStableRowsAfterChatDeletion() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let repo = try gitRepository()
+        let workspaceURL = try createDirectory("App", in: repo)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-delete", workspace: workspaceURL, name: "Delete"),
+            .init(id: "thread-keep", workspace: workspaceURL, name: "Keep"),
+        ]))
+        let controller = context.fetchedResultsController(
+            for: CodexFetchRequest<CodexWorkspace>.workspaces
+        )
+        var transactions = controller.transactions.makeAsyncIterator()
+        try await controller.performFetch()
+        _ = await transactions.next()
+        let workspace = try #require(controller.items.first)
+        let chat = try #require(workspace.chats.first { $0.id.rawValue == "thread-delete" })
+
+        try await runtime.transport.enqueueEmpty(for: "thread/delete")
+        try await chat.delete()
+
+        let transaction = try #require(await transactions.next())
+        #expect(transaction.reason == .remove)
+        #expect(transaction.sectionChanges.isEmpty)
+        #expect(transaction.itemChanges == [
+            .update(itemID: workspace.id, indexPath: .init(section: 0, item: 0)),
+        ])
+        #expect(controller.items.first === workspace)
+        #expect(workspace.chats.map(\.id.rawValue) == ["thread-keep"])
+    }
+
     @Test("controller does not emit moves for item shifts after deletion")
     func controllerDoesNotEmitMovesForItemShiftsAfterDeletion() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
