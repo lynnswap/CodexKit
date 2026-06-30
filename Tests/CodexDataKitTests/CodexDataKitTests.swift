@@ -621,6 +621,51 @@ struct CodexModelContextTests {
         ])
     }
 
+    @Test("workspace-group controller emits delete and insert for non-surviving section moves")
+    func workspaceGroupControllerEmitsDeleteInsertForNonSurvivingSectionMoves() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let firstRepo = try gitRepository(named: "First")
+        let secondRepo = try gitRepository(named: "Second")
+        let firstWorkspaceURL = try createDirectory("App", in: firstRepo)
+        let secondWorkspaceURL = try createDirectory("App", in: secondRepo)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-move", workspace: firstWorkspaceURL, name: "Move"),
+        ]))
+        let controller = context.fetchedResultsController(
+            for: CodexFetchRequest<CodexChat>(
+                sortDescriptors: [CodexSortDescriptor(\.title)]
+            ),
+            sectionedBy: .workspaceGroup
+        )
+        var transactions = controller.transactions.makeAsyncIterator()
+        try await controller.performFetch()
+        _ = await transactions.next()
+        let chat = try #require(controller.items.first)
+        let firstGroupID = try #require(chat.workspace?.workspaceGroup?.id)
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-move"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-move",
+            workspace: secondWorkspaceURL,
+            name: "Move"
+        ))
+        try await chat.refresh(includeTurns: false)
+
+        let transaction = try #require(await transactions.next())
+        let secondGroupID = try #require(chat.workspace?.workspaceGroup?.id)
+        #expect(transaction.reason == .revalidate)
+        #expect(transaction.sectionChanges == [
+            .delete(sectionID: .workspaceGroup(firstGroupID), index: 0),
+            .insert(sectionID: .workspaceGroup(secondGroupID), index: 0),
+        ])
+        #expect(transaction.itemChanges == [
+            .delete(itemID: chat.id, indexPath: .init(section: 0, item: 0)),
+            .insert(itemID: chat.id, indexPath: .init(section: 0, item: 0)),
+        ])
+    }
+
     @Test("controller suppresses unrelated revalidation transactions")
     func controllerSuppressesUnrelatedRevalidationTransactions() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()

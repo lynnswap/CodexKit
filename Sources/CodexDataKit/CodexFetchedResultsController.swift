@@ -204,6 +204,14 @@ public struct CodexFetchedResultsTransaction<Model: CodexObservableModel>: Senda
     ) -> [CodexFetchedResultsItemChange<ItemID>] {
         let oldPositions = indexItems(oldSnapshot)
         let newPositions = indexItems(newSnapshot)
+        let oldSectionIDs = Set(oldSnapshot.sectionIDs)
+        let newSectionIDs = Set(newSnapshot.sectionIDs)
+        let deleteInsertItemIDs = itemIDsForDeleteInsert(
+            oldPositions: oldPositions,
+            newPositions: newPositions,
+            oldSectionIDs: oldSectionIDs,
+            newSectionIDs: newSectionIDs
+        )
         let oldRelativeIndexes = relativeIndexesByItemID(
             in: oldSnapshot,
             positions: oldPositions,
@@ -217,7 +225,7 @@ public struct CodexFetchedResultsTransaction<Model: CodexObservableModel>: Senda
         let reloadStableItems = reason == .refresh
 
         let deletes = oldPositions.values
-            .filter { newPositions[$0.itemID] == nil }
+            .filter { newPositions[$0.itemID] == nil || deleteInsertItemIDs.contains($0.itemID) }
             .sorted { lhs, rhs in
                 if lhs.indexPath.section != rhs.indexPath.section {
                     return lhs.indexPath.section > rhs.indexPath.section
@@ -232,7 +240,7 @@ public struct CodexFetchedResultsTransaction<Model: CodexObservableModel>: Senda
             }
 
         let inserts = newPositions.values
-            .filter { oldPositions[$0.itemID] == nil }
+            .filter { oldPositions[$0.itemID] == nil || deleteInsertItemIDs.contains($0.itemID) }
             .sorted { lhs, rhs in
                 if lhs.indexPath.section != rhs.indexPath.section {
                     return lhs.indexPath.section < rhs.indexPath.section
@@ -249,6 +257,9 @@ public struct CodexFetchedResultsTransaction<Model: CodexObservableModel>: Senda
         let moves = newPositions.values
             .compactMap { newPosition -> CodexFetchedResultsItemChange<ItemID>? in
                 guard let oldPosition = oldPositions[newPosition.itemID] else {
+                    return nil
+                }
+                guard deleteInsertItemIDs.contains(newPosition.itemID) == false else {
                     return nil
                 }
                 if oldPosition.sectionID != newPosition.sectionID {
@@ -281,6 +292,9 @@ public struct CodexFetchedResultsTransaction<Model: CodexObservableModel>: Senda
                 guard oldPositions[newPosition.itemID] != nil else {
                     return nil
                 }
+                guard deleteInsertItemIDs.contains(newPosition.itemID) == false else {
+                    return nil
+                }
                 guard reloadStableItems || updatedItemIDs.contains(newPosition.itemID) else {
                     return nil
                 }
@@ -291,6 +305,28 @@ public struct CodexFetchedResultsTransaction<Model: CodexObservableModel>: Senda
             }
 
         return deletes + inserts + moves + updates
+    }
+
+    private static func itemIDsForDeleteInsert(
+        oldPositions: [ItemID: ItemPosition],
+        newPositions: [ItemID: ItemPosition],
+        oldSectionIDs: Set<CodexFetchSectionID>,
+        newSectionIDs: Set<CodexFetchSectionID>
+    ) -> Set<ItemID> {
+        Set(newPositions.values.compactMap { newPosition in
+            guard let oldPosition = oldPositions[newPosition.itemID],
+                oldPosition.sectionID != newPosition.sectionID
+            else {
+                return nil
+            }
+            guard newSectionIDs.contains(oldPosition.sectionID) == false
+                || oldSectionIDs.contains(newPosition.sectionID) == false
+                || oldPosition.indexPath == newPosition.indexPath
+            else {
+                return nil
+            }
+            return newPosition.itemID
+        })
     }
 
     private static func indexSections(
