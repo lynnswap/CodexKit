@@ -570,6 +570,103 @@ struct CodexModelContextTests {
         #expect(controller.sections.count == 1)
     }
 
+    @Test("workspace-group controller suppresses no-op moves in mixed refresh diffs")
+    func workspaceGroupControllerSuppressesNoOpMovesInMixedRefreshDiffs() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let firstRepo = try gitRepository(named: "First")
+        let secondRepo = try gitRepository(named: "Second")
+        let thirdRepo = try gitRepository(named: "Third")
+        let firstWorkspaceURL = try createDirectory("App", in: firstRepo)
+        let secondWorkspaceURL = try createDirectory("App", in: secondRepo)
+        let thirdWorkspaceURL = try createDirectory("App", in: thirdRepo)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-alpha", workspace: firstWorkspaceURL, name: "Alpha"),
+            .init(id: "thread-beta", workspace: secondWorkspaceURL, name: "Beta"),
+        ]))
+        let controller = context.fetchedResultsController(
+            for: CodexFetchRequest<CodexChat>(
+                sortDescriptors: [CodexSortDescriptor(\.title)]
+            ),
+            sectionedBy: .workspaceGroup
+        )
+        var transactions = controller.transactions.makeAsyncIterator()
+        try await controller.performFetch()
+        _ = await transactions.next()
+        let alpha = try #require(controller.items.first { $0.id.rawValue == "thread-alpha" })
+        let beta = try #require(controller.items.first { $0.id.rawValue == "thread-beta" })
+        let firstGroupID = try #require(alpha.workspace?.workspaceGroup?.id)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-gamma", workspace: thirdWorkspaceURL, name: "Aardvark"),
+            .init(id: "thread-beta", workspace: secondWorkspaceURL, name: "Beta"),
+            .init(id: "thread-alpha", workspace: firstWorkspaceURL, name: "Zulu"),
+        ]))
+
+        try await controller.refresh()
+
+        let transaction = try #require(await transactions.next())
+        let gamma = try #require(controller.items.first { $0.id.rawValue == "thread-gamma" })
+        let thirdGroupID = try #require(gamma.workspace?.workspaceGroup?.id)
+        #expect(transaction.reason == .refresh)
+        #expect(transaction.sectionChanges == [
+            .insert(sectionID: .workspaceGroup(thirdGroupID), index: 0),
+            .move(sectionID: .workspaceGroup(firstGroupID), from: 0, to: 2),
+        ])
+        #expect(transaction.itemChanges == [
+            .insert(itemID: gamma.id, indexPath: .init(section: 0, item: 0)),
+            .update(itemID: beta.id, indexPath: .init(section: 1, item: 0)),
+            .update(itemID: alpha.id, indexPath: .init(section: 2, item: 0)),
+        ])
+    }
+
+    @Test("controller suppresses unrelated revalidation transactions")
+    func controllerSuppressesUnrelatedRevalidationTransactions() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let firstRepo = try gitRepository(named: "First")
+        let secondRepo = try gitRepository(named: "Second")
+        let firstWorkspaceURL = try createDirectory("App", in: firstRepo)
+        let secondWorkspaceURL = try createDirectory("App", in: secondRepo)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-alpha", workspace: firstWorkspaceURL, name: "Alpha"),
+            .init(id: "thread-beta", workspace: secondWorkspaceURL, name: "Beta"),
+        ]))
+        let allResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            sortDescriptors: [CodexSortDescriptor(\.title)]
+        ))
+        try await allResults.performFetch()
+        let alpha = try #require(allResults.items.first { $0.id.rawValue == "thread-alpha" })
+        let beta = try #require(allResults.items.first { $0.id.rawValue == "thread-beta" })
+        let firstWorkspace = try #require(alpha.workspace)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-alpha", workspace: firstWorkspaceURL, name: "Alpha"),
+        ]))
+        let controller = context.fetchedResultsController(
+            for: CodexFetchRequest<CodexChat>.chats(
+                in: firstWorkspace,
+                sortDescriptors: [CodexSortDescriptor(\.title)]
+            )
+        )
+        let recorder = FetchedResultsTransactionRecorder(stream: controller.transactions)
+        try await controller.performFetch()
+        #expect(await eventually { recorder.transactions.count == 1 })
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-beta"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-beta",
+            workspace: secondWorkspaceURL,
+            name: "Beta Updated"
+        ))
+        try await beta.refresh(includeTurns: false)
+
+        #expect(await recorder.count(after: .milliseconds(20)) == 1)
+        #expect(controller.items.map(\.id) == [alpha.id])
+    }
+
     @Test("controller keeps update changes for items that move")
     func controllerKeepsUpdateChangesForItemsThatMove() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -5681,6 +5778,29 @@ private func eventually(
         try? await Task.sleep(for: .milliseconds(10))
     }
     return await condition()
+}
+
+@MainActor
+private final class FetchedResultsTransactionRecorder<Model: CodexObservableModel> {
+    private(set) var transactions: [CodexFetchedResultsTransaction<Model>] = []
+    private var task: Task<Void, Never>?
+
+    init(stream: AsyncStream<CodexFetchedResultsTransaction<Model>>) {
+        task = Task { @MainActor [weak self] in
+            for await transaction in stream {
+                self?.transactions.append(transaction)
+            }
+        }
+    }
+
+    deinit {
+        task?.cancel()
+    }
+
+    func count(after delay: Duration) async -> Int {
+        try? await Task.sleep(for: delay)
+        return transactions.count
+    }
 }
 
 private final class ChatChangeRecorder: @unchecked Sendable {

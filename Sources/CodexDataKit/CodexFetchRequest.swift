@@ -751,7 +751,6 @@ public final class CodexFetchedResults<Model: CodexObservableModel> {
         guard transaction.hasChanges
             || reason == .initialFetch
             || reason == .refresh
-            || updatedItemIDs.isEmpty == false
         else {
             return
         }

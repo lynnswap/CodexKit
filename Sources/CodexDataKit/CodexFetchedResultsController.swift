@@ -172,6 +172,9 @@ public struct CodexFetchedResultsTransaction<Model: CodexObservableModel>: Senda
             guard let oldIndex = oldIndexes[sectionID], let newIndex = newIndexes[sectionID] else {
                 return nil
             }
+            guard oldIndex != newIndex else {
+                return nil
+            }
             return CodexFetchedResultsSectionChange.move(
                 sectionID: sectionID,
                 from: oldIndex,
@@ -258,6 +261,9 @@ public struct CodexFetchedResultsTransaction<Model: CodexObservableModel>: Senda
                 guard oldRelativeIndexes[newPosition.itemID]
                     != newRelativeIndexes[newPosition.itemID]
                 else {
+                    return nil
+                }
+                guard oldPosition.indexPath != newPosition.indexPath else {
                     return nil
                 }
                 return .move(
