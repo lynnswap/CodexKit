@@ -102,6 +102,22 @@ public struct CodexSectionDescriptor<Model: CodexObservableModel>: Sendable, Has
     }
 }
 
+extension CodexSectionDescriptor where Model == CodexWorkspace {
+    public static var workspaceGroup: Self {
+        .init(key: .workspaceGroup)
+    }
+}
+
+extension CodexSectionDescriptor where Model == CodexChat {
+    public static var workspaceGroup: Self {
+        .init(key: .workspaceGroup)
+    }
+
+    public static var workspace: Self {
+        .init(key: .workspace)
+    }
+}
+
 public struct CodexFetchPredicate<Model: CodexObservableModel>: Sendable, Hashable {
     public var archived: Bool?
     public var workspaces: [URL]? {

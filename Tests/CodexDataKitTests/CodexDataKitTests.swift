@@ -329,15 +329,15 @@ struct CodexModelContextTests {
         #expect(params.sortKey == "updated_at")
     }
 
-    @Test("query key path descriptors accept comparable and section fields")
-    func queryKeyPathDescriptorsAcceptComparableAndSectionFields() {
+    @Test("query descriptors accept key path sorts and section aliases")
+    func queryDescriptorsAcceptKeyPathSortsAndSectionAliases() {
         let workspaceQuery = CodexQuery<CodexWorkspace>(sort: \.name)
         let chatQuery = CodexQuery<CodexChat>(sort: \.updatedAt, order: .reverse)
         let sectionedChatQuery = CodexQuery<CodexChat>(
             filter: .init(archived: false),
             sort: \.recencyAt,
             order: .reverse,
-            sectionBy: CodexSectionDescriptor(\.workspaceGroupID)
+            sectionBy: .workspaceGroup
         )
 
         #expect(workspaceQuery.wrappedValue.items.isEmpty)
@@ -1300,7 +1300,7 @@ struct CodexModelContextTests {
         #expect(results.items.map(\.id.rawValue) == ["thread-dated", "thread-undated"])
     }
 
-    @Test("workspace and chat fetches can be sectioned by key paths")
+    @Test("workspace and chat fetches can be sectioned by relationship aliases")
     func fetchesSupportWorkspaceSections() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         let context = CodexModelContainer(appServer: runtime.server).mainContext
@@ -1314,9 +1314,13 @@ struct CodexModelContextTests {
         ])
         try await runtime.transport.enqueueThreadList(page)
 
+        #expect(CodexSectionDescriptor<CodexWorkspace>.workspaceGroup == .init(\.workspaceGroupID))
+        #expect(CodexSectionDescriptor<CodexChat>.workspaceGroup == .init(\.workspaceGroupID))
+        #expect(CodexSectionDescriptor<CodexChat>.workspace == .init(\.workspaceID))
+
         let workspaceResults = context.fetchedResults(
             for: CodexFetchRequest<CodexWorkspace>.workspaces(),
-            sectionedBy: CodexSectionDescriptor(\.workspaceGroupID)
+            sectionedBy: .workspaceGroup
         )
         try await workspaceResults.performFetch()
 
@@ -1335,7 +1339,7 @@ struct CodexModelContextTests {
             for: CodexFetchRequest<CodexChat>(
                 sortDescriptors: [CodexSortDescriptor(\.title)]
             ),
-            sectionedBy: CodexSectionDescriptor(\.workspaceID)
+            sectionedBy: .workspace
         )
         try await chatResults.performFetch()
 

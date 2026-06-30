@@ -48,7 +48,7 @@ let descriptor = CodexFetchDescriptor<CodexChat>(
 
 let results = context.fetchedResults(
     for: descriptor,
-    sectionedBy: CodexSectionDescriptor(\CodexChat.workspaceGroupID)
+    sectionedBy: .workspaceGroup
 )
 try await results.performFetch()
 ```
@@ -67,7 +67,9 @@ try await results.performFetch()
 
 Sort descriptors use the known key-path contract directly. A key path must map to a
 supported CodexDataKit model field; arbitrary key paths are not silently treated as
-app-server sorts. Section descriptors follow the same key-path style.
+app-server sorts. Section descriptors support the same key-path style, plus
+relationship aliases such as `.workspaceGroup` and `.workspace` for the common
+sidebar groupings.
 
 Fetches preserve object identity. If the same app-server thread appears in a later refresh, CodexDataKit mutates the existing `CodexChat` instance instead of replacing it.
 
@@ -101,14 +103,14 @@ Pass `sectionedBy` at the results/query boundary when a UI wants sidebar section
 ```swift
 let workspaces = context.fetchedResults(
     for: CodexFetchDescriptor<CodexWorkspace>.workspaces,
-    sectionedBy: CodexSectionDescriptor(\CodexWorkspace.workspaceGroupID)
+    sectionedBy: .workspaceGroup
 )
 
 let chats = context.fetchedResults(
     for: CodexFetchDescriptor<CodexChat>(
         sortBy: [CodexSortDescriptor(\.updatedAt, order: .reverse)]
     ),
-    sectionedBy: CodexSectionDescriptor(\CodexChat.workspaceID)
+    sectionedBy: .workspace
 )
 ```
 
@@ -199,7 +201,7 @@ struct Sidebar: View {
     @CodexQuery(
         sort: \.updatedAt,
         order: .reverse,
-        sectionBy: CodexSectionDescriptor(\CodexChat.workspaceGroupID)
+        sectionBy: .workspaceGroup
     )
     private var chats
 
