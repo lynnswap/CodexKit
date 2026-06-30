@@ -244,12 +244,7 @@ public struct CodexFetchedResultsTransaction<Model: CodexObservableModel>: Senda
 
         let updates = newPositions.values
             .compactMap { newPosition -> CodexFetchedResultsItemChange<ItemID>? in
-                guard let oldPosition = oldPositions[newPosition.itemID] else {
-                    return nil
-                }
-                guard oldPosition.sectionID == newPosition.sectionID,
-                    oldPosition.indexPath.item == newPosition.indexPath.item
-                else {
+                guard oldPositions[newPosition.itemID] != nil else {
                     return nil
                 }
                 guard reloadStableItems || updatedItemIDs.contains(newPosition.itemID) else {

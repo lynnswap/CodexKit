@@ -502,6 +502,45 @@ struct CodexModelContextTests {
         #expect(controller.sections.isEmpty)
     }
 
+    @Test("controller keeps update changes for items that move")
+    func controllerKeepsUpdateChangesForItemsThatMove() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-alpha", name: "Alpha"),
+            .init(id: "thread-beta", name: "Beta"),
+        ]))
+        let controller = context.fetchedResultsController(for: CodexFetchRequest<CodexChat>(
+            sortDescriptors: [CodexSortDescriptor(\.title)]
+        ))
+        var transactions = controller.transactions.makeAsyncIterator()
+        try await controller.performFetch()
+        _ = await transactions.next()
+        let alpha = try #require(controller.items.first)
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-alpha"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-alpha",
+            name: "Zulu"
+        ))
+        try await alpha.refresh(includeTurns: false)
+
+        let transaction = try #require(await transactions.next())
+        #expect(transaction.reason == .revalidate)
+        #expect(controller.items.map(\.title) == ["Beta", "Zulu"])
+        #expect(transaction.itemChanges.contains(
+            .move(
+                itemID: alpha.id,
+                from: .init(section: 0, item: 0),
+                to: .init(section: 0, item: 1)
+            )
+        ))
+        #expect(transaction.itemChanges.contains(
+            .update(itemID: alpha.id, indexPath: .init(section: 0, item: 1))
+        ))
+    }
+
     @Test("fetched chat exposes app-server thread status and recency")
     func fetchedChatExposesThreadStatusAndRecency() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
