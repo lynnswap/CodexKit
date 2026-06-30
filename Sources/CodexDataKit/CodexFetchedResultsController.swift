@@ -156,17 +156,28 @@ public struct CodexFetchedResultsTransaction<Model: CodexObservableModel>: Senda
                 CodexFetchedResultsSectionChange.insert(sectionID: section.id, index: index)
             }
 
-        let moves = newSnapshot.sections.enumerated()
-            .compactMap { newIndex, section -> CodexFetchedResultsSectionChange? in
-                guard let oldIndex = oldIndexes[section.id], oldIndex != newIndex else {
-                    return nil
-                }
-                return CodexFetchedResultsSectionChange.move(
-                    sectionID: section.id,
-                    from: oldIndex,
-                    to: newIndex
-                )
+        let oldSurvivingSectionIDs = oldSnapshot.sections.map(\.id).filter {
+            newIndexes[$0] != nil
+        }
+        let newSurvivingSectionIDs = newSnapshot.sections.map(\.id).filter {
+            oldIndexes[$0] != nil
+        }
+        let oldSurvivingIndexes = indexSectionIDs(oldSurvivingSectionIDs)
+        let newSurvivingIndexes = indexSectionIDs(newSurvivingSectionIDs)
+        let moves = newSurvivingSectionIDs.compactMap {
+            sectionID -> CodexFetchedResultsSectionChange? in
+            guard oldSurvivingIndexes[sectionID] != newSurvivingIndexes[sectionID] else {
+                return nil
             }
+            guard let oldIndex = oldIndexes[sectionID], let newIndex = newIndexes[sectionID] else {
+                return nil
+            }
+            return CodexFetchedResultsSectionChange.move(
+                sectionID: sectionID,
+                from: oldIndex,
+                to: newIndex
+            )
+        }
 
         let updates = newSnapshot.sections.enumerated()
             .compactMap { newIndex, section -> CodexFetchedResultsSectionChange? in
@@ -190,6 +201,16 @@ public struct CodexFetchedResultsTransaction<Model: CodexObservableModel>: Senda
     ) -> [CodexFetchedResultsItemChange<ItemID>] {
         let oldPositions = indexItems(oldSnapshot)
         let newPositions = indexItems(newSnapshot)
+        let oldRelativeIndexes = relativeIndexesByItemID(
+            in: oldSnapshot,
+            positions: oldPositions,
+            otherPositions: newPositions
+        )
+        let newRelativeIndexes = relativeIndexesByItemID(
+            in: newSnapshot,
+            positions: newPositions,
+            otherPositions: oldPositions
+        )
         let reloadStableItems = reason == .refresh
 
         let deletes = oldPositions.values
@@ -227,8 +248,15 @@ public struct CodexFetchedResultsTransaction<Model: CodexObservableModel>: Senda
                 guard let oldPosition = oldPositions[newPosition.itemID] else {
                     return nil
                 }
-                guard oldPosition.sectionID != newPosition.sectionID
-                    || oldPosition.indexPath.item != newPosition.indexPath.item
+                if oldPosition.sectionID != newPosition.sectionID {
+                    return .move(
+                        itemID: newPosition.itemID,
+                        from: oldPosition.indexPath,
+                        to: newPosition.indexPath
+                    )
+                }
+                guard oldRelativeIndexes[newPosition.itemID]
+                    != newRelativeIndexes[newPosition.itemID]
                 else {
                     return nil
                 }
@@ -267,6 +295,14 @@ public struct CodexFetchedResultsTransaction<Model: CodexObservableModel>: Senda
         })
     }
 
+    private static func indexSectionIDs(
+        _ sectionIDs: [CodexFetchSectionID]
+    ) -> [CodexFetchSectionID: Int] {
+        Dictionary(uniqueKeysWithValues: sectionIDs.enumerated().map { index, sectionID in
+            (sectionID, index)
+        })
+    }
+
     private struct ItemPosition {
         var itemID: ItemID
         var sectionID: CodexFetchSectionID
@@ -290,6 +326,28 @@ public struct CodexFetchedResultsTransaction<Model: CodexObservableModel>: Senda
             }
         }
         return positions
+    }
+
+    private static func relativeIndexesByItemID(
+        in snapshot: CodexFetchedResultsSnapshot<ItemID>,
+        positions: [ItemID: ItemPosition],
+        otherPositions: [ItemID: ItemPosition]
+    ) -> [ItemID: Int] {
+        var indexes: [ItemID: Int] = [:]
+        for section in snapshot.sections {
+            var relativeIndex = 0
+            for itemID in section.itemIDs {
+                guard let position = positions[itemID],
+                    let otherPosition = otherPositions[itemID],
+                    position.sectionID == otherPosition.sectionID
+                else {
+                    continue
+                }
+                indexes[itemID] = relativeIndex
+                relativeIndex += 1
+            }
+        }
+        return indexes
     }
 }
 

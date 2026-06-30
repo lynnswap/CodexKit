@@ -502,6 +502,74 @@ struct CodexModelContextTests {
         #expect(controller.sections.isEmpty)
     }
 
+    @Test("controller does not emit moves for item shifts after deletion")
+    func controllerDoesNotEmitMovesForItemShiftsAfterDeletion() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-alpha", name: "Alpha"),
+            .init(id: "thread-beta", name: "Beta"),
+        ]))
+        let controller = context.fetchedResultsController(for: CodexFetchRequest<CodexChat>(
+            sortDescriptors: [CodexSortDescriptor(\.title)]
+        ))
+        var transactions = controller.transactions.makeAsyncIterator()
+        try await controller.performFetch()
+        _ = await transactions.next()
+        let alpha = try #require(controller.items.first)
+
+        try await runtime.transport.enqueueEmpty(for: "thread/delete")
+        try await alpha.delete()
+
+        let transaction = try #require(await transactions.next())
+        #expect(transaction.reason == .remove)
+        #expect(transaction.itemChanges == [
+            .delete(itemID: alpha.id, indexPath: .init(section: 0, item: 0)),
+        ])
+        #expect(controller.items.map(\.title) == ["Beta"])
+    }
+
+    @Test("workspace-group controller does not emit moves for section shifts after deletion")
+    func workspaceGroupControllerDoesNotEmitMovesForSectionShiftsAfterDeletion() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let firstRepo = try gitRepository(named: "First")
+        let secondRepo = try gitRepository(named: "Second")
+        let firstWorkspaceURL = try createDirectory("App", in: firstRepo)
+        let secondWorkspaceURL = try createDirectory("App", in: secondRepo)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-alpha", workspace: firstWorkspaceURL, name: "Alpha"),
+            .init(id: "thread-beta", workspace: secondWorkspaceURL, name: "Beta"),
+        ]))
+        let controller = context.fetchedResultsController(
+            for: CodexFetchRequest<CodexChat>(
+                sortDescriptors: [CodexSortDescriptor(\.title)]
+            ),
+            sectionedBy: .workspaceGroup
+        )
+        var transactions = controller.transactions.makeAsyncIterator()
+        try await controller.performFetch()
+        _ = await transactions.next()
+        let alpha = try #require(controller.items.first)
+        let firstGroupID = try #require(alpha.workspace?.workspaceGroup?.id)
+
+        try await runtime.transport.enqueueEmpty(for: "thread/delete")
+        try await alpha.delete()
+
+        let transaction = try #require(await transactions.next())
+        #expect(transaction.reason == .remove)
+        #expect(transaction.sectionChanges == [
+            .delete(sectionID: .workspaceGroup(firstGroupID), index: 0),
+        ])
+        #expect(transaction.itemChanges == [
+            .delete(itemID: alpha.id, indexPath: .init(section: 0, item: 0)),
+        ])
+        #expect(controller.items.map(\.title) == ["Beta"])
+        #expect(controller.sections.count == 1)
+    }
+
     @Test("controller keeps update changes for items that move")
     func controllerKeepsUpdateChangesForItemsThatMove() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
