@@ -8,6 +8,9 @@ package enum AppServerAPI {
         package enum Fork {}
         package enum List {}
         package enum Read {}
+        package enum Turns {
+            package enum List {}
+        }
         package enum Archive {}
         package enum Unarchive {}
         package enum Name {
@@ -86,8 +89,11 @@ extension AppServerAPI.Review.Start {
 
 extension AppServerAPI.Review.Start {
     package struct Response: Codable, Equatable, Sendable {
-        package var turnID: String
+        package var turn: AppServerAPI.Turn.Payload
         package var reviewThreadID: String?
+        package var turnID: String {
+            turn.id
+        }
 
         enum CodingKeys: String, CodingKey {
             case turn
@@ -95,20 +101,27 @@ extension AppServerAPI.Review.Start {
         }
 
         package init(turnID: String, reviewThreadID: String? = nil) {
-            self.turnID = turnID
+            self.init(turn: AppServerAPI.Turn.Payload(id: turnID), reviewThreadID: reviewThreadID)
+        }
+
+        package init(
+            turn: AppServerAPI.Turn.Payload,
+            reviewThreadID: String? = nil
+        ) {
+            self.turn = turn
             self.reviewThreadID = reviewThreadID
         }
 
         package init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
-            self.turnID = try container.decode(AppServerAPI.Turn.Payload.self, forKey: .turn).id
+            self.turn = try container.decode(AppServerAPI.Turn.Payload.self, forKey: .turn)
             self.reviewThreadID = try container.decodeIfPresent(
                 String.self, forKey: .reviewThreadID)
         }
 
         package func encode(to encoder: Encoder) throws {
             var container = encoder.container(keyedBy: CodingKeys.self)
-            try container.encode(AppServerAPI.Turn.Payload(id: turnID), forKey: .turn)
+            try container.encode(turn, forKey: .turn)
             try container.encodeIfPresent(reviewThreadID, forKey: .reviewThreadID)
         }
     }
@@ -908,6 +921,65 @@ extension AppServerAPI.Thread.Read {
         }
 
         package init(params: AppServerAPI.Thread.Read.Params) {
+            self.params = params
+        }
+    }
+}
+
+extension AppServerAPI.Thread.Turns.List {
+    package struct Params: Codable, Equatable, Sendable {
+        package var threadID: String
+        package var cursor: String?
+        package var limit: Int?
+        package var sortDirection: CodexSortDirection?
+        package var itemsView: CodexTurnItemsView?
+
+        enum CodingKeys: String, CodingKey {
+            case threadID = "threadId"
+            case cursor
+            case limit
+            case sortDirection
+            case itemsView
+        }
+
+        package init(
+            threadID: String,
+            cursor: String? = nil,
+            limit: Int? = nil,
+            sortDirection: CodexSortDirection? = nil,
+            itemsView: CodexTurnItemsView? = nil
+        ) {
+            self.threadID = threadID
+            self.cursor = cursor
+            self.limit = limit
+            self.sortDirection = sortDirection
+            self.itemsView = itemsView
+        }
+    }
+
+    package struct Response: Codable, Equatable, Sendable {
+        package var data: [AppServerAPI.Turn.Payload]
+        package var nextCursor: String?
+        package var backwardsCursor: String?
+
+        package init(
+            data: [AppServerAPI.Turn.Payload],
+            nextCursor: String? = nil,
+            backwardsCursor: String? = nil
+        ) {
+            self.data = data
+            self.nextCursor = nextCursor
+            self.backwardsCursor = backwardsCursor
+        }
+    }
+
+    package struct Request: AppServerAPI.Request {
+        package typealias Response = AppServerAPI.Thread.Turns.List.Response
+
+        package static let method = "thread/turns/list"
+        package var params: AppServerAPI.Thread.Turns.List.Params
+
+        package init(params: AppServerAPI.Thread.Turns.List.Params) {
             self.params = params
         }
     }

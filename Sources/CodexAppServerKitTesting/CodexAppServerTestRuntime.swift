@@ -112,6 +112,30 @@ public actor CodexAppServerTestThreadStore {
                 thread: CodexAppServerTestTransport.apiSnapshot(from: thread)
             ))
     }
+
+    func listThreadTurnsResponse(for params: Data) throws -> Data {
+        let request = try JSONDecoder().decode(
+            AppServerAPI.Thread.Turns.List.Params.self,
+            from: params
+        )
+        guard let thread = snapshotsByID[request.threadID] else {
+            throw JSONRPC.Error.responseError(
+                code: -32004,
+                message: "No stubbed thread matches thread/turns/list."
+            )
+        }
+        var turns = thread.turns ?? []
+        if request.sortDirection == .descending {
+            turns.reverse()
+        }
+        if let limit = request.limit, limit >= 0 {
+            turns = Array(turns.prefix(limit))
+        }
+        return try JSONEncoder().encode(
+            AppServerAPI.Thread.Turns.List.Response(
+                data: turns.map(CodexAppServerTestTransport.apiTurn(from:))
+            ))
+    }
 }
 
 /// A Codex app-server test runtime backed by an in-memory transport.
@@ -457,6 +481,18 @@ public actor CodexAppServerTestTransport {
         )
     }
 
+    /// Enqueues a thread-turns-list response.
+    public func enqueueThreadTurns(_ page: CodexTurnPage) throws {
+        try enqueue(
+            AppServerAPI.Thread.Turns.List.Response(
+                data: page.turns.map(Self.apiTurn(from:)),
+                nextCursor: page.nextCursor,
+                backwardsCursor: page.backwardsCursor
+            ),
+            for: "thread/turns/list"
+        )
+    }
+
     /// Stubs thread start, list, resume, and read requests from in-memory thread snapshots.
     ///
     /// This is useful for UI previews and tests that should exercise the same
@@ -491,6 +527,9 @@ public actor CodexAppServerTestTransport {
         handle(method: "thread/read") { params in
             try await store.readThreadResponse(for: params)
         }
+        handle(method: "thread/turns/list") { params in
+            try await store.listThreadTurnsResponse(for: params)
+        }
     }
 
     /// Enqueues a thread-unarchive response.
@@ -510,9 +549,28 @@ public actor CodexAppServerTestTransport {
     }
 
     /// Enqueues a review-start response.
-    public func enqueueReviewStart(turnID: String, reviewThreadID: String? = nil) throws {
+    public func enqueueReviewStart(
+        turnID: String,
+        reviewThreadID: String? = nil,
+        status: CodexTurnStatus? = .running,
+        items: [CodexThreadItem] = []
+    ) throws {
+        try enqueueReviewStart(
+            .init(id: .init(rawValue: turnID), status: status, items: items),
+            reviewThreadID: reviewThreadID
+        )
+    }
+
+    /// Enqueues a review-start response.
+    public func enqueueReviewStart(
+        _ turn: CodexTurnSnapshot,
+        reviewThreadID: String? = nil
+    ) throws {
         try enqueue(
-            AppServerAPI.Review.Start.Response(turnID: turnID, reviewThreadID: reviewThreadID),
+            AppServerAPI.Review.Start.Response(
+                turn: Self.apiTurn(from: turn),
+                reviewThreadID: reviewThreadID
+            ),
             for: "review/start"
         )
     }
@@ -644,7 +702,7 @@ public actor CodexAppServerTestTransport {
         }
     }
 
-    private static func apiTurn(from snapshot: CodexTurnSnapshot) -> AppServerAPI.Turn.Payload {
+    fileprivate static func apiTurn(from snapshot: CodexTurnSnapshot) -> AppServerAPI.Turn.Payload {
         .init(
             id: snapshot.id.rawValue,
             status: snapshot.status?.rawValue,

@@ -802,6 +802,13 @@ public struct CodexReviewSession: Identifiable, Sendable {
     /// The active review thread model, when known.
     public let model: String?
 
+    /// The initial turn returned synchronously by `review/start`.
+    ///
+    /// Inline reviews may not emit a separate `turn/started` notification, and
+    /// freshly-created rollouts may not be readable yet. UI clients should seed
+    /// their transcript from this turn before consuming live events.
+    public let initialTurn: CodexTurnSnapshot
+
     /// The live response stream for the review turn.
     public let response: CodexResponseStream
 
@@ -812,6 +819,7 @@ public struct CodexReviewSession: Identifiable, Sendable {
         turnID: CodexTurnID,
         reviewThreadID: CodexThreadID,
         model: String?,
+        initialTurn: CodexTurnSnapshot,
         response: CodexResponseStream,
         eventThread: CodexThread
     ) {
@@ -819,6 +827,7 @@ public struct CodexReviewSession: Identifiable, Sendable {
         self.turnID = turnID
         self.reviewThreadID = reviewThreadID
         self.model = model
+        self.initialTurn = initialTurn
         self.response = response
         self.eventThread = eventThread
     }
@@ -1138,6 +1147,47 @@ public struct CodexTurnSnapshot: Identifiable, Equatable, Sendable {
     }
 }
 
+public enum CodexTurnItemsView: String, Codable, Equatable, Sendable {
+    case notLoaded
+    case summary
+    case full
+}
+
+public struct CodexTurnQuery: Equatable, Sendable {
+    public var cursor: String?
+    public var limit: Int?
+    public var sortDirection: CodexSortDirection?
+    public var itemsView: CodexTurnItemsView?
+
+    public init(
+        cursor: String? = nil,
+        limit: Int? = nil,
+        sortDirection: CodexSortDirection? = nil,
+        itemsView: CodexTurnItemsView? = nil
+    ) {
+        self.cursor = cursor
+        self.limit = limit
+        self.sortDirection = sortDirection
+        self.itemsView = itemsView
+    }
+}
+
+public struct CodexTurnPage: Equatable, Sendable {
+    public var turns: [CodexTurnSnapshot]
+    public var nextCursor: String?
+    public var backwardsCursor: String?
+
+    public init(
+        turns: [CodexTurnSnapshot],
+        nextCursor: String? = nil,
+        backwardsCursor: String? = nil
+    ) {
+        self.turns = turns
+        self.nextCursor = nextCursor
+        self.backwardsCursor = backwardsCursor
+    }
+}
+
 public struct CodexThreadQuery: Equatable, Sendable {
     public var archived: Bool?
     public var cursor: String?
@@ -1277,9 +1327,11 @@ public struct CodexTranscript: Equatable, Sendable {
 }
 
 public struct CodexThreadItem: Identifiable, Equatable, Sendable {
-    public enum Kind: Equatable, Sendable {
+    public enum Kind: Hashable, Sendable {
         case userMessage
         case agentMessage
+        case enteredReviewMode
+        case exitedReviewMode
         case plan
         case reasoning
         case commandExecution
@@ -1303,6 +1355,10 @@ public struct CodexThreadItem: Identifiable, Equatable, Sendable {
                 self = .userMessage
             case "agentMessage":
                 self = .agentMessage
+            case "enteredReviewMode":
+                self = .enteredReviewMode
+            case "exitedReviewMode":
+                self = .exitedReviewMode
             case "plan":
                 self = .plan
             case "reasoning":
@@ -1344,6 +1400,10 @@ public struct CodexThreadItem: Identifiable, Equatable, Sendable {
                 "userMessage"
             case .agentMessage:
                 "agentMessage"
+            case .enteredReviewMode:
+                "enteredReviewMode"
+            case .exitedReviewMode:
+                "exitedReviewMode"
             case .plan:
                 "plan"
             case .reasoning:

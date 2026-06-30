@@ -760,7 +760,7 @@ public final class CodexFetchedResults<Model: CodexObservableModel> {
 
 extension CodexFetchedResults: CodexFetchedResultsRegistration {
     package func insert(_ chat: CodexChat, archived: Bool) async {
-        if requiresServerRefreshAfterMutation {
+        if membershipRequiresServerRefresh {
             await refreshAfterMutation(reason: .insert)
             return
         }

@@ -132,6 +132,7 @@ public final class CodexModelContext: @unchecked Sendable {
     private var chatsByID: [CodexThreadID: CodexChat] = [:]
     private var fetchedResults: [WeakFetchedResultsRegistration] = []
     private var activeChatObservationsByID: [CodexThreadID: ActiveChatObservation] = [:]
+    private var preparedEventThreadsByID: [CodexThreadID: CodexThread] = [:]
 
     package init(container: CodexModelContainer) {
         self.container = container
@@ -303,7 +304,7 @@ public final class CodexModelContext: @unchecked Sendable {
     }
 
     public func refresh(_ chat: CodexChat, includeTurns: Bool = true) async throws {
-        let thread = try await appServer.resumeThread(chat.id)
+        let thread = try await eventThread(for: chat)
         try await refresh(chat, using: thread, includeTurns: includeTurns)
     }
 
@@ -319,7 +320,7 @@ public final class CodexModelContext: @unchecked Sendable {
         observation?.beginBufferingEvents()
         let snapshot: CodexThreadSnapshot
         do {
-            snapshot = try await thread.read(includeTurns: includeTurns)
+            snapshot = try await refreshedThreadSnapshot(for: thread, includeTurns: includeTurns)
         } catch {
             if replaysBufferedEvents {
                 await flushBufferedEvents(from: observation, to: chat)
@@ -345,6 +346,66 @@ public final class CodexModelContext: @unchecked Sendable {
             previousGroup: previousGroup,
             archived: refreshedChat.isArchived
         )
+    }
+
+    private func refreshedThreadSnapshot(
+        for thread: CodexThread,
+        includeTurns: Bool
+    ) async throws -> CodexThreadSnapshot {
+        guard includeTurns else {
+            return try await thread.read(includeTurns: false)
+        }
+
+        do {
+            let turnPage = try await thread.listTurns(.init(
+                sortDirection: .ascending,
+                itemsView: .full
+            ))
+            return try await threadSnapshot(
+                for: thread,
+                withAuthoritativeTurns: turnPage.turns
+            )
+        } catch {
+            return try await thread.read(includeTurns: true)
+        }
+    }
+
+    private func threadSnapshot(
+        for thread: CodexThread,
+        withAuthoritativeTurns turns: [CodexTurnSnapshot]
+    ) async throws -> CodexThreadSnapshot {
+        do {
+            let metadata = try await thread.read(includeTurns: false)
+            var presentFields = metadata.presentFields
+            presentFields.insert(.turns)
+            return .init(
+                id: metadata.id,
+                workspace: metadata.workspace,
+                name: metadata.name,
+                preview: metadata.preview,
+                modelProvider: metadata.modelProvider,
+                createdAt: metadata.createdAt,
+                updatedAt: metadata.updatedAt,
+                recencyAt: metadata.recencyAt,
+                status: metadata.status,
+                ephemeral: metadata.ephemeral,
+                turns: turns,
+                turnItemsAreAuthoritative: true,
+                presentFields: presentFields
+            )
+        } catch {
+            var presentFields: Set<CodexThreadSnapshot.Field> = [.turns]
+            if thread.workspace != nil {
+                presentFields.insert(.workspace)
+            }
+            return .init(
+                id: thread.id,
+                workspace: thread.workspace,
+                turns: turns,
+                turnItemsAreAuthoritative: true,
+                presentFields: presentFields
+            )
+        }
     }
 
     private func flushBufferedEvents(
@@ -453,6 +514,8 @@ public final class CodexModelContext: @unchecked Sendable {
                 thread = eventThread
             } else if let resumedThread {
                 thread = resumedThread
+            } else if let preparedThread = self.preparedEventThread(for: chat.id) {
+                thread = preparedThread
             } else {
                 thread = try await self.appServer.resumeThread(chat.id)
             }
@@ -473,6 +536,8 @@ public final class CodexModelContext: @unchecked Sendable {
         do {
             if let resumedThread {
                 thread = resumedThread
+            } else if let preparedThread = preparedEventThread(for: chat.id) {
+                thread = preparedThread
             } else {
                 thread = try await appServer.resumeThread(chat.id)
             }
@@ -481,7 +546,18 @@ public final class CodexModelContext: @unchecked Sendable {
             await thread.beginEventGeneration()
             observation.beginBufferingEvents()
             await startEventTask(observation, for: chat, thread: thread)
-            try await refresh(chat, using: thread, includeTurns: includeTurns)
+            do {
+                try await refresh(chat, using: thread, includeTurns: includeTurns)
+            } catch {
+                guard canObserveSeededSnapshotAfterInitialRefreshFailure(
+                    chat,
+                    thread: thread,
+                    includeTurns: includeTurns
+                ) else {
+                    throw error
+                }
+                chat.syncPhaseAfterRefresh(includeTurns: includeTurns)
+            }
             try Task.checkCancellation()
             observation.includesTurns = includeTurns
         } catch {
@@ -489,6 +565,16 @@ public final class CodexModelContext: @unchecked Sendable {
             discardChatObservation(chat.id, observation: observation)
             throw error
         }
+    }
+
+    private func canObserveSeededSnapshotAfterInitialRefreshFailure(
+        _ chat: CodexChat,
+        thread: CodexThread,
+        includeTurns: Bool
+    ) -> Bool {
+        includeTurns
+            && preparedEventThread(for: chat.id)?.id == thread.id
+            && chat.turns.isEmpty == false
     }
 
     private func startEventTask(
@@ -584,11 +670,41 @@ public final class CodexModelContext: @unchecked Sendable {
         }
     }
 
+    private func prepareEventThread(_ thread: CodexThread, for chatID: CodexThreadID) {
+        if let observation = activeChatObservationsByID[chatID],
+            observation.isFinished == false
+        {
+            observation.eventThread = observation.eventThread ?? thread
+        } else {
+            preparedEventThreadsByID[chatID] = thread
+        }
+    }
+
+    private func preparedEventThread(for chatID: CodexThreadID) -> CodexThread? {
+        preparedEventThreadsByID[chatID]
+    }
+
+    private func eventThread(for chat: CodexChat) async throws -> CodexThread {
+        guard chat.modelContext === self else {
+            throw CodexModelContextError.modelIsDetached
+        }
+        if let thread = activeChatObservationsByID[chat.id]?.eventThread {
+            return thread
+        }
+        if let thread = preparedEventThread(for: chat.id) {
+            return thread
+        }
+        return try await appServer.resumeThread(chat.id)
+    }
+
     @discardableResult
     public func startChat(
         in workspace: CodexWorkspace,
         input: CodexChatInput = .init()
     ) async throws -> CodexChat {
+        guard workspace.modelContext === self else {
+            throw CodexModelContextError.modelIsDetached
+        }
         let thread = try await appServer.startThread(
             in: workspace.url,
             instructions: input.instructions,
@@ -605,9 +721,67 @@ public final class CodexModelContext: @unchecked Sendable {
         )
         let chat = apply(snapshot)
         chat.setArchived(false)
+        prepareEventThread(thread, for: chat.id)
         workspace.moveChatToFront(chat)
         await insertChatIntoRegisteredResults(chat, archived: false)
         return chat
+    }
+
+    @discardableResult
+    public func startReview(
+        in workspace: URL,
+        input: CodexReviewInput
+    ) async throws -> CodexStartedReview {
+        let review = try await appServer.startReview(
+            in: workspace,
+            target: input.target,
+            instructions: input.instructions,
+            options: input.options,
+            delivery: input.delivery,
+            transcriptErrorHandlingPolicy: input.transcriptErrorHandlingPolicy
+        )
+        return await applyStartedReview(
+            review,
+            workspaceURL: workspace,
+            input: input
+        )
+    }
+
+    @discardableResult
+    public func startReview(
+        in workspace: CodexWorkspace,
+        input: CodexReviewInput
+    ) async throws -> CodexStartedReview {
+        guard workspace.modelContext === self else {
+            throw CodexModelContextError.modelIsDetached
+        }
+        return try await startReview(in: workspace.url, input: input)
+    }
+
+    private func applyStartedReview(
+        _ review: CodexReviewSession,
+        workspaceURL: URL,
+        input: CodexReviewInput
+    ) async -> CodexStartedReview {
+        let now = Date()
+        let snapshot = CodexThreadSnapshot(
+            id: review.activeTurnThreadID,
+            workspace: review.eventThread.workspace ?? workspaceURL,
+            modelProvider: input.options.modelProvider,
+            createdAt: now,
+            updatedAt: now,
+            recencyAt: now,
+            status: .active(activeFlags: []),
+            ephemeral: input.options.ephemeral,
+            turns: [review.initialTurn]
+        )
+        let chat = apply(snapshot)
+        chat.setArchived(false)
+        chat.syncPhaseAfterRefresh(includeTurns: true)
+        prepareEventThread(review.eventThread, for: chat.id)
+        chat.workspace?.moveChatToFront(chat)
+        await insertChatIntoRegisteredResults(chat, archived: false)
+        return CodexStartedReview(chat: chat, session: review)
     }
 
     @discardableResult
@@ -615,7 +789,7 @@ public final class CodexModelContext: @unchecked Sendable {
         _ input: CodexChatMessageInput,
         in chat: CodexChat
     ) async throws -> CodexResponse {
-        let thread = try await appServer.resumeThread(chat.id)
+        let thread = try await eventThread(for: chat)
         do {
             let response = try await thread.respond(to: input.prompt, options: input.options)
             await apply(response, to: chat)
@@ -687,7 +861,7 @@ public final class CodexModelContext: @unchecked Sendable {
     }
 
     public func cancelActiveTurn(in chat: CodexChat) async throws {
-        let thread = try await appServer.resumeThread(chat.id)
+        let thread = try await eventThread(for: chat)
         _ = try await thread.cancelActiveTurn()
     }
 
@@ -695,6 +869,7 @@ public final class CodexModelContext: @unchecked Sendable {
         try await appServer.archiveThread(chat.id)
         let workspace = chat.workspace
         let group = workspace?.workspaceGroup
+        preparedEventThreadsByID.removeValue(forKey: chat.id)
         if let workspace {
             detach(chat, from: workspace)
         }
@@ -1099,6 +1274,7 @@ public final class CodexModelContext: @unchecked Sendable {
     private func remove(_ chat: CodexChat) async {
         let workspace = chat.workspace
         let group = workspace?.workspaceGroup
+        preparedEventThreadsByID.removeValue(forKey: chat.id)
         chatsByID.removeValue(forKey: chat.id)
         if let workspace {
             detach(chat, from: workspace)
@@ -1761,18 +1937,18 @@ private struct CodexWorkspaceGroupIdentity: Sendable {
     private static func enclosingGitMetadataURL(startingAt url: URL, fileManager: FileManager)
         -> URL?
     {
-        var directoryURL = url
+        var directoryPath = url.standardizedFileURL.path
         while true {
-            let gitURL = directoryURL.appendingPathComponent(".git")
-            if fileManager.fileExists(atPath: gitURL.path) {
-                return gitURL
+            let gitPath = (directoryPath as NSString).appendingPathComponent(".git")
+            if fileManager.fileExists(atPath: gitPath) {
+                return URL(fileURLWithPath: gitPath)
             }
 
-            let parentURL = directoryURL.deletingLastPathComponent()
-            guard parentURL.path != directoryURL.path else {
+            let parentPath = (directoryPath as NSString).deletingLastPathComponent
+            guard parentPath != directoryPath, parentPath.isEmpty == false else {
                 return nil
             }
-            directoryURL = parentURL
+            directoryPath = parentPath
         }
     }
 

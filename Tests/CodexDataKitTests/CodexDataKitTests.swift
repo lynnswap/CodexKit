@@ -4286,6 +4286,45 @@ struct CodexModelContextTests {
         #expect(chat.transcript.finalAnswer == "Done")
     }
 
+    @Test("chat refresh loads full turn items through thread turns list")
+    func chatRefreshLoadsFullTurnItemsThroughThreadTurnsList() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-turns-list"))
+        try await runtime.transport.enqueueThreadTurns(.init(turns: [
+            .init(
+                id: "turn-live",
+                status: .running,
+                items: [
+                    .init(
+                        id: "message-live",
+                        kind: .agentMessage,
+                        content: .message(.init(
+                            id: "message-live",
+                            role: .assistant,
+                            text: "Active turn snapshot"
+                        ))
+                    ),
+                ]
+            ),
+        ]))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-turns-list",
+            name: "Turns list"
+        ))
+
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-turns-list"))
+        try await chat.refresh()
+
+        #expect(chat.title == "Turns list")
+        #expect(chat.items.map(\.text) == ["Active turn snapshot"])
+        #expect(await runtime.transport.recordedRequests(method: "thread/turns/list").count == 1)
+        let readRequest = try #require(await runtime.transport.recordedRequests(method: "thread/read").first)
+        let readParams = try readRequest.decodeParams(ThreadReadParams.self)
+        #expect(readParams.includeTurns == false)
+    }
+
     @Test("chat turn helpers scope items and preserve identity")
     func chatTurnHelpersScopeItemsAndPreserveIdentity() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -4922,6 +4961,85 @@ struct CodexModelContextTests {
 
         #expect(chat.items.first { $0.id == "command-replay" }?.text == "Hello")
         #expect(chat.items.filter { $0.id == "command-replay" }.count == 1)
+    }
+
+    @Test("chat observation keeps refreshed message snapshots idempotent with buffered replayed deltas")
+    func chatObservationKeepsRefreshedMessageSnapshotsIdempotentWithBufferedReplayedDeltas() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let gate = CodexAppServerTestGate()
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-message-replay"))
+        await runtime.transport.holdNext(method: "thread/read", gate: gate)
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-message-replay",
+            turns: [
+                .init(
+                    id: "turn-message-replay",
+                    status: .running,
+                    items: [
+                        .init(
+                            id: "message-replay",
+                            kind: .agentMessage,
+                            content: .message(.init(
+                                id: "message-replay",
+                                role: .assistant,
+                                phase: .finalAnswer,
+                                text: "Hello"
+                            ))
+                        ),
+                    ]
+                ),
+            ]
+        ))
+
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-message-replay"))
+        let observeTask = Task {
+            try await chat.observe()
+        }
+        await runtime.transport.waitForRequest(method: "thread/read")
+
+        try await runtime.transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(
+                threadID: "thread-message-replay",
+                turnID: "turn-message-replay",
+                itemID: "message-replay",
+                delta: "Hel",
+                phase: "final_answer"
+            )
+        )
+        try await runtime.transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(
+                threadID: "thread-message-replay",
+                turnID: "turn-message-replay",
+                itemID: "message-replay",
+                delta: "lo",
+                phase: "final_answer"
+            )
+        )
+        try await runtime.transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(
+                threadID: "thread-message-replay",
+                turnID: "turn-message-replay",
+                itemID: "message-replay",
+                delta: " world",
+                phase: "final_answer"
+            )
+        )
+        await gate.open()
+
+        let observation = try await observeTask.value
+        defer {
+            observation.cancel()
+        }
+
+        #expect(await eventually {
+            chat.items.first { $0.id == "message-replay" }?.text == "Hello world"
+        })
+        #expect(chat.items.filter { $0.id == "message-replay" }.count == 1)
     }
 
     @Test("duplicate chat observations share one live consumer")
@@ -5590,6 +5708,266 @@ struct CodexModelContextTests {
         let params = try request.decodeParams(ThreadStartParams.self)
         #expect(params.cwd == workspaceURL.path)
         #expect(params.model == "gpt-5")
+    }
+
+    @Test("model context starts reviews and inserts the active review chat into fetched results")
+    func modelContextStartsReviewAndInsertsActiveChatIntoFetchedResults() async throws {
+        let workspaceURL = temporaryDirectory()
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        try await runtime.transport.enqueueThreadList(.init(threads: []))
+        try await runtime.transport.enqueueThreadStart(threadID: "thread-review", model: "gpt-5")
+        try await runtime.transport.enqueueReviewStart(turnID: "turn-review", reviewThreadID: "thread-review")
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(
+                id: "thread-review",
+                workspace: workspaceURL,
+                name: "Review",
+                modelProvider: "openai",
+                recencyAt: Date(timeIntervalSince1970: 2_000)
+            )
+        ]))
+        let results = context.fetchedResults(
+            for: CodexFetchDescriptor<CodexChat>(
+                sortBy: [CodexSortDescriptor(\.recencyAt, order: .reverse)]
+            ))
+        try await results.performFetch()
+
+        let started = try await context.startReview(
+            in: workspaceURL,
+            input: CodexReviewInput(
+                target: .uncommittedChanges,
+                options: .init(model: "gpt-5", ephemeral: false)
+            )
+        )
+
+        #expect(results.items.first === started.chat)
+        #expect(started.chat.id == started.session.activeTurnThreadID)
+        #expect(started.chat.workspace?.url.path == workspaceURL.path)
+
+        let requests = await runtime.transport.recordedRequests().map(\.method)
+        #expect(requests.contains("thread/start"))
+        #expect(requests.contains("review/start"))
+        #expect(requests.filter { $0 == "thread/list" }.count == 1)
+    }
+
+    @Test("started review observation reuses the live event thread without resuming")
+    func startedReviewObservationReusesLiveEventThreadWithoutResuming() async throws {
+        let workspaceURL = temporaryDirectory()
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        await runtime.transport.enqueueFailure(
+            code: -32_000,
+            message: "thread/resume should not be needed for a just-started review",
+            for: "thread/resume"
+        )
+        try await runtime.transport.enqueueThreadStart(threadID: "thread-review", model: "gpt-5")
+        try await runtime.transport.enqueueReviewStart(
+            turnID: "turn-review",
+            reviewThreadID: "thread-review"
+        )
+        try await runtime.transport.enqueueThreadTurns(.init(turns: [
+            .init(
+                id: "turn-review",
+                status: .running,
+                items: [
+                    .init(
+                        id: "turn-review",
+                        kind: .enteredReviewMode,
+                        content: .log("Review started")
+                    ),
+                ]
+            ),
+        ]))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-review",
+            workspace: workspaceURL,
+            name: "Review",
+            modelProvider: "openai"
+        ))
+
+        let started = try await context.startReview(
+            in: workspaceURL,
+            input: CodexReviewInput(
+                target: .uncommittedChanges,
+                options: .init(model: "gpt-5", ephemeral: false)
+            )
+        )
+        let observation = try await started.chat.observe()
+        defer {
+            observation.cancel()
+        }
+
+        #expect(started.chat.items.map(\.text) == ["Review started"])
+        #expect(await runtime.transport.recordedRequests(method: "thread/resume").isEmpty)
+        #expect(await runtime.transport.recordedRequests(method: "thread/turns/list").count == 1)
+    }
+
+    @Test("started review keeps its live event thread across refresh before observation")
+    func startedReviewKeepsLiveEventThreadAcrossRefreshBeforeObservation() async throws {
+        let workspaceURL = temporaryDirectory()
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        await runtime.transport.enqueueFailure(
+            code: -32_000,
+            message: "thread/resume should not be needed for a just-started review",
+            for: "thread/resume"
+        )
+        try await runtime.transport.enqueueThreadStart(threadID: "thread-review", model: "gpt-5")
+        try await runtime.transport.enqueueReviewStart(
+            turnID: "turn-review",
+            reviewThreadID: "thread-review"
+        )
+        for text in ["Review started", "Review still running"] {
+            try await runtime.transport.enqueueThreadTurns(.init(turns: [
+                .init(
+                    id: "turn-review",
+                    status: .running,
+                    items: [
+                        .init(
+                            id: "turn-review",
+                            kind: .enteredReviewMode,
+                            content: .log(text)
+                        ),
+                    ]
+                ),
+            ]))
+            try await runtime.transport.enqueueThreadRead(.init(
+                id: "thread-review",
+                workspace: workspaceURL,
+                name: "Review",
+                modelProvider: "openai"
+            ))
+        }
+
+        let started = try await context.startReview(
+            in: workspaceURL,
+            input: CodexReviewInput(
+                target: .uncommittedChanges,
+                options: .init(model: "gpt-5", ephemeral: false)
+            )
+        )
+        try await started.chat.refresh()
+        let observation = try await started.chat.observe()
+        defer {
+            observation.cancel()
+        }
+
+        #expect(started.chat.items.map(\.text) == ["Review still running"])
+        #expect(await runtime.transport.recordedRequests(method: "thread/resume").isEmpty)
+        #expect(await runtime.transport.recordedRequests(method: "thread/turns/list").count == 2)
+    }
+
+    @Test("started review observation survives empty rollout history reads")
+    func startedReviewObservationSurvivesEmptyRolloutHistoryReads() async throws {
+        let workspaceURL = temporaryDirectory()
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        await runtime.transport.enqueueFailure(
+            code: -32_000,
+            message: "thread/resume should not be needed for a just-started review",
+            for: "thread/resume"
+        )
+        try await runtime.transport.enqueueThreadStart(threadID: "thread-review", model: "gpt-5")
+        try await runtime.transport.enqueueReviewStart(
+            turnID: "turn-review",
+            reviewThreadID: "thread-review",
+            items: [
+                .init(
+                    id: "turn-review",
+                    kind: .userMessage,
+                    content: .message(.init(
+                        id: "turn-review",
+                        role: .user,
+                        text: "current changes"
+                    ))
+                ),
+            ]
+        )
+        await runtime.transport.enqueueFailure(
+            code: -32_000,
+            message: "rollout is empty",
+            for: "thread/turns/list"
+        )
+        await runtime.transport.enqueueFailure(
+            code: -32_000,
+            message: "includeTurns is unavailable before first user message",
+            for: "thread/read"
+        )
+
+        let started = try await context.startReview(
+            in: workspaceURL,
+            input: CodexReviewInput(
+                target: .uncommittedChanges,
+                options: .init(model: "gpt-5", ephemeral: false)
+            )
+        )
+        #expect(started.chat.items.map(\.text) == ["current changes"])
+        let observation = try await started.chat.observe()
+        defer {
+            observation.cancel()
+        }
+
+        #expect(started.chat.items.map(\.text) == ["current changes"])
+        #expect(started.chat.workspace?.url.path == workspaceURL.path)
+        #expect(await runtime.transport.recordedRequests(method: "thread/resume").isEmpty)
+        #expect(await runtime.transport.recordedRequests(method: "thread/turns/list").count == 1)
+        #expect(await runtime.transport.recordedRequests(method: "thread/read").count == 1)
+    }
+
+    @Test("started review observation replaces response seed with authoritative turn list when available")
+    func startedReviewObservationReplacesResponseSeedWithAuthoritativeTurnListWhenAvailable() async throws {
+        let workspaceURL = temporaryDirectory()
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadStart(threadID: "thread-review", model: "gpt-5")
+        try await runtime.transport.enqueueReviewStart(
+            turnID: "turn-review",
+            reviewThreadID: "thread-review",
+            items: [
+                .init(
+                    id: "turn-review",
+                    kind: .userMessage,
+                    content: .message(.init(
+                        id: "turn-review",
+                        role: .user,
+                        text: "current changes"
+                    ))
+                ),
+            ]
+        )
+        try await runtime.transport.enqueueThreadTurns(.init(turns: [
+            .init(
+                id: "turn-review",
+                status: .running,
+                items: [
+                    .init(
+                        id: "turn-review",
+                        kind: .enteredReviewMode,
+                        content: .log("Review started from live turn list")
+                    ),
+                ]
+            ),
+        ]))
+        try await runtime.transport.enqueueThreadRead(.init(id: "thread-review", workspace: workspaceURL))
+
+        let started = try await context.startReview(
+            in: workspaceURL,
+            input: CodexReviewInput(
+                target: .uncommittedChanges,
+                options: .init(model: "gpt-5", ephemeral: false)
+            )
+        )
+        let observation = try await started.chat.observe()
+        defer {
+            observation.cancel()
+        }
+
+        #expect(started.chat.items.map(\.text) == ["Review started from live turn list"])
     }
 
     @Test("workspace start chat exposes known ephemeral option")

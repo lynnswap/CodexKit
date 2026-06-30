@@ -1008,6 +1008,19 @@ public actor CodexAppServer {
         return fields
     }
 
+    package nonisolated static func turnSnapshots(
+        from turns: [AppServerAPI.Turn.Payload]
+    ) -> [CodexTurnSnapshot] {
+        turns.map {
+            CodexTurnSnapshot(
+                id: .init(rawValue: $0.id),
+                status: $0.status.map(CodexTurnStatus.init(rawValue:)),
+                errorMessage: $0.error?.message,
+                items: AppServerThreadItemMapping.threadItems(from: $0.items)
+            )
+        }
+    }
+
     private nonisolated static func turnSnapshots(
         from turns: [AppServerAPI.Turn.Payload]?,
         includesTurns: Bool
@@ -1018,14 +1031,7 @@ public actor CodexAppServer {
         guard includesTurns || turns.isEmpty == false else {
             return nil
         }
-        return turns.map {
-            CodexTurnSnapshot(
-                id: .init(rawValue: $0.id),
-                status: $0.status.map(CodexTurnStatus.init(rawValue:)),
-                errorMessage: $0.error?.message,
-                items: AppServerThreadItemMapping.threadItems(from: $0.items)
-            )
-        }
+        return turnSnapshots(from: turns)
     }
 
     private nonisolated static func account(from snapshot: AppServerAPI.Account.Snapshot) -> CodexAccount {

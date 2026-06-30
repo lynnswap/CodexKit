@@ -968,6 +968,8 @@ private struct RawThreadItem: Decodable {
                     phase: phase.map(CodexMessagePhase.init(rawValue:)),
                     text: messageText
                 ))
+        case .enteredReviewMode, .exitedReviewMode:
+            return .log(messageText)
         case .plan:
             return .plan(messageText)
         case .reasoning:

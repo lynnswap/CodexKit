@@ -67,6 +67,39 @@ public struct CodexChatInput: Sendable {
     }
 }
 
+public struct CodexReviewInput: Sendable {
+    public var target: CodexReviewTarget
+    public var instructions: CodexInstructions?
+    public var options: CodexThread.Options
+    public var delivery: CodexReviewDelivery
+    public var transcriptErrorHandlingPolicy: CodexTranscriptErrorHandlingPolicy
+
+    public init(
+        target: CodexReviewTarget,
+        instructions: CodexInstructions? = nil,
+        options: CodexThread.Options = .init(),
+        delivery: CodexReviewDelivery = .inline,
+        transcriptErrorHandlingPolicy: CodexTranscriptErrorHandlingPolicy = .preserveTranscript
+    ) {
+        self.target = target
+        self.instructions = instructions
+        self.options = options
+        self.delivery = delivery
+        self.transcriptErrorHandlingPolicy = transcriptErrorHandlingPolicy
+    }
+}
+
+@MainActor
+public struct CodexStartedReview {
+    public let chat: CodexChat
+    public let session: CodexReviewSession
+
+    public init(chat: CodexChat, session: CodexReviewSession) {
+        self.chat = chat
+        self.session = session
+    }
+}
+
 public struct CodexChatMessageInput: Sendable {
     public var prompt: CodexPrompt
     public var options: CodexGenerationOptions
@@ -196,6 +229,14 @@ public final class CodexWorkspace: CodexObservableModel {
             throw CodexModelContextError.modelIsDetached
         }
         return try await modelContext.startChat(in: self, input: input)
+    }
+
+    @discardableResult
+    public func startReview(_ input: CodexReviewInput) async throws -> CodexStartedReview {
+        guard let modelContext else {
+            throw CodexModelContextError.modelIsDetached
+        }
+        return try await modelContext.startReview(in: self, input: input)
     }
 }
 
@@ -419,7 +460,11 @@ public final class CodexChat: CodexObservableModel {
         let existingByKey = Dictionary(uniqueKeysWithValues: items.map { ($0.mergeKey, $0) })
         items = records.flatMap { record in
             record.items.map { incomingItem in
-                let incomingKey = ItemKey(id: incomingItem.id, turnID: record.id)
+                let incomingKey = ItemKey(
+                    id: incomingItem.id,
+                    turnID: record.id,
+                    kind: incomingItem.kind
+                )
                 if let existing = existingByKey[incomingKey] {
                     existing.update(from: incomingItem, turnID: record.id)
                     return existing
@@ -593,7 +638,11 @@ public final class CodexChat: CodexObservableModel {
             {
                 changes.append(contentsOf: removeReasoningParts(parentItemID: incomingItem.id, from: &merged))
             }
-            let incomingKey = ItemKey(id: incomingItem.id, turnID: turnID)
+            let incomingKey = ItemKey(
+                id: incomingItem.id,
+                turnID: turnID,
+                kind: incomingItem.kind
+            )
             if let existing = existingByKey[incomingKey] {
                 let previousSnapshot = CodexChatItemSnapshot(item: existing)
                 if accumulatesOutputDeltas,
@@ -760,7 +809,7 @@ public final class CodexChat: CodexObservableModel {
 
     private func merge(_ delta: CodexMessageDelta, turnID: CodexTurnID?) -> [CodexChatChange] {
         let itemID = delta.itemID ?? scopedFallbackMessageID(turnID: turnID)
-        let key = ItemKey(id: itemID, turnID: turnID)
+        let key = ItemKey(id: itemID, turnID: turnID, kind: .agentMessage)
         let previousAccumulatedText = liveMergeState.messageDeltaTextByItemKey[key] ?? ""
         let accumulatedText = previousAccumulatedText + delta.text
 
@@ -784,7 +833,7 @@ public final class CodexChat: CodexObservableModel {
     }
 
     private func start(_ part: CodexReasoningPart, turnID: CodexTurnID?) -> [CodexChatChange] {
-        let key = ItemKey(id: part.id, turnID: turnID)
+        let key = ItemKey(id: part.id, turnID: turnID, kind: .reasoning)
         guard item(for: key) == nil else {
             return []
         }
@@ -826,11 +875,11 @@ public final class CodexChat: CodexObservableModel {
     }
 
     private func reasoningMergeKey(for delta: CodexReasoningDelta, turnID: CodexTurnID?) -> ItemKey {
-        let parentKey = ItemKey(id: delta.part.itemID, turnID: turnID)
+        let parentKey = ItemKey(id: delta.part.itemID, turnID: turnID, kind: .reasoning)
         if item(for: parentKey)?.reasoning != nil {
             return parentKey
         }
-        return ItemKey(id: delta.id, turnID: turnID)
+        return ItemKey(id: delta.id, turnID: turnID, kind: .reasoning)
     }
 
     private func mergedDeltaText(
@@ -845,10 +894,25 @@ public final class CodexChat: CodexObservableModel {
         if existingText.hasPrefix(accumulatedText) {
             return .init(text: existingText, accumulatedText: accumulatedText)
         }
-        if deltaText.isEmpty == false,
-           existingText == previousAccumulatedText,
-           (existingText.hasPrefix(deltaText) || existingText.hasSuffix(deltaText)) {
-            return .init(text: existingText, accumulatedText: previousAccumulatedText)
+        if existingText.hasSuffix(accumulatedText) {
+            return .init(text: existingText, accumulatedText: existingText)
+        }
+        if accumulatedText.hasPrefix(existingText) {
+            return .init(text: accumulatedText, accumulatedText: accumulatedText)
+        }
+        if previousAccumulatedText.isEmpty,
+            deltaText.isEmpty == false,
+            (existingText.hasPrefix(deltaText) || existingText.hasSuffix(deltaText))
+        {
+            return .init(text: existingText, accumulatedText: existingText)
+        }
+        if previousAccumulatedText.isEmpty {
+            let mergedText = existingText + deltaText
+            return .init(text: mergedText, accumulatedText: mergedText)
+        }
+        if existingText.hasSuffix(previousAccumulatedText) {
+            let mergedText = existingText + deltaText
+            return .init(text: mergedText, accumulatedText: mergedText)
         }
         if existingText == previousAccumulatedText {
             return .init(text: accumulatedText, accumulatedText: accumulatedText)
@@ -996,21 +1060,6 @@ public final class CodexChat: CodexObservableModel {
 
     package func resetLiveMergeStateFromCurrentItems() {
         liveMergeState = LiveMergeState()
-        for item in items {
-            let key = item.mergeKey
-            if let text = item.message?.text, text.isEmpty == false {
-                liveMergeState.messageDeltaTextByItemKey[key] = text
-            }
-            if let reasoning = item.reasoning {
-                let text = reasoning.text
-                if text.isEmpty == false {
-                    liveMergeState.reasoningDeltaTextByItemKey[key] = text
-                }
-            }
-            if let output = outputText(from: item.threadItem), output.isEmpty == false {
-                liveMergeState.outputDeltaTextByItemKey[key] = output
-            }
-        }
     }
 
     private func fail(with message: String) {
@@ -1021,6 +1070,7 @@ public final class CodexChat: CodexObservableModel {
     fileprivate struct ItemKey: Hashable {
         var id: String
         var turnID: CodexTurnID?
+        var kind: CodexThreadItem.Kind
     }
 
     private struct LiveMergeState {
@@ -1088,7 +1138,7 @@ public final class CodexChat: CodexObservableModel {
         }
 
         fileprivate var mergeKey: ItemKey {
-            .init(id: id, turnID: turnID)
+            .init(id: id, turnID: turnID, kind: kind)
         }
 
         fileprivate init(threadItem: CodexThreadItem, turnID: CodexTurnID?) {
