@@ -11,6 +11,8 @@ Use this package when app or UI code needs workspace group, workspace, and chat 
 - `CodexFetchDescriptor`: SwiftData-style value description of predicate, sort order, limit, and offset.
 - `CodexFetchRequest`: CoreData-style mutable request object for predicate, sort descriptors, limit, and offset.
 - `CodexFetchedResults`: Observable CoreData-style fetch results with items, optional sections, cursors, loading phase, and errors.
+- `CodexFetchedResultsController`: Non-UI fetched-results controller that keeps `CodexFetchedResults` as the current-value owner and exposes ordered snapshot transactions.
+- `CodexFetchedResultsSnapshot`, `CodexFetchedResultsTransaction`: Section and item ID snapshots plus section/item changes suitable for conversion to native UI update APIs.
 - `CodexWorkspaceGroup`, `CodexWorkspace`, `CodexChat`: Observable model objects attached to a model context.
 - `CodexQuery`: A SwiftUI `DynamicProperty` wrapper around `CodexFetchedResults`.
 - `CodexDataPhase`: A small data-loading state enum with `idle`, `loading`, `loaded`, and `failed`.
@@ -115,6 +117,34 @@ let chats = context.fetchedResults(
 ```
 
 Passing no section descriptor gives a single unsectioned result. Section identifiers stay typed as `CodexFetchSectionID`, so workspace and workspace-group sections can be used directly in UI selection state.
+
+## Fetched Results Transactions
+
+Use `CodexFetchedResultsController` when non-SwiftUI UI code needs ordered changes instead of only the observable current value.
+
+```swift
+let controller = context.fetchedResultsController(
+    for: CodexFetchDescriptor<CodexChat>.recentChats,
+    sectionedBy: .workspaceGroup
+)
+
+Task {
+    for await transaction in controller.transactions {
+        apply(
+            oldSnapshot: transaction.oldSnapshot,
+            newSnapshot: transaction.newSnapshot,
+            sectionChanges: transaction.sectionChanges,
+            itemChanges: transaction.itemChanges
+        )
+    }
+}
+
+try await controller.performFetch()
+```
+
+The controller does not fetch or store a second copy of the model graph. Its `items`, `sections`, `snapshot`, cursors, phase, and errors are forwarded from the underlying `CodexFetchedResults`, and transactions are emitted from the same state updates that mutate those current values. Snapshots contain section IDs, optional titles, and item IDs only; section and item changes are ordered and include insert, delete, move, and update cases.
+
+CodexDataKit does not import AppKit, UIKit, or SwiftUI for this API. Convert `CodexFetchedResultsTransaction` into `NSCollectionView`, `UICollectionView`, diffable data source, or `NSOutlineView` updates in the UI layer. Detail transcript streams remain the responsibility of `CodexChat.observe()`.
 
 ## Models
 

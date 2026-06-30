@@ -603,6 +603,12 @@ public final class CodexFetchedResults<Model: CodexObservableModel> {
     public var phase: CodexDataPhase = .idle
     public var lastErrorDescription: String?
 
+    @ObservationIgnored
+    private var hasPerformedFetch = false
+
+    @ObservationIgnored
+    private let transactionRelay = CodexAsyncStreamRelay<CodexFetchedResultsTransaction<Model>>()
+
     package init(
         modelContext: CodexModelContext,
         fetchDescriptor: CodexFetchDescriptor<Model>,
@@ -613,8 +619,20 @@ public final class CodexFetchedResults<Model: CodexObservableModel> {
         self.sectionBy = sectionBy
     }
 
+    isolated deinit {
+        transactionRelay.finish()
+    }
+
+    package func makeTransactionStream()
+        -> AsyncStream<CodexFetchedResultsTransaction<Model>>
+    {
+        transactionRelay.makeStream()
+    }
+
     public func performFetch() async throws {
-        try await load(fetchDescriptor, appending: false)
+        let reason: CodexFetchedResultsTransactionReason =
+            hasPerformedFetch ? .refresh : .initialFetch
+        try await load(fetchDescriptor, appending: false, reason: reason)
     }
 
     public func refresh() async throws {
@@ -627,17 +645,20 @@ public final class CodexFetchedResults<Model: CodexObservableModel> {
         }
         var descriptor = fetchDescriptor
         descriptor.cursor = nextCursor
-        try await load(descriptor, appending: true)
+        try await load(descriptor, appending: true, reason: .pageAppend)
     }
 
-    private func load(_ descriptor: CodexFetchDescriptor<Model>, appending: Bool) async throws {
+    private func load(
+        _ descriptor: CodexFetchDescriptor<Model>,
+        appending: Bool,
+        reason: CodexFetchedResultsTransactionReason
+    ) async throws {
         phase = .loading
         lastErrorDescription = nil
         let previousBackwardsCursor = backwardsCursor
         do {
             let page = try await modelContext.fetchPage(descriptor, excluding: self)
             let newItems = loadedItems(from: page, appending: appending)
-            items = newItems
             let relationshipDescriptor = appending ? fetchDescriptor : descriptor
             await modelContext.syncLoadedRelationships(
                 from: page,
@@ -645,10 +666,15 @@ public final class CodexFetchedResults<Model: CodexObservableModel> {
                 loadedItems: newItems,
                 excluding: self
             )
-            sections = modelContext.sections(for: newItems, sectionBy: sectionBy)
             nextCursor = page.nextCursor
             backwardsCursor = appending ? previousBackwardsCursor : page.backwardsCursor
             phase = .loaded
+            hasPerformedFetch = true
+            updateItemsAndSections(
+                items: newItems,
+                sections: modelContext.sections(for: newItems, sectionBy: sectionBy),
+                reason: reason
+            )
         } catch {
             let message = error.localizedDescription
             lastErrorDescription = message
@@ -687,18 +713,62 @@ public final class CodexFetchedResults<Model: CodexObservableModel> {
         }
         return result
     }
+
+    private var currentSnapshot: CodexFetchedResultsSnapshot<Model.ID> {
+        CodexFetchedResultsSnapshot(sections: sections)
+    }
+
+    private func updateItemsAndSections(
+        items newItems: [Model],
+        sections newSections: [CodexFetchSection<Model>],
+        reason: CodexFetchedResultsTransactionReason,
+        updatedItemIDs: Set<Model.ID> = []
+    ) {
+        let oldSnapshot = currentSnapshot
+        items = newItems
+        sections = newSections
+        yieldTransaction(
+            reason: reason,
+            oldSnapshot: oldSnapshot,
+            updatedItemIDs: updatedItemIDs
+        )
+    }
+
+    private func yieldTransaction(
+        reason: CodexFetchedResultsTransactionReason,
+        oldSnapshot: CodexFetchedResultsSnapshot<Model.ID>,
+        updatedItemIDs: Set<Model.ID>
+    ) {
+        guard transactionRelay.hasContinuations else {
+            return
+        }
+        let transaction = CodexFetchedResultsTransaction<Model>(
+            reason: reason,
+            oldSnapshot: oldSnapshot,
+            newSnapshot: currentSnapshot,
+            updatedItemIDs: updatedItemIDs
+        )
+        guard transaction.hasChanges
+            || reason == .initialFetch
+            || reason == .refresh
+            || updatedItemIDs.isEmpty == false
+        else {
+            return
+        }
+        transactionRelay.yield(transaction)
+    }
 }
 
 extension CodexFetchedResults: CodexFetchedResultsRegistration {
     package func insert(_ chat: CodexChat, archived: Bool) async {
         if requiresServerRefreshAfterMutation {
-            await refreshAfterMutation()
+            await refreshAfterMutation(reason: .insert)
             return
         }
         guard let model = insertionModel(for: chat, archived: archived) else {
             return
         }
-        await upsertOrRefresh(model)
+        await upsertOrRefresh(model, reason: .insert)
     }
 
     package func archive(
@@ -714,14 +784,14 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
                     previousGroup: group,
                     archived: true
                 )
-            ])
-            await refreshAfterMutation()
+            ], reason: .archive)
+            await refreshAfterMutation(reason: .archive)
             return
         }
         if let model = insertionModel(for: chat, archived: true) {
-            await upsertOrRefresh(model)
+            await upsertOrRefresh(model, reason: .archive)
         } else {
-            await remove(chat, workspace: workspace, group: group)
+            await remove(chat, workspace: workspace, group: group, reason: .archive)
         }
     }
 
@@ -730,11 +800,11 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             return
         }
         if requiresServerRefreshAfterMutation {
-            _ = applyLocalRevalidation(changes)
-            await refreshAfterMutation()
+            _ = applyLocalRevalidation(changes, reason: .revalidate)
+            await refreshAfterMutation(reason: .revalidate)
             return
         }
-        let originalCount = applyLocalRevalidation(changes)
+        let originalCount = applyLocalRevalidation(changes, reason: .revalidate)
         if await refreshAfterPagedRevalidationIfNeeded(changes) {
             return
         }
@@ -743,12 +813,12 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
                 guard let model = insertionModel(for: change.chat, archived: change.archived) else {
                     continue
                 }
-                guard await upsertOrRefresh(model) else {
+                guard await upsertOrRefresh(model, reason: .revalidate) else {
                     return
                 }
             }
         }
-        await backfillAfterLocalRemovalIfNeeded(originalCount: originalCount)
+        await backfillAfterLocalRemovalIfNeeded(originalCount: originalCount, reason: .revalidate)
     }
 
     package func remove(
@@ -756,24 +826,38 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         workspace: CodexWorkspace?,
         group: CodexWorkspaceGroup?
     ) async {
-        let originalCount = applyLocalRemoval(of: chat, workspace: workspace, group: group)
+        await remove(chat, workspace: workspace, group: group, reason: .remove)
+    }
+
+    private func remove(
+        _ chat: CodexChat,
+        workspace: CodexWorkspace?,
+        group: CodexWorkspaceGroup?,
+        reason: CodexFetchedResultsTransactionReason
+    ) async {
+        let originalCount = applyLocalRemoval(
+            of: chat,
+            workspace: workspace,
+            group: group,
+            reason: reason
+        )
         if fetchDescriptor.fetchOffset > 0 {
-            await refreshAfterMutation()
+            await refreshAfterMutation(reason: reason)
             return
         }
         if requiresServerRefreshAfterMutation {
-            await refreshAfterMutation()
+            await refreshAfterMutation(reason: reason)
             return
         }
         guard items.count != originalCount else {
             if modelContext.localCursorOffset(from: fetchDescriptor.cursor) > 0
                 || fetchDescriptor.fetchOffset > 0
             {
-                await refreshAfterMutation()
+                await refreshAfterMutation(reason: reason)
             }
             return
         }
-        await backfillAfterLocalRemovalIfNeeded(originalCount: originalCount)
+        await backfillAfterLocalRemovalIfNeeded(originalCount: originalCount, reason: reason)
     }
 
     package func refresh(
@@ -784,19 +868,19 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         let originalCount = items.count
         let refreshed = refreshItems(archived: archived, keeping: {
             shouldKeep($0, afterRefreshing: workspace, removedChats: removedChats)
-        })
+        }, reason: .refresh)
         if requiresServerRefreshAfterMutation {
-            await refreshAfterMutation()
+            await refreshAfterMutation(reason: .refresh)
             return
         }
         guard refreshed else {
             return
         }
         guard upsertLoadedModels(from: workspace) else {
-            await refreshAfterMutation()
+            await refreshAfterMutation(reason: .refresh)
             return
         }
-        await backfillAfterLocalRemovalIfNeeded(originalCount: originalCount)
+        await backfillAfterLocalRemovalIfNeeded(originalCount: originalCount, reason: .refresh)
     }
 
     package func refresh(
@@ -807,19 +891,19 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         let originalCount = items.count
         let refreshed = refreshItems(archived: archived, keeping: {
             shouldKeep($0, afterRefreshing: group, removedChats: removedChats)
-        })
+        }, reason: .refresh)
         if requiresServerRefreshAfterMutation {
-            await refreshAfterMutation()
+            await refreshAfterMutation(reason: .refresh)
             return
         }
         guard refreshed else {
             return
         }
         guard upsertLoadedModels(from: group) else {
-            await refreshAfterMutation()
+            await refreshAfterMutation(reason: .refresh)
             return
         }
-        await backfillAfterLocalRemovalIfNeeded(originalCount: originalCount)
+        await backfillAfterLocalRemovalIfNeeded(originalCount: originalCount, reason: .refresh)
     }
 
     private func insertionModel(for chat: CodexChat, archived: Bool) -> Model? {
@@ -851,16 +935,22 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
     }
 
     @discardableResult
-    private func upsertOrRefresh(_ model: Model) async -> Bool {
-        guard upsert(model) else {
-            await refreshAfterMutation()
+    private func upsertOrRefresh(
+        _ model: Model,
+        reason: CodexFetchedResultsTransactionReason
+    ) async -> Bool {
+        guard upsert(model, reason: reason) else {
+            await refreshAfterMutation(reason: reason)
             return false
         }
         return true
     }
 
     @discardableResult
-    private func upsert(_ model: Model) -> Bool {
+    private func upsert(
+        _ model: Model,
+        reason: CodexFetchedResultsTransactionReason
+    ) -> Bool {
         var nextItems = items
         let insertedModel: Bool
         if let index = nextItems.firstIndex(where: { $0.id == model.id }) {
@@ -878,7 +968,6 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             sortedItems,
             insertedModel: insertedModel
         )
-        items = windowItems
         if insertedModel,
             nextCursor == nil,
             sortedItems.count > windowItems.count
@@ -887,7 +976,12 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
                 modelContext.localCursorOffset(from: fetchDescriptor.cursor) + windowItems.count
             nextCursor = modelContext.localCursor(for: cursorOffset)
         }
-        sections = modelContext.sections(for: items, sectionBy: sectionBy)
+        updateItemsAndSections(
+            items: windowItems,
+            sections: modelContext.sections(for: windowItems, sectionBy: sectionBy),
+            reason: reason,
+            updatedItemIDs: insertedModel ? [] : [model.id]
+        )
         return true
     }
 
@@ -935,7 +1029,10 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             || (Model.self == CodexChat.self && fetchDescriptor.sortBy.isEmpty)
     }
 
-    private func backfillAfterLocalRemovalIfNeeded(originalCount: Int) async {
+    private func backfillAfterLocalRemovalIfNeeded(
+        originalCount: Int,
+        reason: CodexFetchedResultsTransactionReason
+    ) async {
         let missingCount = originalCount - items.count
         guard missingCount > 0, shouldRefreshAfterLocalRemoval else {
             return
@@ -945,15 +1042,15 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         descriptor.cursor = modelContext.backfillCursor(after: backfillOffset, currentCursor: nextCursor)
         descriptor.fetchLimit = missingCount
         do {
-            try await load(descriptor, appending: true)
+            try await load(descriptor, appending: true, reason: reason)
         } catch {
             // load records the failed phase; the server mutation has already succeeded.
         }
     }
 
-    private func refreshAfterMutation() async {
+    private func refreshAfterMutation(reason: CodexFetchedResultsTransactionReason) async {
         do {
-            try await performFetch()
+            try await load(fetchDescriptor, appending: false, reason: reason)
         } catch {
             // performFetch records the failed phase; the server mutation has already succeeded.
         }
@@ -969,7 +1066,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             return false
         }
         do {
-            try await performFetch()
+            try await load(fetchDescriptor, appending: false, reason: .revalidate)
             return true
         } catch {
             // performFetch records the failed phase; the server mutation has already succeeded.
@@ -1155,21 +1252,28 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
     private func applyLocalRemoval(
         of chat: CodexChat,
         workspace: CodexWorkspace?,
-        group: CodexWorkspaceGroup?
+        group: CodexWorkspaceGroup?,
+        reason: CodexFetchedResultsTransactionReason
     ) -> Int {
         let originalCount = items.count
         let filteredItems = items.filter {
             shouldKeep($0, afterRemoving: chat, workspace: workspace, group: group)
         }
         if filteredItems.count != items.count {
-            items = filteredItems
-            sections = modelContext.sections(for: filteredItems, sectionBy: sectionBy)
+            updateItemsAndSections(
+                items: filteredItems,
+                sections: modelContext.sections(for: filteredItems, sectionBy: sectionBy),
+                reason: reason
+            )
         }
         return originalCount
     }
 
     @discardableResult
-    private func applyLocalRevalidation(_ changes: [CodexFetchedChatRevalidation]) -> Int {
+    private func applyLocalRevalidation(
+        _ changes: [CodexFetchedChatRevalidation],
+        reason: CodexFetchedResultsTransactionReason
+    ) -> Int {
         let originalCount = items.count
         var filteredItems = items
         for change in changes {
@@ -1183,23 +1287,58 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
                 )
             }
         }
-        items = modelContext.sortedItems(filteredItems, for: fetchDescriptor)
-        sections = modelContext.sections(for: items, sectionBy: sectionBy)
+        let sortedItems = modelContext.sortedItems(filteredItems, for: fetchDescriptor)
+        updateItemsAndSections(
+            items: sortedItems,
+            sections: modelContext.sections(for: sortedItems, sectionBy: sectionBy),
+            reason: reason,
+            updatedItemIDs: updatedItemIDs(for: changes)
+        )
         return originalCount
+    }
+
+    private func updatedItemIDs(for changes: [CodexFetchedChatRevalidation]) -> Set<Model.ID> {
+        var ids: Set<Model.ID> = []
+        for change in changes {
+            insertUpdatedItemID(change.chat, into: &ids)
+            insertUpdatedItemID(change.previousWorkspace, into: &ids)
+            insertUpdatedItemID(change.chat.workspace, into: &ids)
+            insertUpdatedItemID(change.previousGroup, into: &ids)
+            insertUpdatedItemID(change.chat.workspace?.workspaceGroup, into: &ids)
+        }
+        return ids
+    }
+
+    private func insertUpdatedItemID(
+        _ model: (any CodexObservableModel)?,
+        into ids: inout Set<Model.ID>
+    ) {
+        guard let item = model as? Model else {
+            return
+        }
+        ids.insert(item.id)
     }
 
     @discardableResult
     private func refreshItems(
         archived: Bool,
-        keeping shouldKeep: (Model) -> Bool
+        keeping shouldKeep: (Model) -> Bool,
+        reason: CodexFetchedResultsTransactionReason
     ) -> Bool {
         guard requestMatchesArchiveScope(archived) else {
-            sections = modelContext.sections(for: items, sectionBy: sectionBy)
+            updateItemsAndSections(
+                items: items,
+                sections: modelContext.sections(for: items, sectionBy: sectionBy),
+                reason: reason
+            )
             return false
         }
         let filteredItems = items.filter(shouldKeep)
-        items = filteredItems
-        sections = modelContext.sections(for: filteredItems, sectionBy: sectionBy)
+        updateItemsAndSections(
+            items: filteredItems,
+            sections: modelContext.sections(for: filteredItems, sectionBy: sectionBy),
+            reason: reason
+        )
         return true
     }
 
@@ -1208,7 +1347,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             guard let model = insertionModel(for: chat, archived: chat.isArchived) else {
                 continue
             }
-            guard upsert(model) else {
+            guard upsert(model, reason: .refresh) else {
                 return false
             }
         }
@@ -1261,5 +1400,65 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
 
     private static func standardizedPath(_ url: URL) -> String {
         url.standardizedFileURL.resolvingSymlinksInPath().path
+    }
+}
+
+@MainActor
+private final class CodexAsyncStreamRelay<Element: Sendable>: @unchecked Sendable {
+    private var continuations: [UUID: AsyncStream<Element>.Continuation] = [:]
+
+    var hasContinuations: Bool {
+        continuations.isEmpty == false
+    }
+
+    func makeStream() -> AsyncStream<Element> {
+        let id = UUID()
+        let pair = AsyncStream<Element>.makeStream(bufferingPolicy: .unbounded)
+        continuations[id] = pair.continuation
+        let owner = CodexAsyncStreamRelayWeakBox(self)
+        pair.continuation.onTermination = codexAsyncStreamRelayTermination(owner: owner, id: id)
+        return pair.stream
+    }
+
+    func yield(_ element: Element) {
+        for continuation in continuations.values {
+            continuation.yield(element)
+        }
+    }
+
+    fileprivate func removeStream(_ id: UUID) {
+        continuations.removeValue(forKey: id)?.finish()
+    }
+
+    func finish() {
+        for continuation in continuations.values {
+            continuation.finish()
+        }
+        continuations.removeAll(keepingCapacity: false)
+    }
+
+    isolated deinit {
+        finish()
+    }
+}
+
+private final class CodexAsyncStreamRelayWeakBox<Element: Sendable>: @unchecked Sendable {
+    @MainActor
+    weak var value: CodexAsyncStreamRelay<Element>?
+
+    @MainActor
+    init(_ value: CodexAsyncStreamRelay<Element>) {
+        self.value = value
+    }
+}
+
+private func codexAsyncStreamRelayTermination<Element: Sendable>(
+    owner: CodexAsyncStreamRelayWeakBox<Element>,
+    id: UUID
+) -> @Sendable (AsyncStream<Element>.Continuation.Termination) -> Void {
+    { @Sendable _ in
+        Task { @MainActor in
+            owner.value?.removeStream(id)
+        }
     }
 }

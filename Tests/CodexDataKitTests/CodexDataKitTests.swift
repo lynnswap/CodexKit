@@ -345,6 +345,163 @@ struct CodexModelContextTests {
         #expect(sectionedChatQuery.wrappedValue.items.isEmpty)
     }
 
+    @Test("fetched results controller emits an initial fetch transaction")
+    func fetchedResultsControllerEmitsInitialFetchTransaction() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-alpha", name: "Alpha"),
+            .init(id: "thread-beta", name: "Beta"),
+        ]))
+
+        let controller = context.fetchedResultsController(for: CodexFetchRequest<CodexChat>(
+            sortDescriptors: [CodexSortDescriptor(\.title)]
+        ))
+        var transactions = controller.transactions.makeAsyncIterator()
+
+        try await controller.performFetch()
+
+        let transaction = try #require(await transactions.next())
+        #expect(transaction.reason == .initialFetch)
+        #expect(transaction.isInitialFetch)
+        #expect(transaction.oldSnapshot.sections.isEmpty)
+        #expect(transaction.newSnapshot.sectionIDs == [.default])
+        #expect(transaction.newSnapshot.itemIDs.map(\.rawValue) == ["thread-alpha", "thread-beta"])
+        #expect(transaction.sectionChanges == [
+            .insert(sectionID: .default, index: 0),
+        ])
+        #expect(transaction.itemChanges == [
+            .insert(
+                itemID: CodexThreadID(rawValue: "thread-alpha"),
+                indexPath: .init(section: 0, item: 0)
+            ),
+            .insert(
+                itemID: CodexThreadID(rawValue: "thread-beta"),
+                indexPath: .init(section: 0, item: 1)
+            ),
+        ])
+        #expect(controller.snapshot == transaction.newSnapshot)
+        #expect(controller.items.map(\.id.rawValue) == ["thread-alpha", "thread-beta"])
+        #expect(controller.sections.first?.items.first === controller.items.first)
+    }
+
+    @Test("workspace-group controller emits section and item inserts")
+    func workspaceGroupControllerEmitsSectionAndItemInserts() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let repo = try gitRepository()
+        let workspaceURL = try createDirectory("App", in: repo)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-archived", workspace: workspaceURL, name: "Archived")
+        ]))
+        let workspaceResults = context.fetchedResults(for: CodexFetchRequest<CodexWorkspace>(
+            predicate: .init(archived: true)
+        ))
+        try await workspaceResults.performFetch()
+        let workspace = try #require(workspaceResults.items.first)
+        let groupID = try #require(workspace.workspaceGroup?.id)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: []))
+        let controller = context.fetchedResultsController(
+            for: CodexFetchRequest<CodexChat>.recentChats,
+            sectionedBy: .workspaceGroup
+        )
+        var transactions = controller.transactions.makeAsyncIterator()
+        try await controller.performFetch()
+        _ = await transactions.next()
+
+        try await runtime.transport.enqueueThreadStart(threadID: "thread-new")
+        let chat = try await workspace.startChat()
+
+        let transaction = try #require(await transactions.next())
+        #expect(transaction.reason == .insert)
+        #expect(transaction.oldSnapshot.sections.isEmpty)
+        #expect(transaction.newSnapshot.sectionIDs == [.workspaceGroup(groupID)])
+        #expect(transaction.newSnapshot.itemIDs == [chat.id])
+        #expect(transaction.sectionChanges == [
+            .insert(sectionID: .workspaceGroup(groupID), index: 0),
+        ])
+        #expect(transaction.itemChanges == [
+            .insert(itemID: chat.id, indexPath: .init(section: 0, item: 0)),
+        ])
+        #expect(controller.items.first === chat)
+        #expect(controller.sections.first?.items.first === chat)
+    }
+
+    @Test("workspace-group controller emits section and item deletes when archiving")
+    func workspaceGroupControllerEmitsDeletesWhenArchiving() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let repo = try gitRepository()
+        let workspaceURL = try createDirectory("App", in: repo)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-archive", workspace: workspaceURL, name: "Archive")
+        ]))
+        let controller = context.fetchedResultsController(
+            for: CodexFetchRequest<CodexChat>.recentChats,
+            sectionedBy: .workspaceGroup
+        )
+        var transactions = controller.transactions.makeAsyncIterator()
+        try await controller.performFetch()
+        _ = await transactions.next()
+
+        let chat = try #require(controller.items.first)
+        let groupID = try #require(chat.workspace?.workspaceGroup?.id)
+
+        try await runtime.transport.enqueueEmpty(for: "thread/archive")
+        try await chat.archive()
+
+        let transaction = try #require(await transactions.next())
+        #expect(transaction.reason == .archive)
+        #expect(transaction.oldSnapshot.sectionIDs == [.workspaceGroup(groupID)])
+        #expect(transaction.newSnapshot.sections.isEmpty)
+        #expect(transaction.sectionChanges == [
+            .delete(sectionID: .workspaceGroup(groupID), index: 0),
+        ])
+        #expect(transaction.itemChanges == [
+            .delete(itemID: chat.id, indexPath: .init(section: 0, item: 0)),
+        ])
+        #expect(controller.items.isEmpty)
+        #expect(controller.sections.isEmpty)
+    }
+
+    @Test("unsectioned controller emits item and default-section deletes when deleting")
+    func unsectionedControllerEmitsDeletesWhenDeleting() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-delete", name: "Delete")
+        ]))
+        let controller = context.fetchedResultsController(
+            for: CodexFetchRequest<CodexChat>.recentChats
+        )
+        var transactions = controller.transactions.makeAsyncIterator()
+        try await controller.performFetch()
+        _ = await transactions.next()
+
+        let chat = try #require(controller.items.first)
+
+        try await runtime.transport.enqueueEmpty(for: "thread/delete")
+        try await chat.delete()
+
+        let transaction = try #require(await transactions.next())
+        #expect(transaction.reason == .remove)
+        #expect(transaction.oldSnapshot.sectionIDs == [.default])
+        #expect(transaction.newSnapshot.sections.isEmpty)
+        #expect(transaction.sectionChanges == [
+            .delete(sectionID: .default, index: 0),
+        ])
+        #expect(transaction.itemChanges == [
+            .delete(itemID: chat.id, indexPath: .init(section: 0, item: 0)),
+        ])
+        #expect(controller.items.isEmpty)
+        #expect(controller.sections.isEmpty)
+    }
+
     @Test("fetched chat exposes app-server thread status and recency")
     func fetchedChatExposesThreadStatusAndRecency() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
