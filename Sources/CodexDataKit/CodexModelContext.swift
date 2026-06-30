@@ -172,6 +172,22 @@ public final class CodexModelContext: @unchecked Sendable {
         fetchedResults(for: request.fetchDescriptor, sectionedBy: sectionBy)
     }
 
+    public func fetchedResultsController<Model: CodexObservableModel>(
+        for descriptor: CodexFetchDescriptor<Model>,
+        sectionedBy sectionBy: CodexSectionDescriptor<Model>? = nil
+    ) -> CodexFetchedResultsController<Model> {
+        CodexFetchedResultsController(
+            fetchedResults: fetchedResults(for: descriptor, sectionedBy: sectionBy)
+        )
+    }
+
+    public func fetchedResultsController<Model: CodexObservableModel>(
+        for request: CodexFetchRequest<Model>,
+        sectionedBy sectionBy: CodexSectionDescriptor<Model>? = nil
+    ) -> CodexFetchedResultsController<Model> {
+        fetchedResultsController(for: request.fetchDescriptor, sectionedBy: sectionBy)
+    }
+
     public func model(for id: CodexThreadID) -> CodexChat {
         chat(for: id)
     }

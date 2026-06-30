@@ -3,7 +3,7 @@ import Foundation
 import Observation
 
 @MainActor
-public protocol CodexObservableModel: AnyObject, Identifiable where ID: Sendable {
+public protocol CodexObservableModel: AnyObject, Identifiable where ID: Hashable & Sendable {
     var id: ID { get }
     var modelContext: CodexModelContext? { get }
 }
