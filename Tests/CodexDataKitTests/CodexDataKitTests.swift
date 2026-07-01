@@ -7568,8 +7568,16 @@ struct CodexModelContextTests {
                 phase: "final_answer"
             )
         )
-        try await runtime.transport.enqueueThreadTurns(.init(turns: []))
-        try await runtime.transport.enqueueThreadRead(.init(id: "thread-review", workspace: workspaceURL))
+        await runtime.transport.enqueueFailure(
+            code: -32_000,
+            message: "rollout is empty",
+            for: "thread/turns/list"
+        )
+        await runtime.transport.enqueueFailure(
+            code: -32_000,
+            message: "includeTurns is unavailable before first user message",
+            for: "thread/read"
+        )
 
         let observation = try await started.chat.observe()
         defer {
@@ -7581,6 +7589,82 @@ struct CodexModelContextTests {
             started.chat.items.first { $0.itemID == "message-before-observe" }?.text
                 == "Buffered before observe"
         })
+        withExtendedLifetime(changes) {}
+    }
+
+    @Test("started review observation skips prepared thread history covered by refresh")
+    func startedReviewObservationSkipsPreparedThreadHistoryCoveredByRefresh() async throws {
+        let workspaceURL = temporaryDirectory()
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadStart(threadID: "thread-review", model: "gpt-5")
+        try await runtime.transport.enqueueReviewStart(
+            turnID: "turn-review",
+            reviewThreadID: "thread-review",
+            items: [
+                .init(
+                    id: "turn-review",
+                    kind: .userMessage,
+                    content: .message(.init(
+                        id: "turn-review",
+                        role: .user,
+                        text: "current changes"
+                    ))
+                ),
+            ]
+        )
+
+        let started = try await context.startReview(
+            in: workspaceURL,
+            input: CodexReviewInput(
+                target: .uncommittedChanges,
+                options: .init(model: "gpt-5", ephemeral: false)
+            )
+        )
+        try await runtime.transport.emitServerNotification(
+            method: "turn/started",
+            params: TurnStartedParams(
+                threadID: "thread-review",
+                turnID: "turn-review"
+            )
+        )
+        try await runtime.transport.enqueueThreadTurns(.init(turns: [
+            .init(
+                id: "turn-review",
+                status: .completed,
+                itemsLoadState: .full,
+                items: [
+                    .init(
+                        id: "final-message",
+                        kind: .agentMessage,
+                        content: .message(.init(
+                            id: "final-message",
+                            role: .assistant,
+                            phase: .finalAnswer,
+                            text: "Done"
+                        ))
+                    ),
+                ]
+            ),
+        ]))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-review",
+            workspace: workspaceURL,
+            status: .idle
+        ))
+
+        let observation = try await started.chat.observe()
+        defer {
+            observation.cancel()
+        }
+        let changes = ChatUpdateRecorder(stream: observation.updates)
+
+        try? await Task.sleep(for: .milliseconds(100))
+
+        #expect(started.chat.turn(id: "turn-review")?.status == .completed)
+        #expect(started.chat.phase == .loaded)
+        #expect(started.chat.items.map(\.itemID) == ["final-message"])
         withExtendedLifetime(changes) {}
     }
 

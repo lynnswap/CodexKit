@@ -869,26 +869,29 @@ public final class CodexModelContext {
         chat.phase = .loading
         chat.lastErrorDescription = nil
         let thread: CodexThread
+        let usesPreparedThread: Bool
         do {
             let threadSource: String
             if let resumedThread {
                 thread = resumedThread
                 threadSource = "resumedThread"
+                usesPreparedThread = false
             } else if let preparedThread = preparedEventThread(for: chat.id) {
                 thread = preparedThread
                 threadSource = "preparedEventThread"
+                usesPreparedThread = true
             } else {
                 thread = try await appServer.resumeThread(chat.id)
                 threadSource = "resumeThread"
+                usesPreparedThread = false
             }
             logger.debug(
                 "Starting chat observation chatID=\(chat.id.rawValue, privacy: .public) includeTurns=\(includeTurns, privacy: .public) source=\(threadSource, privacy: .public) turns=\(chat.turns.count, privacy: .public) items=\(chat.items.count, privacy: .public)"
             )
             observation.eventThread = thread
             try Task.checkCancellation()
-            observation.eventStream = await thread.makeCurrentGenerationEventStream()
-            if let eventStream = observation.eventStream {
-                observation.eventPump = ThreadEventPump(eventStream)
+            if usesPreparedThread == false {
+                await startEventPump(observation, thread: thread)
             }
             do {
                 try await refresh(
@@ -907,6 +910,12 @@ public final class CodexModelContext {
                 }
                 chat.syncPhaseAfterRefresh(includeTurns: includeTurns)
             }
+            if usesPreparedThread {
+                if shouldResetPreparedEventGenerationBeforeObserving(chat, includeTurns: includeTurns) {
+                    await thread.beginEventGeneration()
+                }
+                await startEventPump(observation, thread: thread)
+            }
             try Task.checkCancellation()
             observation.includesTurns = includeTurns
         } catch {
@@ -914,6 +923,26 @@ public final class CodexModelContext {
             discardChatObservation(chat.id, observation: observation)
             throw error
         }
+    }
+
+    private func startEventPump(_ observation: ActiveChatObservation, thread: CodexThread) async {
+        observation.eventStream = await thread.makeCurrentGenerationEventStream()
+        if let eventStream = observation.eventStream {
+            observation.eventPump = ThreadEventPump(eventStream)
+        }
+    }
+
+    private func shouldResetPreparedEventGenerationBeforeObserving(
+        _ chat: CodexChat,
+        includeTurns: Bool
+    ) -> Bool {
+        guard includeTurns else {
+            return false
+        }
+        if chat.phase == .loading || chat.status?.isActive == true {
+            return false
+        }
+        return true
     }
 
     private func applyObservedEvent(
