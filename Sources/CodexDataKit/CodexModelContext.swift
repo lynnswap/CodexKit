@@ -428,8 +428,11 @@ public final class CodexModelContext: @unchecked Sendable {
             }
             throw error
         }
-        let chatShouldPreserveTurnItems = chat.shouldPreserveTurnItemsWhenReconcilingSnapshot
-        let observationShouldPreserveTurnItems = observation?.shouldPreserveLiveTurnItems == true
+        let snapshotCanLagBehindLiveEvents = snapshotCanLagBehindLiveEvents(snapshot)
+        let chatShouldPreserveTurnItems = snapshotCanLagBehindLiveEvents
+            && chat.shouldPreserveTurnItemsWhenReconcilingSnapshot
+        let observationShouldPreserveTurnItems = snapshotCanLagBehindLiveEvents
+            && observation?.shouldPreserveLiveTurnItems == true
         let preservesExistingTurnItems = replaysBufferedEvents
             && (chatShouldPreserveTurnItems || observationShouldPreserveTurnItems)
         if preservesExistingTurnItems {
@@ -464,6 +467,21 @@ public final class CodexModelContext: @unchecked Sendable {
             previousGroup: previousGroup,
             archived: refreshedChat.isArchived
         )
+    }
+
+    private func snapshotCanLagBehindLiveEvents(_ snapshot: CodexThreadSnapshot) -> Bool {
+        guard snapshot.hasField(.status), let status = snapshot.status else {
+            return true
+        }
+        switch status {
+        case .active,
+            .unknown:
+            return true
+        case .idle,
+            .notLoaded,
+            .systemError:
+            return false
+        }
     }
 
     private func refreshedThreadSnapshot(
@@ -918,6 +936,7 @@ public final class CodexModelContext: @unchecked Sendable {
         )
         let chat = apply(snapshot)
         chat.preserveSeededMetadataUntilAuthoritativeSnapshot()
+        chat.markProvisionalSeedTurn(review.initialTurn.id)
         chat.applyContextArchived(false)
         chat.syncPhaseAfterRefresh(includeTurns: true)
         prepareEventThread(review.eventThread, for: chat.id)

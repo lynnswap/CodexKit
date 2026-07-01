@@ -495,6 +495,8 @@ public final class CodexChat: CodexPersistentModel {
     private var itemsByMergeKey: [CodexChatItemKey: CodexItem] = [:]
     @ObservationIgnored
     private var itemsByTurnID: [CodexTurnID: [CodexItem]] = [:]
+    @ObservationIgnored
+    private var provisionalSeedTurnID: CodexTurnID?
 
     @ObservationIgnored
     public private(set) weak var modelContext: CodexModelContext?
@@ -607,6 +609,10 @@ public final class CodexChat: CodexPersistentModel {
 
     package func preserveSeededMetadataUntilAuthoritativeSnapshot() {
         preservesSeededMetadataUntilAuthoritativeSnapshot = true
+    }
+
+    package func markProvisionalSeedTurn(_ turnID: CodexTurnID?) {
+        provisionalSeedTurnID = turnID
     }
 
     package func detachFromContext() {
@@ -726,6 +732,7 @@ public final class CodexChat: CodexPersistentModel {
     }
 
     private func replaceTurns(with records: [CodexTurnSnapshot]) {
+        provisionalSeedTurnID = nil
         let existingByID = Dictionary(uniqueKeysWithValues: turns.map { ($0.id, $0) })
         turns = records.map { record in
             let turn = existingByID[record.id] ?? contextTurn(id: record.id)
@@ -872,6 +879,7 @@ public final class CodexChat: CodexPersistentModel {
         var changes: [CodexChatUpdate] = []
         switch event {
         case .turnStarted(let turnID):
+            removeProvisionalSeedTurnIfNeeded(for: turnID, into: &changes)
             changes.appendIfPresent(upsertTurn(
                 id: turnID,
                 status: .running,
@@ -908,17 +916,29 @@ public final class CodexChat: CodexPersistentModel {
             fail(with: message)
         case .itemStarted(let item, let turnID):
             insertRunningTurnIfMissing(turnID, into: &changes)
+            changes.append(contentsOf: terminalizeActiveItemsBeforeAppending(
+                item,
+                turnID: turnID
+            ))
             changes.append(contentsOf: mergeItems([
                 itemByApplyingLifecycleStatus(.running, to: item),
             ], turnID: turnID))
             changes.appendIfPresent(markRunningIfNeeded())
         case .itemCompleted(let item, let turnID):
             insertRunningTurnIfMissing(turnID, into: &changes)
+            changes.append(contentsOf: terminalizeActiveItemsBeforeAppending(
+                item,
+                turnID: turnID
+            ))
             changes.append(contentsOf: mergeItems([
                 itemByApplyingLifecycleStatus(.completed, to: item),
             ], turnID: turnID))
         case .itemUpdated(let item, let turnID):
             insertRunningTurnIfMissing(turnID, into: &changes)
+            changes.append(contentsOf: terminalizeActiveItemsBeforeAppending(
+                item,
+                turnID: turnID
+            ))
             changes.append(contentsOf: mergeItems(
                 [item],
                 turnID: turnID,
@@ -932,18 +952,39 @@ public final class CodexChat: CodexPersistentModel {
                 kind: message.role == .user ? .userMessage : .agentMessage,
                 content: .message(message)
             )
+            changes.append(contentsOf: terminalizeActiveItemsBeforeAppending(
+                item,
+                turnID: turnID
+            ))
             changes.append(contentsOf: mergeItems([item], turnID: turnID))
             changes.appendIfPresent(markRunningIfNeeded())
         case .messageDelta(let delta, let turnID):
             insertRunningTurnIfMissing(turnID, into: &changes)
+            changes.append(contentsOf: terminalizeActiveItemsBeforeAppending(
+                incomingKey: CodexChatItemKey(
+                    id: delta.itemID ?? scopedFallbackMessageID(turnID: turnID),
+                    kind: .agentMessage,
+                    turnID: turnID
+                ),
+                turnID: turnID
+            ))
             changes.append(contentsOf: merge(delta, turnID: turnID))
             changes.appendIfPresent(markRunningIfNeeded())
         case .reasoningSummaryPartAdded(let part, let turnID):
             insertRunningTurnIfMissing(turnID, into: &changes)
+            let item = CodexThreadItem(id: part.id, kind: .reasoning, content: .reasoning(.empty))
+            changes.append(contentsOf: terminalizeActiveItemsBeforeAppending(
+                item,
+                turnID: turnID
+            ))
             changes.append(contentsOf: start(part, turnID: turnID))
             changes.appendIfPresent(markRunningIfNeeded())
         case .reasoningDelta(let delta, let turnID):
             insertRunningTurnIfMissing(turnID, into: &changes)
+            changes.append(contentsOf: terminalizeActiveItemsBeforeAppending(
+                incomingKey: reasoningMergeKey(for: delta, turnID: turnID),
+                turnID: turnID
+            ))
             changes.append(contentsOf: merge(delta, turnID: turnID))
             changes.appendIfPresent(markRunningIfNeeded())
         case .tokenUsageUpdated(let usage, let turnID):
@@ -1077,21 +1118,43 @@ public final class CodexChat: CodexPersistentModel {
         let content: CodexThreadItem.Content
         switch (incomingItem.content, existingItem.content) {
         case (.command(var incomingCommand), .command(let existingCommand)):
-            incomingCommand.status = incomingCommand.status ?? existingCommand.status
+            incomingCommand.status = mergedLifecycleStatus(
+                incoming: incomingCommand.status,
+                existing: existingCommand.status
+            )
             incomingCommand.startedAt = incomingCommand.startedAt ?? existingCommand.startedAt
             incomingCommand.completedAt = incomingCommand.completedAt ?? existingCommand.completedAt
             incomingCommand.duration = incomingCommand.duration ?? existingCommand.duration
             content = .command(incomingCommand)
         case (.fileChange(var incomingFileChange), .fileChange(let existingFileChange)):
-            incomingFileChange.status = incomingFileChange.status ?? existingFileChange.status
+            incomingFileChange.status = mergedLifecycleStatus(
+                incoming: incomingFileChange.status,
+                existing: existingFileChange.status
+            )
             content = .fileChange(incomingFileChange)
         case (.toolCall(var incomingToolCall), .toolCall(let existingToolCall)):
-            incomingToolCall.status = incomingToolCall.status ?? existingToolCall.status
+            incomingToolCall.status = mergedLifecycleStatus(
+                incoming: incomingToolCall.status,
+                existing: existingToolCall.status
+            )
             content = .toolCall(incomingToolCall)
         default:
             return incomingItem
         }
         return itemByReplacingContent(in: incomingItem, with: content)
+    }
+
+    private func mergedLifecycleStatus(
+        incoming: CodexTurnStatus?,
+        existing: CodexTurnStatus?
+    ) -> CodexTurnStatus? {
+        guard let incoming else {
+            return existing
+        }
+        if existing?.isTerminal == true, incoming.isTerminal == false {
+            return existing
+        }
+        return incoming
     }
 
     private func terminalizeActiveItems(
@@ -1102,13 +1165,15 @@ public final class CodexChat: CodexPersistentModel {
         guard status.isTerminal else {
             return []
         }
-        let completionDate = completedAt ?? Date()
         var changes: [CodexChatUpdate] = []
         for item in itemsByTurnID[turnID] ?? [] {
             let previousItem = item.threadItem
             let terminalItem = itemByApplyingTerminalLifecycleStatus(
                 status,
-                completedAt: completionDate,
+                completedAt: terminalCompletionDate(
+                    preferred: completedAt,
+                    for: previousItem
+                ),
                 to: previousItem
             )
             guard terminalItem != previousItem else {
@@ -1203,6 +1268,29 @@ public final class CodexChat: CodexPersistentModel {
         return status.isTerminal == false
     }
 
+    private func terminalCompletionDate(
+        preferred: Date?,
+        for item: CodexThreadItem
+    ) -> Date {
+        let fallback = Date()
+        guard let preferred else {
+            return fallback
+        }
+        guard let startedAt = commandStartedAt(in: item),
+            preferred <= startedAt
+        else {
+            return preferred
+        }
+        return fallback > startedAt ? fallback : startedAt.addingTimeInterval(0.001)
+    }
+
+    private func commandStartedAt(in item: CodexThreadItem) -> Date? {
+        guard case .command(let command) = item.content else {
+            return nil
+        }
+        return command.startedAt
+    }
+
     private func lifecycleStatus(
         for command: CodexCommand,
         fallback status: CodexTurnStatus
@@ -1271,6 +1359,7 @@ public final class CodexChat: CodexPersistentModel {
         _ turnID: CodexTurnID?,
         into changes: inout [CodexChatUpdate]
     ) {
+        removeProvisionalSeedTurnIfNeeded(for: turnID, into: &changes)
         guard let turnID, turnsByID[turnID] == nil else {
             return
         }
@@ -1527,6 +1616,82 @@ public final class CodexChat: CodexPersistentModel {
 
     private func item(for key: CodexChatItemKey) -> CodexItem? {
         itemsByMergeKey[key]
+    }
+
+    @discardableResult
+    private func removeProvisionalSeedTurnIfNeeded(
+        for liveTurnID: CodexTurnID?,
+        into changes: inout [CodexChatUpdate]
+    ) -> Bool {
+        guard let provisionalTurnID = provisionalSeedTurnID,
+            let liveTurnID
+        else {
+            return false
+        }
+        provisionalSeedTurnID = nil
+        guard provisionalTurnID != liveTurnID,
+            let provisionalTurn = turnsByID[provisionalTurnID]
+        else {
+            return false
+        }
+
+        let removedItems = items.filter { $0.turnID == provisionalTurnID }
+        let removedKeys = Set(removedItems.map(\.mergeKey))
+        if removedKeys.isEmpty == false {
+            items.removeAll { item in
+                removedKeys.contains(item.mergeKey)
+            }
+            for item in removedItems {
+                removeItemFromIndexes(item)
+            }
+            changes.append(contentsOf: removedItems.map { item in
+                .itemRemoved(id: item.itemID, turnID: item.turnID)
+            })
+        }
+
+        turns.removeAll { $0 === provisionalTurn }
+        turnsByID.removeValue(forKey: provisionalTurnID)
+        itemsByTurnID.removeValue(forKey: provisionalTurnID)
+        provisionalTurn.replaceContextItems([])
+        changes.append(.turnUpdated(id: provisionalTurnID))
+        return true
+    }
+
+    private func terminalizeActiveItemsBeforeAppending(
+        _ incomingItem: CodexThreadItem,
+        turnID: CodexTurnID?
+    ) -> [CodexChatUpdate] {
+        terminalizeActiveItemsBeforeAppending(
+            incomingKey: CodexChatItemKey(threadItem: incomingItem, turnID: turnID),
+            turnID: turnID
+        )
+    }
+
+    private func terminalizeActiveItemsBeforeAppending(
+        incomingKey: CodexChatItemKey,
+        turnID: CodexTurnID?
+    ) -> [CodexChatUpdate] {
+        guard let turnID else {
+            return []
+        }
+        guard item(for: incomingKey) == nil else {
+            return []
+        }
+        var changes: [CodexChatUpdate] = []
+        for item in itemsByTurnID[turnID] ?? [] where item.mergeKey != incomingKey {
+            let previousItem = item.threadItem
+            let terminalItem = itemByApplyingTerminalLifecycleStatus(
+                .completed,
+                completedAt: terminalCompletionDate(preferred: nil, for: previousItem),
+                to: previousItem
+            )
+            guard terminalItem != previousItem else {
+                continue
+            }
+            item.update(from: terminalItem, itemsLoadState: item.itemsLoadState)
+            changes.appendIfPresent(changeForUpdatedItem(item, previousItem: previousItem))
+        }
+        return changes
     }
 
     private func removeReasoningParts(

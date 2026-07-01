@@ -4769,12 +4769,13 @@ struct CodexModelContextTests {
                 turnID: "turn-command-status-terminal"
             )
         )
+        let startedAt = Date().addingTimeInterval(-45)
         try await runtime.transport.emitServerNotification(
             method: "item/started",
             params: ThreadItemParams(
                 threadID: "thread-command-status-terminal",
                 turnID: "turn-command-status-terminal",
-                startedAtMs: 1_782_900_000_000,
+                startedAtMs: Int64((startedAt.timeIntervalSince1970 * 1_000).rounded()),
                 item: .init(
                     id: "command-status-terminal",
                     type: "commandExecution",
@@ -4798,13 +4799,176 @@ struct CodexModelContextTests {
             guard case .command(let command) = commandItem.content else {
                 return false
             }
+            guard let startedAt = command.startedAt,
+                let completedAt = command.completedAt
+            else {
+                return false
+            }
             return chat.turn(id: "turn-command-status-terminal")?.status == .completed
                 && command.status == .completed
-                && command.completedAt != nil
+                && completedAt > startedAt
         })
         #expect(await changes.itemUpdated(id: "command-status-terminal") != nil)
         #expect(chat.phase == .loaded)
         #expect(chat.status == .idle)
+    }
+
+    @Test("later turn content terminalizes running command when item completion is omitted")
+    func laterTurnContentTerminalizesRunningCommandWhenItemCompletionIsOmitted() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-command-progress"))
+        try await runtime.transport.enqueueThreadRead(.init(id: "thread-command-progress", turns: []))
+
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-command-progress"))
+        let observation = try await chat.observe()
+        defer {
+            observation.cancel()
+        }
+
+        try await runtime.transport.emitServerNotification(
+            method: "turn/started",
+            params: TurnStartedParams(
+                threadID: "thread-command-progress",
+                turnID: "turn-command-progress"
+            )
+        )
+        let startedAt = Date().addingTimeInterval(-45)
+        try await runtime.transport.emitServerNotification(
+            method: "item/started",
+            params: ThreadItemParams(
+                threadID: "thread-command-progress",
+                turnID: "turn-command-progress",
+                startedAtMs: Int64((startedAt.timeIntervalSince1970 * 1_000).rounded()),
+                item: .init(
+                    id: "command-progress",
+                    type: "commandExecution",
+                    command: "/bin/zsh -lc"
+                )
+            )
+        )
+        #expect(await eventually {
+            chat.items.contains { $0.itemID == "command-progress" }
+        })
+        let commandItem = try #require(chat.items.first { $0.itemID == "command-progress" })
+        guard case .command(let startedCommand) = commandItem.content else {
+            Issue.record("Expected command item")
+            return
+        }
+        #expect(startedCommand.status == .running)
+
+        try await runtime.transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(
+                threadID: "thread-command-progress",
+                turnID: "turn-command-progress",
+                itemID: "message-after-command",
+                delta: "Next step"
+            )
+        )
+
+        #expect(await eventually {
+            guard case .command(let command) = commandItem.content else {
+                return false
+            }
+            guard let startedAt = command.startedAt,
+                let completedAt = command.completedAt
+            else {
+                return false
+            }
+            return command.status == .completed
+                && completedAt > startedAt
+                && chat.items.contains { $0.itemID == "message-after-command" }
+        })
+    }
+
+    @Test("late prior command update does not regress terminalized lifecycle items")
+    func latePriorCommandUpdateDoesNotRegressTerminalizedLifecycleItems() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-command-late-update"))
+        try await runtime.transport.enqueueThreadRead(.init(id: "thread-command-late-update", turns: []))
+
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-command-late-update"))
+        let observation = try await chat.observe()
+        defer {
+            observation.cancel()
+        }
+
+        try await runtime.transport.emitServerNotification(
+            method: "turn/started",
+            params: TurnStartedParams(
+                threadID: "thread-command-late-update",
+                turnID: "turn-command-late-update"
+            )
+        )
+        try await runtime.transport.emitServerNotification(
+            method: "item/started",
+            params: ThreadItemParams(
+                threadID: "thread-command-late-update",
+                turnID: "turn-command-late-update",
+                item: .init(
+                    id: "command-first",
+                    type: "commandExecution",
+                    command: "git status"
+                )
+            )
+        )
+        try await runtime.transport.emitServerNotification(
+            method: "item/started",
+            params: ThreadItemParams(
+                threadID: "thread-command-late-update",
+                turnID: "turn-command-late-update",
+                item: .init(
+                    id: "command-second",
+                    type: "commandExecution",
+                    command: "git diff"
+                )
+            )
+        )
+
+        #expect(await eventually {
+            chat.items.contains { $0.itemID == "command-first" }
+                && chat.items.contains { $0.itemID == "command-second" }
+        })
+        let firstCommand = try #require(chat.items.first { $0.itemID == "command-first" })
+        let secondCommand = try #require(chat.items.first { $0.itemID == "command-second" })
+        #expect(await eventually {
+            guard case .command(let first) = firstCommand.content,
+                case .command(let second) = secondCommand.content
+            else {
+                return false
+            }
+            return first.status == .completed && second.status == .running
+        })
+
+        try await runtime.transport.emitServerNotification(
+            method: "item/updated",
+            params: ThreadItemParams(
+                threadID: "thread-command-late-update",
+                turnID: "turn-command-late-update",
+                item: .init(
+                    id: "command-first",
+                    type: "commandExecution",
+                    command: "git status",
+                    output: "late output",
+                    status: "inProgress"
+                )
+            )
+        )
+
+        #expect(await eventually {
+            guard case .command(let first) = firstCommand.content,
+                case .command(let second) = secondCommand.content
+            else {
+                return false
+            }
+            return first.status == .completed
+                && first.output == "late output"
+                && second.status == .running
+        })
     }
 
     @Test("chat send with revert policy refreshes observed transcript after failure")
@@ -5586,6 +5750,67 @@ struct CodexModelContextTests {
         #expect(chat.items.first { $0.itemID == "message-live" } === liveItem)
         #expect(chat.items.first { $0.itemID == "message-live" }?.text == "Live update")
         #expect(chat.turns.contains { $0.id == "turn-live" })
+    }
+
+    @Test("terminal chat refresh replaces live-streamed items with authoritative snapshot")
+    func terminalChatRefreshReplacesLiveStreamedItemsWithAuthoritativeSnapshot() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-refresh-terminal"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-refresh-terminal",
+            status: .active(activeFlags: []),
+            turns: []
+        ))
+
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-refresh-terminal"))
+        let observation = try await chat.observe()
+        defer {
+            observation.cancel()
+        }
+        let changes = ChatUpdateRecorder(stream: observation.updates)
+
+        try await runtime.transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(
+                threadID: "thread-refresh-terminal",
+                turnID: "turn-live",
+                itemID: "message-live",
+                delta: "Live duplicate",
+                phase: "final_answer"
+            )
+        )
+        #expect(await changes.itemInserted(id: "message-live") != nil)
+        #expect(chat.items.map(\.itemID) == ["message-live"])
+
+        try await runtime.transport.enqueueThreadTurns(.init(turns: [
+            .init(
+                id: "turn-authoritative",
+                status: .completed,
+                items: [
+                    .init(
+                        id: "message-authoritative",
+                        kind: .agentMessage,
+                        content: .message(.init(
+                            id: "message-authoritative",
+                            role: .assistant,
+                            text: "Authoritative"
+                        ))
+                    ),
+                ]
+            ),
+        ]))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-refresh-terminal",
+            status: .idle
+        ))
+
+        try await context.refresh(chat)
+
+        #expect(chat.turns.map(\.id.rawValue) == ["turn-authoritative"])
+        #expect(chat.items.map(\.itemID) == ["message-authoritative"])
+        #expect(chat.items.map(\.text) == ["Authoritative"])
     }
 
     @Test("restarted chat observation preserves prior live-streamed items omitted by lagging snapshots")
@@ -6422,6 +6647,81 @@ struct CodexModelContextTests {
         #expect(await runtime.transport.recordedRequests(method: "thread/resume").isEmpty)
         #expect(await runtime.transport.recordedRequests(method: "thread/turns/list").count == 1)
         #expect(await runtime.transport.recordedRequests(method: "thread/read").count == 1)
+    }
+
+    @Test("started review live turn replaces provisional seed after empty history read")
+    func startedReviewLiveTurnReplacesProvisionalSeedAfterEmptyHistoryRead() async throws {
+        let workspaceURL = temporaryDirectory()
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadStart(threadID: "thread-review", model: "gpt-5")
+        try await runtime.transport.enqueueReviewStart(
+            turnID: "turn-seed",
+            reviewThreadID: "thread-review",
+            items: [
+                .init(
+                    id: "turn-seed",
+                    kind: .userMessage,
+                    content: .message(.init(
+                        id: "turn-seed",
+                        role: .user,
+                        text: "current changes"
+                    ))
+                ),
+            ]
+        )
+        await runtime.transport.enqueueFailure(
+            code: -32_000,
+            message: "rollout is empty",
+            for: "thread/turns/list"
+        )
+        await runtime.transport.enqueueFailure(
+            code: -32_000,
+            message: "includeTurns is unavailable before first user message",
+            for: "thread/read"
+        )
+
+        let started = try await context.startReview(
+            in: workspaceURL,
+            input: CodexReviewInput(
+                target: .uncommittedChanges,
+                options: .init(model: "gpt-5", ephemeral: false)
+            )
+        )
+        #expect(started.chat.turns.map(\.id.rawValue) == ["turn-seed"])
+        #expect(started.chat.items.map(\.text) == ["current changes"])
+
+        let observation = try await started.chat.observe()
+        defer {
+            observation.cancel()
+        }
+
+        try await runtime.transport.emitServerNotification(
+            method: "turn/started",
+            params: TurnStartedParams(
+                threadID: "thread-review",
+                turnID: "turn-live"
+            )
+        )
+        try await runtime.transport.emitServerNotification(
+            method: "item/started",
+            params: ThreadItemParams(
+                threadID: "thread-review",
+                turnID: "turn-live",
+                item: .init(
+                    id: "review-mode",
+                    type: "enteredReviewMode",
+                    text: "current changes"
+                )
+            )
+        )
+
+        #expect(await eventually {
+            started.chat.turns.map(\.id.rawValue) == ["turn-live"]
+                && started.chat.items.map(\.itemID) == ["review-mode"]
+                && started.chat.items.map(\.text) == ["current changes"]
+        })
     }
 
     @Test("started review observation replaces response seed with authoritative turn list when available")
