@@ -369,12 +369,13 @@ public actor CodexAppServer {
         _ id: CodexThreadID,
         options: CodexThread.ResumeOptions = .init()
     ) async throws -> CodexThread {
-        await router.beginThreadEventGeneration(id)
+        let generationCursor = await router.threadEventGenerationCursor(id)
         let response = try await client.send(
             AppServerAPI.Thread.Resume.Request(
                 threadID: id.rawValue,
                 params: threadStartParams(options: options)
             ))
+        await router.beginThreadEventGeneration(id, at: generationCursor)
         return thread(from: response.thread, model: response.model ?? options.model)
     }
 

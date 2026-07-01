@@ -148,6 +148,15 @@ package actor CodexAppServerNotificationRouter {
         threadGenerationStartIndexByThreadID[threadID] = threadHistoryByThreadID[threadID]?.count ?? 0
     }
 
+    package func threadEventGenerationCursor(_ threadID: CodexThreadID) -> Int {
+        threadHistoryByThreadID[threadID]?.count ?? 0
+    }
+
+    package func beginThreadEventGeneration(_ threadID: CodexThreadID, at cursor: Int) {
+        let historyCount = threadHistoryByThreadID[threadID]?.count ?? 0
+        threadGenerationStartIndexByThreadID[threadID] = min(cursor, historyCount)
+    }
+
     private func route(_ notification: JSONRPC.Notification) {
         let reviewNotification = try? AppServerReviewNotification(
             method: notification.method,

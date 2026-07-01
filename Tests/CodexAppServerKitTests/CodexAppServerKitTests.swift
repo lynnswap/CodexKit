@@ -2336,6 +2336,44 @@ struct CodexAppServerKitTests {
         })
     }
 
+    @Test func failedResumeDoesNotAdvanceThreadEventGeneration() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-resume-failure"))
+        let thread = try await runtime.server.resumeThread("thread-resume-failure")
+        try await runtime.transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(
+                threadID: "thread-resume-failure",
+                turnID: "turn-resume-failure",
+                delta: "Before failed resume"
+            )
+        )
+
+        await runtime.transport.enqueueFailure(
+            code: -32_000,
+            message: "resume failed",
+            for: "thread/resume"
+        )
+        do {
+            _ = try await runtime.server.resumeThread("thread-resume-failure")
+            Issue.record("Expected resume failure.")
+        } catch {
+            // Expected failure; the existing generation must remain replayable.
+        }
+        try await runtime.transport.emitServerNotification(
+            method: "thread/closed",
+            params: ThreadIDParams(threadID: "thread-resume-failure")
+        )
+
+        let events = try await collect(thread.events)
+        #expect(events.contains { event in
+            if case .messageDelta(let delta, let turnID) = event {
+                return delta.text == "Before failed resume" && turnID == "turn-resume-failure"
+            }
+            return false
+        })
+    }
+
     @Test func turnEventStreamCancellationRemovesRouterSubscriber() async throws {
         let transport = CodexAppServerTestTransport()
         let client = AppServerClient(transport: transport)
