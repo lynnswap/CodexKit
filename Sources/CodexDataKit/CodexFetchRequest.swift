@@ -987,7 +987,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
     private var canInsertLiveModel: Bool {
         canEvaluateFilterLocally
             && fetchDescriptor.cursor == nil
-            && nextCursor == nil
+            && (nextCursor == nil || fetchDescriptor.fetchLimit == nil)
     }
 
     private func loadedWindowItems(_ models: [Model], insertedModel: Bool) -> [Model] {

@@ -5715,18 +5715,20 @@ struct CodexModelContextTests {
         let workspaceURL = temporaryDirectory()
         let runtime = try await CodexAppServerTestRuntime.start()
         let context = CodexModelContainer(appServer: runtime.server).mainContext
-        try await runtime.transport.enqueueThreadList(.init(threads: []))
+        try await runtime.transport.enqueueThreadList(.init(
+            threads: [
+                .init(
+                    id: "thread-existing",
+                    workspace: workspaceURL,
+                    name: "Existing",
+                    modelProvider: "openai",
+                    recencyAt: Date(timeIntervalSince1970: 1_000)
+                ),
+            ],
+            nextCursor: "server-next"
+        ))
         try await runtime.transport.enqueueThreadStart(threadID: "thread-review", model: "gpt-5")
         try await runtime.transport.enqueueReviewStart(turnID: "turn-review", reviewThreadID: "thread-review")
-        try await runtime.transport.enqueueThreadList(.init(threads: [
-            .init(
-                id: "thread-review",
-                workspace: workspaceURL,
-                name: "Review",
-                modelProvider: "openai",
-                recencyAt: Date(timeIntervalSince1970: 2_000)
-            )
-        ]))
         let results = context.fetchedResults(
             for: CodexFetchDescriptor<CodexChat>(
                 sortBy: [CodexSortDescriptor(\.recencyAt, order: .reverse)]
@@ -5742,6 +5744,7 @@ struct CodexModelContextTests {
         )
 
         #expect(results.items.first === started.chat)
+        #expect(results.items.map(\.id.rawValue) == ["thread-review", "thread-existing"])
         #expect(started.chat.id == started.session.activeTurnThreadID)
         #expect(started.chat.workspace?.url.path == workspaceURL.path)
 
