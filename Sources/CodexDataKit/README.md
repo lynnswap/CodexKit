@@ -13,7 +13,8 @@ Use this package when app or UI code needs workspace group, workspace, and chat 
 - `CodexFetchedResults`: Observable CoreData-style fetch results with items, optional sections, cursors, loading phase, and errors.
 - `CodexFetchedResultsController`: Non-UI fetched-results controller that keeps `CodexFetchedResults` as the current-value owner and exposes ordered snapshot transactions.
 - `CodexFetchedResultsSnapshot`, `CodexFetchedResultsTransaction`: Section and item ID snapshots plus section/item changes suitable for conversion to native UI update APIs.
-- `CodexWorkspaceGroup`, `CodexWorkspace`, `CodexChat`: Observable model objects attached to a model context.
+- `CodexPersistentModel`: SwiftData-style model protocol. The protocol itself is not main-actor isolated; concrete context ownership decides the isolation domain.
+- `CodexWorkspaceGroup`, `CodexWorkspace`, `CodexChat`, `CodexTurn`, `CodexItem`: Observable model objects attached to a model context.
 - `CodexQuery`: A SwiftUI `DynamicProperty` wrapper around `CodexFetchedResults`.
 - `CodexDataPhase`: A small data-loading state enum with `idle`, `loading`, `loaded`, and `failed`.
 
@@ -171,6 +172,17 @@ if let server = chat?.modelContext?.appServer {
 }
 ```
 
+Current CodexDataKit models are owned by the container's main context. Treat model
+instances like Core Data or SwiftData model objects: keep them inside the context
+that vended them, mutate same-identity objects in place, and pass semantic IDs or
+value DTOs across concurrency domains. Do not make UI-owned mirrors of model
+properties just to observe changes.
+
+The main context is the UI-facing context, similar to SwiftData's
+`ModelContainer.mainContext`. Future background contexts or model actors should own
+their own model instances and merge by semantic IDs, not share mutable model
+objects across actors.
+
 Keep review-specific state, parsed findings, and review timelines outside CodexDataKit. CodexDataKit owns generic Codex app-server data models; higher-level packages can layer their own indices on top of `CodexChat.id`, workspace IDs, or sectioned fetch results.
 
 ## Live Chat Observation
@@ -192,7 +204,7 @@ Task {
 observation.cancel()
 ```
 
-Observation first refreshes or seeds the chat with `includeTurns: true`, then consumes `CodexThread.events`. Turn, item, message, delta, usage, completion, and failure events mutate the existing `CodexChat`, `CodexChat.Turn`, and `CodexChat.Item` instances in place.
+Observation first refreshes or seeds the chat with `includeTurns: true`, then consumes `CodexThread.events`. Turn, item, message, delta, usage, completion, and failure events mutate the existing context-owned `CodexChat`, `CodexTurn`, and `CodexItem` instances in place. `CodexItem.id` is the stable model identity; `CodexItem.itemID` keeps the raw app-server item ID.
 
 `CodexChatObservation.chat` is the current value at observation creation and stays identical to the context-owned `CodexChat` instance. `updates` is a multicast async sequence of subsequent `CodexChatUpdate` values. The stream does not replay the current value. Consumers render the current value once, then use `updates` as invalidation or incremental hints while reading the same observable model.
 

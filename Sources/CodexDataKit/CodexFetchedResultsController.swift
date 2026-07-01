@@ -43,8 +43,7 @@ public struct CodexFetchedResultsSnapshot<ItemID: Hashable & Sendable>: Sendable
 }
 
 extension CodexFetchedResultsSnapshot {
-    @MainActor
-    init<Model: CodexObservableModel>(
+    init<Model: CodexPersistentModel>(
         sections: [CodexFetchSection<Model>]
     ) where Model.ID == ItemID {
         self.init(sections: sections.map { section in
@@ -85,7 +84,7 @@ public enum CodexFetchedResultsTransactionReason: Sendable, Hashable {
     case revalidate
 }
 
-public struct CodexFetchedResultsTransaction<Model: CodexObservableModel>: Sendable, Hashable {
+public struct CodexFetchedResultsTransaction<Model: CodexPersistentModel>: Sendable, Hashable {
     public typealias ItemID = Model.ID
 
     public var reason: CodexFetchedResultsTransactionReason
@@ -419,7 +418,7 @@ extension CodexFetchedResultsIndexPath: Comparable {
 }
 
 @MainActor
-public final class CodexFetchedResultsController<Model: CodexObservableModel> {
+public final class CodexFetchedResultsController<Model: CodexPersistentModel> {
     public let fetchedResults: CodexFetchedResults<Model>
 
     public var modelContext: CodexModelContext {

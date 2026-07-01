@@ -23,7 +23,7 @@ package enum CodexSortKey: Sendable, Hashable {
     case recencyAt
 }
 
-public struct CodexSortDescriptor<Model: CodexObservableModel>: Sendable, Hashable {
+public struct CodexSortDescriptor<Model: CodexPersistentModel>: Sendable, Hashable {
     package var key: CodexSortKey
     public var order: CodexSortOrder
 
@@ -70,7 +70,7 @@ package enum CodexSectionKey: Sendable, Hashable {
     case workspace
 }
 
-public struct CodexSectionDescriptor<Model: CodexObservableModel>: Sendable, Hashable {
+public struct CodexSectionDescriptor<Model: CodexPersistentModel>: Sendable, Hashable {
     package var key: CodexSectionKey
 
     package init(key: CodexSectionKey) {
@@ -118,7 +118,7 @@ extension CodexSectionDescriptor where Model == CodexChat {
     }
 }
 
-public struct CodexFetchPredicate<Model: CodexObservableModel>: Sendable, Hashable {
+public struct CodexFetchPredicate<Model: CodexPersistentModel>: Sendable, Hashable {
     public var archived: Bool?
     public var workspaces: [URL]? {
         didSet {
@@ -177,13 +177,12 @@ public struct CodexFetchPredicate<Model: CodexObservableModel>: Sendable, Hashab
     }
 }
 
-public struct CodexFetchDescriptor<Model: CodexObservableModel>: Sendable, Hashable {
+public struct CodexFetchDescriptor<Model: CodexPersistentModel>: Sendable, Hashable {
     public var predicate: CodexFetchPredicate<Model>
     public var sortBy: [CodexSortDescriptor<Model>]
     public var fetchLimit: Int?
     public var fetchOffset: Int
     public var includePendingChanges: Bool
-    package var cursor: String?
 
     public init(
         predicate: CodexFetchPredicate<Model> = .init(),
@@ -197,14 +196,13 @@ public struct CodexFetchDescriptor<Model: CodexObservableModel>: Sendable, Hasha
         self.fetchLimit = fetchLimit
         self.fetchOffset = max(0, fetchOffset)
         self.includePendingChanges = includePendingChanges
-        self.cursor = nil
     }
 
 }
 
 private enum CodexKnownKeyPaths {
     @MainActor
-    static func sortKey<Model: CodexObservableModel>(
+    static func sortKey<Model: CodexPersistentModel>(
         for _: Model.Type,
         keyPath: AnyKeyPath
     ) -> CodexSortKey? {
@@ -221,7 +219,7 @@ private enum CodexKnownKeyPaths {
     }
 
     @MainActor
-    static func sectionKey<Model: CodexObservableModel>(
+    static func sectionKey<Model: CodexPersistentModel>(
         for _: Model.Type,
         keyPath: AnyKeyPath
     ) -> CodexSectionKey? {
@@ -271,25 +269,22 @@ private enum CodexKnownKeyPaths {
     }
 }
 
-public final class CodexFetchRequest<Model: CodexObservableModel>: @unchecked Sendable {
+public final class CodexFetchRequest<Model: CodexPersistentModel>: @unchecked Sendable {
     public var predicate: CodexFetchPredicate<Model>
     public var sortDescriptors: [CodexSortDescriptor<Model>]
     public var fetchLimit: Int?
     public var fetchOffset: Int
     public var includePendingChanges: Bool
-    package var cursor: String?
 
     public var fetchDescriptor: CodexFetchDescriptor<Model> {
         get {
-            var descriptor = CodexFetchDescriptor(
+            CodexFetchDescriptor(
                 predicate: predicate,
                 sortBy: sortDescriptors,
                 fetchLimit: fetchLimit,
                 fetchOffset: fetchOffset,
                 includePendingChanges: includePendingChanges
             )
-            descriptor.cursor = cursor
-            return descriptor
         }
         set {
             predicate = newValue.predicate
@@ -297,7 +292,6 @@ public final class CodexFetchRequest<Model: CodexObservableModel>: @unchecked Se
             fetchLimit = newValue.fetchLimit
             fetchOffset = newValue.fetchOffset
             includePendingChanges = newValue.includePendingChanges
-            cursor = newValue.cursor
         }
     }
 
@@ -313,7 +307,6 @@ public final class CodexFetchRequest<Model: CodexObservableModel>: @unchecked Se
         self.fetchLimit = fetchLimit
         self.fetchOffset = max(0, fetchOffset)
         self.includePendingChanges = includePendingChanges
-        self.cursor = nil
     }
 
     public convenience init(_ descriptor: CodexFetchDescriptor<Model>) {
@@ -324,7 +317,6 @@ public final class CodexFetchRequest<Model: CodexObservableModel>: @unchecked Se
             fetchOffset: descriptor.fetchOffset,
             includePendingChanges: descriptor.includePendingChanges
         )
-        self.cursor = descriptor.cursor
     }
 
     package func copy() -> CodexFetchRequest<Model> {
@@ -464,7 +456,7 @@ public enum CodexFetchSectionID: Sendable, Hashable, CustomStringConvertible {
     }
 }
 
-public struct CodexFetchSection<Model: CodexObservableModel>: Identifiable {
+public struct CodexFetchSection<Model: CodexPersistentModel>: Identifiable {
     public var id: CodexFetchSectionID
     public var title: String?
     public var items: [Model]
@@ -566,7 +558,7 @@ private func codexOnlyWorkspaceGroup(_ groups: [CodexWorkspaceGroup?]) -> CodexW
     return hasMissingGroup && result != nil ? nil : result
 }
 
-package struct CodexFetchPage<Model: CodexObservableModel> {
+package struct CodexFetchPage<Model: CodexPersistentModel> {
     package var items: [Model]
     package var nextCursor: String?
     package var backwardsCursor: String?
@@ -601,7 +593,7 @@ package protocol CodexFetchedResultsRegistration: AnyObject {
 
 @MainActor
 @Observable
-public final class CodexFetchedResults<Model: CodexObservableModel> {
+public final class CodexFetchedResults<Model: CodexPersistentModel> {
     public let modelContext: CodexModelContext
     public private(set) var fetchDescriptor: CodexFetchDescriptor<Model>
     public private(set) var sectionBy: CodexSectionDescriptor<Model>?
@@ -652,13 +644,17 @@ public final class CodexFetchedResults<Model: CodexObservableModel> {
         guard let nextCursor else {
             return
         }
-        var descriptor = fetchDescriptor
-        descriptor.cursor = nextCursor
-        try await load(descriptor, appending: true, reason: .pageAppend)
+        try await load(
+            fetchDescriptor,
+            cursor: nextCursor,
+            appending: true,
+            reason: .pageAppend
+        )
     }
 
     private func load(
         _ descriptor: CodexFetchDescriptor<Model>,
+        cursor: String? = nil,
         appending: Bool,
         reason: CodexFetchedResultsTransactionReason
     ) async throws {
@@ -666,13 +662,18 @@ public final class CodexFetchedResults<Model: CodexObservableModel> {
         lastErrorDescription = nil
         let previousBackwardsCursor = backwardsCursor
         do {
-            let page = try await modelContext.fetchPage(descriptor, excluding: self)
+            let page = try await modelContext.fetchPage(
+                descriptor,
+                cursor: cursor,
+                excluding: self
+            )
             let newItems = loadedItems(from: page, appending: appending)
             let relationshipDescriptor = appending ? fetchDescriptor : descriptor
             await modelContext.syncLoadedRelationships(
                 from: page,
                 descriptor: relationshipDescriptor,
                 loadedItems: newItems,
+                cursor: cursor,
                 excluding: self
             )
             nextCursor = page.nextCursor
@@ -701,8 +702,7 @@ public final class CodexFetchedResults<Model: CodexObservableModel> {
         }
         if page.relationshipIsComplete == true, let authoritativeItems = page.relationshipItems {
             let start = min(
-                modelContext.localCursorOffset(from: fetchDescriptor.cursor)
-                    + fetchDescriptor.fetchOffset,
+                fetchDescriptor.fetchOffset,
                 authoritativeItems.count
             )
             let end = min(start + items.count + page.items.count, authoritativeItems.count)
@@ -866,11 +866,6 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             return
         }
         guard items.count != originalCount else {
-            if modelContext.localCursorOffset(from: fetchDescriptor.cursor) > 0
-                || fetchDescriptor.fetchOffset > 0
-            {
-                await refreshAfterMutation(reason: reason)
-            }
             return
         }
         await backfillAfterLocalRemovalIfNeeded(originalCount: originalCount, reason: reason)
@@ -988,8 +983,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             nextCursor == nil,
             sortedItems.count > windowItems.count
         {
-            let cursorOffset =
-                modelContext.localCursorOffset(from: fetchDescriptor.cursor) + windowItems.count
+            let cursorOffset = fetchDescriptor.fetchOffset + windowItems.count
             nextCursor = modelContext.localCursor(for: cursorOffset)
         }
         updateItemsAndSections(
@@ -1003,7 +997,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
 
     private var canInsertLiveModel: Bool {
         canEvaluateFilterLocally
-            && fetchDescriptor.cursor == nil
+            && fetchDescriptor.fetchOffset == 0
             && (nextCursor == nil || fetchDescriptor.fetchLimit == nil)
     }
 
@@ -1053,12 +1047,16 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         guard missingCount > 0, shouldRefreshAfterLocalRemoval else {
             return
         }
-        let backfillOffset = modelContext.localCursorOffset(from: fetchDescriptor.cursor) + items.count
+        let backfillOffset = fetchDescriptor.fetchOffset + items.count
         var descriptor = fetchDescriptor
-        descriptor.cursor = modelContext.backfillCursor(after: backfillOffset, currentCursor: nextCursor)
         descriptor.fetchLimit = missingCount
         do {
-            try await load(descriptor, appending: true, reason: reason)
+            try await load(
+                descriptor,
+                cursor: modelContext.backfillCursor(after: backfillOffset, currentCursor: nextCursor),
+                appending: true,
+                reason: reason
+            )
         } catch {
             // load records the failed phase; the server mutation has already succeeded.
         }
@@ -1076,7 +1074,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         _ changes: [CodexFetchedChatRevalidation]
     ) async -> Bool {
         guard Model.self == CodexChat.self,
-            (nextCursor != nil || fetchDescriptor.cursor != nil || fetchDescriptor.fetchOffset > 0),
+            (nextCursor != nil || fetchDescriptor.fetchOffset > 0),
             changes.contains(where: { shouldInclude($0.chat, archived: $0.archived) })
         else {
             return false
@@ -1344,7 +1342,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
     }
 
     private func insertUpdatedItemID(
-        _ model: (any CodexObservableModel)?,
+        _ model: (any CodexPersistentModel)?,
         into ids: inout Set<Model.ID>
     ) {
         guard let item = model as? Model else {
