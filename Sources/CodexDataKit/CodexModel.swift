@@ -1778,22 +1778,18 @@ public final class CodexChat: CodexPersistentModel {
     package func syncPhaseWithTurnsAfterRefresh() -> CodexChatUpdate? {
         let previousPhase = phase
         guard let latestTurn = turns.last else {
-            _ = markIdleIfActive()
-            phase = .loaded
+            phase = status?.isActive == true ? .loading : .loaded
             lastErrorDescription = nil
             return phase == previousPhase ? nil : .phaseChanged(phase)
         }
         switch latestTurn.status {
         case .running:
-            _ = markRunningIfNeeded()
-            phase = .loading
+            phase = status?.isActive == true ? .loading : .loaded
             lastErrorDescription = nil
         case .failed, .interrupted, .cancelled:
-            _ = markIdleIfActive()
             fail(with: latestTurn.errorDescription ?? latestTurn.status?.rawValue ?? "Turn failed")
         case .completed, .unknown, .none:
-            _ = markIdleIfActive()
-            phase = .loaded
+            phase = status?.isActive == true ? .loading : .loaded
             lastErrorDescription = nil
         }
         return phase == previousPhase ? nil : .phaseChanged(phase)

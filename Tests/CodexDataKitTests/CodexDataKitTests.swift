@@ -3903,8 +3903,8 @@ struct CodexModelContextTests {
         #expect(chat.status == .idle)
     }
 
-    @Test("turn snapshots without fresh thread status do not terminalize from stale status")
-    func turnSnapshotsWithoutFreshThreadStatusDoNotTerminalizeFromStaleStatus() async throws {
+    @Test("turn snapshots without fresh thread status preserve app-server thread status")
+    func turnSnapshotsWithoutFreshThreadStatusPreserveAppServerThreadStatus() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         let context = CodexModelContainer(appServer: runtime.server).mainContext
 
@@ -3949,7 +3949,44 @@ struct CodexModelContextTests {
         #expect(turn.status == .running)
         #expect(command.status == .running)
         #expect(command.completedAt == nil)
-        #expect(chat.phase == .loading)
+        #expect(chat.status == .idle)
+        #expect(chat.phase == .loaded)
+    }
+
+    @Test("fresh idle thread status wins over stale running turn snapshots")
+    func freshIdleThreadStatusWinsOverStaleRunningTurnSnapshots() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-idle-with-running-turn"))
+        try await runtime.transport.enqueueThreadTurns(.init(turns: [
+            .init(
+                id: "turn-stale-running",
+                status: .running,
+                items: [
+                    .init(
+                        id: "command-stale-running",
+                        kind: .commandExecution,
+                        content: .command(.init(
+                            command: "/bin/zsh -lc",
+                            status: .running,
+                            startedAt: Date(timeIntervalSince1970: 4_500)
+                        ))
+                    ),
+                ]
+            ),
+        ]))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-idle-with-running-turn",
+            status: .idle
+        ))
+
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-idle-with-running-turn"))
+        try await context.refresh(chat)
+
+        #expect(chat.status == .idle)
+        #expect(chat.phase == .loaded)
+        #expect(chat.turn(id: "turn-stale-running")?.status == .completed)
     }
 
     @Test("server-only chat refresh re-sorts current results")
@@ -4576,6 +4613,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadResume(.init(id: "thread-send-phase"))
         try await runtime.transport.enqueueThreadRead(.init(
             id: "thread-send-phase",
+            status: .active(activeFlags: []),
             turns: [.init(id: "turn-existing", status: .running)]
         ))
 
@@ -5648,6 +5686,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadResume(.init(id: "thread-refresh-stream"))
         try await runtime.transport.enqueueThreadRead(.init(
             id: "thread-refresh-stream",
+            status: .active(activeFlags: []),
             turns: [.init(id: "turn-running", status: .running)]
         ))
 
@@ -6052,14 +6091,15 @@ struct CodexModelContextTests {
         #expect(await runtime.transport.recordedRequests(method: "thread/resume").count == 1)
     }
 
-    @Test("chat observation preserves loading phase for running snapshots")
-    func chatObservationPreservesLoadingPhaseForRunningSnapshots() async throws {
+    @Test("chat observation preserves loading phase for active thread snapshots")
+    func chatObservationPreservesLoadingPhaseForActiveThreadSnapshots() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         let context = CodexModelContainer(appServer: runtime.server).mainContext
 
         try await runtime.transport.enqueueThreadResume(.init(id: "thread-running"))
         try await runtime.transport.enqueueThreadRead(.init(
             id: "thread-running",
+            status: .active(activeFlags: []),
             turns: [.init(id: "turn-running", status: .running)]
         ))
 
