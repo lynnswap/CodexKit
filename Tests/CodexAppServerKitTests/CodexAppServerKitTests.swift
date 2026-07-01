@@ -1079,6 +1079,31 @@ struct CodexAppServerKitTests {
                 false
             }
         })
+
+        let logs = try await collect(review.logEntries)
+        #expect(logs.map(\.id) == ["command-1", "reasoning-1", "tool-1", "file-1"])
+        #expect(logs.allSatisfy { $0.turnID == "turn-review" })
+        #expect(logs.contains {
+            if case .command(let command) = $0.item?.content {
+                command.command == "swift test"
+            } else {
+                false
+            }
+        })
+        #expect(logs.contains {
+            if case .toolCall(let toolCall) = $0.item?.content {
+                toolCall.name == "review_read"
+            } else {
+                false
+            }
+        })
+        #expect(logs.contains {
+            if case .fileChange(let fileChange) = $0.item?.content {
+                fileChange.path == "Sources/File.swift"
+            } else {
+                false
+            }
+        })
     }
 
     @Test func reviewSessionExposesPersistableLifecycleIdentity() async throws {

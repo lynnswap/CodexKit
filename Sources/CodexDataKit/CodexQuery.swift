@@ -108,15 +108,6 @@ public struct CodexQuery<Model: CodexPersistentModel>: @preconcurrency DynamicPr
         )
     }
 
-    public init(
-        fetchRequest request: CodexFetchRequest<Model>,
-        animation _: Animation? = nil,
-        sectionBy: CodexSectionDescriptor<Model>? = nil
-    ) {
-        self.fetchDescriptor = request.fetchDescriptor
-        self.sectionBy = sectionBy
-    }
-
     public var wrappedValue: CodexQueryResults<Model> {
         guard let fetchedResults else {
             return CodexQueryResults()

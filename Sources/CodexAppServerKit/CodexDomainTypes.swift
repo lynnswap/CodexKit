@@ -884,6 +884,11 @@ public struct CodexReviewSession: Identifiable, Sendable {
         eventThread.transcriptUpdates
     }
 
+    /// Log-oriented item events emitted by the review thread.
+    public var logEntries: CodexThreadLogSequence {
+        eventThread.logEntries
+    }
+
     /// Incremental progress snapshots for the review thread.
     public var progress: CodexReviewProgressSequence {
         .init(events: eventThread.events, terminalTurnID: turnID)
