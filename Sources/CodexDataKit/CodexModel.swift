@@ -1215,49 +1215,76 @@ public final class CodexChat: CodexPersistentModel {
                 threadItem: incomingItem,
                 turnID: turnID
             )
-            if let existing = item(for: incomingKey),
+            let directlyMatchedItem = item(for: incomingKey)
+            if let existing = directlyMatchedItem,
                 isDuplicateNarrativeReplay(incomingItem, replacing: existing.threadItem)
             {
                 continue
             }
-            if item(for: incomingKey) == nil,
+            if directlyMatchedItem == nil,
                 hasNarrativeItem(matching: incomingItem, turnID: turnID)
             {
                 continue
             }
-            if item(for: incomingKey) == nil,
+            if directlyMatchedItem == nil,
                 hasReplayNarrativeItem(matching: incomingItem)
             {
                 continue
             }
-            if let existing = itemsByMergeKey[incomingKey]
-                ?? commandReplayItem(matching: incomingItem, turnID: turnID)
+            let indexedItem = itemsByMergeKey[incomingKey]
+            let replayItem = indexedItem == nil
+                ? commandReplayItem(matching: incomingItem, turnID: turnID)
+                : nil
+            let existingItem = indexedItem ?? replayItem
+            if let existing = existingItem
             {
                 let previousItem = existing.threadItem
                 let previousMergeKey = existing.mergeKey
+                let previousTurnID = existing.turnID
                 let incomingItem = itemByPreservingExistingLifecycle(
                     from: incomingItem,
                     existing: previousItem
                 )
+                let movesAcrossTurns = previousTurnID != turnID
+                let updateChange: CodexChatUpdate?
                 if accumulatesOutputDeltas,
                     mergeOutputDelta(incomingItem, into: existing, key: previousMergeKey)
                 {
-                    changes.appendIfPresent(changeForUpdatedItem(
+                    if movesAcrossTurns {
+                        moveItemInIndexes(existing, to: turnID)
+                    }
+                    updateChange = changeForUpdatedItem(
                         existing,
                         previousItem: previousItem
-                    ))
+                    )
                 } else {
+                    if movesAcrossTurns {
+                        removeItemFromIndexes(existing)
+                        existing.applyContextOwners(
+                            chat: self,
+                            turn: turnID.map { contextTurn(id: $0) }
+                        )
+                    }
                     existing.update(
                         from: incomingItem,
                         itemsLoadState: itemsLoadState
                     )
-                    changes.appendIfPresent(changeForUpdatedItem(
+                    if movesAcrossTurns {
+                        addItemToIndexes(existing)
+                    }
+                    updateChange = changeForUpdatedItem(
                         existing,
                         previousItem: previousItem
-                    ))
+                    )
                 }
-                if existing.mergeKey != previousMergeKey {
+                if movesAcrossTurns {
+                    changes.append(.itemRemoved(id: previousItem.id, turnID: previousTurnID))
+                    changes.append(.itemInserted(id: existing.itemID, turnID: existing.turnID))
+                } else if existing.mergeKey != previousMergeKey {
                     rebuildItemIndexes()
+                    changes.appendIfPresent(updateChange)
+                } else {
+                    changes.appendIfPresent(updateChange)
                 }
             } else {
                 if accumulatesOutputDeltas {
@@ -1321,23 +1348,85 @@ public final class CodexChat: CodexPersistentModel {
         guard let incomingCommand = incomingItem.command else {
             return nil
         }
-        let candidates: [CodexItem]
+        let sameTurnCandidates: [CodexItem]
         if let turnID {
-            candidates = itemsByTurnID[turnID] ?? []
+            sameTurnCandidates = itemsByTurnID[turnID] ?? []
         } else {
-            candidates = items.filter { $0.turnID == nil }
+            sameTurnCandidates = items.filter { $0.turnID == nil }
         }
-        return candidates.first { item in
+        if let sameTurnReplay = sameTurnCandidates.first(where: { item in
             guard let existingCommand = item.threadItem.command else {
                 return false
             }
             guard existingCommand.status?.isTerminal != true else {
                 return false
             }
-            return existingCommand.command == incomingCommand.command
-                && existingCommand.cwd == incomingCommand.cwd
-                && existingCommand.source == incomingCommand.source
+            return commandsMatchForReplay(existingCommand, incomingCommand)
+        }) {
+            return sameTurnReplay
         }
+        return items.first { item in
+            guard item.turnID != turnID else {
+                return false
+            }
+            guard let existingCommand = item.threadItem.command else {
+                return false
+            }
+            guard existingCommand.status?.isTerminal != true else {
+                return false
+            }
+            guard commandsMatchForReplay(existingCommand, incomingCommand) else {
+                return false
+            }
+            return commandsShareReplayIdentity(
+                existingItemID: item.itemID,
+                existingCommand: existingCommand,
+                incomingItemID: incomingItem.id,
+                incomingCommand: incomingCommand
+            )
+        }
+    }
+
+    private func commandsMatchForReplay(
+        _ existingCommand: CodexCommand,
+        _ incomingCommand: CodexCommand
+    ) -> Bool {
+        guard existingCommand.command == incomingCommand.command else {
+            return false
+        }
+        if let existingCWD = existingCommand.cwd,
+            let incomingCWD = incomingCommand.cwd,
+            existingCWD != incomingCWD
+        {
+            return false
+        }
+        if let existingProcessID = existingCommand.processID,
+            let incomingProcessID = incomingCommand.processID,
+            existingProcessID != incomingProcessID
+        {
+            return false
+        }
+        return existingCommand.source == incomingCommand.source
+            || existingCommand.source == nil
+            || incomingCommand.source == nil
+    }
+
+    private func commandsShareReplayIdentity(
+        existingItemID: String,
+        existingCommand: CodexCommand,
+        incomingItemID: String,
+        incomingCommand: CodexCommand
+    ) -> Bool {
+        if existingItemID == incomingItemID {
+            return true
+        }
+        if let existingProcessID = existingCommand.processID,
+            let incomingProcessID = incomingCommand.processID,
+            existingProcessID == incomingProcessID
+        {
+            return true
+        }
+        return false
     }
 
     private func itemByApplyingLifecycleStatus(
@@ -1347,13 +1436,17 @@ public final class CodexChat: CodexPersistentModel {
         let content: CodexThreadItem.Content
         switch item.content {
         case .command(var command):
-            command.status = command.status ?? lifecycleStatus(for: command, fallback: status)
+            if status.isTerminal {
+                command.status = lifecycleStatus(for: command, fallback: status)
+            } else {
+                command.status = command.status ?? lifecycleStatus(for: command, fallback: status)
+            }
             content = .command(command)
         case .fileChange(var fileChange):
-            fileChange.status = fileChange.status ?? status
+            fileChange.status = status.isTerminal ? status : fileChange.status ?? status
             content = .fileChange(fileChange)
         case .toolCall(var toolCall):
-            toolCall.status = toolCall.status ?? status
+            toolCall.status = status.isTerminal ? status : toolCall.status ?? status
             content = .toolCall(toolCall)
         default:
             return item
@@ -1375,6 +1468,12 @@ public final class CodexChat: CodexPersistentModel {
             incomingCommand.startedAt = incomingCommand.startedAt ?? existingCommand.startedAt
             incomingCommand.completedAt = incomingCommand.completedAt ?? existingCommand.completedAt
             incomingCommand.duration = incomingCommand.duration ?? existingCommand.duration
+            incomingCommand.cwd = incomingCommand.cwd ?? existingCommand.cwd
+            incomingCommand.processID = incomingCommand.processID ?? existingCommand.processID
+            incomingCommand.source = incomingCommand.source ?? existingCommand.source
+            if incomingCommand.commandActions.isEmpty {
+                incomingCommand.commandActions = existingCommand.commandActions
+            }
             content = .command(incomingCommand)
         case (.fileChange(var incomingFileChange), .fileChange(let existingFileChange)):
             incomingFileChange.status = mergedLifecycleStatus(
@@ -1868,6 +1967,15 @@ public final class CodexChat: CodexPersistentModel {
         itemsByMergeKey[key]
     }
 
+    private func moveItemInIndexes(_ item: CodexItem, to turnID: CodexTurnID?) {
+        removeItemFromIndexes(item)
+        item.applyContextOwners(
+            chat: self,
+            turn: turnID.map { contextTurn(id: $0) }
+        )
+        addItemToIndexes(item)
+    }
+
     private func removeProvisionalSeedTurn(_ provisionalTurnID: CodexTurnID) -> [CodexItem] {
         provisionalSeedTurnID = nil
         guard let provisionalTurn = turnsByID[provisionalTurnID] else {
@@ -1934,7 +2042,9 @@ public final class CodexChat: CodexPersistentModel {
         guard let turnID else {
             return []
         }
-        guard item(for: incomingKey) == nil else {
+        if let existingItem = item(for: incomingKey),
+            isLifecycleTrackedItem(existingItem.threadItem)
+        {
             return []
         }
         var changes: [CodexChatUpdate] = []
@@ -1952,6 +2062,15 @@ public final class CodexChat: CodexPersistentModel {
             changes.appendIfPresent(changeForUpdatedItem(item, previousItem: previousItem))
         }
         return changes
+    }
+
+    private func isLifecycleTrackedItem(_ item: CodexThreadItem) -> Bool {
+        switch item.content {
+        case .command, .fileChange, .toolCall:
+            true
+        default:
+            false
+        }
     }
 
     private func removeReasoningParts(

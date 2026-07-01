@@ -4805,7 +4805,8 @@ struct CodexModelContextTests {
                     type: "commandExecution",
                     command: "/bin/zsh -lc",
                     output: "done",
-                    exitCode: 0
+                    exitCode: 0,
+                    status: "running"
                 )
             )
         )
@@ -4886,6 +4887,91 @@ struct CodexModelContextTests {
         #expect(await changes.itemUpdated(id: "command-status-terminal") != nil)
         #expect(chat.phase == .loaded)
         #expect(chat.status == .idle)
+    }
+
+    @Test("existing later turn content terminalizes running command when item completion is omitted")
+    func existingLaterTurnContentTerminalizesRunningCommandWhenItemCompletionIsOmitted()
+        async throws
+    {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-command-existing-progress"))
+        try await runtime.transport.enqueueThreadRead(.init(id: "thread-command-existing-progress", turns: []))
+
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-command-existing-progress"))
+        let observation = try await chat.observe()
+        defer {
+            observation.cancel()
+        }
+        let changes = ChatUpdateRecorder(stream: observation.updates)
+
+        try await runtime.transport.emitServerNotification(
+            method: "turn/started",
+            params: TurnStartedParams(
+                threadID: "thread-command-existing-progress",
+                turnID: "turn-command-existing-progress"
+            )
+        )
+        try await runtime.transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(
+                threadID: "thread-command-existing-progress",
+                turnID: "turn-command-existing-progress",
+                itemID: "message-around-command",
+                delta: "Before command"
+            )
+        )
+        let startedAt = Date().addingTimeInterval(-45)
+        try await runtime.transport.emitServerNotification(
+            method: "item/started",
+            params: ThreadItemParams(
+                threadID: "thread-command-existing-progress",
+                turnID: "turn-command-existing-progress",
+                startedAtMs: Int64((startedAt.timeIntervalSince1970 * 1_000).rounded()),
+                item: .init(
+                    id: "command-existing-progress",
+                    type: "commandExecution",
+                    command: "/bin/zsh -lc"
+                )
+            )
+        )
+        #expect(await eventually {
+            chat.items.contains { $0.itemID == "command-existing-progress" }
+                && chat.items.contains { $0.itemID == "message-around-command" }
+        })
+        let commandItem = try #require(chat.items.first { $0.itemID == "command-existing-progress" })
+        guard case .command(let startedCommand) = commandItem.content else {
+            Issue.record("Expected command item")
+            return
+        }
+        #expect(startedCommand.status == .running)
+
+        try await runtime.transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(
+                threadID: "thread-command-existing-progress",
+                turnID: "turn-command-existing-progress",
+                itemID: "message-around-command",
+                delta: " after command"
+            )
+        )
+
+        #expect(await eventually {
+            guard case .command(let command) = commandItem.content else {
+                return false
+            }
+            guard let startedAt = command.startedAt,
+                let completedAt = command.completedAt
+            else {
+                return false
+            }
+            return command.status == .completed
+                && completedAt > startedAt
+                && chat.items.first { $0.itemID == "message-around-command" }?.text
+                    == "Before command after command"
+        })
+        withExtendedLifetime(changes) {}
     }
 
     @Test("later turn content terminalizes running command when item completion is omitted")
@@ -7604,6 +7690,194 @@ struct CodexModelContextTests {
         #expect(refreshedItem === seededItem)
         #expect(refreshedItem.itemID == "review-mode")
         #expect(refreshedItem.id.rawValue == "turn-review:review-marker:enteredReviewMode")
+    }
+
+    @Test("started review refresh coalesces running command snapshot replay")
+    func startedReviewRefreshCoalescesRunningCommandSnapshotReplay() async throws {
+        let workspaceURL = temporaryDirectory()
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let startedAt = Date(timeIntervalSince1970: 10)
+
+        try await runtime.transport.enqueueThreadStart(threadID: "thread-review", model: "gpt-5")
+        try await runtime.transport.enqueueReviewStart(
+            turnID: "turn-review",
+            reviewThreadID: "thread-review"
+        )
+
+        let started = try await context.startReview(
+            in: workspaceURL,
+            input: CodexReviewInput(
+                target: .uncommittedChanges,
+                options: .init(model: "gpt-5", ephemeral: false)
+            )
+        )
+        started.chat.apply(.itemStarted(
+            .init(
+                id: "live-command",
+                kind: .commandExecution,
+                content: .command(.init(
+                    command: "/bin/zsh -lc 'git status --short'",
+                    cwd: workspaceURL.path,
+                    status: .running,
+                    startedAt: startedAt,
+                    processID: "123",
+                    source: .agent
+                ))
+            ),
+            turnID: "turn-review"
+        ))
+        let seededCommand = try #require(
+            started.chat.items.first { $0.kind == .commandExecution }
+        )
+
+        started.chat.apply(
+            .init(
+                id: "thread-review",
+                workspace: workspaceURL,
+                status: .active(activeFlags: []),
+                turns: [
+                    .init(
+                        id: "turn-review",
+                        status: .running,
+                        itemsLoadState: .full,
+                        items: [
+                            .init(
+                                id: "snapshot-command",
+                                kind: .commandExecution,
+                                content: .command(.init(
+                                    command: "/bin/zsh -lc 'git status --short'",
+                                    status: .running
+                                ))
+                            ),
+                        ]
+                    ),
+                ]
+            ),
+            workspace: started.chat.workspace,
+            preservesExistingTurnItems: true
+        )
+
+        let commandItems = started.chat.items.filter { $0.kind == .commandExecution }
+        let commandItem = try #require(commandItems.first)
+        let command: CodexCommand
+        switch commandItem.content {
+        case .command(let value):
+            command = value
+        default:
+            Issue.record("Expected a command item.")
+            return
+        }
+        #expect(commandItems.count == 1)
+        #expect(commandItem === seededCommand)
+        #expect(commandItem.itemID == "snapshot-command")
+        #expect(command.cwd == workspaceURL.path)
+        #expect(command.startedAt == startedAt)
+        #expect(command.processID == "123")
+        #expect(command.source == .agent)
+    }
+
+    @Test("started review refresh moves running command replay into authoritative turn")
+    func startedReviewRefreshMovesRunningCommandReplayIntoAuthoritativeTurn() async throws {
+        let workspaceURL = temporaryDirectory()
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let startedAt = Date(timeIntervalSince1970: 10)
+
+        try await runtime.transport.enqueueThreadStart(threadID: "thread-review", model: "gpt-5")
+        try await runtime.transport.enqueueReviewStart(
+            turnID: "turn-seed",
+            reviewThreadID: "thread-review",
+            items: [
+                .init(
+                    id: "turn-seed",
+                    kind: .userMessage,
+                    content: .message(.init(
+                        id: "turn-seed",
+                        role: .user,
+                        text: "current changes"
+                    ))
+                ),
+            ]
+        )
+
+        let started = try await context.startReview(
+            in: workspaceURL,
+            input: CodexReviewInput(
+                target: .uncommittedChanges,
+                options: .init(model: "gpt-5", ephemeral: false)
+            )
+        )
+        _ = started.chat.apply(.turnStarted("turn-seed"))
+        _ = started.chat.apply(.itemStarted(
+            .init(
+                id: "call-live",
+                kind: .commandExecution,
+                content: .command(.init(
+                    command: "/bin/zsh -lc 'git status --short'",
+                    cwd: workspaceURL.path,
+                    status: .running,
+                    startedAt: startedAt,
+                    processID: "123",
+                    source: .agent
+                ))
+            ),
+            turnID: "turn-seed"
+        ))
+        _ = started.chat.apply(.turnStarted("turn-live"))
+        let liveCommand = try #require(
+            started.chat.items.first { $0.kind == .commandExecution }
+        )
+        #expect(liveCommand.turnID?.rawValue == "turn-seed")
+
+        started.chat.apply(
+            .init(
+                id: "thread-review",
+                workspace: workspaceURL,
+                status: .active(activeFlags: []),
+                turns: [
+                    .init(
+                        id: "turn-live",
+                        status: .running,
+                        itemsLoadState: .full,
+                        items: [
+                            .init(
+                                id: "call-live",
+                                kind: .commandExecution,
+                                content: .command(.init(
+                                    command: "/bin/zsh -lc 'git status --short'",
+                                    cwd: workspaceURL.path,
+                                    status: .running,
+                                    processID: "123",
+                                    source: .agent
+                                ))
+                            ),
+                        ]
+                    ),
+                ]
+            ),
+            workspace: started.chat.workspace,
+            preservesExistingTurnItems: true
+        )
+
+        let commandItems = started.chat.items.filter { $0.kind == .commandExecution }
+        let commandItem = try #require(commandItems.first)
+        let command: CodexCommand
+        switch commandItem.content {
+        case .command(let value):
+            command = value
+        default:
+            Issue.record("Expected a command item.")
+            return
+        }
+        #expect(commandItems.count == 1)
+        #expect(commandItem === liveCommand)
+        #expect(commandItem.turnID?.rawValue == "turn-live")
+        #expect(started.chat.items(in: "turn-seed").contains { $0.kind == .commandExecution } == false)
+        #expect(started.chat.items(in: "turn-live").filter { $0.kind == .commandExecution }.count == 1)
+        #expect(command.startedAt == startedAt)
+        #expect(command.processID == "123")
+        #expect(command.source == .agent)
     }
 
     @Test("started review preserves seeded row metadata across null metadata refresh")
