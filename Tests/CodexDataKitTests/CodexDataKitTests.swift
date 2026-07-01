@@ -5813,6 +5813,69 @@ struct CodexModelContextTests {
         #expect(chat.items.map(\.text) == ["Authoritative"])
     }
 
+    @Test("not-loaded metadata refresh replaces live-streamed items with authoritative turns")
+    func notLoadedMetadataRefreshReplacesLiveStreamedItemsWithAuthoritativeTurns() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-refresh-not-loaded"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-refresh-not-loaded",
+            status: .active(activeFlags: []),
+            turns: []
+        ))
+
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-refresh-not-loaded"))
+        let observation = try await chat.observe()
+        defer {
+            observation.cancel()
+        }
+        let changes = ChatUpdateRecorder(stream: observation.updates)
+
+        try await runtime.transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(
+                threadID: "thread-refresh-not-loaded",
+                turnID: "turn-live",
+                itemID: "message-live",
+                delta: "Live duplicate",
+                phase: "final_answer"
+            )
+        )
+        #expect(await changes.itemInserted(id: "message-live") != nil)
+        #expect(chat.items.map(\.itemID) == ["message-live"])
+
+        try await runtime.transport.enqueueThreadTurns(.init(turns: [
+            .init(
+                id: "turn-authoritative",
+                status: .completed,
+                items: [
+                    .init(
+                        id: "message-authoritative",
+                        kind: .agentMessage,
+                        content: .message(.init(
+                            id: "message-authoritative",
+                            role: .assistant,
+                            text: "Authoritative interruption"
+                        ))
+                    ),
+                ]
+            ),
+        ]))
+        await runtime.transport.enqueueFailure(
+            code: -32_004,
+            message: "thread not loaded: thread-refresh-not-loaded",
+            for: "thread/read"
+        )
+
+        try await context.refresh(chat)
+
+        #expect(chat.status == .notLoaded)
+        #expect(chat.turns.map(\.id.rawValue) == ["turn-authoritative"])
+        #expect(chat.items.map(\.itemID) == ["message-authoritative"])
+        #expect(chat.items.map(\.text) == ["Authoritative interruption"])
+    }
+
     @Test("restarted chat observation preserves prior live-streamed items omitted by lagging snapshots")
     func restartedChatObservationPreservesPriorLiveStreamedItemsOmittedByLaggingSnapshots() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()

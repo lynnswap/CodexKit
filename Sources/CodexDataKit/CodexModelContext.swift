@@ -530,6 +530,20 @@ public final class CodexModelContext: @unchecked Sendable {
                 presentFields: presentFields
             )
         } catch {
+            if Self.isThreadNotLoadedError(error) {
+                var presentFields: Set<CodexThreadSnapshot.Field> = [.status, .turns]
+                if thread.workspace != nil {
+                    presentFields.insert(.workspace)
+                }
+                return .init(
+                    id: thread.id,
+                    workspace: thread.workspace,
+                    status: .notLoaded,
+                    turns: turns,
+                    turnItemsAreAuthoritative: true,
+                    presentFields: presentFields
+                )
+            }
             var presentFields: Set<CodexThreadSnapshot.Field> = [.turns]
             if thread.workspace != nil {
                 presentFields.insert(.workspace)
@@ -542,6 +556,13 @@ public final class CodexModelContext: @unchecked Sendable {
                 presentFields: presentFields
             )
         }
+    }
+
+    private static func isThreadNotLoadedError(_ error: Error) -> Bool {
+        guard case JSONRPC.Error.responseError(_, let message) = error else {
+            return false
+        }
+        return message.lowercased().contains("thread not loaded")
     }
 
     private func flushBufferedEvents(
