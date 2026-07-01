@@ -93,25 +93,39 @@ public struct CodexThreadLogSequence: AsyncSequence, Sendable {
     public typealias Element = CodexThreadLogEntry
 
     private let events: CodexThreadEventSequence
+    private let terminalTurnID: CodexTurnID?
 
-    package init(events: CodexThreadEventSequence) {
+    package init(events: CodexThreadEventSequence, terminalTurnID: CodexTurnID? = nil) {
         self.events = events
+        self.terminalTurnID = terminalTurnID
     }
 
     public func makeAsyncIterator() -> Iterator {
-        Iterator(events: events.makeAsyncIterator())
+        Iterator(events: events.makeAsyncIterator(), terminalTurnID: terminalTurnID)
     }
 
     public struct Iterator: AsyncIteratorProtocol {
         private var events: AsyncThrowingStream<CodexThreadEvent, Error>.Iterator
+        private let terminalTurnID: CodexTurnID?
         private var logEntryIndex = 0
+        private var finished = false
 
-        fileprivate init(events: AsyncThrowingStream<CodexThreadEvent, Error>.Iterator) {
+        fileprivate init(
+            events: AsyncThrowingStream<CodexThreadEvent, Error>.Iterator,
+            terminalTurnID: CodexTurnID?
+        ) {
             self.events = events
+            self.terminalTurnID = terminalTurnID
         }
 
         public mutating func next() async throws -> CodexThreadLogEntry? {
+            guard finished == false else {
+                return nil
+            }
             while let event = try await events.next() {
+                guard reviewEventMatches(event, terminalTurnID: terminalTurnID) else {
+                    continue
+                }
                 switch event {
                 case .itemStarted(let item, let turnID):
                     return .itemStarted(item, turnID: turnID)
@@ -132,11 +146,20 @@ public struct CodexThreadLogSequence: AsyncSequence, Sendable {
                     return .reasoningPartStarted(part, turnID: turnID)
                 case .reasoningDelta(let delta, let turnID):
                     return .reasoningDelta(delta, turnID: turnID)
-                case .turnStarted, .turnCompleted, .turnFailed, .tokenUsageUpdated, .statusChanged,
-                    .closed, .unknown:
+                case .turnCompleted, .turnFailed:
+                    guard terminalTurnID != nil else {
+                        continue
+                    }
+                    finished = true
+                    return nil
+                case .closed:
+                    finished = true
+                    return nil
+                case .turnStarted, .tokenUsageUpdated, .statusChanged, .unknown:
                     continue
                 }
             }
+            finished = true
             return nil
         }
 

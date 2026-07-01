@@ -982,6 +982,9 @@ extension AppServerAPI.Thread.Turns.List {
 
         package static let method = "thread/turns/list"
         package var params: AppServerAPI.Thread.Turns.List.Params
+        package var scope: AppServerAPI.RequestScope? {
+            .thread(params.threadID)
+        }
 
         package init(params: AppServerAPI.Thread.Turns.List.Params) {
             self.params = params

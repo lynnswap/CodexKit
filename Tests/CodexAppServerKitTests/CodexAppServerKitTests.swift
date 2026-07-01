@@ -610,6 +610,32 @@ struct CodexAppServerKitTests {
         #expect(params.cwd == .paths([app.path, tools.path]))
     }
 
+    @Test func appServerListThreadsTreatsClearedWorkspaceFiltersAsNoFilter() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueue(
+            AppServerAPI.Thread.List.Response(data: []),
+            for: "thread/list"
+        )
+        let client = AppServerClient(transport: transport)
+        let server = CodexAppServer(
+            client: client,
+            router: CodexAppServerNotificationRouter(client: client)
+        )
+        var query = CodexThreadQuery(
+            workspaces: [URL(fileURLWithPath: "/tmp/project", isDirectory: true)]
+        )
+        query.workspaces = []
+
+        _ = try await server.listThreads(query)
+
+        let request = try #require(await transport.recordedRequests().first)
+        let params = try JSONDecoder().decode(
+            AppServerAPI.Thread.List.Params.self,
+            from: request.params
+        )
+        #expect(params.cwd == nil)
+    }
+
     @Test func appServerListThreadsMapsStatusAndRecency() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueueJSON(
@@ -1279,12 +1305,18 @@ struct CodexAppServerKitTests {
             role: .assistant,
             text: "Current review"
         )
+        let followUpMessage = CodexMessage(
+            id: "follow-up-message",
+            role: .assistant,
+            text: "Follow-up turn"
+        )
         let events = [
             CodexThreadEvent.message(oldMessage, turnID: "turn-old"),
             .statusChanged(.active(activeFlags: [])),
             .message(currentMessage, turnID: "turn-current"),
             .turnCompleted(.init(turnID: "turn-old", status: .completed)),
             .turnCompleted(.init(turnID: "turn-current", status: .completed)),
+            .message(followUpMessage, turnID: "turn-follow-up"),
         ]
         let eventSequence = CodexThreadEventSequence {
             AsyncThrowingStream { continuation in
@@ -1303,12 +1335,24 @@ struct CodexAppServerKitTests {
             events: eventSequence,
             terminalTurnID: "turn-current"
         ))
+        let logs = try await collect(CodexThreadLogSequence(
+            events: eventSequence,
+            terminalTurnID: "turn-current"
+        ))
 
         #expect(reviewEvents.count == 3)
         #expect(reviewEvents.contains(.statusChanged(.active(activeFlags: []))))
         #expect(progress.count == 3)
         #expect(progress.last?.result?.turnID == "turn-current")
         #expect(progress.last?.transcript.responseText == "Current review")
+        #expect(logs.map(\.id) == ["current-message"])
+        #expect(logs.allSatisfy { $0.turnID == "turn-current" })
+    }
+
+    @Test func threadTurnsListRequestUsesThreadScope() {
+        let request = AppServerAPI.Thread.Turns.List.Request(params: .init(threadID: "thread-1"))
+
+        #expect(request.scope == .thread("thread-1"))
     }
 
     @Test func appServerPrepareAndRestartReviewUsesLifecycleControlSequence() async throws {
@@ -2749,6 +2793,35 @@ struct CodexAppServerKitTests {
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(threadID: "thread-1", turnID: "turn-1", delta: "Second")
+        )
+        try await transport.emitServerNotification(
+            method: "thread/closed",
+            params: ThreadIDParams(threadID: "thread-1")
+        )
+
+        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let logs = try await collect(thread.logEntries)
+        #expect(logs.map(\.id) == ["agent-message-delta:0", "agent-message-delta:1"])
+        #expect(logs.compactMap(\.messageDelta).map(\.text) == ["First", "Second"])
+    }
+
+    @Test func threadLogEntriesContinueAfterTurnCompletionUntilThreadClosed() async throws {
+        let transport = CodexAppServerTestTransport()
+        let client = AppServerClient(transport: transport)
+        let router = CodexAppServerNotificationRouter(client: client)
+        await router.start()
+        await transport.waitForNotificationStreamCount(1)
+        try await transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(threadID: "thread-1", turnID: "turn-1", delta: "First")
+        )
+        try await transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(id: "turn-1", status: "completed"))
+        )
+        try await transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(threadID: "thread-1", turnID: "turn-2", delta: "Second")
         )
         try await transport.emitServerNotification(
             method: "thread/closed",

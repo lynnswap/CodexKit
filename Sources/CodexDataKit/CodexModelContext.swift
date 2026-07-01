@@ -2070,6 +2070,7 @@ public final class CodexModelContext {
         requiresIncludePendingChanges: Bool
     ) -> Bool {
         (requiresIncludePendingChanges == false || descriptor.includePendingChanges)
+            && descriptor.fetchOffset == 0
             && descriptor.predicate.searchTerm?.isEmpty != false
             && descriptor.predicate.modelProviders?.isEmpty != false
             && descriptor.predicate.sourceKinds == nil

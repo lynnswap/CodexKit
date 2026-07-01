@@ -866,6 +866,36 @@ struct CodexModelContextTests {
         #expect(results.items.map(\.title) == ["B"])
     }
 
+    @Test("offset chat fetches do not preserve live chats omitted from the page")
+    func offsetChatFetchesDoNotPreserveLiveChatsOmittedFromPage() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let liveChat = context.model(for: CodexThreadID(rawValue: "thread-a"))
+        liveChat.apply(
+            .init(
+                id: "thread-a",
+                name: "A",
+                status: .active(activeFlags: [])
+            ),
+            workspace: nil
+        )
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-b", name: "B"),
+            .init(id: "thread-c", name: "C"),
+        ]))
+
+        let request = CodexFetchRequest<CodexChat>(
+            sortDescriptors: [CodexSortDescriptor(\.name)],
+            fetchLimit: 1,
+            fetchOffset: 1
+        )
+        let results = context.fetchedResults(for: request)
+        try await results.performFetch()
+
+        #expect(results.items.map(\.title) == ["C"])
+    }
+
     @Test("name-sorted chat pages are sliced after local sorting")
     func nameSortedChatPagesAreSlicedAfterLocalSorting() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()

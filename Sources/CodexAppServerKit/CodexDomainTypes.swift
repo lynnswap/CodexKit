@@ -886,7 +886,7 @@ public struct CodexReviewSession: Identifiable, Sendable {
 
     /// Log-oriented item events emitted by the review thread.
     public var logEntries: CodexThreadLogSequence {
-        eventThread.logEntries
+        .init(events: eventThread.events, terminalTurnID: turnID)
     }
 
     /// Incremental progress snapshots for the review thread.
@@ -1203,13 +1203,20 @@ public struct CodexTurnPage: Equatable, Sendable {
 public struct CodexThreadQuery: Equatable, Sendable {
     public var archived: Bool?
     public var cursor: String?
-    public var workspaces: [URL]?
+    public var workspaces: [URL]? {
+        get {
+            _workspaces
+        }
+        set {
+            _workspaces = Self.normalizedWorkspaces(newValue)
+        }
+    }
     public var workspace: URL? {
         get {
             workspaces?.first
         }
         set {
-            workspaces = newValue.map { [$0] }
+            _workspaces = Self.normalizedWorkspaces(newValue.map { [$0] })
         }
     }
     public var limit: Int?
@@ -1219,6 +1226,7 @@ public struct CodexThreadQuery: Equatable, Sendable {
     public var sortKey: CodexThreadSortKey?
     public var sourceKinds: [CodexThreadSourceKind]?
     public var useStateDBOnly: Bool?
+    private var _workspaces: [URL]?
 
     public init(
         archived: Bool? = nil,
@@ -1235,7 +1243,7 @@ public struct CodexThreadQuery: Equatable, Sendable {
     ) {
         self.archived = archived
         self.cursor = cursor
-        self.workspaces = Self.normalizedWorkspaces(workspaces ?? workspace.map { [$0] })
+        self._workspaces = Self.normalizedWorkspaces(workspaces ?? workspace.map { [$0] })
         self.limit = limit
         self.searchTerm = searchTerm
         self.modelProviders = modelProviders
