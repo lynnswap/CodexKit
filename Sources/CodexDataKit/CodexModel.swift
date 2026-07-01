@@ -901,8 +901,8 @@ public final class CodexChat: CodexPersistentModel {
     private func recordsByCoalescingReplayNarrativeItems(
         _ records: [CodexTurnSnapshot]
     ) -> [CodexTurnSnapshot] {
-        var seenSignatures = Set<CodexNarrativeItemSignature>()
         return records.map { record in
+            var seenSignatures = Set<CodexNarrativeItemSignature>()
             var record = record
             record.items = record.items.filter { item in
                 guard let signature = item.replayNarrativeSignature else {
@@ -1239,7 +1239,7 @@ public final class CodexChat: CodexPersistentModel {
                 continue
             }
             if directlyMatchedItem == nil,
-                hasReplayNarrativeItem(matching: incomingItem)
+                hasReplayNarrativeItem(matching: incomingItem, turnID: turnID)
             {
                 continue
             }
@@ -1286,6 +1286,9 @@ public final class CodexChat: CodexPersistentModel {
                         previousItem: previousItem
                     )
                 } else {
+                    if shouldPreserveExistingFullItem(existing, incomingLoadState: itemsLoadState) {
+                        continue
+                    }
                     existing.update(
                         from: incomingItem,
                         itemsLoadState: itemsLoadState
@@ -1346,14 +1349,28 @@ public final class CodexChat: CodexPersistentModel {
     }
 
     private func hasReplayNarrativeItem(
-        matching incomingItem: CodexThreadItem
+        matching incomingItem: CodexThreadItem,
+        turnID: CodexTurnID?
     ) -> Bool {
         guard let incomingSignature = incomingItem.replayNarrativeSignature else {
             return false
         }
-        return items.contains {
-            $0.threadItem.replayNarrativeSignature == incomingSignature
+        if let turnID {
+            return itemsByTurnID[turnID]?.contains {
+                $0.threadItem.replayNarrativeSignature == incomingSignature
+            } == true
+        } else {
+            return items.contains {
+                $0.turnID == nil && $0.threadItem.replayNarrativeSignature == incomingSignature
+            }
         }
+    }
+
+    private func shouldPreserveExistingFullItem(
+        _ existing: CodexItem,
+        incomingLoadState: CodexTurnItemsLoadState
+    ) -> Bool {
+        existing.itemsLoadState == .full && incomingLoadState != .full
     }
 
     private func commandReplayItem(

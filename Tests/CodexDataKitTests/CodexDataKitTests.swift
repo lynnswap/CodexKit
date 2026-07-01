@@ -1347,6 +1347,54 @@ struct CodexModelContextTests {
         #expect(staleChat.workspace == nil)
     }
 
+    @Test("started review prepared threads do not preserve stale fetched chat rows")
+    func startedReviewPreparedThreadsDoNotPreserveStaleFetchedChatRows() async throws {
+        let workspace = temporaryDirectory()
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadStart(threadID: "thread-review", model: "gpt-5")
+        try await runtime.transport.enqueueReviewStart(
+            .init(
+                id: "turn-review",
+                status: .running,
+                items: [
+                    .init(
+                        id: "review-mode",
+                        kind: .enteredReviewMode,
+                        content: .log("current changes")
+                    ),
+                ]
+            ),
+            reviewThreadID: "thread-review"
+        )
+
+        let started = try await context.startReview(
+            in: workspace,
+            input: CodexReviewInput(
+                target: .uncommittedChanges,
+                options: .init(model: "gpt-5", ephemeral: false)
+            )
+        )
+        let chat = started.chat
+        #expect(chat.workspace != nil)
+
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-review",
+            workspace: workspace,
+            status: .idle
+        ))
+        try await context.refresh(chat, includeTurns: false)
+        #expect(chat.status == .idle)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: []))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>.recentChats)
+        try await results.performFetch()
+
+        #expect(results.items.isEmpty)
+        #expect(chat.workspace == nil)
+    }
+
     @Test("archived false chat refresh prunes stale workspace chats")
     func archivedFalseChatRefreshPrunesStaleWorkspaceChats() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -4288,7 +4336,25 @@ struct CodexModelContextTests {
             .init(
                 id: "thread-summary",
                 name: "After",
-                turns: [.init(id: "turn-summary", status: .completed)]
+                turns: [
+                    .init(
+                        id: "turn-summary",
+                        status: .completed,
+                        itemsLoadState: .summary,
+                        items: [
+                            .init(
+                                id: "message-summary",
+                                kind: .agentMessage,
+                                content: .message(.init(
+                                    id: "message-summary",
+                                    role: .assistant,
+                                    phase: .finalAnswer,
+                                    text: "Summary placeholder"
+                                ))
+                            ),
+                        ]
+                    )
+                ]
             )
         ]))
         try await results.refresh()
@@ -4298,6 +4364,7 @@ struct CodexModelContextTests {
         #expect(turn.status == CodexTurnStatus.completed)
         #expect(chat.turns.contains { $0.id == "turn-omitted" })
         #expect(chat.items.first === item)
+        #expect(item.text == "Done")
         #expect(chat.transcript.finalAnswer == "Done")
     }
 
@@ -5833,8 +5900,8 @@ struct CodexModelContextTests {
         ])
     }
 
-    @Test("chat observation coalesces replay narrative snapshot items across turns")
-    func chatObservationCoalescesReplayNarrativeSnapshotItemsAcrossTurns() async throws {
+    @Test("chat observation preserves replay narrative snapshot items across turns")
+    func chatObservationPreservesReplayNarrativeSnapshotItemsAcrossTurns() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         let context = CodexModelContainer(appServer: runtime.server).mainContext
 
@@ -5951,10 +6018,66 @@ struct CodexModelContextTests {
             "reasoning-a",
             "diagnostic-a",
             "answer-a",
+            "review-b",
             "user-b",
+            "reasoning-b",
+            "diagnostic-b",
             "answer-b",
             "reasoning-c",
         ])
+    }
+
+    @Test("chat observation preserves replay narrative live items across turns")
+    func chatObservationPreservesReplayNarrativeLiveItemsAcrossTurns() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-replay-live"))
+        try await runtime.transport.enqueueThreadRead(.init(id: "thread-replay-live", turns: []))
+
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-replay-live"))
+        let observation = try await chat.observe()
+        defer {
+            observation.cancel()
+        }
+        let changes = ChatUpdateRecorder(stream: observation.updates)
+
+        for turnID in ["turn-replay-a", "turn-replay-b"] {
+            try await runtime.transport.emitServerNotification(
+                method: "item/started",
+                params: ThreadItemParams(
+                    threadID: "thread-replay-live",
+                    turnID: turnID,
+                    item: .init(
+                        id: "reasoning-\(turnID)",
+                        type: "reasoning",
+                        text: "Checking diff"
+                    )
+                )
+            )
+            try await runtime.transport.emitServerNotification(
+                method: "item/started",
+                params: ThreadItemParams(
+                    threadID: "thread-replay-live",
+                    turnID: turnID,
+                    item: .init(
+                        id: "diagnostic-\(turnID)",
+                        type: "diagnostic",
+                        text: "Review was interrupted."
+                    )
+                )
+            )
+        }
+
+        #expect(await eventually {
+            chat.items.map(\.itemID) == [
+                "reasoning-turn-replay-a",
+                "diagnostic-turn-replay-a",
+                "reasoning-turn-replay-b",
+                "diagnostic-turn-replay-b",
+            ]
+        })
+        withExtendedLifetime(changes) {}
     }
 
     @Test("chat observation coalesces duplicate narrative live items")
@@ -6311,8 +6434,8 @@ struct CodexModelContextTests {
         #expect(chat.turns.contains { $0.id == "turn-live" })
     }
 
-    @Test("active chat refresh coalesces replay reasoning from lagging snapshots")
-    func activeChatRefreshCoalescesReplayReasoningFromLaggingSnapshots() async throws {
+    @Test("active chat refresh preserves replay reasoning across turns")
+    func activeChatRefreshPreservesReplayReasoningAcrossTurns() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         let context = CodexModelContainer(appServer: runtime.server).mainContext
 
@@ -6364,7 +6487,7 @@ struct CodexModelContextTests {
 
         try await context.refresh(chat)
 
-        #expect(chat.items.map(\.itemID) == ["reasoning-live"])
+        #expect(chat.items.map(\.itemID) == ["reasoning-live", "reasoning-snapshot"])
         #expect(chat.turns.contains { $0.id == "turn-live" })
         #expect(chat.turns.contains { $0.id == "turn-snapshot" })
     }
@@ -7444,22 +7567,21 @@ struct CodexModelContextTests {
         withExtendedLifetime(changes) {}
     }
 
-    @Test("started review keeps its live event thread across refresh before observation")
-    func startedReviewKeepsLiveEventThreadAcrossRefreshBeforeObservation() async throws {
+    @Test("started review consumes its prepared event thread across refresh before observation")
+    func startedReviewConsumesPreparedEventThreadAcrossRefreshBeforeObservation() async throws {
         let workspaceURL = temporaryDirectory()
         let runtime = try await CodexAppServerTestRuntime.start()
         let context = CodexModelContainer(appServer: runtime.server).mainContext
 
-        await runtime.transport.enqueueFailure(
-            code: -32_000,
-            message: "thread/resume should not be needed for a just-started review",
-            for: "thread/resume"
-        )
         try await runtime.transport.enqueueThreadStart(threadID: "thread-review", model: "gpt-5")
         try await runtime.transport.enqueueReviewStart(
             turnID: "turn-review",
             reviewThreadID: "thread-review"
         )
+        try await runtime.transport.enqueueThreadResume(.init(
+            id: "thread-review",
+            workspace: workspaceURL
+        ))
         for text in ["Review started", "Review still running"] {
             try await runtime.transport.enqueueThreadTurns(.init(turns: [
                 .init(
@@ -7496,7 +7618,7 @@ struct CodexModelContextTests {
         }
 
         #expect(started.chat.items.map(\.text) == ["Review still running"])
-        #expect(await runtime.transport.recordedRequests(method: "thread/resume").isEmpty)
+        #expect(await runtime.transport.recordedRequests(method: "thread/resume").count == 1)
         #expect(await runtime.transport.recordedRequests(method: "thread/turns/list").count == 2)
     }
 

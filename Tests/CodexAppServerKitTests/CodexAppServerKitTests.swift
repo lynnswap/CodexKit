@@ -802,6 +802,44 @@ struct CodexAppServerKitTests {
         #expect(snapshot.hasField(.turns))
     }
 
+    @Test func threadReadDoesNotTreatSummaryTurnsAsAuthoritative() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueJSON(
+            """
+            {
+              "thread": {
+                "id": "thread-summary",
+                "turns": [
+                  {
+                    "id": "turn-summary",
+                    "itemsView": "summary",
+                    "items": [
+                      {
+                        "id": "message-summary",
+                        "type": "agentMessage",
+                        "text": "Summary"
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+            """,
+            for: "thread/read"
+        )
+        let client = AppServerClient(transport: transport)
+        let thread = CodexThread(
+            id: .init(rawValue: "thread-summary"),
+            client: client,
+            router: CodexAppServerNotificationRouter(client: client)
+        )
+
+        let snapshot = try await thread.read(includeTurns: true)
+
+        #expect(snapshot.turns?.first?.itemsLoadState == .summary)
+        #expect(snapshot.turnItemsAreAuthoritative == false)
+    }
+
     @Test func threadStoreDrivesRuntimeThreadStubsAfterStart() async throws {
         let workspace = URL(fileURLWithPath: "/tmp/project", isDirectory: true)
         let initial = CodexThreadSnapshot(

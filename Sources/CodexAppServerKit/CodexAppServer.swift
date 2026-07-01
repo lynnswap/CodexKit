@@ -966,7 +966,7 @@ public actor CodexAppServer {
             },
             ephemeral: snapshot.ephemeral,
             turns: turns,
-            turnItemsAreAuthoritative: includesTurns,
+            turnItemsAreAuthoritative: turns?.allSatisfy(\.itemsAreAuthoritative) ?? false,
             presentFields: threadSnapshotPresentFields(from: snapshot, turns: turns)
         )
     }

@@ -876,7 +876,7 @@ public final class CodexModelContext {
                 thread = resumedThread
                 threadSource = "resumedThread"
                 usesPreparedThread = false
-            } else if let preparedThread = preparedEventThread(for: chat.id) {
+            } else if let preparedThread = takePreparedEventThread(for: chat.id) {
                 thread = preparedThread
                 threadSource = "preparedEventThread"
                 usesPreparedThread = true
@@ -903,7 +903,7 @@ public final class CodexModelContext {
             } catch {
                 guard canObserveSeededSnapshotAfterInitialRefreshFailure(
                     chat,
-                    thread: thread,
+                    usesPreparedThread: usesPreparedThread,
                     includeTurns: includeTurns
                 ) else {
                     throw error
@@ -961,11 +961,11 @@ public final class CodexModelContext {
 
     private func canObserveSeededSnapshotAfterInitialRefreshFailure(
         _ chat: CodexChat,
-        thread: CodexThread,
+        usesPreparedThread: Bool,
         includeTurns: Bool
     ) -> Bool {
         includeTurns
-            && preparedEventThread(for: chat.id)?.id == thread.id
+            && usesPreparedThread
             && chat.turns.isEmpty == false
     }
 
@@ -1034,6 +1034,7 @@ public final class CodexModelContext {
             observation.isFinished == false
         {
             observation.eventThread = observation.eventThread ?? thread
+            preparedEventThreadsByID.removeValue(forKey: chatID)
         } else {
             preparedEventThreadsByID[chatID] = thread
         }
@@ -1043,6 +1044,10 @@ public final class CodexModelContext {
         preparedEventThreadsByID[chatID]
     }
 
+    private func takePreparedEventThread(for chatID: CodexThreadID) -> CodexThread? {
+        preparedEventThreadsByID.removeValue(forKey: chatID)
+    }
+
     private func eventThread(for chat: CodexChat) async throws -> CodexThread {
         guard chat.modelContext === self else {
             throw CodexModelContextError.modelIsDetached
@@ -1050,7 +1055,7 @@ public final class CodexModelContext {
         if let thread = activeChatObservationsByID[chat.id]?.eventThread {
             return thread
         }
-        if let thread = preparedEventThread(for: chat.id) {
+        if let thread = takePreparedEventThread(for: chat.id) {
             return thread
         }
         let thread = try await appServer.resumeThread(chat.id)
@@ -2051,9 +2056,6 @@ public final class CodexModelContext {
             return false
         }
         if activeChatObservationsByID[chat.id]?.isFinished == false {
-            return true
-        }
-        if preparedEventThreadsByID[chat.id] != nil {
             return true
         }
         if chat.status?.isActive == true {
