@@ -95,6 +95,54 @@ private extension CodexThreadItem {
         }
     }
 
+    var replayNarrativeSignature: CodexNarrativeItemSignature? {
+        switch kind {
+        case .reasoning:
+            guard let text = reasoningReplaySignatureText else {
+                return nil
+            }
+            return .init(kind: kind, text: text)
+        case .enteredReviewMode,
+            .exitedReviewMode,
+            .diagnostic,
+            .error:
+            guard let text, text.isEmpty == false else {
+                return nil
+            }
+            return .init(kind: kind, text: text)
+        case .agentMessage,
+            .userMessage,
+            .plan,
+            .commandExecution,
+            .fileChange,
+            .mcpToolCall,
+            .dynamicToolCall,
+            .collabAgentToolCall,
+            .subAgentActivity,
+            .webSearch,
+            .imageView,
+            .sleep,
+            .imageGeneration,
+            .contextCompaction,
+            .unknown:
+            return nil
+        }
+    }
+
+    private var reasoningReplaySignatureText: String? {
+        guard case .reasoning(let reasoning) = content else {
+            return nil
+        }
+        let parts = [
+            reasoning.summary.joined(separator: "\n"),
+            reasoning.content.joined(separator: "\n"),
+        ].filter { $0.isEmpty == false }
+        guard parts.isEmpty == false else {
+            return nil
+        }
+        return parts.joined(separator: "\u{0}")
+    }
+
     var command: CodexCommand? {
         guard case .command(let command) = content else {
             return nil
@@ -802,11 +850,12 @@ public final class CodexChat: CodexPersistentModel {
     private func normalizedIncomingTurnRecords(
         _ records: [CodexTurnSnapshot]
     ) -> [CodexTurnSnapshot] {
-        recordsByRemovingReplacedProvisionalSeed(records).map { record in
+        let records = recordsByRemovingReplacedProvisionalSeed(records).map { record in
             var record = record
             record.items = itemsByCoalescingDuplicateNarrativeItems(record.items)
             return record
         }
+        return recordsByCoalescingReplayNarrativeItems(records)
     }
 
     private func recordsByRemovingReplacedProvisionalSeed(
@@ -841,6 +890,22 @@ public final class CodexChat: CodexPersistentModel {
             items.append(item)
         }
         return items
+    }
+
+    private func recordsByCoalescingReplayNarrativeItems(
+        _ records: [CodexTurnSnapshot]
+    ) -> [CodexTurnSnapshot] {
+        var seenSignatures = Set<CodexNarrativeItemSignature>()
+        return records.map { record in
+            var record = record
+            record.items = record.items.filter { item in
+                guard let signature = item.replayNarrativeSignature else {
+                    return true
+                }
+                return seenSignatures.insert(signature).inserted
+            }
+            return record
+        }
     }
 
     private func mergeTurns(with records: [CodexTurnSnapshot]) {
@@ -1160,6 +1225,11 @@ public final class CodexChat: CodexPersistentModel {
             {
                 continue
             }
+            if item(for: incomingKey) == nil,
+                hasReplayNarrativeItem(matching: incomingItem)
+            {
+                continue
+            }
             if let existing = itemsByMergeKey[incomingKey]
                 ?? commandReplayItem(matching: incomingItem, turnID: turnID)
             {
@@ -1230,6 +1300,17 @@ public final class CodexChat: CodexPersistentModel {
             return items.contains {
                 $0.turnID == nil && $0.threadItem.duplicateNarrativeSignature == incomingSignature
             }
+        }
+    }
+
+    private func hasReplayNarrativeItem(
+        matching incomingItem: CodexThreadItem
+    ) -> Bool {
+        guard let incomingSignature = incomingItem.replayNarrativeSignature else {
+            return false
+        }
+        return items.contains {
+            $0.threadItem.replayNarrativeSignature == incomingSignature
         }
     }
 

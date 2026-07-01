@@ -34,6 +34,33 @@ struct CodexAppServerKitTests {
         #expect(homeFallback.path == "/tmp/home/Library/Application Support/Codex")
     }
 
+    @Test func reasoningTextCoalescesDuplicateFragmentsAndKeepsMarkdownBlocks() {
+        let review = """
+        **Reviewing inspection needs**
+
+        I need to inspect the changes.
+        """
+        let slowness = """
+        **Investigating potential slowness**
+
+        I need to inspect the running command.
+        """
+
+        let reasoning = CodexReasoning(
+            summary: [
+                review,
+                review,
+                slowness,
+                slowness,
+            ],
+            content: ["raw", "raw"]
+        )
+
+        #expect(reasoning.summary == [review, slowness])
+        #expect(reasoning.content == ["raw"])
+        #expect(reasoning.text == "\(review)\n\n\(slowness)")
+    }
+
     @Test func localProcessConfigurationResolvesExplicitExecutableCommandNames() throws {
         let rootURL = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)

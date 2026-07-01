@@ -18,6 +18,11 @@ private actor TestCodexModelActor: CodexModelActor {
         try await modelContext.fetch(CodexFetchDescriptor<CodexChat>.recentChats)
             .map(\.id)
     }
+
+    func startReviewID(in workspace: URL, input: CodexReviewInput) async throws -> CodexThreadID {
+        let started = try await modelContext.startReview(in: workspace, input: input)
+        return started.chat.id
+    }
 }
 
 @MainActor
@@ -5651,6 +5656,130 @@ struct CodexModelContextTests {
         ])
     }
 
+    @Test("chat observation coalesces replay narrative snapshot items across turns")
+    func chatObservationCoalescesReplayNarrativeSnapshotItemsAcrossTurns() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-replay-history"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-replay-history",
+            turns: [
+                .init(
+                    id: "turn-replay-a",
+                    status: .completed,
+                    items: [
+                        .init(
+                            id: "review-a",
+                            kind: .enteredReviewMode,
+                            content: .log("current changes")
+                        ),
+                        .init(
+                            id: "user-a",
+                            kind: .userMessage,
+                            content: .message(.init(
+                                id: "user-a",
+                                role: .user,
+                                text: "Review current changes"
+                            ))
+                        ),
+                        .init(
+                            id: "reasoning-a",
+                            kind: .reasoning,
+                            content: .reasoning(.init(summary: "Checking diff"))
+                        ),
+                        .init(
+                            id: "diagnostic-a",
+                            kind: .diagnostic,
+                            content: .diagnostic("Review was interrupted.")
+                        ),
+                        .init(
+                            id: "answer-a",
+                            kind: .agentMessage,
+                            content: .message(.init(
+                                id: "answer-a",
+                                role: .assistant,
+                                phase: .finalAnswer,
+                                text: "Same final answer"
+                            ))
+                        ),
+                    ]
+                ),
+                .init(
+                    id: "turn-replay-b",
+                    status: .completed,
+                    items: [
+                        .init(
+                            id: "review-b",
+                            kind: .enteredReviewMode,
+                            content: .log("current changes")
+                        ),
+                        .init(
+                            id: "user-b",
+                            kind: .userMessage,
+                            content: .message(.init(
+                                id: "user-b",
+                                role: .user,
+                                text: "Review current changes"
+                            ))
+                        ),
+                        .init(
+                            id: "reasoning-b",
+                            kind: .reasoning,
+                            content: .reasoning(.init(summary: "Checking diff"))
+                        ),
+                        .init(
+                            id: "diagnostic-b",
+                            kind: .diagnostic,
+                            content: .diagnostic("Review was interrupted.")
+                        ),
+                        .init(
+                            id: "answer-b",
+                            kind: .agentMessage,
+                            content: .message(.init(
+                                id: "answer-b",
+                                role: .assistant,
+                                phase: .finalAnswer,
+                                text: "Same final answer"
+                            ))
+                        ),
+                    ]
+                ),
+                .init(
+                    id: "turn-replay-c",
+                    status: .completed,
+                    items: [
+                        .init(
+                            id: "reasoning-c",
+                            kind: .reasoning,
+                            content: .reasoning(.init(
+                                summary: ["Checking diff"],
+                                content: ["Distinct raw trace"]
+                            ))
+                        ),
+                    ]
+                ),
+            ]
+        ))
+
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-replay-history"))
+        let observation = try await chat.observe()
+        defer {
+            observation.cancel()
+        }
+
+        #expect(chat.items.map(\.itemID) == [
+            "review-a",
+            "user-a",
+            "reasoning-a",
+            "diagnostic-a",
+            "answer-a",
+            "user-b",
+            "answer-b",
+            "reasoning-c",
+        ])
+    }
+
     @Test("chat observation coalesces duplicate narrative live items")
     func chatObservationCoalescesDuplicateNarrativeLiveItems() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -6003,6 +6132,64 @@ struct CodexModelContextTests {
         #expect(chat.items.first { $0.itemID == "message-live" } === liveItem)
         #expect(chat.items.first { $0.itemID == "message-live" }?.text == "Live update")
         #expect(chat.turns.contains { $0.id == "turn-live" })
+    }
+
+    @Test("active chat refresh coalesces replay reasoning from lagging snapshots")
+    func activeChatRefreshCoalescesReplayReasoningFromLaggingSnapshots() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-refresh-replay"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-refresh-replay",
+            status: .active(activeFlags: []),
+            turns: []
+        ))
+
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-refresh-replay"))
+        let observation = try await chat.observe()
+        defer {
+            observation.cancel()
+        }
+        let changes = ChatUpdateRecorder(stream: observation.updates)
+
+        try await runtime.transport.emitServerNotification(
+            method: "item/started",
+            params: ThreadItemParams(
+                threadID: "thread-refresh-replay",
+                turnID: "turn-live",
+                item: .init(
+                    id: "reasoning-live",
+                    type: "reasoning",
+                    text: "Checking diff"
+                )
+            )
+        )
+        #expect(await changes.itemInserted(id: "reasoning-live") != nil)
+
+        try await runtime.transport.enqueueThreadTurns(.init(turns: [
+            .init(
+                id: "turn-snapshot",
+                status: .running,
+                items: [
+                    .init(
+                        id: "reasoning-snapshot",
+                        kind: .reasoning,
+                        content: .reasoning(.init(summary: "Checking diff"))
+                    ),
+                ]
+            ),
+        ]))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-refresh-replay",
+            status: .active(activeFlags: [])
+        ))
+
+        try await context.refresh(chat)
+
+        #expect(chat.items.map(\.itemID) == ["reasoning-live"])
+        #expect(chat.turns.contains { $0.id == "turn-live" })
+        #expect(chat.turns.contains { $0.id == "turn-snapshot" })
     }
 
     @Test("terminal chat refresh replaces live-streamed items with authoritative snapshot")
@@ -6806,6 +6993,74 @@ struct CodexModelContextTests {
         #expect(requests.contains("thread/start"))
         #expect(requests.contains("review/start"))
         #expect(requests.filter { $0 == "thread/list" }.count == 1)
+    }
+
+    @Test("model actor review start multicasts the active review to the main context")
+    func modelActorReviewStartMulticastsActiveReviewToMainContext() async throws {
+        let workspaceURL = temporaryDirectory()
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let container = CodexModelContainer(appServer: runtime.server)
+        let mainContext = container.mainContext
+        let actor = TestCodexModelActor(modelContainer: container)
+        try await runtime.transport.enqueueThreadList(.init(threads: []))
+        let results = mainContext.fetchedResults(
+            for: CodexFetchDescriptor<CodexChat>(
+                sortBy: [CodexSortDescriptor(\.recencyAt, order: .reverse)]
+            ))
+        try await results.performFetch()
+
+        await runtime.transport.enqueueFailure(
+            code: -32_000,
+            message: "thread/resume should not be needed for a just-started review",
+            for: "thread/resume"
+        )
+        try await runtime.transport.enqueueThreadStart(threadID: "thread-review", model: "gpt-5")
+        try await runtime.transport.enqueueReviewStart(
+            turnID: "turn-review",
+            reviewThreadID: "thread-review",
+            items: [
+                .init(
+                    id: "turn-review",
+                    kind: .userMessage,
+                    content: .message(.init(
+                        id: "turn-review",
+                        role: .user,
+                        text: "current changes"
+                    ))
+                ),
+            ]
+        )
+
+        let reviewChatID = try await actor.startReviewID(
+            in: workspaceURL,
+            input: CodexReviewInput(
+                target: .uncommittedChanges,
+                options: .init(model: "gpt-5", ephemeral: false)
+            )
+        )
+
+        let mainChat = try #require(mainContext.registeredModel(for: reviewChatID))
+        #expect(results.items.first === mainChat)
+        #expect(results.items.map(\.id.rawValue) == ["thread-review"])
+        #expect(mainChat.workspace?.url.path == workspaceURL.path)
+        #expect(mainChat.items.map(\.text) == ["current changes"])
+
+        await runtime.transport.enqueueFailure(
+            code: -32_000,
+            message: "rollout is empty",
+            for: "thread/turns/list"
+        )
+        await runtime.transport.enqueueFailure(
+            code: -32_000,
+            message: "includeTurns is unavailable before first user message",
+            for: "thread/read"
+        )
+        let observation = try await mainChat.observe()
+        defer {
+            observation.cancel()
+        }
+        #expect(mainChat.items.map(\.text) == ["current changes"])
+        #expect(await runtime.transport.recordedRequests(method: "thread/resume").isEmpty)
     }
 
     @Test("started review chat survives temporary thread list omission")

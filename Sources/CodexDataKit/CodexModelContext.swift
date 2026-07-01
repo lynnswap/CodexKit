@@ -11,16 +11,60 @@ public enum CodexModelContextError: Error, Equatable, Sendable {
     case chatObservationAlreadyActive(CodexThreadID)
 }
 
+package struct CodexModelContextID: Hashable, Sendable {
+    private let rawValue: UUID
+
+    package init() {
+        self.rawValue = UUID()
+    }
+}
+
+package struct CodexStartedReviewContextChange: Sendable {
+    package var snapshot: CodexThreadSnapshot
+    package var eventThread: CodexThread
+    package var archived: Bool
+    package var provisionalSeedTurnID: CodexTurnID?
+
+    package init(
+        snapshot: CodexThreadSnapshot,
+        eventThread: CodexThread,
+        archived: Bool,
+        provisionalSeedTurnID: CodexTurnID?
+    ) {
+        self.snapshot = snapshot
+        self.eventThread = eventThread
+        self.archived = archived
+        self.provisionalSeedTurnID = provisionalSeedTurnID
+    }
+}
+
+package struct CodexModelContextTransaction: Sendable {
+    package var startedReviews: [CodexStartedReviewContextChange] = []
+
+    package init(startedReviews: [CodexStartedReviewContextChange] = []) {
+        self.startedReviews = startedReviews
+    }
+
+    package var isEmpty: Bool {
+        startedReviews.isEmpty
+    }
+}
+
 public final class CodexModelContainer: @unchecked Sendable {
     public let appServer: CodexAppServer
 
     @MainActor
     public var mainContext: CodexModelContext {
-        _mainContext
+        if let context = _mainContext {
+            return context
+        }
+        let context = CodexModelContext(self)
+        _mainContext = context
+        return context
     }
 
     @MainActor
-    private lazy var _mainContext = CodexModelContext(self)
+    private var _mainContext: CodexModelContext?
 
     public init(appServer: CodexAppServer) {
         self.appServer = appServer
@@ -31,6 +75,20 @@ public final class CodexModelContainer: @unchecked Sendable {
     ) async throws {
         let appServer = try await CodexAppServer(configuration: configuration)
         self.init(appServer: appServer)
+    }
+
+    @MainActor
+    package func multicast(
+        _ transaction: CodexModelContextTransaction,
+        from sourceContextID: CodexModelContextID
+    ) async {
+        guard transaction.isEmpty == false,
+            let context = _mainContext,
+            context.contextID != sourceContextID
+        else {
+            return
+        }
+        await context.merge(transaction)
     }
 }
 
@@ -275,6 +333,7 @@ public final class CodexModelContext {
 
     public private(set) weak var container: CodexModelContainer?
     public let appServer: CodexAppServer
+    package let contextID = CodexModelContextID()
 
     private var workspaceGroupsByID: [CodexWorkspaceGroupID: CodexWorkspaceGroup] = [:]
     private var workspacesByID: [CodexWorkspaceID: CodexWorkspace] = [:]
@@ -1020,30 +1079,55 @@ public final class CodexModelContext {
     ) async -> CodexStartedReview {
         let isExistingChat = chatsByID[review.activeTurnThreadID] != nil
         let now = Date()
-        let snapshot = CodexThreadSnapshot(
-            id: review.activeTurnThreadID,
-            workspace: review.eventThread.workspace ?? workspaceURL,
-            preview: input.target.dataKitPreview,
-            modelProvider: input.options.modelProvider,
-            createdAt: now,
-            updatedAt: now,
-            recencyAt: now,
-            status: .active(activeFlags: []),
-            ephemeral: input.options.ephemeral,
-            turns: [review.initialTurn]
+        let change = CodexStartedReviewContextChange(
+            snapshot: CodexThreadSnapshot(
+                id: review.activeTurnThreadID,
+                workspace: review.eventThread.workspace ?? workspaceURL,
+                preview: input.target.dataKitPreview,
+                modelProvider: input.options.modelProvider,
+                createdAt: now,
+                updatedAt: now,
+                recencyAt: now,
+                status: .active(activeFlags: []),
+                ephemeral: input.options.ephemeral,
+                turns: [review.initialTurn]
+            ),
+            eventThread: review.eventThread,
+            archived: false,
+            provisionalSeedTurnID: review.initialTurn.id
         )
-        let chat = apply(snapshot)
-        chat.preserveSeededMetadataUntilAuthoritativeSnapshot()
-        chat.markProvisionalSeedTurn(review.initialTurn.id)
-        chat.applyContextArchived(false)
-        chat.syncPhaseAfterRefresh(includeTurns: true)
-        prepareEventThread(review.eventThread, for: chat.id)
-        chat.workspace?.moveContextChatToFront(chat)
-        await insertChatIntoRegisteredResults(chat, archived: false)
+        let chat = await applyStartedReview(change)
+        if let container {
+            await container.multicast(
+                CodexModelContextTransaction(startedReviews: [change]),
+                from: contextID
+            )
+        }
         logger.debug(
             "Started review chat chatID=\(chat.id.rawValue, privacy: .public) reusedExistingChat=\(isExistingChat, privacy: .public) initialTurns=\(chat.turns.count, privacy: .public) initialItems=\(chat.items.count, privacy: .public)"
         )
         return CodexStartedReview(chat: chat, session: review)
+    }
+
+    @discardableResult
+    private func applyStartedReview(_ change: CodexStartedReviewContextChange) async -> CodexChat {
+        let chat = apply(change.snapshot)
+        chat.preserveSeededMetadataUntilAuthoritativeSnapshot()
+        if let provisionalSeedTurnID = change.provisionalSeedTurnID {
+            chat.markProvisionalSeedTurn(provisionalSeedTurnID)
+        }
+        chat.applyContextArchived(change.archived)
+        chat.syncPhaseAfterRefresh(includeTurns: change.snapshot.hasField(.turns))
+        prepareEventThread(change.eventThread, for: chat.id)
+        chat.workspace?.moveContextChatToFront(chat)
+        await insertChatIntoRegisteredResults(chat, archived: change.archived)
+        return chat
+    }
+
+    package func merge(_ transaction: CodexModelContextTransaction) async {
+        for change in transaction.startedReviews {
+            await applyStartedReview(change)
+        }
     }
 
     @discardableResult

@@ -1507,29 +1507,52 @@ public struct CodexThreadItem: Identifiable, Equatable, Sendable {
 }
 
 public struct CodexReasoning: Equatable, Sendable {
-    public var summary: [String]
-    public var content: [String]
+    public var summary: [String] {
+        didSet {
+            summary = Self.normalizedFragments(summary)
+        }
+    }
+    public var content: [String] {
+        didSet {
+            content = Self.normalizedFragments(content)
+        }
+    }
 
     public static let empty = Self(summary: [], content: [])
 
     public init(summary: [String] = [], content: [String] = []) {
-        self.summary = summary
-        self.content = content
+        self.summary = Self.normalizedFragments(summary)
+        self.content = Self.normalizedFragments(content)
     }
 
     public init(summary: String, content: String? = nil) {
-        self.summary = [summary]
-        self.content = content.map { [$0] } ?? []
+        self.init(
+            summary: [summary],
+            content: content.map { [$0] } ?? []
+        )
     }
 
     public init(content: String) {
-        self.summary = []
-        self.content = [content]
+        self.init(summary: [], content: [content])
     }
 
     public var text: String {
         let preferred = summary.isEmpty ? content : summary
-        return preferred.joined(separator: "\n")
+        return preferred.joined(separator: "\n\n")
+    }
+
+    private static func normalizedFragments(_ fragments: [String]) -> [String] {
+        var seen = Set<String>()
+        var normalized: [String] = []
+        normalized.reserveCapacity(fragments.count)
+        for fragment in fragments {
+            let key = fragment.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard key.isEmpty == false, seen.insert(key).inserted else {
+                continue
+            }
+            normalized.append(fragment)
+        }
+        return normalized
     }
 }
 
