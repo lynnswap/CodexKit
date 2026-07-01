@@ -1,6 +1,7 @@
 import CodexAppServerKit
 import Foundation
 import Observation
+import Synchronization
 
 public enum CodexSortOrder: Sendable, Hashable, Codable {
     case forward
@@ -32,7 +33,6 @@ public struct CodexSortDescriptor<Model: CodexPersistentModel>: Sendable, Hashab
         self.order = order
     }
 
-    @MainActor
     public init<Value: Comparable>(
         _ keyPath: KeyPath<Model, Value>,
         order: CodexSortOrder = .forward
@@ -43,7 +43,6 @@ public struct CodexSortDescriptor<Model: CodexPersistentModel>: Sendable, Hashab
         )
     }
 
-    @MainActor
     public init<Value: Comparable>(
         _ keyPath: KeyPath<Model, Value?>,
         order: CodexSortOrder = .forward
@@ -54,7 +53,6 @@ public struct CodexSortDescriptor<Model: CodexPersistentModel>: Sendable, Hashab
         )
     }
 
-    @MainActor
     private static func requireKnownSortKey(for keyPath: AnyKeyPath) -> CodexSortKey {
         guard let key = CodexKnownKeyPaths.sortKey(for: Model.self, keyPath: keyPath) else {
             preconditionFailure(
@@ -77,21 +75,18 @@ public struct CodexSectionDescriptor<Model: CodexPersistentModel>: Sendable, Has
         self.key = key
     }
 
-    @MainActor
     public init<SectionIdentifier: Hashable & Sendable>(
         _ keyPath: KeyPath<Model, SectionIdentifier>
     ) {
         self.init(key: Self.requireKnownSectionKey(for: keyPath))
     }
 
-    @MainActor
     public init<SectionIdentifier: Hashable & Sendable>(
         _ keyPath: KeyPath<Model, SectionIdentifier?>
     ) {
         self.init(key: Self.requireKnownSectionKey(for: keyPath))
     }
 
-    @MainActor
     private static func requireKnownSectionKey(for keyPath: AnyKeyPath) -> CodexSectionKey {
         guard let key = CodexKnownKeyPaths.sectionKey(for: Model.self, keyPath: keyPath) else {
             preconditionFailure(
@@ -201,7 +196,6 @@ public struct CodexFetchDescriptor<Model: CodexPersistentModel>: Sendable, Hasha
 }
 
 private enum CodexKnownKeyPaths {
-    @MainActor
     static func sortKey<Model: CodexPersistentModel>(
         for _: Model.Type,
         keyPath: AnyKeyPath
@@ -218,7 +212,6 @@ private enum CodexKnownKeyPaths {
         return nil
     }
 
-    @MainActor
     static func sectionKey<Model: CodexPersistentModel>(
         for _: Model.Type,
         keyPath: AnyKeyPath
@@ -239,17 +232,14 @@ private enum CodexKnownKeyPaths {
         return nil
     }
 
-    @MainActor
     private static func sortKeyForWorkspaceGroup(_ keyPath: AnyKeyPath) -> CodexSortKey? {
         keyPath == (\CodexWorkspaceGroup.name as AnyKeyPath) ? .name : nil
     }
 
-    @MainActor
     private static func sortKeyForWorkspace(_ keyPath: AnyKeyPath) -> CodexSortKey? {
         keyPath == (\CodexWorkspace.name as AnyKeyPath) ? .name : nil
     }
 
-    @MainActor
     private static func sortKeyForChat(_ keyPath: AnyKeyPath) -> CodexSortKey? {
         if keyPath == (\CodexChat.title as AnyKeyPath)
             || keyPath == (\CodexChat.name as AnyKeyPath)
@@ -269,7 +259,7 @@ private enum CodexKnownKeyPaths {
     }
 }
 
-public final class CodexFetchRequest<Model: CodexPersistentModel>: @unchecked Sendable {
+public final class CodexFetchRequest<Model: CodexPersistentModel> {
     public var predicate: CodexFetchPredicate<Model>
     public var sortDescriptors: [CodexSortDescriptor<Model>]
     public var fetchLimit: Int?
@@ -347,7 +337,6 @@ extension CodexFetchDescriptor where Model == CodexChat {
         .init(sortBy: codexDefaultChatSortDescriptors())
     }
 
-    @MainActor
     public static func chats(
         in workspace: CodexWorkspace,
         fetchLimit: Int? = nil
@@ -355,7 +344,6 @@ extension CodexFetchDescriptor where Model == CodexChat {
         chats(in: workspace, sortBy: codexDefaultChatSortDescriptors(), fetchLimit: fetchLimit)
     }
 
-    @MainActor
     public static func chats(
         in workspace: CodexWorkspace,
         sortBy: [CodexSortDescriptor<CodexChat>],
@@ -393,7 +381,6 @@ extension CodexFetchRequest where Model == CodexChat {
         Self(.recentChats)
     }
 
-    @MainActor
     public static func chats(
         in workspace: CodexWorkspace,
         fetchLimit: Int? = nil
@@ -405,7 +392,6 @@ extension CodexFetchRequest where Model == CodexChat {
         )
     }
 
-    @MainActor
     public static func chats(
         in workspace: CodexWorkspace,
         sortDescriptors: [CodexSortDescriptor<CodexChat>],
@@ -483,27 +469,22 @@ extension CodexFetchSection where Model == CodexChat {
         return id
     }
 
-    @MainActor
     public var workspaceGroup: CodexWorkspaceGroup? {
         codexOnlyWorkspaceGroup(items.map { $0.workspace?.workspaceGroup })
     }
 
-    @MainActor
     public var workspaces: [CodexWorkspace] {
         codexUniqueWorkspaces(items.compactMap(\.workspace))
     }
 
-    @MainActor
     public var uncategorizedChats: [CodexChat] {
         items.filter { $0.workspace == nil }
     }
 
-    @MainActor
     public func chats(in workspaceID: CodexWorkspaceID) -> [CodexChat] {
         items.filter { $0.workspace?.id == workspaceID }
     }
 
-    @MainActor
     public func chat(id: CodexThreadID) -> CodexChat? {
         items.first { $0.id == id }
     }
@@ -517,18 +498,15 @@ extension CodexFetchSection where Model == CodexWorkspace {
         return id
     }
 
-    @MainActor
     public var workspaceGroup: CodexWorkspaceGroup? {
         codexOnlyWorkspaceGroup(items.map(\.workspaceGroup))
     }
 
-    @MainActor
     public var workspaces: [CodexWorkspace] {
         codexUniqueWorkspaces(items)
     }
 }
 
-@MainActor
 private func codexUniqueWorkspaces(_ workspaces: [CodexWorkspace]) -> [CodexWorkspace] {
     var seen: Set<CodexWorkspaceID> = []
     var result: [CodexWorkspace] = []
@@ -538,7 +516,6 @@ private func codexUniqueWorkspaces(_ workspaces: [CodexWorkspace]) -> [CodexWork
     return result
 }
 
-@MainActor
 private func codexOnlyWorkspaceGroup(_ groups: [CodexWorkspaceGroup?]) -> CodexWorkspaceGroup? {
     var result: CodexWorkspaceGroup?
     var hasMissingGroup = false
@@ -573,7 +550,6 @@ package struct CodexFetchedChatRevalidation {
     package var archived: Bool
 }
 
-@MainActor
 package protocol CodexFetchedResultsRegistration: AnyObject {
     func insert(_ chat: CodexChat, archived: Bool) async
     func archive(
@@ -591,7 +567,6 @@ package protocol CodexFetchedResultsRegistration: AnyObject {
     func refresh(_ group: CodexWorkspaceGroup, archived: Bool, removedChats: [CodexChat]) async
 }
 
-@MainActor
 @Observable
 public final class CodexFetchedResults<Model: CodexPersistentModel> {
     public let modelContext: CodexModelContext
@@ -620,7 +595,7 @@ public final class CodexFetchedResults<Model: CodexPersistentModel> {
         self.sectionBy = sectionBy
     }
 
-    isolated deinit {
+    deinit {
         transactionRelay.finish()
     }
 
@@ -630,17 +605,17 @@ public final class CodexFetchedResults<Model: CodexPersistentModel> {
         transactionRelay.makeStream()
     }
 
-    public func performFetch() async throws {
+    public nonisolated(nonsending) func performFetch() async throws {
         let reason: CodexFetchedResultsTransactionReason =
             hasPerformedFetch ? .refresh : .initialFetch
         try await load(fetchDescriptor, appending: false, reason: reason)
     }
 
-    public func refresh() async throws {
+    public nonisolated(nonsending) func refresh() async throws {
         try await performFetch()
     }
 
-    public func loadNextPage() async throws {
+    public nonisolated(nonsending) func loadNextPage() async throws {
         guard let nextCursor else {
             return
         }
@@ -1435,50 +1410,65 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
     }
 }
 
-@MainActor
-private final class CodexAsyncStreamRelay<Element: Sendable>: @unchecked Sendable {
-    private var continuations: [UUID: AsyncStream<Element>.Continuation] = [:]
+private final class CodexAsyncStreamRelay<Element: Sendable>: Sendable {
+    private struct State {
+        var continuations: [UUID: AsyncStream<Element>.Continuation] = [:]
+    }
+
+    private let state = Mutex(State())
 
     var hasContinuations: Bool {
-        continuations.isEmpty == false
+        state.withLock { state in
+            state.continuations.isEmpty == false
+        }
     }
 
     func makeStream() -> AsyncStream<Element> {
         let id = UUID()
         let pair = AsyncStream<Element>.makeStream(bufferingPolicy: .unbounded)
-        continuations[id] = pair.continuation
+        state.withLock { state in
+            state.continuations[id] = pair.continuation
+        }
         let owner = CodexAsyncStreamRelayWeakBox(self)
         pair.continuation.onTermination = codexAsyncStreamRelayTermination(owner: owner, id: id)
         return pair.stream
     }
 
     func yield(_ element: Element) {
-        for continuation in continuations.values {
+        let continuations = state.withLock { state in
+            Array(state.continuations.values)
+        }
+        for continuation in continuations {
             continuation.yield(element)
         }
     }
 
     fileprivate func removeStream(_ id: UUID) {
-        continuations.removeValue(forKey: id)?.finish()
+        let continuation = state.withLock { state in
+            state.continuations.removeValue(forKey: id)
+        }
+        continuation?.finish()
     }
 
     func finish() {
-        for continuation in continuations.values {
+        let continuations = state.withLock { state in
+            let continuations = Array(state.continuations.values)
+            state.continuations.removeAll(keepingCapacity: false)
+            return continuations
+        }
+        for continuation in continuations {
             continuation.finish()
         }
-        continuations.removeAll(keepingCapacity: false)
     }
 
-    isolated deinit {
+    deinit {
         finish()
     }
 }
 
 private final class CodexAsyncStreamRelayWeakBox<Element: Sendable>: @unchecked Sendable {
-    @MainActor
     weak var value: CodexAsyncStreamRelay<Element>?
 
-    @MainActor
     init(_ value: CodexAsyncStreamRelay<Element>) {
         self.value = value
     }
@@ -1489,7 +1479,7 @@ private func codexAsyncStreamRelayTermination<Element: Sendable>(
     id: UUID
 ) -> @Sendable (AsyncStream<Element>.Continuation.Termination) -> Void {
     { @Sendable _ in
-        Task { @MainActor in
+        Task {
             owner.value?.removeStream(id)
         }
     }

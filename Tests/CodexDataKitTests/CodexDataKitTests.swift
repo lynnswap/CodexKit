@@ -5,6 +5,21 @@ import Foundation
 import Synchronization
 import Testing
 
+private actor TestCodexModelActor: CodexModelActor {
+    nonisolated let modelContainer: CodexModelContainer
+    nonisolated let modelExecutor: any CodexModelExecutor
+
+    init(modelContainer: CodexModelContainer) {
+        self.modelContainer = modelContainer
+        self.modelExecutor = CodexDefaultSerialModelExecutor(modelContainer: modelContainer)
+    }
+
+    func fetchRecentChatIDs() async throws -> [CodexThreadID] {
+        try await modelContext.fetch(CodexFetchDescriptor<CodexChat>.recentChats)
+            .map(\.id)
+    }
+}
+
 @MainActor
 struct CodexModelContextTests {
     @Test("container releases its main context without a retain cycle")
@@ -56,6 +71,21 @@ struct CodexModelContextTests {
         #expect(weakGroup == nil)
         #expect(weakWorkspace == nil)
         #expect(weakChat == nil)
+    }
+
+    @Test("model actor creates its own context from a container")
+    func modelActorCreatesOwnContextFromContainer() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let container = CodexModelContainer(appServer: runtime.server)
+        let modelActor = TestCodexModelActor(modelContainer: container)
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "model-actor-chat", workspace: temporaryDirectory(), name: "Model Actor")
+        ]))
+
+        let chatIDs = try await modelActor.fetchRecentChatIDs()
+
+        #expect(chatIDs == [CodexThreadID("model-actor-chat")])
+        #expect(container.mainContext.registeredModel(for: CodexThreadID("model-actor-chat")) == nil)
     }
 
     @Test("parent model refreshes throw after detaching from context")
@@ -4535,6 +4565,7 @@ struct CodexModelContextTests {
         defer {
             observation.cancel()
         }
+        let changes = ChatUpdateRecorder(stream: observation.updates)
 
         let failedTurn = try #require(chat.turn(id: "turn-failed"))
         #expect(failedTurn.status == CodexTurnStatus.failed)
@@ -4562,6 +4593,7 @@ struct CodexModelContextTests {
         #expect(completedTurn.usage?.inputTokens == 13)
         #expect(completedTurn.usage?.outputTokens == 21)
         #expect(completedTurn.usage?.modelContextWindow == 128_000)
+        withExtendedLifetime(changes) {}
     }
 
     @Test("chat send merges response transcript into observable items")
@@ -4622,7 +4654,7 @@ struct CodexModelContextTests {
         defer {
             observation.cancel()
         }
-        let changes = ChatUpdateRecorder(stream: observation.updates)
+        let updateRecorder = ChatUpdateRecorder(stream: observation.updates)
         #expect(chat.phase == .loading)
 
         try await runtime.transport.enqueueThreadResume(.init(id: "thread-send-phase"))
@@ -4639,7 +4671,7 @@ struct CodexModelContextTests {
 
         _ = try await sendTask.value
 
-        let phaseChange = await changes.phaseChanged(.loaded)
+        let phaseChange = await updateRecorder.phaseChanged(.loaded)
         #expect(phaseChange != nil)
         #expect(chat.phase == .loaded)
     }
@@ -4661,7 +4693,7 @@ struct CodexModelContextTests {
         defer {
             observation.cancel()
         }
-        let changes = ChatUpdateRecorder(stream: observation.updates)
+        let updateRecorder = ChatUpdateRecorder(stream: observation.updates)
 
         #expect(chat.status == .idle)
         #expect(chat.phase == .loaded)
@@ -4674,7 +4706,7 @@ struct CodexModelContextTests {
             )
         )
 
-        #expect(await changes.statusChanged(.active(activeFlags: [])) != nil)
+        #expect(await updateRecorder.statusChanged(.active(activeFlags: [])) != nil)
         #expect(chat.status == .active(activeFlags: []))
         #expect(chat.phase == .loading)
 
@@ -4683,7 +4715,7 @@ struct CodexModelContextTests {
             params: TurnCompletedParams(turn: .init(id: "turn-status-lifecycle", status: "completed"))
         )
 
-        #expect(await changes.statusChanged(.idle) != nil)
+        #expect(await updateRecorder.statusChanged(.idle) != nil)
         #expect(chat.status == .idle)
         #expect(chat.phase == .loaded)
     }
@@ -4864,6 +4896,7 @@ struct CodexModelContextTests {
         defer {
             observation.cancel()
         }
+        let changes = ChatUpdateRecorder(stream: observation.updates)
 
         try await runtime.transport.emitServerNotification(
             method: "turn/started",
@@ -4919,6 +4952,7 @@ struct CodexModelContextTests {
                 && completedAt > startedAt
                 && chat.items.contains { $0.itemID == "message-after-command" }
         })
+        withExtendedLifetime(changes) {}
     }
 
     @Test("late prior command update does not regress terminalized lifecycle items")
@@ -4934,6 +4968,7 @@ struct CodexModelContextTests {
         defer {
             observation.cancel()
         }
+        let changes = ChatUpdateRecorder(stream: observation.updates)
 
         try await runtime.transport.emitServerNotification(
             method: "turn/started",
@@ -5007,6 +5042,7 @@ struct CodexModelContextTests {
                 && first.output == "late output"
                 && second.status == .running
         })
+        withExtendedLifetime(changes) {}
     }
 
     @Test("chat send with revert policy refreshes observed transcript after failure")
@@ -5100,6 +5136,7 @@ struct CodexModelContextTests {
         defer {
             observation.cancel()
         }
+        let changes = ChatUpdateRecorder(stream: observation.updates)
 
         let snapshotItem = try #require(chat.items.first)
         #expect(observation.chat === chat)
@@ -5183,6 +5220,7 @@ struct CodexModelContextTests {
         #expect(chat.updatedAt == completedAt)
         #expect(chat.transcript.finalAnswer == "Hello")
         #expect(await runtime.transport.recordedRequests(method: "thread/resume").count == 1)
+        withExtendedLifetime(changes) {}
 
         observation.cancel()
         try await runtime.transport.enqueueThreadResume(.init(id: "thread-live"))
@@ -5220,8 +5258,8 @@ struct CodexModelContextTests {
         #expect(await runtime.transport.recordedRequests(method: "thread/resume").count == 2)
     }
 
-    @Test("chat observation upgrades shared leases to include turn items")
-    func chatObservationUpgradesSharedLeaseToIncludeTurnItems() async throws {
+    @Test("chat observation rejects concurrent include-turn upgrade")
+    func chatObservationRejectsConcurrentIncludeTurnUpgrade() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         let context = CodexModelContainer(appServer: runtime.server).mainContext
 
@@ -5236,6 +5274,16 @@ struct CodexModelContextTests {
 
         #expect(chat.turn(id: "turn-history") == nil)
 
+        do {
+            _ = try await chat.observe(includeTurns: true)
+            Issue.record("Expected concurrent observation to throw.")
+        } catch CodexModelContextError.chatObservationAlreadyActive(let id) {
+            #expect(id == chat.id)
+        }
+
+        metadataObservation.cancel()
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-upgrade"))
         try await runtime.transport.enqueueThreadRead(.init(
             id: "thread-upgrade",
             turns: [
@@ -5266,7 +5314,7 @@ struct CodexModelContextTests {
         let turn = try #require(chat.turn(id: "turn-history"))
         #expect(turn.status == .completed)
         #expect(chat.items(in: "turn-history").map(\.text) == ["Loaded from upgrade"])
-        #expect(await runtime.transport.recordedRequests(method: "thread/resume").count == 1)
+        #expect(await runtime.transport.recordedRequests(method: "thread/resume").count == 2)
         let readRequests = await runtime.transport.recordedRequests(method: "thread/read")
         #expect(readRequests.count == 2)
         let firstParams = try readRequests[0].decodeParams(ThreadReadParams.self)
@@ -5288,12 +5336,14 @@ struct CodexModelContextTests {
         defer {
             firstObservation.cancel()
         }
+        let firstChanges = ChatUpdateRecorder(stream: firstObservation.updates)
 
         try await runtime.transport.emitServerNotification(
             method: "thread/closed",
             params: ThreadClosedParams(threadID: "thread-finished")
         )
         #expect(await eventually { chat.status == .notLoaded && chat.phase == .loaded })
+        #expect(await eventually { firstChanges.isFinished })
 
         try await runtime.transport.enqueueThreadResume(.init(id: "thread-finished"))
         try await runtime.transport.enqueueThreadRead(.init(
@@ -5305,6 +5355,7 @@ struct CodexModelContextTests {
         defer {
             restartedObservation.cancel()
         }
+        let restartedChanges = ChatUpdateRecorder(stream: restartedObservation.updates)
 
         #expect(chat.turn(id: "turn-restarted") != nil)
         #expect(await runtime.transport.recordedRequests(method: "thread/resume").count == 2)
@@ -5323,6 +5374,7 @@ struct CodexModelContextTests {
         #expect(await eventually {
             chat.items.first { $0.itemID == "message-restarted" }?.text == "Live after restart"
         })
+        withExtendedLifetime(restartedChanges) {}
     }
 
     @Test("chat observation change streams finish when setup consumes terminal events")
@@ -5336,8 +5388,9 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadRead(.init(id: "thread-terminal-setup"))
 
         let chat = context.model(for: CodexThreadID(rawValue: "thread-terminal-setup"))
-        let observeTask = Task {
-            try await chat.observe()
+        var observedChat: CodexChatObservation?
+        let observeTask = Task { @MainActor in
+            observedChat = try await chat.observe()
         }
 
         await runtime.transport.waitForRequest(method: "thread/read")
@@ -5347,7 +5400,8 @@ struct CodexModelContextTests {
         )
         await gate.open()
 
-        let observation = try await observeTask.value
+        try await observeTask.value
+        let observation = try #require(observedChat)
         defer {
             observation.cancel()
         }
@@ -5441,8 +5495,9 @@ struct CodexModelContextTests {
         ))
 
         let chat = context.model(for: CodexThreadID(rawValue: "thread-message-replay"))
-        let observeTask = Task {
-            try await chat.observe()
+        var observedChat: CodexChatObservation?
+        let observeTask = Task { @MainActor in
+            observedChat = try await chat.observe()
         }
         await runtime.transport.waitForRequest(method: "thread/read")
 
@@ -5478,19 +5533,22 @@ struct CodexModelContextTests {
         )
         await gate.open()
 
-        let observation = try await observeTask.value
+        try await observeTask.value
+        let observation = try #require(observedChat)
         defer {
             observation.cancel()
         }
+        let changes = ChatUpdateRecorder(stream: observation.updates)
 
         #expect(await eventually {
             chat.items.first { $0.itemID == "message-replay" }?.text == "Hello world"
         })
         #expect(chat.items.filter { $0.itemID == "message-replay" }.count == 1)
+        withExtendedLifetime(changes) {}
     }
 
-    @Test("duplicate chat observations share one live consumer")
-    func duplicateChatObservationsShareOneLiveConsumer() async throws {
+    @Test("duplicate chat observations are rejected")
+    func duplicateChatObservationsAreRejected() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         let context = CodexModelContainer(appServer: runtime.server).mainContext
 
@@ -5499,38 +5557,197 @@ struct CodexModelContextTests {
 
         let chat = context.model(for: CodexThreadID(rawValue: "thread-duplicate"))
         let firstObservation = try await chat.observe()
-        let secondObservation = try await chat.observe()
         defer {
             firstObservation.cancel()
-            secondObservation.cancel()
         }
 
+        do {
+            _ = try await chat.observe()
+            Issue.record("Expected duplicate observation to throw.")
+        } catch CodexModelContextError.chatObservationAlreadyActive(let id) {
+            #expect(id == chat.id)
+        }
+        #expect(await runtime.transport.recordedRequests(method: "thread/resume").count == 1)
+    }
+
+    @Test("chat observation coalesces duplicate narrative snapshot items")
+    func chatObservationCoalescesDuplicateNarrativeSnapshotItems() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-duplicate-history"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-duplicate-history",
+            turns: [
+                .init(
+                    id: "turn-duplicate-history",
+                    status: .running,
+                    items: [
+                        .init(
+                            id: "review-a",
+                            kind: .enteredReviewMode,
+                            content: .log("current changes")
+                        ),
+                        .init(
+                            id: "user-a",
+                            kind: .userMessage,
+                            content: .message(.init(
+                                id: "user-a",
+                                role: .user,
+                                text: "Review current changes"
+                            ))
+                        ),
+                        .init(
+                            id: "reasoning-a",
+                            kind: .reasoning,
+                            content: .reasoning(.init(summary: "Checking diff"))
+                        ),
+                        .init(
+                            id: "command-a",
+                            kind: .commandExecution,
+                            content: .command(.init(command: "/bin/zsh -lc"))
+                        ),
+                        .init(
+                            id: "review-b",
+                            kind: .enteredReviewMode,
+                            content: .log("current changes")
+                        ),
+                        .init(
+                            id: "user-b",
+                            kind: .userMessage,
+                            content: .message(.init(
+                                id: "user-b",
+                                role: .user,
+                                text: "Review current changes"
+                            ))
+                        ),
+                        .init(
+                            id: "reasoning-b",
+                            kind: .reasoning,
+                            content: .reasoning(.init(summary: "Checking diff"))
+                        ),
+                        .init(
+                            id: "command-b",
+                            kind: .commandExecution,
+                            content: .command(.init(command: "/bin/zsh -lc"))
+                        ),
+                    ]
+                ),
+            ]
+        ))
+
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-duplicate-history"))
+        let observation = try await chat.observe()
+        defer {
+            observation.cancel()
+        }
+
+        #expect(chat.items.map(\.itemID) == [
+            "review-a",
+            "user-a",
+            "reasoning-a",
+            "command-a",
+            "command-b",
+        ])
+    }
+
+    @Test("chat observation coalesces duplicate narrative live items")
+    func chatObservationCoalescesDuplicateNarrativeLiveItems() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-duplicate-live"))
+        try await runtime.transport.enqueueThreadRead(.init(id: "thread-duplicate-live", turns: []))
+
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-duplicate-live"))
+        let observation = try await chat.observe()
+        defer {
+            observation.cancel()
+        }
+        let changes = ChatUpdateRecorder(stream: observation.updates)
+
         try await runtime.transport.emitServerNotification(
-            method: "item/agentMessage/delta",
-            params: TurnDeltaParams(
-                threadID: "thread-duplicate",
-                turnID: "turn-duplicate",
-                itemID: "message-duplicate",
-                delta: "Hel",
-                phase: "final_answer"
+            method: "item/started",
+            params: ThreadItemParams(
+                threadID: "thread-duplicate-live",
+                turnID: "turn-duplicate-live",
+                item: .init(
+                    id: "review-a",
+                    type: "enteredReviewMode",
+                    text: "current changes"
+                )
             )
         )
         try await runtime.transport.emitServerNotification(
-            method: "item/agentMessage/delta",
-            params: TurnDeltaParams(
-                threadID: "thread-duplicate",
-                turnID: "turn-duplicate",
-                itemID: "message-duplicate",
-                delta: "lo",
-                phase: "final_answer"
+            method: "item/started",
+            params: ThreadItemParams(
+                threadID: "thread-duplicate-live",
+                turnID: "turn-duplicate-live",
+                item: .init(
+                    id: "reasoning-a",
+                    type: "reasoning",
+                    text: "Checking diff"
+                )
+            )
+        )
+        try await runtime.transport.emitServerNotification(
+            method: "item/started",
+            params: ThreadItemParams(
+                threadID: "thread-duplicate-live",
+                turnID: "turn-duplicate-live",
+                item: .init(
+                    id: "command-a",
+                    type: "commandExecution",
+                    command: "/bin/zsh -lc"
+                )
+            )
+        )
+        try await runtime.transport.emitServerNotification(
+            method: "item/started",
+            params: ThreadItemParams(
+                threadID: "thread-duplicate-live",
+                turnID: "turn-duplicate-live",
+                item: .init(
+                    id: "review-b",
+                    type: "enteredReviewMode",
+                    text: "current changes"
+                )
+            )
+        )
+        try await runtime.transport.emitServerNotification(
+            method: "item/started",
+            params: ThreadItemParams(
+                threadID: "thread-duplicate-live",
+                turnID: "turn-duplicate-live",
+                item: .init(
+                    id: "reasoning-b",
+                    type: "reasoning",
+                    text: "Checking diff"
+                )
+            )
+        )
+        try await runtime.transport.emitServerNotification(
+            method: "item/started",
+            params: ThreadItemParams(
+                threadID: "thread-duplicate-live",
+                turnID: "turn-duplicate-live",
+                item: .init(
+                    id: "command-b",
+                    type: "commandExecution",
+                    command: "/bin/zsh -lc"
+                )
             )
         )
 
         #expect(await eventually {
-            chat.items.first { $0.itemID == "message-duplicate" }?.text == "Hello"
+            chat.items.map(\.itemID) == [
+                "review-a",
+                "reasoning-a",
+                "command-a",
+                "command-b",
+            ]
         })
-        #expect(chat.items.filter { $0.itemID == "message-duplicate" }.count == 1)
-        #expect(await runtime.transport.recordedRequests(method: "thread/resume").count == 1)
+        withExtendedLifetime(changes) {}
     }
 
     @Test("chat observations stream snapshots and item text changes")
@@ -5707,10 +5924,7 @@ struct CodexModelContextTests {
 
         try await context.refresh(chat)
 
-        guard case .resynchronized(reason: .refresh) = await changes.next() else {
-            Issue.record("Expected refresh resynchronization update.")
-            return
-        }
+        #expect(await changes.resynchronized(reason: .refresh) != nil)
         #expect(chat.phase == .loaded)
     }
 
@@ -5901,11 +6115,10 @@ struct CodexModelContextTests {
                 ]
             ),
         ]))
-        await runtime.transport.enqueueFailure(
-            code: -32_004,
-            message: "thread not loaded: thread-refresh-not-loaded",
-            for: "thread/read"
-        )
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-refresh-not-loaded",
+            status: .notLoaded
+        ))
 
         try await context.refresh(chat)
 
@@ -5913,6 +6126,79 @@ struct CodexModelContextTests {
         #expect(chat.turns.map(\.id.rawValue) == ["turn-authoritative"])
         #expect(chat.items.map(\.itemID) == ["message-authoritative"])
         #expect(chat.items.map(\.text) == ["Authoritative interruption"])
+    }
+
+    @Test("not-loaded metadata fallback preserves live-streamed items omitted by turns")
+    func notLoadedMetadataFallbackPreservesLiveStreamedItemsOmittedByTurns() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-refresh-not-loaded-fallback"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-refresh-not-loaded-fallback",
+            status: .active(activeFlags: []),
+            turns: []
+        ))
+
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-refresh-not-loaded-fallback"))
+        let observation = try await chat.observe()
+        defer {
+            observation.cancel()
+        }
+        let changes = ChatUpdateRecorder(stream: observation.updates)
+
+        try await runtime.transport.emitServerNotification(
+            method: "turn/started",
+            params: TurnStartedParams(
+                threadID: "thread-refresh-not-loaded-fallback",
+                turnID: "turn-live"
+            )
+        )
+        try await runtime.transport.emitServerNotification(
+            method: "item/started",
+            params: ThreadItemParams(
+                threadID: "thread-refresh-not-loaded-fallback",
+                turnID: "turn-live",
+                item: .init(
+                    id: "command-live",
+                    type: "commandExecution",
+                    command: "/bin/zsh -lc 'git status --short'"
+                )
+            )
+        )
+        #expect(await changes.itemInserted(id: "command-live") != nil)
+        let liveCommand = try #require(chat.items.first { $0.itemID == "command-live" })
+
+        try await runtime.transport.enqueueThreadTurns(.init(turns: [
+            .init(
+                id: "turn-summary",
+                status: .interrupted,
+                items: [
+                    .init(
+                        id: "message-interrupted",
+                        kind: .agentMessage,
+                        content: .message(.init(
+                            id: "message-interrupted",
+                            role: .assistant,
+                            text: "Review was interrupted."
+                        ))
+                    ),
+                ]
+            ),
+        ]))
+        await runtime.transport.enqueueFailure(
+            code: -32_004,
+            message: "thread not loaded: thread-refresh-not-loaded-fallback",
+            for: "thread/read"
+        )
+
+        try await context.refresh(chat)
+
+        #expect(chat.status == .notLoaded)
+        #expect(chat.items.first { $0.itemID == "command-live" } === liveCommand)
+        #expect(chat.items.first { $0.itemID == "message-interrupted" }?.text == "Review was interrupted.")
+        #expect(chat.items.map(\.itemID).contains("command-live"))
+        #expect(chat.items.map(\.itemID).contains("message-interrupted"))
     }
 
     @Test("restarted chat observation preserves prior live-streamed items omitted by lagging snapshots")
@@ -6049,8 +6335,8 @@ struct CodexModelContextTests {
         #expect(chat.items.first { $0.itemID == "message-buffered" }?.text == "Buffered")
     }
 
-    @Test("duplicate chat observations receive independent change streams")
-    func duplicateChatObservationsReceiveIndependentChangeStreams() async throws {
+    @Test("active chat observation owns the update stream")
+    func activeChatObservationOwnsTheUpdateStream() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         let context = CodexModelContainer(appServer: runtime.server).mainContext
 
@@ -6059,35 +6345,17 @@ struct CodexModelContextTests {
 
         let chat = context.model(for: CodexThreadID(rawValue: "thread-shared-changes"))
         let firstObservation = try await chat.observe()
-        let secondObservation = try await chat.observe()
         defer {
             firstObservation.cancel()
-            secondObservation.cancel()
         }
-        let firstChanges = ChatUpdateRecorder(stream: firstObservation.updates)
-        let secondChanges = ChatUpdateRecorder(stream: secondObservation.updates)
         #expect(firstObservation.chat === chat)
-        #expect(secondObservation.chat === chat)
 
-        try await runtime.transport.emitServerNotification(
-            method: "item/commandExecution/outputDelta",
-            params: OutputDeltaParams(
-                threadID: "thread-shared-changes",
-                turnID: "turn-shared-changes",
-                itemID: "command-shared-changes",
-                delta: "line 1\n"
-            )
-        )
-
-        let firstInserted = await firstChanges.itemInserted(
-            id: "command-shared-changes"
-        )
-        let secondInserted = await secondChanges.itemInserted(
-            id: "command-shared-changes"
-        )
-        #expect(firstInserted != nil)
-        #expect(secondInserted != nil)
-        #expect(chat.items.first { $0.itemID == "command-shared-changes" }?.text == "line 1\n")
+        do {
+            _ = try await chat.observe()
+            Issue.record("Expected duplicate observation to throw.")
+        } catch CodexModelContextError.chatObservationAlreadyActive(let id) {
+            #expect(id == chat.id)
+        }
         #expect(await runtime.transport.recordedRequests(method: "thread/resume").count == 1)
     }
 
@@ -6126,6 +6394,7 @@ struct CodexModelContextTests {
         defer {
             observation.cancel()
         }
+        let changes = ChatUpdateRecorder(stream: observation.updates)
 
         await runtime.transport.emitServerNotificationJSON(
             method: "turn/failed",
@@ -6150,6 +6419,7 @@ struct CodexModelContextTests {
         )
 
         #expect(await eventually { chat.phase == .failed("Tool failed") })
+        withExtendedLifetime(changes) {}
     }
 
     @Test("thread closed notifications clear active chat status")
@@ -6165,6 +6435,7 @@ struct CodexModelContextTests {
         defer {
             observation.cancel()
         }
+        let changes = ChatUpdateRecorder(stream: observation.updates)
 
         try await runtime.transport.emitServerNotification(
             method: "thread/status/changed",
@@ -6183,6 +6454,7 @@ struct CodexModelContextTests {
         )
 
         #expect(await eventually { chat.status == .notLoaded && chat.phase == .loaded })
+        withExtendedLifetime(changes) {}
     }
 
     @Test("live item output deltas accumulate until replacement arrives")
@@ -6198,6 +6470,7 @@ struct CodexModelContextTests {
         defer {
             observation.cancel()
         }
+        let changes = ChatUpdateRecorder(stream: observation.updates)
 
         try await runtime.transport.emitServerNotification(
             method: "item/commandExecution/outputDelta",
@@ -6239,6 +6512,7 @@ struct CodexModelContextTests {
         #expect(await eventually {
             chat.items.first { $0.itemID == "command-output" }?.text == "Completed output"
         })
+        withExtendedLifetime(changes) {}
     }
 
     @Test("replacement file change updates do not append output")
@@ -6254,6 +6528,7 @@ struct CodexModelContextTests {
         defer {
             observation.cancel()
         }
+        let changes = ChatUpdateRecorder(stream: observation.updates)
 
         try await runtime.transport.emitServerNotification(
             method: "item/fileChange/patchUpdated",
@@ -6281,6 +6556,7 @@ struct CodexModelContextTests {
         #expect(await eventually {
             chat.items.first { $0.itemID == "file-patch" }?.text == "Patch two"
         })
+        withExtendedLifetime(changes) {}
     }
 
     @Test("chat send revalidates recent fetched results")
@@ -6632,10 +6908,12 @@ struct CodexModelContextTests {
         defer {
             observation.cancel()
         }
+        let changes = ChatUpdateRecorder(stream: observation.updates)
 
         #expect(started.chat.items.map(\.text) == ["Review started"])
         #expect(await runtime.transport.recordedRequests(method: "thread/resume").isEmpty)
         #expect(await runtime.transport.recordedRequests(method: "thread/turns/list").count == 1)
+        withExtendedLifetime(changes) {}
     }
 
     @Test("started review keeps its live event thread across refresh before observation")
@@ -6799,6 +7077,7 @@ struct CodexModelContextTests {
         defer {
             observation.cancel()
         }
+        let changes = ChatUpdateRecorder(stream: observation.updates)
 
         try await runtime.transport.emitServerNotification(
             method: "turn/started",
@@ -6825,6 +7104,76 @@ struct CodexModelContextTests {
                 && started.chat.items.map(\.itemID) == ["review-mode"]
                 && started.chat.items.map(\.text) == ["current changes"]
         })
+        withExtendedLifetime(changes) {}
+    }
+
+    @Test("started review snapshot merge replaces provisional seed with authoritative review turn")
+    func startedReviewSnapshotMergeReplacesProvisionalSeedWithAuthoritativeReviewTurn() async throws {
+        let workspaceURL = temporaryDirectory()
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadStart(threadID: "thread-review", model: "gpt-5")
+        try await runtime.transport.enqueueReviewStart(
+            turnID: "turn-seed",
+            reviewThreadID: "thread-review",
+            items: [
+                .init(
+                    id: "turn-seed",
+                    kind: .userMessage,
+                    content: .message(.init(
+                        id: "turn-seed",
+                        role: .user,
+                        text: "current changes"
+                    ))
+                ),
+            ]
+        )
+
+        let started = try await context.startReview(
+            in: workspaceURL,
+            input: CodexReviewInput(
+                target: .uncommittedChanges,
+                options: .init(model: "gpt-5", ephemeral: false)
+            )
+        )
+        #expect(started.chat.turns.map(\.id.rawValue) == ["turn-seed"])
+        #expect(started.chat.items.map(\.text) == ["current changes"])
+
+        started.chat.apply(
+            .init(
+                id: "thread-review",
+                workspace: workspaceURL,
+                status: .active(activeFlags: []),
+                turns: [
+                    .init(
+                        id: "turn-live",
+                        status: .running,
+                        items: [
+                            .init(
+                                id: "review-mode",
+                                kind: .enteredReviewMode,
+                                content: .log("current changes")
+                            ),
+                            .init(
+                                id: "command-1",
+                                kind: .commandExecution,
+                                content: .command(.init(
+                                    command: "/bin/zsh -lc",
+                                    status: .running
+                                ))
+                            ),
+                        ]
+                    ),
+                ]
+            ),
+            workspace: started.chat.workspace,
+            preservesExistingTurnItems: true
+        )
+
+        #expect(started.chat.turns.map(\.id.rawValue) == ["turn-live"])
+        #expect(started.chat.items.map(\.itemID) == ["review-mode", "command-1"])
+        #expect(started.chat.items.map(\.text) == ["current changes", "/bin/zsh -lc"])
     }
 
     @Test("started review observation replaces response seed with authoritative turn list when available")
@@ -7374,17 +7723,14 @@ private final class FetchedResultsTransactionRecorder<Model: CodexPersistentMode
     }
 }
 
-private final class ChatUpdateRecorder: @unchecked Sendable {
-    private struct State {
-        var changes: [CodexChatUpdate] = []
-        var streamFinished = false
-    }
-
-    private let state = Mutex(State())
+@MainActor
+private final class ChatUpdateRecorder {
+    private var changes: [CodexChatUpdate] = []
+    private var streamFinished = false
     private var task: Task<Void, Never>?
 
     init(stream: CodexChatUpdates) {
-        task = Task { [weak self] in
+        task = Task { @MainActor [weak self] in
             for await change in stream {
                 self?.append(change)
             }
@@ -7445,33 +7791,34 @@ private final class ChatUpdateRecorder: @unchecked Sendable {
         }
     }
 
-    var isFinished: Bool {
-        state.withLock { state in
-            state.streamFinished
+    func resynchronized(reason: CodexChatResynchronizationReason) async -> CodexChatUpdate? {
+        await next { change in
+            if case .resynchronized(let candidate) = change {
+                return candidate == reason
+            }
+            return false
         }
+    }
+
+    var isFinished: Bool {
+        streamFinished
     }
 
     private func append(_ change: CodexChatUpdate) {
-        state.withLock { state in
-            state.changes.append(change)
-        }
+        changes.append(change)
     }
 
     private func markFinished() {
-        state.withLock { state in
-            state.streamFinished = true
-        }
+        streamFinished = true
     }
 
     private func popFirst(
         matching predicate: (CodexChatUpdate) -> Bool
     ) -> CodexChatUpdate? {
-        state.withLock { state in
-            guard let index = state.changes.firstIndex(where: predicate) else {
-                return nil
-            }
-            return state.changes.remove(at: index)
+        guard let index = changes.firstIndex(where: predicate) else {
+            return nil
         }
+        return changes.remove(at: index)
     }
 
     private func next(

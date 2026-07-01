@@ -6,7 +6,6 @@ public protocol CodexPersistentModel: AnyObject, Observable, Hashable, Identifia
 where ID: Hashable & Sendable {
     nonisolated var id: ID { get }
 
-    @MainActor
     var modelContext: CodexModelContext? { get }
 }
 
@@ -48,6 +47,59 @@ private extension Array where Element == CodexChatUpdate {
 
     var containsTurnItemMutation: Bool {
         contains { $0.affectedTurnID != nil }
+    }
+}
+
+private struct CodexNarrativeItemSignature: Hashable {
+    var kind: CodexThreadItem.Kind
+    var text: String
+}
+
+private extension CodexThreadItem {
+    var isReviewModeMarker: Bool {
+        switch kind {
+        case .enteredReviewMode, .exitedReviewMode:
+            true
+        default:
+            false
+        }
+    }
+
+    var duplicateNarrativeSignature: CodexNarrativeItemSignature? {
+        guard let text, text.isEmpty == false else {
+            return nil
+        }
+        switch kind {
+        case .agentMessage,
+            .userMessage,
+            .enteredReviewMode,
+            .exitedReviewMode,
+            .reasoning,
+            .diagnostic,
+            .error:
+            return .init(kind: kind, text: text)
+        case .plan,
+            .commandExecution,
+            .fileChange,
+            .mcpToolCall,
+            .dynamicToolCall,
+            .collabAgentToolCall,
+            .subAgentActivity,
+            .webSearch,
+            .imageView,
+            .sleep,
+            .imageGeneration,
+            .contextCompaction,
+            .unknown:
+            return nil
+        }
+    }
+
+    var command: CodexCommand? {
+        guard case .command(let command) = content else {
+            return nil
+        }
+        return command
     }
 }
 
@@ -131,7 +183,6 @@ public struct CodexReviewInput: Sendable {
     }
 }
 
-@MainActor
 public struct CodexStartedReview {
     public let chat: CodexChat
     public let session: CodexReviewSession
@@ -163,7 +214,6 @@ public struct CodexChatMessageInput: Sendable {
     }
 }
 
-@MainActor
 @Observable
 public final class CodexWorkspaceGroup: CodexPersistentModel {
     public let id: CodexWorkspaceGroupID
@@ -205,7 +255,6 @@ private extension CodexTurnStatus {
     }
 }
 
-@MainActor
 @Observable
 public final class CodexWorkspace: CodexPersistentModel {
     public let id: CodexWorkspaceID
@@ -264,7 +313,9 @@ public final class CodexWorkspace: CodexPersistentModel {
     }
 
     @discardableResult
-    public func startChat(_ input: CodexChatInput = .init()) async throws -> CodexChat {
+    public nonisolated(nonsending) func startChat(
+        _ input: CodexChatInput = .init()
+    ) async throws -> CodexChat {
         guard let modelContext else {
             throw CodexModelContextError.modelIsDetached
         }
@@ -272,7 +323,9 @@ public final class CodexWorkspace: CodexPersistentModel {
     }
 
     @discardableResult
-    public func startReview(_ input: CodexReviewInput) async throws -> CodexStartedReview {
+    public nonisolated(nonsending) func startReview(
+        _ input: CodexReviewInput
+    ) async throws -> CodexStartedReview {
         guard let modelContext else {
             throw CodexModelContextError.modelIsDetached
         }
@@ -280,7 +333,6 @@ public final class CodexWorkspace: CodexPersistentModel {
     }
 }
 
-@MainActor
 @Observable
 public final class CodexTurn: CodexPersistentModel {
     public let id: CodexTurnID
@@ -334,7 +386,6 @@ public final class CodexTurn: CodexPersistentModel {
     }
 }
 
-@MainActor
 @Observable
 public final class CodexItem: CodexPersistentModel {
     public let id: CodexChatItemID
@@ -455,7 +506,6 @@ package struct CodexChatItemKey: Hashable {
     }
 }
 
-@MainActor
 @Observable
 public final class CodexChat: CodexPersistentModel {
     public let id: CodexThreadID
@@ -584,6 +634,7 @@ public final class CodexChat: CodexPersistentModel {
             ephemeral = snapshot.ephemeral
         }
         if let turns = snapshot.turns {
+            let turns = normalizedIncomingTurnRecords(turns)
             if snapshot.turnItemsAreAuthoritative && preservesExistingTurnItems == false {
                 replaceTurns(with: turns)
                 replaceItems(with: turns)
@@ -626,7 +677,9 @@ public final class CodexChat: CodexPersistentModel {
         }
     }
 
-    public func observe(includeTurns: Bool = true) async throws -> CodexChatObservation {
+    public nonisolated(nonsending) func observe(
+        includeTurns: Bool = true
+    ) async throws -> CodexChatObservation {
         guard let modelContext else {
             throw CodexModelContextError.modelIsDetached
         }
@@ -638,7 +691,9 @@ public final class CodexChat: CodexPersistentModel {
     }
 
     @discardableResult
-    public func send(_ input: CodexChatMessageInput) async throws -> CodexResponse {
+    public nonisolated(nonsending) func send(
+        _ input: CodexChatMessageInput
+    ) async throws -> CodexResponse {
         guard let modelContext else {
             throw CodexModelContextError.modelIsDetached
         }
@@ -660,35 +715,35 @@ public final class CodexChat: CodexPersistentModel {
     }
 
     @discardableResult
-    public func send(
+    public nonisolated(nonsending) func send(
         _ text: String,
         options: CodexGenerationOptions = .init()
     ) async throws -> CodexResponse {
         try await send(.init(text, options: options))
     }
 
-    public func cancel() async throws {
+    public nonisolated(nonsending) func cancel() async throws {
         guard let modelContext else {
             throw CodexModelContextError.modelIsDetached
         }
         try await modelContext.cancelActiveTurn(in: self)
     }
 
-    public func archive() async throws {
+    public nonisolated(nonsending) func archive() async throws {
         guard let modelContext else {
             throw CodexModelContextError.modelIsDetached
         }
         try await modelContext.archive(self)
     }
 
-    public func unarchive() async throws {
+    public nonisolated(nonsending) func unarchive() async throws {
         guard let modelContext else {
             throw CodexModelContextError.modelIsDetached
         }
         try await modelContext.unarchive(self)
     }
 
-    public func delete() async throws {
+    public nonisolated(nonsending) func delete() async throws {
         guard let modelContext else {
             throw CodexModelContextError.modelIsDetached
         }
@@ -742,6 +797,50 @@ public final class CodexChat: CodexPersistentModel {
             return turn
         }
         rebuildTurnIndex()
+    }
+
+    private func normalizedIncomingTurnRecords(
+        _ records: [CodexTurnSnapshot]
+    ) -> [CodexTurnSnapshot] {
+        recordsByRemovingReplacedProvisionalSeed(records).map { record in
+            var record = record
+            record.items = itemsByCoalescingDuplicateNarrativeItems(record.items)
+            return record
+        }
+    }
+
+    private func recordsByRemovingReplacedProvisionalSeed(
+        _ records: [CodexTurnSnapshot]
+    ) -> [CodexTurnSnapshot] {
+        guard let provisionalTurnID = provisionalSeedTurnID else {
+            return records
+        }
+        guard records.contains(where: { record in
+            record.id != provisionalTurnID && record.items.contains(where: \.isReviewModeMarker)
+        }) else {
+            return records
+        }
+        _ = removeProvisionalSeedTurn(provisionalTurnID)
+        return records.filter { $0.id != provisionalTurnID }
+    }
+
+    private func itemsByCoalescingDuplicateNarrativeItems(
+        _ incomingItems: [CodexThreadItem]
+    ) -> [CodexThreadItem] {
+        var seenSignatures = Set<CodexNarrativeItemSignature>()
+        var items: [CodexThreadItem] = []
+        items.reserveCapacity(incomingItems.count)
+        for item in incomingItems {
+            guard let signature = item.duplicateNarrativeSignature else {
+                items.append(item)
+                continue
+            }
+            guard seenSignatures.insert(signature).inserted else {
+                continue
+            }
+            items.append(item)
+        }
+        return items
     }
 
     private func mergeTurns(with records: [CodexTurnSnapshot]) {
@@ -1051,14 +1150,27 @@ public final class CodexChat: CodexPersistentModel {
                 threadItem: incomingItem,
                 turnID: turnID
             )
-            if let existing = itemsByMergeKey[incomingKey] {
+            if let existing = item(for: incomingKey),
+                isDuplicateNarrativeReplay(incomingItem, replacing: existing.threadItem)
+            {
+                continue
+            }
+            if item(for: incomingKey) == nil,
+                hasNarrativeItem(matching: incomingItem, turnID: turnID)
+            {
+                continue
+            }
+            if let existing = itemsByMergeKey[incomingKey]
+                ?? commandReplayItem(matching: incomingItem, turnID: turnID)
+            {
                 let previousItem = existing.threadItem
+                let previousMergeKey = existing.mergeKey
                 let incomingItem = itemByPreservingExistingLifecycle(
                     from: incomingItem,
                     existing: previousItem
                 )
                 if accumulatesOutputDeltas,
-                    mergeOutputDelta(incomingItem, into: existing, key: incomingKey)
+                    mergeOutputDelta(incomingItem, into: existing, key: previousMergeKey)
                 {
                     changes.appendIfPresent(changeForUpdatedItem(
                         existing,
@@ -1074,6 +1186,9 @@ public final class CodexChat: CodexPersistentModel {
                         previousItem: previousItem
                     ))
                 }
+                if existing.mergeKey != previousMergeKey {
+                    rebuildItemIndexes()
+                }
             } else {
                 if accumulatesOutputDeltas {
                     seedOutputDeltaStateIfNeeded(incomingItem, key: incomingKey)
@@ -1088,6 +1203,60 @@ public final class CodexChat: CodexPersistentModel {
             }
         }
         return changes
+    }
+
+    private func isDuplicateNarrativeReplay(
+        _ incomingItem: CodexThreadItem,
+        replacing existingItem: CodexThreadItem
+    ) -> Bool {
+        guard let incomingSignature = incomingItem.duplicateNarrativeSignature else {
+            return false
+        }
+        return existingItem.duplicateNarrativeSignature == incomingSignature
+    }
+
+    private func hasNarrativeItem(
+        matching incomingItem: CodexThreadItem,
+        turnID: CodexTurnID?
+    ) -> Bool {
+        guard let incomingSignature = incomingItem.duplicateNarrativeSignature else {
+            return false
+        }
+        if let turnID {
+            return itemsByTurnID[turnID]?.contains {
+                $0.threadItem.duplicateNarrativeSignature == incomingSignature
+            } == true
+        } else {
+            return items.contains {
+                $0.turnID == nil && $0.threadItem.duplicateNarrativeSignature == incomingSignature
+            }
+        }
+    }
+
+    private func commandReplayItem(
+        matching incomingItem: CodexThreadItem,
+        turnID: CodexTurnID?
+    ) -> CodexItem? {
+        guard let incomingCommand = incomingItem.command else {
+            return nil
+        }
+        let candidates: [CodexItem]
+        if let turnID {
+            candidates = itemsByTurnID[turnID] ?? []
+        } else {
+            candidates = items.filter { $0.turnID == nil }
+        }
+        return candidates.first { item in
+            guard let existingCommand = item.threadItem.command else {
+                return false
+            }
+            guard existingCommand.status?.isTerminal != true else {
+                return false
+            }
+            return existingCommand.command == incomingCommand.command
+                && existingCommand.cwd == incomingCommand.cwd
+                && existingCommand.source == incomingCommand.source
+        }
     }
 
     private func itemByApplyingLifecycleStatus(
@@ -1618,21 +1787,10 @@ public final class CodexChat: CodexPersistentModel {
         itemsByMergeKey[key]
     }
 
-    @discardableResult
-    private func removeProvisionalSeedTurnIfNeeded(
-        for liveTurnID: CodexTurnID?,
-        into changes: inout [CodexChatUpdate]
-    ) -> Bool {
-        guard let provisionalTurnID = provisionalSeedTurnID,
-            let liveTurnID
-        else {
-            return false
-        }
+    private func removeProvisionalSeedTurn(_ provisionalTurnID: CodexTurnID) -> [CodexItem] {
         provisionalSeedTurnID = nil
-        guard provisionalTurnID != liveTurnID,
-            let provisionalTurn = turnsByID[provisionalTurnID]
-        else {
-            return false
+        guard let provisionalTurn = turnsByID[provisionalTurnID] else {
+            return []
         }
 
         let removedItems = items.filter { $0.turnID == provisionalTurnID }
@@ -1644,15 +1802,36 @@ public final class CodexChat: CodexPersistentModel {
             for item in removedItems {
                 removeItemFromIndexes(item)
             }
-            changes.append(contentsOf: removedItems.map { item in
-                .itemRemoved(id: item.itemID, turnID: item.turnID)
-            })
         }
 
         turns.removeAll { $0 === provisionalTurn }
         turnsByID.removeValue(forKey: provisionalTurnID)
         itemsByTurnID.removeValue(forKey: provisionalTurnID)
         provisionalTurn.replaceContextItems([])
+        return removedItems
+    }
+
+    @discardableResult
+    private func removeProvisionalSeedTurnIfNeeded(
+        for liveTurnID: CodexTurnID?,
+        into changes: inout [CodexChatUpdate]
+    ) -> Bool {
+        guard let provisionalTurnID = provisionalSeedTurnID,
+            let liveTurnID
+        else {
+            return false
+        }
+        guard provisionalTurnID != liveTurnID,
+            turnsByID[provisionalTurnID] != nil
+        else {
+            provisionalSeedTurnID = nil
+            return false
+        }
+
+        let removedItems = removeProvisionalSeedTurn(provisionalTurnID)
+        changes.append(contentsOf: removedItems.map { item in
+            .itemRemoved(id: item.itemID, turnID: item.turnID)
+        })
         changes.append(.turnUpdated(id: provisionalTurnID))
         return true
     }
@@ -1904,3 +2083,38 @@ public final class CodexChat: CodexPersistentModel {
     }
 
 }
+
+@available(
+    *,
+    unavailable,
+    message: "Codex persistent models are not Sendable. Use the model ID to cross concurrency contexts."
+)
+extension CodexWorkspaceGroup: Sendable {}
+
+@available(
+    *,
+    unavailable,
+    message: "Codex persistent models are not Sendable. Use the model ID to cross concurrency contexts."
+)
+extension CodexWorkspace: Sendable {}
+
+@available(
+    *,
+    unavailable,
+    message: "Codex persistent models are not Sendable. Use the model ID to cross concurrency contexts."
+)
+extension CodexTurn: Sendable {}
+
+@available(
+    *,
+    unavailable,
+    message: "Codex persistent models are not Sendable. Use the model ID to cross concurrency contexts."
+)
+extension CodexItem: Sendable {}
+
+@available(
+    *,
+    unavailable,
+    message: "Codex persistent models are not Sendable. Use the model ID to cross concurrency contexts."
+)
+extension CodexChat: Sendable {}

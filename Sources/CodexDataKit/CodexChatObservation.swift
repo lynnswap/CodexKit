@@ -1,19 +1,18 @@
 import Foundation
 
-public typealias CodexChatUpdates = any AsyncSequence<CodexChatUpdate, Never> & Sendable
+public typealias CodexChatUpdates = any AsyncSequence<CodexChatUpdate, Never>
 
-@MainActor
 public final class CodexChatObservation {
     public let chat: CodexChat
     public let updates: CodexChatUpdates
 
-    private let cancellation: @MainActor () -> Void
+    private let cancellation: () -> Void
     public private(set) var isCancelled = false
 
     package init(
         chat: CodexChat,
         updates: CodexChatUpdates,
-        cancellation: @escaping @MainActor () -> Void
+        cancellation: @escaping () -> Void
     ) {
         self.chat = chat
         self.updates = updates
@@ -28,7 +27,7 @@ public final class CodexChatObservation {
         cancellation()
     }
 
-    isolated deinit {
+    deinit {
         cancel()
     }
 }

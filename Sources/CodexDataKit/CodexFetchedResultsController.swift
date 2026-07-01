@@ -417,7 +417,6 @@ extension CodexFetchedResultsIndexPath: Comparable {
     }
 }
 
-@MainActor
 public final class CodexFetchedResultsController<Model: CodexPersistentModel> {
     public let fetchedResults: CodexFetchedResults<Model>
 
@@ -469,15 +468,15 @@ public final class CodexFetchedResultsController<Model: CodexPersistentModel> {
         self.fetchedResults = fetchedResults
     }
 
-    public func performFetch() async throws {
+    public nonisolated(nonsending) func performFetch() async throws {
         try await fetchedResults.performFetch()
     }
 
-    public func refresh() async throws {
+    public nonisolated(nonsending) func refresh() async throws {
         try await fetchedResults.refresh()
     }
 
-    public func loadNextPage() async throws {
+    public nonisolated(nonsending) func loadNextPage() async throws {
         try await fetchedResults.loadNextPage()
     }
 }

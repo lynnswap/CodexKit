@@ -37,6 +37,7 @@ let package = Package(
             ],
             swiftSettings: [
                 .enableUpcomingFeature("ApproachableConcurrency"),
+                .enableUpcomingFeature("NonisolatedNonsendingByDefault"),
             ],
         ),
         .target(
@@ -64,6 +65,7 @@ let package = Package(
             exclude: ["README.md"],
             swiftSettings: [
                 .swiftLanguageMode(.v6),
+                .enableUpcomingFeature("NonisolatedNonsendingByDefault"),
             ],
         ),
         .testTarget(
@@ -91,6 +93,7 @@ let package = Package(
             ],
             swiftSettings: [
                 .swiftLanguageMode(.v6),
+                .enableUpcomingFeature("NonisolatedNonsendingByDefault"),
             ],
         ),
     ]

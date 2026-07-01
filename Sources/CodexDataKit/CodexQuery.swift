@@ -1,14 +1,7 @@
 import SwiftUI
 
-private struct CodexModelContextEnvironmentKey: EnvironmentKey {
-    static let defaultValue: CodexModelContext? = nil
-}
-
 extension EnvironmentValues {
-    public var codexModelContext: CodexModelContext? {
-        get { self[CodexModelContextEnvironmentKey.self] }
-        set { self[CodexModelContextEnvironmentKey.self] = newValue }
-    }
+    @Entry public var codexModelContext: CodexModelContext? = nil
 }
 
 extension View {
