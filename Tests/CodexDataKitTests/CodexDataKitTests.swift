@@ -4450,6 +4450,67 @@ struct CodexModelContextTests {
         #expect(readParams.includeTurns == false)
     }
 
+    @Test("chat refresh follows all turn-list pages before applying authoritative turns")
+    func chatRefreshFollowsAllTurnListPagesBeforeApplyingAuthoritativeTurns() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-turns-pages"))
+        try await runtime.transport.enqueueThreadTurns(.init(
+            turns: [
+                .init(
+                    id: "turn-page-1",
+                    status: .completed,
+                    items: [
+                        .init(
+                            id: "message-page-1",
+                            kind: .agentMessage,
+                            content: .message(.init(
+                                id: "message-page-1",
+                                role: .assistant,
+                                text: "First page"
+                            ))
+                        ),
+                    ]
+                ),
+            ],
+            nextCursor: "page-2"
+        ))
+        try await runtime.transport.enqueueThreadTurns(.init(turns: [
+            .init(
+                id: "turn-page-2",
+                status: .completed,
+                items: [
+                    .init(
+                        id: "message-page-2",
+                        kind: .agentMessage,
+                        content: .message(.init(
+                            id: "message-page-2",
+                            role: .assistant,
+                            text: "Second page"
+                        ))
+                    ),
+                ]
+            ),
+        ]))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-turns-pages",
+            name: "Turns pages"
+        ))
+
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-turns-pages"))
+        try await context.refresh(chat)
+
+        #expect(chat.items.map(\.text) == ["First page", "Second page"])
+        #expect(chat.turns.map(\.id.rawValue) == ["turn-page-1", "turn-page-2"])
+        let requests = await runtime.transport.recordedRequests(method: "thread/turns/list")
+        #expect(requests.count == 2)
+        let firstParams = try #require(requests.first).decodeParams(ThreadTurnsListParams.self)
+        let secondParams = try #require(requests.dropFirst().first).decodeParams(ThreadTurnsListParams.self)
+        #expect(firstParams.cursor == nil)
+        #expect(secondParams.cursor == "page-2")
+    }
+
     @Test("chat turn helpers scope items and preserve identity")
     func chatTurnHelpersScopeItemsAndPreserveIdentity() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -8028,6 +8089,16 @@ private struct ThreadReadParams: Decodable, Sendable {
     enum CodingKeys: String, CodingKey {
         case threadID = "threadId"
         case includeTurns
+    }
+}
+
+private struct ThreadTurnsListParams: Decodable, Sendable {
+    var threadID: String
+    var cursor: String?
+
+    enum CodingKeys: String, CodingKey {
+        case threadID = "threadId"
+        case cursor
     }
 }
 

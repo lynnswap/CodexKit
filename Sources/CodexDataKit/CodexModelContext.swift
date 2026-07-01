@@ -688,13 +688,10 @@ public final class CodexModelContext {
         }
 
         do {
-            let turnPage = try await thread.listTurns(.init(
-                sortDirection: .ascending,
-                itemsLoadState: .full
-            ))
+            let turns = try await fullTurnList(for: thread)
             return try await threadSnapshot(
                 for: thread,
-                withAuthoritativeTurns: turnPage.turns
+                withAuthoritativeTurns: turns
             )
         } catch {
             return .init(
@@ -702,6 +699,21 @@ public final class CodexModelContext {
                 metadataReadCompleted: true
             )
         }
+    }
+
+    private func fullTurnList(for thread: CodexThread) async throws -> [CodexTurnSnapshot] {
+        var cursor: String?
+        var turns: [CodexTurnSnapshot] = []
+        repeat {
+            let page = try await thread.listTurns(.init(
+                cursor: cursor,
+                sortDirection: .ascending,
+                itemsLoadState: .full
+            ))
+            turns.append(contentsOf: page.turns)
+            cursor = page.nextCursor
+        } while cursor != nil
+        return turns
     }
 
     private func threadSnapshot(
