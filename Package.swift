@@ -25,6 +25,9 @@ let package = Package(
             targets: ["CodexDataKit"]
         ),
     ],
+    dependencies: [
+        .package(url: "https://github.com/apple/swift-async-algorithms", from: "1.1.0"),
+    ],
     targets: [
         .target(
             name: "CodexKit",
@@ -56,6 +59,7 @@ let package = Package(
             name: "CodexDataKit",
             dependencies: [
                 "CodexAppServerKit",
+                .product(name: "AsyncAlgorithms", package: "swift-async-algorithms"),
             ],
             exclude: ["README.md"],
             swiftSettings: [

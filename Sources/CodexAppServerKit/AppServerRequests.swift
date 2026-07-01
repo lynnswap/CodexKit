@@ -772,6 +772,7 @@ extension AppServerAPI.Turn {
         package var startedAt: Int?
         package var completedAt: Int?
         package var durationMS: Int?
+        package var itemsLoadState: CodexTurnItemsLoadState?
         package var items: [AppServerJSONValue]?
 
         enum CodingKeys: String, CodingKey {
@@ -781,6 +782,7 @@ extension AppServerAPI.Turn {
             case startedAt
             case completedAt
             case durationMS = "durationMs"
+            case itemsLoadState = "itemsView"
             case items
         }
 
@@ -791,6 +793,7 @@ extension AppServerAPI.Turn {
             startedAt: Int? = nil,
             completedAt: Int? = nil,
             durationMS: Int? = nil,
+            itemsLoadState: CodexTurnItemsLoadState? = nil,
             items: [AppServerJSONValue]? = nil
         ) {
             self.id = id
@@ -799,6 +802,7 @@ extension AppServerAPI.Turn {
             self.startedAt = startedAt
             self.completedAt = completedAt
             self.durationMS = durationMS
+            self.itemsLoadState = itemsLoadState
             self.items = items
         }
     }
@@ -932,14 +936,14 @@ extension AppServerAPI.Thread.Turns.List {
         package var cursor: String?
         package var limit: Int?
         package var sortDirection: CodexSortDirection?
-        package var itemsView: CodexTurnItemsView?
+        package var itemsLoadState: CodexTurnItemsLoadState?
 
         enum CodingKeys: String, CodingKey {
             case threadID = "threadId"
             case cursor
             case limit
             case sortDirection
-            case itemsView
+            case itemsLoadState = "itemsView"
         }
 
         package init(
@@ -947,13 +951,13 @@ extension AppServerAPI.Thread.Turns.List {
             cursor: String? = nil,
             limit: Int? = nil,
             sortDirection: CodexSortDirection? = nil,
-            itemsView: CodexTurnItemsView? = nil
+            itemsLoadState: CodexTurnItemsLoadState? = nil
         ) {
             self.threadID = threadID
             self.cursor = cursor
             self.limit = limit
             self.sortDirection = sortDirection
-            self.itemsView = itemsView
+            self.itemsLoadState = itemsLoadState
         }
     }
 

@@ -1016,6 +1016,7 @@ public actor CodexAppServer {
                 id: .init(rawValue: $0.id),
                 status: $0.status.map(CodexTurnStatus.init(rawValue:)),
                 errorMessage: $0.error?.message,
+                itemsLoadState: $0.itemsLoadState ?? ($0.items == nil ? .notLoaded : .full),
                 items: AppServerThreadItemMapping.threadItems(from: $0.items)
             )
         }

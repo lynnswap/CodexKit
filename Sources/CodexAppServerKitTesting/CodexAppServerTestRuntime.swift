@@ -707,6 +707,7 @@ public actor CodexAppServerTestTransport {
             id: snapshot.id.rawValue,
             status: snapshot.status?.rawValue,
             error: snapshot.errorMessage.map { .init(message: $0) },
+            itemsLoadState: snapshot.itemsLoadState,
             items: snapshot.items.map(Self.apiItem(from:))
         )
     }

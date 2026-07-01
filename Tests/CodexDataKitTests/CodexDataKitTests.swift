@@ -2,6 +2,7 @@ import CodexAppServerKit
 import CodexAppServerKitTesting
 import CodexDataKit
 import Foundation
+import Synchronization
 import Testing
 
 @MainActor
@@ -92,8 +93,11 @@ struct CodexModelContextTests {
         #expect(workspace.modelContext == nil)
         #expect(group.modelContext == nil)
 
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
         do {
-            try await workspace.refresh()
+            try await context.refresh(workspace)
             Issue.record("Expected detached workspace refresh to throw")
         } catch let error as CodexModelContextError {
             #expect(error == .modelIsDetached)
@@ -102,7 +106,7 @@ struct CodexModelContextTests {
         }
 
         do {
-            try await group.refresh()
+            try await context.refresh(group)
             Issue.record("Expected detached group refresh to throw")
         } catch let error as CodexModelContextError {
             #expect(error == .modelIsDetached)
@@ -214,7 +218,7 @@ struct CodexModelContextTests {
         #expect(chat.modelProvider == "gpt-test")
         #expect(chat.workspace?.url == workspace)
 
-        try await chat.refresh(includeTurns: false)
+        try await context.refresh(chat, includeTurns: false)
         #expect(chat.title == "Seeded review")
         #expect(await runtime.transport.recordedRequests(method: "thread/list").count == 1)
         #expect(await runtime.transport.recordedRequests(method: "thread/resume").count == 1)
@@ -684,7 +688,7 @@ struct CodexModelContextTests {
             workspace: secondWorkspaceURL,
             name: "Move"
         ))
-        try await chat.refresh(includeTurns: false)
+        try await context.refresh(chat, includeTurns: false)
 
         let transaction = try #require(await transactions.next())
         let secondGroupID = try #require(chat.workspace?.workspaceGroup?.id)
@@ -739,7 +743,7 @@ struct CodexModelContextTests {
             workspace: secondWorkspaceURL,
             name: "Beta Updated"
         ))
-        try await beta.refresh(includeTurns: false)
+        try await context.refresh(beta, includeTurns: false)
 
         #expect(await recorder.count(after: .milliseconds(20)) == 1)
         #expect(controller.items.map(\.id) == [alpha.id])
@@ -767,7 +771,7 @@ struct CodexModelContextTests {
             id: "thread-alpha",
             name: "Zulu"
         ))
-        try await alpha.refresh(includeTurns: false)
+        try await context.refresh(alpha, includeTurns: false)
 
         let transaction = try #require(await transactions.next())
         #expect(transaction.reason == .revalidate)
@@ -1324,7 +1328,7 @@ struct CodexModelContextTests {
             workspace: newWorkspaceURL,
             name: "Move"
         ))
-        try await chat.refresh(includeTurns: false)
+        try await context.refresh(chat, includeTurns: false)
 
         #expect(oldWorkspace.chats.isEmpty)
         #expect(chat.workspace?.url == newWorkspaceURL)
@@ -1360,7 +1364,7 @@ struct CodexModelContextTests {
             workspace: newWorkspaceURL,
             name: "Move"
         ))
-        try await chat.refresh(includeTurns: false)
+        try await context.refresh(chat, includeTurns: false)
 
         #expect(oldWorkspaceResults.items.isEmpty)
         #expect(allResults.items.first === chat)
@@ -1502,7 +1506,7 @@ struct CodexModelContextTests {
             workspace: workspaceURL,
             name: "Archived"
         ))
-        try await chat.refresh(includeTurns: false)
+        try await context.refresh(chat, includeTurns: false)
 
         #expect(archivedResults.items.first === chat)
         #expect(activeResults.items.isEmpty)
@@ -1560,7 +1564,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadList(.init(threads: [
             .init(id: "thread-source", workspace: workspaceURL, name: "Source")
         ]))
-        try await chat.refresh(includeTurns: false)
+        try await context.refresh(chat, includeTurns: false)
 
         #expect(results.items.first === chat)
     }
@@ -1594,7 +1598,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadList(.init(threads: [
             .init(id: "thread-source", workspace: newWorkspaceURL, name: "Source")
         ]))
-        try await chat.refresh(includeTurns: false)
+        try await context.refresh(chat, includeTurns: false)
 
         #expect(results.items.first === chat)
         #expect(
@@ -1693,7 +1697,7 @@ struct CodexModelContextTests {
             .init(id: "thread-beta", name: "Beta"),
             .init(id: "thread-alpha", name: "Alpha"),
         ]))
-        try await alpha.refresh(includeTurns: false)
+        try await context.refresh(alpha, includeTurns: false)
 
         #expect(results.items.map(\.id.rawValue) == ["thread-beta", "thread-alpha"])
         #expect(await runtime.transport.recordedRequests(method: "thread/list").count == 2)
@@ -1939,7 +1943,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadList(.init(threads: [
             .init(id: "thread-regroup", workspace: workspaceURL, name: "Regroup")
         ]))
-        try await previousGroup.refresh()
+        try await context.refresh(previousGroup)
 
         let currentGroup = try #require(workspace.workspaceGroup)
         #expect(currentGroup !== previousGroup)
@@ -1974,7 +1978,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadList(.init(threads: [
             .init(id: "thread-keep", workspace: workspaceURL, name: "Keep")
         ]))
-        try await previousGroup.refresh()
+        try await context.refresh(previousGroup)
 
         let currentGroup = try #require(workspace.workspaceGroup)
         #expect(currentGroup !== previousGroup)
@@ -2042,7 +2046,7 @@ struct CodexModelContextTests {
             .init(id: "thread-backfill", workspace: backfill, name: "Backfill"),
             .init(id: "thread-move", workspace: tools, name: "Move"),
         ]))
-        try await chat.refresh(includeTurns: false)
+        try await context.refresh(chat, includeTurns: false)
 
         #expect(results.items.map(\.url) == [backfill])
     }
@@ -2079,7 +2083,7 @@ struct CodexModelContextTests {
             .init(id: "thread-move", workspace: incoming, name: "Move"),
             .init(id: "thread-visible", workspace: visible, name: "Visible"),
         ]))
-        try await chat.refresh(includeTurns: false)
+        try await context.refresh(chat, includeTurns: false)
 
         #expect(results.items.map(\.url) == [incoming])
         #expect(await runtime.transport.recordedRequests(method: "thread/list").count == 2)
@@ -2119,7 +2123,7 @@ struct CodexModelContextTests {
             .init(id: "thread-move", workspace: incoming, name: "Move"),
             .init(id: "thread-visible", workspace: visible, name: "Visible"),
         ]))
-        try await chat.refresh(includeTurns: false)
+        try await context.refresh(chat, includeTurns: false)
 
         #expect(results.items.map(\.name) == ["AIncoming"])
         #expect(await runtime.transport.recordedRequests(method: "thread/list").count == 2)
@@ -2324,7 +2328,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadList(.init(threads: [
             .init(id: "thread-app", workspace: app, name: "App")
         ]))
-        try await group.refresh()
+        try await context.refresh(group)
 
         #expect(group.workspaces.map(\.url) == [app])
     }
@@ -2348,7 +2352,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadList(.init(threads: [
             .init(id: "thread-app", workspace: app, name: "App")
         ]))
-        try await group.refresh()
+        try await context.refresh(group)
 
         #expect(chatResults.items.map(\.id.rawValue) == ["thread-app"])
         #expect(group.workspaces.map(\.url) == [app])
@@ -2374,7 +2378,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadList(.init(threads: [
             .init(id: "thread-move", workspace: tools, name: "Move")
         ]))
-        try await group.refresh()
+        try await context.refresh(group)
 
         #expect(chat.workspace?.url == tools)
         #expect(chatResults.items.first === chat)
@@ -2402,7 +2406,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadList(.init(threads: [
             .init(id: "thread-app", workspace: app, name: "App")
         ]))
-        try await appGroup.refresh()
+        try await context.refresh(appGroup)
 
         #expect(toolsWorkspace.chats.first === toolsChat)
         #expect(toolsChat.workspace === toolsWorkspace)
@@ -2429,7 +2433,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadList(.init(threads: [
             .init(id: "thread-active", workspace: app, name: "Active")
         ]))
-        try await group.refresh()
+        try await context.refresh(group)
 
         #expect(Set(group.workspaces.map(\.url)) == Set([app, archived]))
     }
@@ -2516,7 +2520,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadList(.init(threads: [
             .init(id: "thread-remaining", workspace: workspaceURL, name: "Remaining")
         ]))
-        try await workspace.refresh()
+        try await context.refresh(workspace)
 
         #expect(scopedResults.items.map(\.id.rawValue) == ["thread-remaining"])
         #expect(workspace.chats.map(\.id.rawValue) == ["thread-remaining"])
@@ -2547,7 +2551,7 @@ struct CodexModelContextTests {
             .init(id: "thread-existing", workspace: workspaceURL, name: "Existing"),
             .init(id: "thread-new", workspace: workspaceURL, name: "New"),
         ]))
-        try await workspace.refresh()
+        try await context.refresh(workspace)
 
         #expect(Set(scopedResults.items.map(\.id.rawValue)) == ["thread-existing", "thread-new"])
         #expect(Set(workspace.chats.map(\.id.rawValue)) == ["thread-existing", "thread-new"])
@@ -2579,7 +2583,7 @@ struct CodexModelContextTests {
             """,
             for: "thread/list"
         )
-        try await workspace.refresh()
+        try await context.refresh(workspace)
 
         let chat = try #require(workspace.chats.first)
         #expect(chat.workspace === workspace)
@@ -2604,7 +2608,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadList(.init(threads: [
             .init(id: "thread-remaining", workspace: workspaceURL, name: "Remaining")
         ]))
-        try await workspace.refresh()
+        try await context.refresh(workspace)
 
         #expect(results.items.map(\.id.rawValue) == ["thread-remaining"])
         #expect(workspace.chats.map(\.id.rawValue) == ["thread-remaining"])
@@ -2629,7 +2633,7 @@ struct CodexModelContextTests {
             .init(id: "thread-app", workspace: app, name: "App"),
             .init(id: "thread-tools", workspace: tools, name: "Tools"),
         ]))
-        try await group.refresh()
+        try await context.refresh(group)
 
         #expect(Set(workspaceResults.items.map(\.url)) == Set([app, tools]))
         #expect(Set(group.workspaces.map(\.url)) == Set([app, tools]))
@@ -2653,7 +2657,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadList(.init(threads: [
             .init(id: "thread-active", workspace: workspaceURL, name: "Active")
         ]))
-        try await workspace.refresh()
+        try await context.refresh(workspace)
 
         #expect(Set(workspace.chats.map(\.id.rawValue)) == [
             "thread-archived",
@@ -2680,7 +2684,7 @@ struct CodexModelContextTests {
             .init(id: "thread-match", workspace: workspaceURL, name: "Renamed")
         ]))
         try await runtime.transport.enqueueThreadList(.init(threads: []))
-        try await workspace.refresh()
+        try await context.refresh(workspace)
 
         #expect(results.items.isEmpty)
         #expect(workspace.chats.map(\.title) == ["Renamed"])
@@ -2708,7 +2712,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadList(.init(threads: [
             .init(id: "thread-search", workspace: workspaceURL, name: "Untitled")
         ]))
-        try await workspace.refresh()
+        try await context.refresh(workspace)
 
         #expect(results.items.first === chat)
         #expect(workspace.chats.first === chat)
@@ -2732,7 +2736,7 @@ struct CodexModelContextTests {
 
         try await runtime.transport.enqueueThreadList(.init(threads: []))
         await runtime.transport.enqueueFailure(code: -32000, message: "offline", for: "thread/list")
-        try await workspace.refresh()
+        try await context.refresh(workspace)
 
         #expect(results.items.isEmpty)
         #expect(workspace.chats.isEmpty)
@@ -2755,7 +2759,7 @@ struct CodexModelContextTests {
         let workspace = try #require(group.workspaces.first)
 
         try await runtime.transport.enqueueThreadList(.init(threads: []))
-        try await workspace.refresh()
+        try await context.refresh(workspace)
 
         #expect(workspace.chats.isEmpty)
         #expect(group.workspaces.isEmpty)
@@ -2785,7 +2789,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadList(.init(threads: [
             .init(id: "thread-backfill", workspace: backfillURL, name: "Backfill")
         ]))
-        try await workspace.refresh()
+        try await context.refresh(workspace)
 
         #expect(results.items.map(\.id.rawValue) == ["thread-backfill"])
     }
@@ -2814,7 +2818,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadList(.init(threads: [
             .init(id: "thread-backfill", workspace: backfillURL, name: "Backfill")
         ]))
-        try await group.refresh()
+        try await context.refresh(group)
 
         #expect(results.items.map(\.id.rawValue) == ["thread-backfill"])
     }
@@ -2849,7 +2853,7 @@ struct CodexModelContextTests {
             name: "Renamed"
         ))
         try await runtime.transport.enqueueThreadList(.init(threads: []))
-        try await chat.refresh(includeTurns: false)
+        try await context.refresh(chat, includeTurns: false)
 
         #expect(filteredResults.items.isEmpty)
     }
@@ -3271,7 +3275,7 @@ struct CodexModelContextTests {
             .init(id: "thread-a", workspace: workspaceURL, name: "A"),
             .init(id: "thread-c", workspace: workspaceURL, name: "C"),
         ]))
-        try await movingChat.refresh(includeTurns: false)
+        try await context.refresh(movingChat, includeTurns: false)
 
         #expect(offsetPage.items.map(\.title) == ["A", "C"])
         #expect(offsetPage.nextCursor == nil)
@@ -3422,7 +3426,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadList(.init(threads: [
             .init(id: "thread-any-provider", name: "After")
         ]))
-        try await chat.refresh(includeTurns: false)
+        try await context.refresh(chat, includeTurns: false)
 
         #expect(results.items.first === chat)
         #expect(chat.title == "After")
@@ -3566,7 +3570,7 @@ struct CodexModelContextTests {
             workspace: workspaceURL,
             name: "Gamma"
         ))
-        try await beta.refresh(includeTurns: false)
+        try await context.refresh(beta, includeTurns: false)
 
         #expect(results.items.map(\.title) == ["Alpha", "Gamma"])
     }
@@ -3854,7 +3858,7 @@ struct CodexModelContextTests {
                 turns: []
             ))
 
-        try await chat.refresh(includeTurns: false)
+        try await context.refresh(chat, includeTurns: false)
 
         #expect(chat.title == "After")
         #expect(chat.workspace?.url == workspaceURL)
@@ -3883,7 +3887,7 @@ struct CodexModelContextTests {
         ))
 
         let chat = context.model(for: CodexThreadID(rawValue: "thread-metadata-phase"))
-        try await chat.refresh()
+        try await context.refresh(chat)
         #expect(chat.phase == .loading)
 
         try await runtime.transport.enqueueThreadResume(.init(id: "thread-metadata-phase"))
@@ -3892,7 +3896,7 @@ struct CodexModelContextTests {
             status: .idle
         ))
 
-        try await chat.refresh(includeTurns: false)
+        try await context.refresh(chat, includeTurns: false)
 
         #expect(chat.turn(id: "turn-stale")?.status == .running)
         #expect(chat.phase == .loaded)
@@ -3921,7 +3925,7 @@ struct CodexModelContextTests {
             .init(id: "thread-beta", name: "Aardvark"),
             .init(id: "thread-alpha", name: "Alpha"),
         ]))
-        try await beta.refresh(includeTurns: false)
+        try await context.refresh(beta, includeTurns: false)
 
         #expect(results.items.map(\.title) == ["Aardvark", "Alpha"])
     }
@@ -3950,7 +3954,7 @@ struct CodexModelContextTests {
             name: "Move"
         ))
         try await runtime.transport.enqueueThreadList(.init(threads: []))
-        try await chat.refresh(includeTurns: false)
+        try await context.refresh(chat, includeTurns: false)
 
         #expect(results.items.isEmpty)
     }
@@ -3974,7 +3978,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadList(.init(threads: [
             .init(id: "thread-search", name: "Untitled")
         ]))
-        try await chat.refresh(includeTurns: false)
+        try await context.refresh(chat, includeTurns: false)
 
         #expect(results.items.first === chat)
         #expect(await runtime.transport.recordedRequests(method: "thread/list").count == 2)
@@ -4040,7 +4044,7 @@ struct CodexModelContextTests {
             .init(id: "thread-alpha", name: "Zulu"),
             .init(id: "thread-beta", name: "Beta"),
         ]))
-        try await alpha.refresh(includeTurns: false)
+        try await context.refresh(alpha, includeTurns: false)
 
         #expect(results.items.map(\.id.rawValue) == ["thread-beta"])
     }
@@ -4187,7 +4191,7 @@ struct CodexModelContextTests {
             name: "After",
             turns: []
         ))
-        try await chat.refresh()
+        try await context.refresh(chat)
 
         #expect(chat.turns.isEmpty)
         #expect(chat.items.isEmpty)
@@ -4240,7 +4244,7 @@ struct CodexModelContextTests {
             """,
             for: "thread/read"
         )
-        try await chat.refresh()
+        try await context.refresh(chat)
 
         #expect(chat.title == "After")
         #expect(chat.turns.isEmpty)
@@ -4276,7 +4280,7 @@ struct CodexModelContextTests {
         ))
 
         let chat = context.model(for: CodexThreadID(rawValue: "thread-history"))
-        try await chat.refresh()
+        try await context.refresh(chat)
 
         let item = try #require(chat.items.first)
         #expect(chat.items.count == 1)
@@ -4315,7 +4319,7 @@ struct CodexModelContextTests {
         ))
 
         let chat = context.model(for: CodexThreadID(rawValue: "thread-turns-list"))
-        try await chat.refresh()
+        try await context.refresh(chat)
 
         #expect(chat.title == "Turns list")
         #expect(chat.items.map(\.text) == ["Active turn snapshot"])
@@ -4378,29 +4382,26 @@ struct CodexModelContextTests {
         ))
 
         let chat = context.model(for: CodexThreadID(rawValue: "thread-snapshot"))
-        try await chat.refresh()
+        try await context.refresh(chat)
 
         let alphaTurn = try #require(chat.turn(id: "turn-alpha"))
         let alphaItem = try #require(chat.items.first { $0.id == "message-alpha-user" })
         let alphaItems = chat.items(in: "turn-alpha")
         let betaItems = chat.items(in: "turn-beta")
-        let snapshot = try #require(chat.turnSnapshot(for: "turn-alpha"))
+        let alphaThreadItems = threadItems(from: alphaItems)
 
         #expect(alphaItems.map(\.id) == ["message-alpha-user", "message-alpha-agent"])
         #expect(betaItems.map(\.id) == ["message-beta"])
         #expect(alphaItems.first === alphaItem)
-        #expect(snapshot.turn === alphaTurn)
-        #expect(snapshot.items.first === alphaItem)
-        #expect(snapshot.items.map(\.id) == alphaItems.map(\.id))
-        #expect(snapshot.threadItems.map(\.id) == ["message-alpha-user", "message-alpha-agent"])
-        #expect(snapshot.transcript.finalAnswer == "Alpha answer")
-        #expect(snapshot.status == CodexTurnStatus.completed)
-        #expect(snapshot.errorDescription == nil)
-        #expect(snapshot.usage == nil)
+        #expect(alphaTurn.status == CodexTurnStatus.completed)
+        #expect(alphaTurn.errorDescription == nil)
+        #expect(alphaTurn.usage == nil)
+        #expect(alphaThreadItems.map(\.id) == ["message-alpha-user", "message-alpha-agent"])
+        #expect(CodexTranscript(items: alphaThreadItems).finalAnswer == "Alpha answer")
     }
 
-    @Test("chat turn snapshots expose metadata and missing turn results")
-    func chatTurnSnapshotsExposeMetadataAndMissingTurnResults() async throws {
+    @Test("chat turn helpers expose metadata and missing turn results")
+    func chatTurnHelpersExposeMetadataAndMissingTurnResults() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         let context = CodexModelContainer(appServer: runtime.server).mainContext
 
@@ -4449,13 +4450,12 @@ struct CodexModelContextTests {
             observation.cancel()
         }
 
-        let failedSnapshot = try #require(chat.turnSnapshot(for: "turn-failed"))
-        #expect(failedSnapshot.status == CodexTurnStatus.failed)
-        #expect(failedSnapshot.errorDescription == "Tool failed")
-        #expect(failedSnapshot.usage == nil)
+        let failedTurn = try #require(chat.turn(id: "turn-failed"))
+        #expect(failedTurn.status == CodexTurnStatus.failed)
+        #expect(failedTurn.errorDescription == "Tool failed")
+        #expect(failedTurn.usage == nil)
         #expect(chat.turn(id: "turn-missing") == nil)
         #expect(chat.items(in: "turn-missing").isEmpty)
-        #expect(chat.turnSnapshot(for: "turn-missing") == nil)
 
         try await runtime.transport.emitServerNotification(
             method: "thread/tokenUsage/updated",
@@ -4470,14 +4470,12 @@ struct CodexModelContextTests {
         )
 
         #expect(await eventually {
-            chat.turnSnapshot(for: "turn-completed")?.usage?.totalTokens == 34
+            chat.turn(id: "turn-completed")?.usage?.totalTokens == 34
         })
         let completedTurn = try #require(chat.turn(id: "turn-completed"))
-        let completedSnapshot = try #require(chat.turnSnapshot(for: "turn-completed"))
-        #expect(completedSnapshot.turn === completedTurn)
-        #expect(completedSnapshot.usage?.inputTokens == 13)
-        #expect(completedSnapshot.usage?.outputTokens == 21)
-        #expect(completedSnapshot.usage?.modelContextWindow == 128_000)
+        #expect(completedTurn.usage?.inputTokens == 13)
+        #expect(completedTurn.usage?.outputTokens == 21)
+        #expect(completedTurn.usage?.modelContextWindow == 128_000)
     }
 
     @Test("chat send merges response transcript into observable items")
@@ -4537,8 +4535,7 @@ struct CodexModelContextTests {
         defer {
             observation.cancel()
         }
-        let changes = ChatChangeRecorder(stream: observation.changes)
-        _ = await changes.next()
+        let changes = ChatUpdateRecorder(stream: observation.updates)
         #expect(chat.phase == .loading)
 
         try await runtime.transport.enqueueThreadResume(.init(id: "thread-send-phase"))
@@ -4558,6 +4555,143 @@ struct CodexModelContextTests {
         let phaseChange = await changes.phaseChanged(.loaded)
         #expect(phaseChange != nil)
         #expect(chat.phase == .loaded)
+    }
+
+    @Test("thread event lifecycle updates observable chat status")
+    func threadEventLifecycleUpdatesObservableChatStatus() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-status-lifecycle"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-status-lifecycle",
+            status: .idle,
+            turns: []
+        ))
+
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-status-lifecycle"))
+        let observation = try await chat.observe()
+        defer {
+            observation.cancel()
+        }
+        let changes = ChatUpdateRecorder(stream: observation.updates)
+
+        #expect(chat.status == .idle)
+        #expect(chat.phase == .loaded)
+
+        try await runtime.transport.emitServerNotification(
+            method: "turn/started",
+            params: TurnStartedParams(
+                threadID: "thread-status-lifecycle",
+                turnID: "turn-status-lifecycle"
+            )
+        )
+
+        #expect(await changes.statusChanged(.active(activeFlags: [])) != nil)
+        #expect(chat.status == .active(activeFlags: []))
+        #expect(chat.phase == .loading)
+
+        try await runtime.transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(id: "turn-status-lifecycle", status: "completed"))
+        )
+
+        #expect(await changes.statusChanged(.idle) != nil)
+        #expect(chat.status == .idle)
+        #expect(chat.phase == .loaded)
+    }
+
+    @Test("item lifecycle updates observable command status")
+    func itemLifecycleUpdatesObservableCommandStatus() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-command-lifecycle"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-command-lifecycle",
+            status: .idle,
+            turns: []
+        ))
+
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-command-lifecycle"))
+        let observation = try await chat.observe()
+        defer {
+            observation.cancel()
+        }
+        let changes = ChatUpdateRecorder(stream: observation.updates)
+
+        try await runtime.transport.emitServerNotification(
+            method: "turn/started",
+            params: TurnStartedParams(
+                threadID: "thread-command-lifecycle",
+                turnID: "turn-command-lifecycle"
+            )
+        )
+        try await runtime.transport.emitServerNotification(
+            method: "item/started",
+            params: ThreadItemParams(
+                threadID: "thread-command-lifecycle",
+                turnID: "turn-command-lifecycle",
+                startedAtMs: 1_782_900_000_000,
+                item: .init(
+                    id: "command-1",
+                    type: "commandExecution",
+                    command: "/bin/zsh -lc"
+                )
+            )
+        )
+
+        #expect(await changes.itemInserted(id: "command-1") != nil)
+        let commandItem = try #require(chat.items.first { $0.id == "command-1" })
+        guard case .command(let startedCommand) = commandItem.content else {
+            Issue.record("Expected command item")
+            return
+        }
+        #expect(startedCommand.status == .running)
+        #expect(startedCommand.startedAt != nil)
+
+        try await runtime.transport.emitServerNotification(
+            method: "item/updated",
+            params: ThreadItemParams(
+                threadID: "thread-command-lifecycle",
+                turnID: "turn-command-lifecycle",
+                item: .init(
+                    id: "command-1",
+                    type: "commandExecution",
+                    command: "/bin/zsh -lc",
+                    output: "done"
+                )
+            )
+        )
+        #expect(await changes.itemUpdated(id: "command-1") != nil)
+        guard case .command(let updatedCommand) = commandItem.content else {
+            Issue.record("Expected command item")
+            return
+        }
+        #expect(updatedCommand.status == .running)
+
+        try await runtime.transport.emitServerNotification(
+            method: "item/completed",
+            params: ThreadItemParams(
+                threadID: "thread-command-lifecycle",
+                turnID: "turn-command-lifecycle",
+                completedAtMs: 1_782_900_001_000,
+                item: .init(
+                    id: "command-1",
+                    type: "commandExecution",
+                    command: "/bin/zsh -lc",
+                    output: "done",
+                    exitCode: 0
+                )
+            )
+        )
+        #expect(await changes.itemUpdated(id: "command-1") != nil)
+        guard case .command(let completedCommand) = commandItem.content else {
+            Issue.record("Expected command item")
+            return
+        }
+        #expect(completedCommand.status == .completed)
+        #expect(completedCommand.completedAt != nil)
     }
 
     @Test("chat send with revert policy refreshes observed transcript after failure")
@@ -4771,8 +4905,8 @@ struct CodexModelContextTests {
         #expect(await runtime.transport.recordedRequests(method: "thread/resume").count == 2)
     }
 
-    @Test("chat observation upgrades shared leases to include turn snapshots")
-    func chatObservationUpgradesSharedLeaseToIncludeTurnSnapshots() async throws {
+    @Test("chat observation upgrades shared leases to include turn items")
+    func chatObservationUpgradesSharedLeaseToIncludeTurnItems() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         let context = CodexModelContainer(appServer: runtime.server).mainContext
 
@@ -4785,7 +4919,7 @@ struct CodexModelContextTests {
             metadataObservation.cancel()
         }
 
-        #expect(chat.turnSnapshot(for: "turn-history") == nil)
+        #expect(chat.turn(id: "turn-history") == nil)
 
         try await runtime.transport.enqueueThreadRead(.init(
             id: "thread-upgrade",
@@ -4814,8 +4948,9 @@ struct CodexModelContextTests {
             turnObservation.cancel()
         }
 
-        let turnSnapshot = try #require(chat.turnSnapshot(for: "turn-history"))
-        #expect(turnSnapshot.items.map(\.text) == ["Loaded from upgrade"])
+        let turn = try #require(chat.turn(id: "turn-history"))
+        #expect(turn.status == .completed)
+        #expect(chat.items(in: "turn-history").map(\.text) == ["Loaded from upgrade"])
         #expect(await runtime.transport.recordedRequests(method: "thread/resume").count == 1)
         let readRequests = await runtime.transport.recordedRequests(method: "thread/read")
         #expect(readRequests.count == 2)
@@ -4856,7 +4991,7 @@ struct CodexModelContextTests {
             restartedObservation.cancel()
         }
 
-        #expect(chat.turnSnapshot(for: "turn-restarted") != nil)
+        #expect(chat.turn(id: "turn-restarted") != nil)
         #expect(await runtime.transport.recordedRequests(method: "thread/resume").count == 2)
 
         try await runtime.transport.emitServerNotification(
@@ -4901,12 +5036,9 @@ struct CodexModelContextTests {
         defer {
             observation.cancel()
         }
-        let changes = ChatChangeRecorder(stream: observation.changes)
-
-        guard case .snapshot = await changes.next() else {
-            Issue.record("Expected initial snapshot change.")
-            return
-        }
+        let changes = ChatUpdateRecorder(stream: observation.updates)
+        #expect(observation.chat === chat)
+        #expect(observation.chat.id == "thread-terminal-setup")
         #expect(await eventually { changes.isFinished })
     }
 
@@ -5119,14 +5251,9 @@ struct CodexModelContextTests {
         defer {
             observation.cancel()
         }
-        let changes = ChatChangeRecorder(stream: observation.changes)
-
-        guard case .snapshot(let snapshot) = await changes.next() else {
-            Issue.record("Expected initial chat snapshot change.")
-            return
-        }
-        #expect(snapshot.chatID == "thread-changes")
-        #expect(snapshot.items.map(\.text) == ["Snapshot"])
+        let changes = ChatUpdateRecorder(stream: observation.updates)
+        #expect(observation.chat === chat)
+        #expect(chat.items.map(\.text) == ["Snapshot"])
 
         try await runtime.transport.emitServerNotification(
             method: "item/agentMessage/delta",
@@ -5139,8 +5266,9 @@ struct CodexModelContextTests {
             )
         )
 
-        let insertedChange = await changes.itemInserted(id: "message-live", text: "Hel")
+        let insertedChange = await changes.itemInserted(id: "message-live")
         #expect(insertedChange != nil)
+        #expect(chat.items.first { $0.id == "message-live" }?.text == "Hel")
 
         try await runtime.transport.emitServerNotification(
             method: "item/agentMessage/delta",
@@ -5153,7 +5281,7 @@ struct CodexModelContextTests {
             )
         )
 
-        guard case .itemTextAppended(let id, let turnID, let delta, let item) =
+        guard case .itemTextAppended(let id, let turnID, let delta) =
             await changes.itemTextAppended(id: "message-live", delta: "lo")
         else {
             Issue.record("Expected appended text change.")
@@ -5162,7 +5290,7 @@ struct CodexModelContextTests {
         #expect(id == "message-live")
         #expect(turnID == "turn-live")
         #expect(delta == "lo")
-        #expect(item.text == "Hello")
+        #expect(chat.items.first { $0.id == "message-live" }?.text == "Hello")
 
         try await runtime.transport.emitServerNotification(
             method: "item/updated",
@@ -5178,8 +5306,61 @@ struct CodexModelContextTests {
             )
         )
 
-        let updatedChange = await changes.itemUpdated(id: "message-live", text: "Rewritten")
+        let updatedChange = await changes.itemUpdated(id: "message-live")
         #expect(updatedChange != nil)
+        #expect(chat.items.first { $0.id == "message-live" }?.text == "Rewritten")
+    }
+
+    @Test("chat item identity ignores kind changes from baseline to live updates")
+    func chatItemIdentityIgnoresKindChangesFromBaselineToLiveUpdates() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-kind-change"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-kind-change",
+            turns: [
+                .init(
+                    id: "turn-kind-change",
+                    status: .running,
+                    items: [
+                        .init(
+                            id: "item-kind-change",
+                            kind: .unknown("progress"),
+                            content: .diagnostic("Initial")
+                        ),
+                    ]
+                ),
+            ]
+        ))
+
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-kind-change"))
+        let observation = try await chat.observe()
+        defer {
+            observation.cancel()
+        }
+        let changes = ChatUpdateRecorder(stream: observation.updates)
+        let originalItem = try #require(chat.items.first)
+
+        try await runtime.transport.emitServerNotification(
+            method: "item/updated",
+            params: ThreadItemParams(
+                threadID: "thread-kind-change",
+                turnID: "turn-kind-change",
+                item: .init(
+                    id: "item-kind-change",
+                    type: "diagnostic",
+                    text: "Updated"
+                )
+            )
+        )
+
+        let updatedChange = await changes.itemUpdated(id: "item-kind-change")
+        #expect(updatedChange != nil)
+        #expect(chat.items.count == 1)
+        #expect(chat.items.first === originalItem)
+        #expect(chat.items.first?.kind == .diagnostic)
+        #expect(chat.items.first?.text == "Updated")
     }
 
     @Test("active chat refresh emits snapshots after phase reconciliation")
@@ -5198,9 +5379,7 @@ struct CodexModelContextTests {
         defer {
             observation.cancel()
         }
-        let changes = ChatChangeRecorder(stream: observation.changes)
-
-        _ = await changes.next()
+        let changes = ChatUpdateRecorder(stream: observation.updates)
         #expect(chat.phase == .loading)
 
         try await runtime.transport.enqueueThreadResume(.init(id: "thread-refresh-stream"))
@@ -5210,14 +5389,172 @@ struct CodexModelContextTests {
             turns: []
         ))
 
-        try await chat.refresh()
+        try await context.refresh(chat)
 
-        guard case .snapshot(let snapshot) = await changes.next() else {
-            Issue.record("Expected refresh snapshot change.")
+        guard case .resynchronized(reason: .refresh) = await changes.next() else {
+            Issue.record("Expected refresh resynchronization update.")
             return
         }
-        #expect(snapshot.phase == .loaded)
         #expect(chat.phase == .loaded)
+    }
+
+    @Test("active chat refresh preserves live-streamed items omitted by lagging snapshots")
+    func activeChatRefreshPreservesLiveStreamedItemsOmittedByLaggingSnapshots() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-refresh-live"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-refresh-live",
+            status: .active(activeFlags: []),
+            turns: [
+                .init(
+                    id: "turn-existing",
+                    status: .running,
+                    items: [
+                        .init(
+                            id: "message-existing",
+                            kind: .agentMessage,
+                            content: .message(.init(
+                                id: "message-existing",
+                                role: .assistant,
+                                text: "Snapshot baseline"
+                            ))
+                        ),
+                    ]
+                ),
+            ]
+        ))
+
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-refresh-live"))
+        let observation = try await chat.observe()
+        defer {
+            observation.cancel()
+        }
+        let changes = ChatUpdateRecorder(stream: observation.updates)
+
+        try await runtime.transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(
+                threadID: "thread-refresh-live",
+                turnID: "turn-live",
+                itemID: "message-live",
+                delta: "Live update",
+                phase: "final_answer"
+            )
+        )
+        #expect(await changes.itemInserted(id: "message-live") != nil)
+        let liveItem = try #require(chat.items.first { $0.id == "message-live" })
+
+        try await runtime.transport.enqueueThreadTurns(.init(turns: [
+            .init(
+                id: "turn-existing",
+                status: .running,
+                items: [
+                    .init(
+                        id: "message-existing",
+                        kind: .agentMessage,
+                        content: .message(.init(
+                            id: "message-existing",
+                            role: .assistant,
+                            text: "Snapshot baseline"
+                        ))
+                    ),
+                ]
+            ),
+        ]))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-refresh-live",
+            status: .active(activeFlags: [])
+        ))
+
+        try await context.refresh(chat)
+
+        #expect(chat.items.first { $0.id == "message-live" } === liveItem)
+        #expect(chat.items.first { $0.id == "message-live" }?.text == "Live update")
+        #expect(chat.turns.contains { $0.id == "turn-live" })
+    }
+
+    @Test("restarted chat observation preserves prior live-streamed items omitted by lagging snapshots")
+    func restartedChatObservationPreservesPriorLiveStreamedItemsOmittedByLaggingSnapshots() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-reobserve-live"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-reobserve-live",
+            status: .active(activeFlags: []),
+            turns: [
+                .init(
+                    id: "turn-existing",
+                    status: .running,
+                    items: [
+                        .init(
+                            id: "message-existing",
+                            kind: .agentMessage,
+                            content: .message(.init(
+                                id: "message-existing",
+                                role: .assistant,
+                                text: "Snapshot baseline"
+                            ))
+                        ),
+                    ]
+                ),
+            ]
+        ))
+
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-reobserve-live"))
+        let observation = try await chat.observe()
+        let changes = ChatUpdateRecorder(stream: observation.updates)
+
+        try await runtime.transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(
+                threadID: "thread-reobserve-live",
+                turnID: "turn-live",
+                itemID: "message-live",
+                delta: "Live update",
+                phase: "final_answer"
+            )
+        )
+        #expect(await changes.itemInserted(id: "message-live") != nil)
+        let liveItem = try #require(chat.items.first { $0.id == "message-live" })
+        let liveTurn = try #require(chat.turn(id: "turn-live"))
+
+        observation.cancel()
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-reobserve-live"))
+        try await runtime.transport.enqueueThreadTurns(.init(turns: [
+            .init(
+                id: "turn-existing",
+                status: .running,
+                items: [
+                    .init(
+                        id: "message-existing",
+                        kind: .agentMessage,
+                        content: .message(.init(
+                            id: "message-existing",
+                            role: .assistant,
+                            text: "Snapshot baseline"
+                        ))
+                    ),
+                ]
+            ),
+        ]))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-reobserve-live",
+            status: .active(activeFlags: [])
+        ))
+
+        let restartedObservation = try await chat.observe()
+        defer {
+            restartedObservation.cancel()
+        }
+
+        #expect(chat.items.first { $0.id == "message-live" } === liveItem)
+        #expect(chat.items.first { $0.id == "message-live" }?.text == "Live update")
+        #expect(chat.turn(id: "turn-live") === liveTurn)
+        #expect(chat.items.map(\.id).filter { $0 == "message-live" }.count == 1)
     }
 
     @Test("active chat refresh applies buffered live events after read failure")
@@ -5233,8 +5570,7 @@ struct CodexModelContextTests {
         defer {
             observation.cancel()
         }
-        let changes = ChatChangeRecorder(stream: observation.changes)
-        _ = await changes.next()
+        let changes = ChatUpdateRecorder(stream: observation.updates)
 
         let gate = CodexAppServerTestGate()
         try await runtime.transport.enqueueThreadResume(.init(id: "thread-refresh-failure"))
@@ -5246,7 +5582,7 @@ struct CodexModelContextTests {
         )
 
         let refreshTask = Task {
-            try await chat.refresh()
+            try await context.refresh(chat)
         }
 
         await runtime.transport.waitForRequest(method: "thread/read", count: 2)
@@ -5268,7 +5604,7 @@ struct CodexModelContextTests {
         } catch {
         }
 
-        let inserted = await changes.itemInserted(id: "message-buffered", text: "Buffered")
+        let inserted = await changes.itemInserted(id: "message-buffered")
         #expect(inserted != nil)
         #expect(chat.items.first { $0.id == "message-buffered" }?.text == "Buffered")
     }
@@ -5288,10 +5624,10 @@ struct CodexModelContextTests {
             firstObservation.cancel()
             secondObservation.cancel()
         }
-        let firstChanges = ChatChangeRecorder(stream: firstObservation.changes)
-        let secondChanges = ChatChangeRecorder(stream: secondObservation.changes)
-        _ = await firstChanges.next()
-        _ = await secondChanges.next()
+        let firstChanges = ChatUpdateRecorder(stream: firstObservation.updates)
+        let secondChanges = ChatUpdateRecorder(stream: secondObservation.updates)
+        #expect(firstObservation.chat === chat)
+        #expect(secondObservation.chat === chat)
 
         try await runtime.transport.emitServerNotification(
             method: "item/commandExecution/outputDelta",
@@ -5304,15 +5640,14 @@ struct CodexModelContextTests {
         )
 
         let firstInserted = await firstChanges.itemInserted(
-            id: "command-shared-changes",
-            text: "line 1\n"
+            id: "command-shared-changes"
         )
         let secondInserted = await secondChanges.itemInserted(
-            id: "command-shared-changes",
-            text: "line 1\n"
+            id: "command-shared-changes"
         )
         #expect(firstInserted != nil)
         #expect(secondInserted != nil)
+        #expect(chat.items.first { $0.id == "command-shared-changes" }?.text == "line 1\n")
         #expect(await runtime.transport.recordedRequests(method: "thread/resume").count == 1)
     }
 
@@ -5747,11 +6082,66 @@ struct CodexModelContextTests {
         #expect(results.items.map(\.id.rawValue) == ["thread-review", "thread-existing"])
         #expect(started.chat.id == started.session.activeTurnThreadID)
         #expect(started.chat.workspace?.url.path == workspaceURL.path)
+        #expect(started.chat.preview == "Review the current code changes (staged, unstaged, and untracked files) and provide prioritized findings.")
+        #expect(started.chat.title == started.chat.preview)
 
         let requests = await runtime.transport.recordedRequests().map(\.method)
         #expect(requests.contains("thread/start"))
         #expect(requests.contains("review/start"))
         #expect(requests.filter { $0 == "thread/list" }.count == 1)
+    }
+
+    @Test("started review chat survives temporary thread list omission")
+    func startedReviewChatSurvivesTemporaryThreadListOmission() async throws {
+        let workspaceURL = temporaryDirectory()
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(
+                id: "thread-existing",
+                workspace: workspaceURL,
+                name: "Existing",
+                recencyAt: Date(timeIntervalSince1970: 1_000)
+            ),
+        ]))
+        try await runtime.transport.enqueueThreadStart(threadID: "thread-review", model: "gpt-5")
+        try await runtime.transport.enqueueReviewStart(
+            turnID: "turn-review",
+            reviewThreadID: "thread-review"
+        )
+        let results = context.fetchedResults(
+            for: CodexFetchDescriptor<CodexChat>(
+                sortBy: [CodexSortDescriptor(\.recencyAt, order: .reverse)]
+            ))
+        try await results.performFetch()
+
+        let started = try await context.startReview(
+            in: workspaceURL,
+            input: CodexReviewInput(
+                target: .uncommittedChanges,
+                options: .init(model: "gpt-5", ephemeral: false)
+            )
+        )
+        let reviewChat = started.chat
+        let workspace = try #require(reviewChat.workspace)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(
+                id: "thread-existing",
+                workspace: workspaceURL,
+                name: "Existing",
+                recencyAt: Date(timeIntervalSince1970: 1_000)
+            ),
+        ]))
+
+        try await results.performFetch()
+
+        #expect(results.items.contains { $0 === reviewChat })
+        #expect(results.items.map(\.id.rawValue) == ["thread-review", "thread-existing"])
+        #expect(workspace.chats.contains { $0 === reviewChat })
+        #expect(reviewChat.modelContext === context)
+        #expect(context.registeredModel(for: reviewChat.id) === reviewChat)
+        #expect(await runtime.transport.recordedRequests(method: "thread/list").count == 2)
     }
 
     @Test("started review observation reuses the live event thread without resuming")
@@ -5852,7 +6242,7 @@ struct CodexModelContextTests {
                 options: .init(model: "gpt-5", ephemeral: false)
             )
         )
-        try await started.chat.refresh()
+        try await context.refresh(started.chat)
         let observation = try await started.chat.observe()
         defer {
             observation.cancel()
@@ -5973,6 +6363,131 @@ struct CodexModelContextTests {
         #expect(started.chat.items.map(\.text) == ["Review started from live turn list"])
     }
 
+    @Test("started review observation drops not-loaded response seed when full turn items arrive")
+    func startedReviewObservationDropsNotLoadedSeedWhenFullTurnItemsArrive() async throws {
+        let workspaceURL = temporaryDirectory()
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadStart(threadID: "thread-review", model: "gpt-5")
+        try await runtime.transport.enqueueReviewStart(
+            .init(
+                id: "turn-review",
+                status: .running,
+                itemsLoadState: .notLoaded,
+                items: [
+                    .init(
+                        id: "seed-review",
+                        kind: .enteredReviewMode,
+                        content: .log("current changes")
+                    ),
+                ]
+            ),
+            reviewThreadID: "thread-review"
+        )
+        try await runtime.transport.enqueueThreadTurns(.init(turns: [
+            .init(
+                id: "turn-review",
+                status: .running,
+                itemsLoadState: .full,
+                items: [
+                    .init(
+                        id: "review-mode",
+                        kind: .enteredReviewMode,
+                        content: .log("current changes")
+                    ),
+                    .init(
+                        id: "command-1",
+                        kind: .commandExecution,
+                        content: .command(.init(
+                            command: "/bin/zsh -lc",
+                            status: .running
+                        ))
+                    ),
+                ]
+            ),
+        ]))
+        try await runtime.transport.enqueueThreadRead(.init(id: "thread-review", workspace: workspaceURL))
+
+        let started = try await context.startReview(
+            in: workspaceURL,
+            input: CodexReviewInput(
+                target: .uncommittedChanges,
+                options: .init(model: "gpt-5", ephemeral: false)
+            )
+        )
+        #expect(started.chat.items.map(\.id) == ["seed-review"])
+
+        let observation = try await started.chat.observe()
+        defer {
+            observation.cancel()
+        }
+
+        #expect(started.chat.items.map(\.id) == ["review-mode", "command-1"])
+        #expect(started.chat.items.map(\.text) == ["current changes", "/bin/zsh -lc"])
+    }
+
+    @Test("started review preserves seeded row metadata across null metadata refresh")
+    func startedReviewPreservesSeededRowMetadataAcrossNullMetadataRefresh() async throws {
+        let workspaceURL = temporaryDirectory()
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadStart(threadID: "thread-review", model: "gpt-5")
+        try await runtime.transport.enqueueReviewStart(
+            turnID: "turn-review",
+            reviewThreadID: "thread-review"
+        )
+        try await runtime.transport.enqueueThreadTurns(.init(turns: [
+            .init(
+                id: "turn-review",
+                status: .running,
+                itemsLoadState: .full,
+                items: [
+                    .init(
+                        id: "review-mode",
+                        kind: .enteredReviewMode,
+                        content: .log("current changes")
+                    ),
+                ]
+            ),
+        ]))
+        try await runtime.transport.enqueueJSON(
+            """
+            {
+              "thread": {
+                "id": "thread-review",
+                "cwd": "\(workspaceURL.path)",
+                "name": null,
+                "preview": null,
+                "modelProvider": null
+              }
+            }
+            """,
+            for: "thread/read"
+        )
+
+        let started = try await context.startReview(
+            in: workspaceURL,
+            input: CodexReviewInput(
+                target: .uncommittedChanges,
+                options: .init(modelProvider: "openai", ephemeral: false)
+            )
+        )
+        let expectedPreview = "Review the current code changes (staged, unstaged, and untracked files) and provide prioritized findings."
+        #expect(started.chat.preview == expectedPreview)
+        #expect(started.chat.modelProvider == "openai")
+
+        let observation = try await started.chat.observe()
+        defer {
+            observation.cancel()
+        }
+
+        #expect(started.chat.preview == expectedPreview)
+        #expect(started.chat.title == expectedPreview)
+        #expect(started.chat.modelProvider == "openai")
+    }
+
     @Test("workspace start chat exposes known ephemeral option")
     func workspaceStartChatExposesKnownEphemeralOption() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -6073,19 +6588,29 @@ private struct ThreadStartParams: Decodable, Sendable {
 private struct ThreadItemParams: Encodable, Sendable {
     var threadID: String
     var turnID: String
+    var startedAtMs: Int64? = nil
+    var completedAtMs: Int64? = nil
     var item: Item
 
     enum CodingKeys: String, CodingKey {
         case threadID = "threadId"
         case turnID = "turnId"
+        case startedAtMs
+        case completedAtMs
         case item
     }
 
     struct Item: Encodable, Sendable {
         var id: String
         var type: String
-        var text: String?
-        var phase: String?
+        var text: String? = nil
+        var phase: String? = nil
+        var command: String? = nil
+        var cwd: String? = nil
+        var output: String? = nil
+        var exitCode: Int? = nil
+        var status: String? = nil
+        var durationMs: Int? = nil
     }
 }
 
@@ -6240,6 +6765,18 @@ private func eventually(
 }
 
 @MainActor
+private func threadItems(from items: [CodexChat.Item]) -> [CodexThreadItem] {
+    items.map {
+        CodexThreadItem(
+            id: $0.id,
+            kind: $0.kind,
+            content: $0.content,
+            rawPayload: $0.rawPayload
+        )
+    }
+}
+
+@MainActor
 private final class FetchedResultsTransactionRecorder<Model: CodexObservableModel> {
     private(set) var transactions: [CodexFetchedResultsTransaction<Model>] = []
     private var task: Task<Void, Never>?
@@ -6262,13 +6799,16 @@ private final class FetchedResultsTransactionRecorder<Model: CodexObservableMode
     }
 }
 
-private final class ChatChangeRecorder: @unchecked Sendable {
-    private let lock = NSLock()
-    private var changes: [CodexChatChange] = []
-    private var streamFinished = false
+private final class ChatUpdateRecorder: @unchecked Sendable {
+    private struct State {
+        var changes: [CodexChatUpdate] = []
+        var streamFinished = false
+    }
+
+    private let state = Mutex(State())
     private var task: Task<Void, Never>?
 
-    init(stream: AsyncStream<CodexChatChange>) {
+    init(stream: CodexChatUpdates) {
         task = Task { [weak self] in
             for await change in stream {
                 self?.append(change)
@@ -6281,38 +6821,38 @@ private final class ChatChangeRecorder: @unchecked Sendable {
         task?.cancel()
     }
 
-    func next() async -> CodexChatChange? {
+    func next() async -> CodexChatUpdate? {
         await next { _ in true }
     }
 
-    func itemInserted(id: String, text: String?) async -> CodexChatChange? {
+    func itemInserted(id: String) async -> CodexChatUpdate? {
         await next { change in
-            if case .itemInserted(let item) = change {
-                return item.id == id && item.text == text
+            if case .itemInserted(let changeID, _) = change {
+                return changeID == id
             }
             return false
         }
     }
 
-    func itemUpdated(id: String, text: String?) async -> CodexChatChange? {
+    func itemUpdated(id: String) async -> CodexChatUpdate? {
         await next { change in
-            if case .itemUpdated(let item) = change {
-                return item.id == id && item.text == text
+            if case .itemUpdated(let changeID, _) = change {
+                return changeID == id
             }
             return false
         }
     }
 
-    func itemTextAppended(id: String, delta: String) async -> CodexChatChange? {
+    func itemTextAppended(id: String, delta: String) async -> CodexChatUpdate? {
         await next { change in
-            if case .itemTextAppended(let changeID, _, let changeDelta, _) = change {
+            if case .itemTextAppended(let changeID, _, let changeDelta) = change {
                 return changeID == id && changeDelta == delta
             }
             return false
         }
     }
 
-    func phaseChanged(_ phase: CodexDataPhase) async -> CodexChatChange? {
+    func phaseChanged(_ phase: CodexDataPhase) async -> CodexChatUpdate? {
         await next { change in
             if case .phaseChanged(let candidate) = change {
                 return candidate == phase
@@ -6321,38 +6861,47 @@ private final class ChatChangeRecorder: @unchecked Sendable {
         }
     }
 
-    var isFinished: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return streamFinished
+    func statusChanged(_ status: CodexThreadStatus?) async -> CodexChatUpdate? {
+        await next { change in
+            if case .statusChanged(let candidate) = change {
+                return candidate == status
+            }
+            return false
+        }
     }
 
-    private func append(_ change: CodexChatChange) {
-        lock.lock()
-        defer { lock.unlock() }
-        changes.append(change)
+    var isFinished: Bool {
+        state.withLock { state in
+            state.streamFinished
+        }
+    }
+
+    private func append(_ change: CodexChatUpdate) {
+        state.withLock { state in
+            state.changes.append(change)
+        }
     }
 
     private func markFinished() {
-        lock.lock()
-        defer { lock.unlock() }
-        streamFinished = true
+        state.withLock { state in
+            state.streamFinished = true
+        }
     }
 
     private func popFirst(
-        matching predicate: (CodexChatChange) -> Bool
-    ) -> CodexChatChange? {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let index = changes.firstIndex(where: predicate) else {
-            return nil
+        matching predicate: (CodexChatUpdate) -> Bool
+    ) -> CodexChatUpdate? {
+        state.withLock { state in
+            guard let index = state.changes.firstIndex(where: predicate) else {
+                return nil
+            }
+            return state.changes.remove(at: index)
         }
-        return changes.remove(at: index)
     }
 
     private func next(
-        matching predicate: (CodexChatChange) -> Bool
-    ) async -> CodexChatChange? {
+        matching predicate: (CodexChatUpdate) -> Bool
+    ) async -> CodexChatUpdate? {
         for _ in 0..<50 {
             if let change = popFirst(matching: predicate) {
                 return change

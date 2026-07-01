@@ -557,7 +557,10 @@ package actor CodexAppServerNotificationRouter {
         guard let payload = try? decoder.decode(ItemPayload.self, from: data) else {
             return nil
         }
-        return payload.item.threadItem
+        return payload.item.threadItem(
+            startedAt: payload.startedAtMS.map(Self.date(millisecondsSince1970:)),
+            completedAt: payload.completedAtMS.map(Self.date(millisecondsSince1970:))
+        )
     }
 
     private func itemUpdate(from data: Data, kind: CodexThreadItem.Kind) -> CodexThreadItem? {
@@ -718,6 +721,10 @@ package actor CodexAppServerNotificationRouter {
     private static func objectValue(named name: String, in object: [String: Any]) -> [String: Any]? {
         object[name] as? [String: Any]
     }
+
+    private nonisolated static func date(millisecondsSince1970 milliseconds: Int64) -> Date {
+        Date(timeIntervalSince1970: TimeInterval(milliseconds) / 1_000)
+    }
 }
 
 private struct TurnCompletedPayload: Decodable {
@@ -783,6 +790,14 @@ private struct ReasoningTextDeltaPayload: Decodable {
 
 private struct ItemPayload: Decodable {
     var item: RawThreadItem
+    var startedAtMS: Int64?
+    var completedAtMS: Int64?
+
+    enum CodingKeys: String, CodingKey {
+        case item
+        case startedAtMS = "startedAtMs"
+        case completedAtMS = "completedAtMs"
+    }
 }
 
 private struct ItemProgressPayload: Decodable {
@@ -851,6 +866,57 @@ private struct RawTokenUsageBreakdown: Decodable {
     var totalTokens: Int?
 }
 
+private struct RawCommandAction: Decodable {
+    var kind: String
+    var command: String?
+    var name: String?
+    var path: String?
+    var query: String?
+
+    var codexCommandAction: CodexCommand.Action {
+        CodexCommand.Action(
+            kind: codexKind,
+            command: command,
+            name: name,
+            path: path,
+            query: query
+        )
+    }
+
+    private var codexKind: CodexCommand.Action.Kind {
+        switch kind {
+        case "read":
+            .read
+        case "listFiles", "list_files":
+            .listFiles
+        case "search":
+            .search
+        default:
+            .unknown
+        }
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case type
+        case kind
+        case command
+        case name
+        case path
+        case query
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        kind = (try? container.decodeStringIfPresent(forKey: .type))
+            ?? (try? container.decodeStringIfPresent(forKey: .kind))
+            ?? "unknown"
+        command = try? container.decodeStringIfPresent(forKey: .command)
+        name = try? container.decodeStringIfPresent(forKey: .name)
+        path = try? container.decodeStringIfPresent(forKey: .path)
+        query = try? container.decodeStringIfPresent(forKey: .query)
+    }
+}
+
 private struct RawThreadItem: Decodable {
     var id: String?
     var type: String?
@@ -860,9 +926,13 @@ private struct RawThreadItem: Decodable {
     var phase: String?
     var command: String?
     var cwd: String?
+    var processID: String?
+    var source: String?
     var aggregatedOutput: String?
     var output: String?
     var exitCode: Int?
+    var durationMs: Int?
+    var commandActions: [RawCommandAction]
     var status: String?
     var path: String?
     var namespace: String?
@@ -889,9 +959,13 @@ private struct RawThreadItem: Decodable {
         case phase
         case command
         case cwd
+        case processID = "processId"
+        case source
         case aggregatedOutput
         case output
         case exitCode
+        case durationMs
+        case commandActions
         case status
         case path
         case namespace
@@ -920,9 +994,13 @@ private struct RawThreadItem: Decodable {
         phase = try container.decodeStringIfPresent(forKey: .phase)
         command = try container.decodeStringIfPresent(forKey: .command)
         cwd = try container.decodeStringIfPresent(forKey: .cwd)
+        processID = try container.decodeStringIfPresent(forKey: .processID)
+        source = try container.decodeStringIfPresent(forKey: .source)
         aggregatedOutput = try container.decodeStringIfPresent(forKey: .aggregatedOutput)
         output = try container.decodeStringIfPresent(forKey: .output)
         exitCode = try? container.decodeIfPresent(Int.self, forKey: .exitCode)
+        durationMs = try? container.decodeIfPresent(Int.self, forKey: .durationMs)
+        commandActions = (try? container.decodeIfPresent([RawCommandAction].self, forKey: .commandActions)) ?? []
         status = try container.decodeStringIfPresent(forKey: .status)
         path = try container.decodeStringIfPresent(forKey: .path)
         namespace = try container.decodeStringIfPresent(forKey: .namespace)
@@ -941,13 +1019,23 @@ private struct RawThreadItem: Decodable {
     }
 
     var threadItem: CodexThreadItem {
+        threadItem(startedAt: nil, completedAt: nil)
+    }
+
+    func threadItem(startedAt: Date?, completedAt: Date?) -> CodexThreadItem {
         let rawType = type ?? kind ?? "unknown"
         let kind = CodexThreadItem.Kind(rawValue: rawType)
         let itemID = id ?? UUID().uuidString
         return .init(
             id: itemID,
             kind: kind,
-            content: content(kind: kind, id: itemID, rawType: rawType),
+            content: content(
+                kind: kind,
+                id: itemID,
+                rawType: rawType,
+                startedAt: startedAt,
+                completedAt: completedAt
+            ),
             rawPayload: rawPayload
         )
     }
@@ -955,7 +1043,9 @@ private struct RawThreadItem: Decodable {
     private func content(
         kind: CodexThreadItem.Kind,
         id: String,
-        rawType: String
+        rawType: String,
+        startedAt: Date?,
+        completedAt: Date?
     ) -> CodexThreadItem.Content {
         switch kind {
         case .userMessage:
@@ -986,7 +1076,13 @@ private struct RawThreadItem: Decodable {
                     cwd: cwd,
                     output: aggregatedOutput ?? output ?? text,
                     exitCode: exitCode,
-                    status: status.map(CodexTurnStatus.init(rawValue:))
+                    status: status.map(CodexTurnStatus.init(rawValue:)),
+                    startedAt: startedAt,
+                    completedAt: completedAt,
+                    duration: durationMs.map { .milliseconds(Int64($0)) },
+                    processID: processID,
+                    source: source.map(CodexCommand.Source.init(rawValue:)),
+                    commandActions: commandActions.map(\.codexCommandAction)
                 ))
         case .fileChange:
             return .fileChange(

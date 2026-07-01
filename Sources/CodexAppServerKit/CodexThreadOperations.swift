@@ -263,7 +263,7 @@ extension CodexThread {
                     cursor: query.cursor,
                     limit: query.limit,
                     sortDirection: query.sortDirection,
-                    itemsView: query.itemsView
+                    itemsLoadState: query.itemsLoadState
                 )
             ))
         return .init(

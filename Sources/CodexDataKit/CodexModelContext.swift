@@ -1,18 +1,24 @@
+import AsyncAlgorithms
 import CodexAppServerKit
 import Foundation
+import OSLog
+
+private let logger = Logger(subsystem: "CodexDataKit", category: "model-context")
 
 public enum CodexModelContextError: Error, Equatable, Sendable {
     case unsupportedModelType(String)
     case modelIsDetached
 }
 
-@MainActor
 public final class CodexModelContainer: @unchecked Sendable {
     public let appServer: CodexAppServer
+
+    @MainActor
     public var mainContext: CodexModelContext {
         _mainContext
     }
 
+    @MainActor
     private lazy var _mainContext = CodexModelContext(container: self)
 
     public init(appServer: CodexAppServer) {
@@ -46,6 +52,9 @@ public final class CodexModelContext: @unchecked Sendable {
     }
 
     private final class ActiveChatObservation {
+        private let updateContinuation: AsyncStream<CodexChatUpdate>.Continuation
+        private let sharedUpdates: CodexChatUpdates
+
         var leaseCount = 0
         var setupTask: Task<Void, Error>?
         var eventTask: Task<Void, Never>?
@@ -55,7 +64,13 @@ public final class CodexModelContext: @unchecked Sendable {
         var isFinished = false
         var isBufferingEvents = false
         var bufferedEvents: [CodexThreadEvent] = []
-        var changeContinuations: [UUID: AsyncStream<CodexChatChange>.Continuation] = [:]
+        var hasAppliedLiveUpdates = false
+
+        init() {
+            let updates = AsyncStream<CodexChatUpdate>.makeStream(bufferingPolicy: .unbounded)
+            updateContinuation = updates.continuation
+            sharedUpdates = updates.stream.share(bufferingPolicy: .unbounded)
+        }
 
         func cancel() {
             isFinished = true
@@ -63,7 +78,7 @@ public final class CodexModelContext: @unchecked Sendable {
             eventTask?.cancel()
             turnsUpgradeTask?.cancel()
             discardBufferedEvents()
-            finishChangeStreams()
+            finishUpdates()
         }
 
         func beginBufferingEvents() {
@@ -72,6 +87,18 @@ public final class CodexModelContext: @unchecked Sendable {
 
         func appendBufferedEvent(_ event: CodexThreadEvent) {
             bufferedEvents.append(event)
+        }
+
+        var hasBufferedEvents: Bool {
+            bufferedEvents.isEmpty == false
+        }
+
+        var shouldPreserveLiveTurnItems: Bool {
+            hasAppliedLiveUpdates || hasBufferedEvents
+        }
+
+        func markAppliedLiveUpdates() {
+            hasAppliedLiveUpdates = true
         }
 
         func finishBufferingEvents() -> [CodexThreadEvent] {
@@ -87,40 +114,36 @@ public final class CodexModelContext: @unchecked Sendable {
             bufferedEvents.removeAll(keepingCapacity: true)
         }
 
-        func makeChangeStream(
-            initialSnapshot: CodexChatSnapshot
-        ) -> (id: UUID, stream: AsyncStream<CodexChatChange>) {
-            let id = UUID()
-            let pair = AsyncStream<CodexChatChange>.makeStream(bufferingPolicy: .unbounded)
-            pair.continuation.yield(.snapshot(initialSnapshot))
+        func makeUpdateStream() -> CodexChatUpdates {
+            let pair = AsyncStream<CodexChatUpdate>.makeStream(bufferingPolicy: .unbounded)
             if isFinished {
                 pair.continuation.finish()
             } else {
-                changeContinuations[id] = pair.continuation
-            }
-            return (id, pair.stream)
-        }
-
-        func removeChangeStream(id: UUID) {
-            changeContinuations.removeValue(forKey: id)?.finish()
-        }
-
-        func yield(_ changes: [CodexChatChange]) {
-            guard changes.isEmpty == false else {
-                return
-            }
-            for continuation in changeContinuations.values {
-                for change in changes {
-                    continuation.yield(change)
+                let sharedUpdates = sharedUpdates
+                let task = Task {
+                    for await update in sharedUpdates {
+                        pair.continuation.yield(update)
+                    }
+                    pair.continuation.finish()
+                }
+                pair.continuation.onTermination = { @Sendable _ in
+                    task.cancel()
                 }
             }
+            return pair.stream.share(bufferingPolicy: .unbounded)
         }
 
-        func finishChangeStreams() {
-            for continuation in changeContinuations.values {
-                continuation.finish()
+        func yield(_ updates: [CodexChatUpdate]) {
+            guard updates.isEmpty == false else {
+                return
             }
-            changeContinuations.removeAll(keepingCapacity: true)
+            for update in updates {
+                updateContinuation.yield(update)
+            }
+        }
+
+        func finishUpdates() {
+            updateContinuation.finish()
         }
     }
 
@@ -143,8 +166,9 @@ public final class CodexModelContext: @unchecked Sendable {
         _ descriptor: CodexFetchDescriptor<Model>
     ) async throws -> [Model] {
         let page = try await fetchPage(descriptor)
-        await syncLoadedRelationships(from: page, descriptor: descriptor)
-        return page.items
+        let items = fetchedItemsIncludingPendingChanges(from: page, descriptor: descriptor)
+        await syncLoadedRelationships(from: page, descriptor: descriptor, loadedItems: items)
+        return items
     }
 
     public func fetch<Model: CodexObservableModel>(
@@ -214,6 +238,10 @@ public final class CodexModelContext: @unchecked Sendable {
     }
 
     public func refresh(_ group: CodexWorkspaceGroup) async throws {
+        guard group.modelContext === self else {
+            throw CodexModelContextError.modelIsDetached
+        }
+
         let descriptor = CodexFetchDescriptor<CodexWorkspace>(
             sortBy: [CodexSortDescriptor(\.name)]
         )
@@ -237,7 +265,7 @@ public final class CodexModelContext: @unchecked Sendable {
                     && shouldPreserve($0, outside: descriptor.predicate.archived)
             }
             let currentChats = fetchedWorkspaceChats + preservedChats
-            workspace.setChats(currentChats)
+            workspace.replaceContextChats(currentChats)
             pruneWorkspaceIfEmpty(workspace)
             _ = detachStaleChats(
                 previousWorkspaceChats,
@@ -255,7 +283,7 @@ public final class CodexModelContext: @unchecked Sendable {
             refreshedWorkspaceIDs.contains($0.id) == false
                 && containsOutOfScopeChat(in: $0, archivedScope: descriptor.predicate.archived)
         }
-        group.setWorkspaces(sort(refreshedWorkspaces + preservedWorkspaces, using: descriptor.sortBy))
+        group.replaceContextWorkspaces(sort(refreshedWorkspaces + preservedWorkspaces, using: descriptor.sortBy))
         let currentChatIDs = Set(group.workspaces.flatMap(\.chats).map(\.id))
         let removedChats = previousChats.filter {
             currentChatIDs.contains($0.id) == false
@@ -270,6 +298,10 @@ public final class CodexModelContext: @unchecked Sendable {
     }
 
     public func refresh(_ workspace: CodexWorkspace) async throws {
+        guard workspace.modelContext === self else {
+            throw CodexModelContextError.modelIsDetached
+        }
+
         let descriptor = CodexFetchDescriptor<CodexChat>.chats(in: workspace)
         let previousChats = workspace.chats
         let snapshots = try await fetchAllThreadSnapshots(matching: descriptor)
@@ -288,7 +320,7 @@ public final class CodexModelContext: @unchecked Sendable {
                 && shouldPreserve($0, outside: descriptor.predicate.archived)
         }
         let currentChats = chats + preservedChats
-        workspace.setChats(currentChats)
+        workspace.replaceContextChats(currentChats)
         pruneWorkspaceIfEmpty(workspace)
         let removedChats = detachStaleChats(
             previousChats,
@@ -304,15 +336,27 @@ public final class CodexModelContext: @unchecked Sendable {
     }
 
     public func refresh(_ chat: CodexChat, includeTurns: Bool = true) async throws {
-        let thread = try await eventThread(for: chat)
-        try await refresh(chat, using: thread, includeTurns: includeTurns)
+        guard chat.modelContext === self else {
+            throw CodexModelContextError.modelIsDetached
+        }
+
+        chat.phase = .loading
+        chat.lastErrorDescription = nil
+        do {
+            let thread = try await eventThread(for: chat)
+            try await refresh(chat, using: thread, includeTurns: includeTurns)
+        } catch {
+            chat.fail(with: error)
+            throw error
+        }
     }
 
     private func refresh(
         _ chat: CodexChat,
         using thread: CodexThread,
         includeTurns: Bool,
-        replaysBufferedEvents: Bool = true
+        replaysBufferedEvents: Bool = true,
+        emitsResynchronization: Bool = true
     ) async throws {
         let previousWorkspace = chat.workspace
         let previousGroup = previousWorkspace?.workspaceGroup
@@ -329,12 +373,28 @@ public final class CodexModelContext: @unchecked Sendable {
             }
             throw error
         }
-        let refreshedChat = apply(snapshot)
+        let chatShouldPreserveTurnItems = chat.shouldPreserveTurnItemsWhenReconcilingSnapshot
+        let observationShouldPreserveTurnItems = observation?.shouldPreserveLiveTurnItems == true
+        let preservesExistingTurnItems = replaysBufferedEvents
+            && (chatShouldPreserveTurnItems || observationShouldPreserveTurnItems)
+        if preservesExistingTurnItems {
+            logger.debug(
+                "Preserving live chat turn items during snapshot refresh chatID=\(chat.id.rawValue, privacy: .public) includeTurns=\(includeTurns, privacy: .public) chatHasLiveUpdates=\(chatShouldPreserveTurnItems, privacy: .public) observationHasLiveUpdates=\(observationShouldPreserveTurnItems, privacy: .public)"
+            )
+        }
+        let refreshedChat = apply(
+            snapshot,
+            preservesExistingTurnItems: preservesExistingTurnItems
+        )
         if includeTurns {
             refreshedChat.resetLiveMergeStateFromCurrentItems()
         }
         refreshedChat.syncPhaseAfterRefresh(includeTurns: includeTurns)
-        observation?.yield([.snapshot(CodexChatSnapshot(chat: refreshedChat))])
+        if emitsResynchronization {
+            observation?.yield([
+                .resynchronized(reason: .refresh),
+            ])
+        }
         if replaysBufferedEvents {
             await flushBufferedEvents(from: observation, to: refreshedChat)
         } else {
@@ -359,7 +419,7 @@ public final class CodexModelContext: @unchecked Sendable {
         do {
             let turnPage = try await thread.listTurns(.init(
                 sortDirection: .ascending,
-                itemsView: .full
+                itemsLoadState: .full
             ))
             return try await threadSnapshot(
                 for: thread,
@@ -415,6 +475,7 @@ public final class CodexModelContext: @unchecked Sendable {
         let bufferedEvents = observation?.finishBufferingEvents() ?? []
         for event in bufferedEvents {
             let changes = await apply(event, to: chat)
+            observation?.markAppliedLiveUpdates()
             observation?.yield(changes)
         }
     }
@@ -510,15 +571,23 @@ public final class CodexModelContext: @unchecked Sendable {
                 return
             }
             let thread: CodexThread
+            let threadSource: String
             if let eventThread = observation.eventThread {
                 thread = eventThread
+                threadSource = "existingEventThread"
             } else if let resumedThread {
                 thread = resumedThread
+                threadSource = "resumedThread"
             } else if let preparedThread = self.preparedEventThread(for: chat.id) {
                 thread = preparedThread
+                threadSource = "preparedEventThread"
             } else {
                 thread = try await self.appServer.resumeThread(chat.id)
+                threadSource = "resumeThread"
             }
+            logger.debug(
+                "Upgrading chat observation to include turns chatID=\(chat.id.rawValue, privacy: .public) source=\(threadSource, privacy: .public)"
+            )
             try await self.refresh(chat, using: thread, includeTurns: true)
             observation.includesTurns = true
         }
@@ -534,20 +603,32 @@ public final class CodexModelContext: @unchecked Sendable {
         chat.lastErrorDescription = nil
         let thread: CodexThread
         do {
+            let threadSource: String
             if let resumedThread {
                 thread = resumedThread
+                threadSource = "resumedThread"
             } else if let preparedThread = preparedEventThread(for: chat.id) {
                 thread = preparedThread
+                threadSource = "preparedEventThread"
             } else {
                 thread = try await appServer.resumeThread(chat.id)
+                threadSource = "resumeThread"
             }
+            logger.debug(
+                "Starting chat observation chatID=\(chat.id.rawValue, privacy: .public) includeTurns=\(includeTurns, privacy: .public) source=\(threadSource, privacy: .public) turns=\(chat.turns.count, privacy: .public) items=\(chat.items.count, privacy: .public)"
+            )
             observation.eventThread = thread
             try Task.checkCancellation()
             await thread.beginEventGeneration()
             observation.beginBufferingEvents()
             await startEventTask(observation, for: chat, thread: thread)
             do {
-                try await refresh(chat, using: thread, includeTurns: includeTurns)
+                try await refresh(
+                    chat,
+                    using: thread,
+                    includeTurns: includeTurns,
+                    emitsResynchronization: false
+                )
             } catch {
                 guard canObserveSeededSnapshotAfterInitialRefreshFailure(
                     chat,
@@ -598,6 +679,7 @@ public final class CodexModelContext: @unchecked Sendable {
                             continue
                         }
                         let changes = await self.apply(event, to: chat)
+                        observation.markAppliedLiveUpdates()
                         observation.yield(changes)
                     }
                 } catch is CancellationError {
@@ -608,7 +690,7 @@ public final class CodexModelContext: @unchecked Sendable {
                 while observation.isBufferingEvents {
                     try? await Task.sleep(for: .milliseconds(1))
                 }
-                observation.finishChangeStreams()
+                observation.finishUpdates()
                 self.finishChatObservationIfIdle(chat.id, observation: observation)
             }
         }
@@ -657,15 +739,12 @@ public final class CodexModelContext: @unchecked Sendable {
         activeObservation: ActiveChatObservation
     ) -> CodexChatObservation {
         let chatID = chat.id
-        let changeStream = activeObservation.makeChangeStream(
-            initialSnapshot: CodexChatSnapshot(chat: chat)
-        )
-        return CodexChatObservation(chat: chat, changes: changeStream.stream) {
+        let updates = activeObservation.makeUpdateStream()
+        return CodexChatObservation(chat: chat, updates: updates) {
             [weak self, weak activeObservation] in
             guard let activeObservation else {
                 return
             }
-            activeObservation.removeChangeStream(id: changeStream.id)
             self?.releaseChatObservation(chatID, observation: activeObservation)
         }
     }
@@ -694,7 +773,8 @@ public final class CodexModelContext: @unchecked Sendable {
         if let thread = preparedEventThread(for: chat.id) {
             return thread
         }
-        return try await appServer.resumeThread(chat.id)
+        let thread = try await appServer.resumeThread(chat.id)
+        return thread
     }
 
     @discardableResult
@@ -720,9 +800,10 @@ public final class CodexModelContext: @unchecked Sendable {
             ephemeral: input.options.ephemeral
         )
         let chat = apply(snapshot)
-        chat.setArchived(false)
+        chat.preserveSeededMetadataUntilAuthoritativeSnapshot()
+        chat.applyContextArchived(false)
         prepareEventThread(thread, for: chat.id)
-        workspace.moveChatToFront(chat)
+        workspace.moveContextChatToFront(chat)
         await insertChatIntoRegisteredResults(chat, archived: false)
         return chat
     }
@@ -763,10 +844,12 @@ public final class CodexModelContext: @unchecked Sendable {
         workspaceURL: URL,
         input: CodexReviewInput
     ) async -> CodexStartedReview {
+        let isExistingChat = chatsByID[review.activeTurnThreadID] != nil
         let now = Date()
         let snapshot = CodexThreadSnapshot(
             id: review.activeTurnThreadID,
             workspace: review.eventThread.workspace ?? workspaceURL,
+            preview: input.target.dataKitPreview,
             modelProvider: input.options.modelProvider,
             createdAt: now,
             updatedAt: now,
@@ -776,11 +859,14 @@ public final class CodexModelContext: @unchecked Sendable {
             turns: [review.initialTurn]
         )
         let chat = apply(snapshot)
-        chat.setArchived(false)
+        chat.applyContextArchived(false)
         chat.syncPhaseAfterRefresh(includeTurns: true)
         prepareEventThread(review.eventThread, for: chat.id)
-        chat.workspace?.moveChatToFront(chat)
+        chat.workspace?.moveContextChatToFront(chat)
         await insertChatIntoRegisteredResults(chat, archived: false)
+        logger.debug(
+            "Started review chat chatID=\(chat.id.rawValue, privacy: .public) reusedExistingChat=\(isExistingChat, privacy: .public) initialTurns=\(chat.turns.count, privacy: .public) initialItems=\(chat.items.count, privacy: .public)"
+        )
         return CodexStartedReview(chat: chat, session: review)
     }
 
@@ -808,7 +894,7 @@ public final class CodexModelContext: @unchecked Sendable {
     }
 
     @discardableResult
-    package func apply(_ response: CodexResponse, to chat: CodexChat) async -> [CodexChatChange] {
+    package func apply(_ response: CodexResponse, to chat: CodexChat) async -> [CodexChatUpdate] {
         let previousWorkspace = chat.workspace
         let previousGroup = previousWorkspace?.workspaceGroup
         let previousUpdatedAt = chat.updatedAt
@@ -817,7 +903,7 @@ public final class CodexModelContext: @unchecked Sendable {
             let updatedAt = chat.updatedAt,
             previousUpdatedAt.map({ updatedAt > $0 }) ?? true
         {
-            workspace.moveChatToFront(chat)
+            workspace.moveContextChatToFront(chat)
         }
         await revalidateChatInRegisteredResults(
             chat,
@@ -825,7 +911,9 @@ public final class CodexModelContext: @unchecked Sendable {
             previousGroup: previousGroup,
             archived: chat.isArchived
         )
-        activeChatObservationsByID[chat.id]?.yield(changes)
+        let observation = activeChatObservationsByID[chat.id]
+        observation?.markAppliedLiveUpdates()
+        observation?.yield(changes)
         return changes
     }
 
@@ -837,7 +925,7 @@ public final class CodexModelContext: @unchecked Sendable {
     }
 
     @discardableResult
-    package func apply(_ event: CodexThreadEvent, to chat: CodexChat) async -> [CodexChatChange] {
+    package func apply(_ event: CodexThreadEvent, to chat: CodexChat) async -> [CodexChatUpdate] {
         let previousWorkspace = chat.workspace
         let previousGroup = previousWorkspace?.workspaceGroup
         let previousState = fetchedResultState(for: chat)
@@ -847,7 +935,7 @@ public final class CodexModelContext: @unchecked Sendable {
             let updatedAt = chat.updatedAt,
             previousUpdatedAt.map({ updatedAt > $0 }) ?? true
         {
-            workspace.moveChatToFront(chat)
+            workspace.moveContextChatToFront(chat)
         }
         if previousState != fetchedResultState(for: chat) {
             await revalidateChatInRegisteredResults(
@@ -873,7 +961,7 @@ public final class CodexModelContext: @unchecked Sendable {
         if let workspace {
             detach(chat, from: workspace)
         }
-        chat.setArchived(true)
+        chat.applyContextArchived(true)
         await archiveChatInRegisteredResults(chat, workspace: workspace, group: group)
     }
 
@@ -992,6 +1080,113 @@ public final class CodexModelContext: @unchecked Sendable {
             }
         }
         return items
+    }
+
+    package func fetchedItemsIncludingPendingChanges<Model: CodexObservableModel>(
+        from page: CodexFetchPage<Model>,
+        descriptor: CodexFetchDescriptor<Model>,
+        existingItems: [Model] = []
+    ) -> [Model] {
+        guard Model.self == CodexChat.self else {
+            return page.items
+        }
+        let preservedChats = preservedLiveChats(
+            omittedFrom: page.items,
+            descriptor: descriptor
+        )
+        guard preservedChats.isEmpty == false else {
+            return page.items
+        }
+        logger.debug(
+            "Keeping live chats omitted from fetched page preservedCount=\(preservedChats.count, privacy: .public) pageCount=\(page.items.count, privacy: .public)"
+        )
+        let chatDescriptor = descriptor as! CodexFetchDescriptor<CodexChat>
+        let mergedChats = mergePreservedLiveChats(
+            preservedChats,
+            into: page.items as! [CodexChat],
+            existingChats: existingItems as? [CodexChat] ?? [],
+            descriptor: chatDescriptor
+        )
+        return mergedChats.map { $0 as! Model }
+    }
+
+    private func mergePreservedLiveChats(
+        _ preservedChats: [CodexChat],
+        into pageChats: [CodexChat],
+        existingChats: [CodexChat],
+        descriptor: CodexFetchDescriptor<CodexChat>
+    ) -> [CodexChat] {
+        var result = pageChats
+        let existingIndexes = Dictionary(
+            uniqueKeysWithValues: existingChats.enumerated().map { ($0.element.id, $0.offset) }
+        )
+        let orderedPreservedChats = preservedChats.sorted { lhs, rhs in
+            switch (existingIndexes[lhs.id], existingIndexes[rhs.id]) {
+            case (.some(let lhsIndex), .some(let rhsIndex)):
+                return lhsIndex < rhsIndex
+            case (.some, .none):
+                return true
+            case (.none, .some):
+                return false
+            case (.none, .none):
+                return liveChatShouldSortBefore(lhs, rhs, descriptor: descriptor)
+            }
+        }
+        for chat in orderedPreservedChats {
+            let insertionIndex = min(
+                existingIndexes[chat.id]
+                    ?? liveChatInsertionIndex(for: chat, in: result, descriptor: descriptor),
+                result.count
+            )
+            result.insert(chat, at: insertionIndex)
+        }
+        return result
+    }
+
+    private func liveChatInsertionIndex(
+        for chat: CodexChat,
+        in chats: [CodexChat],
+        descriptor: CodexFetchDescriptor<CodexChat>
+    ) -> Int {
+        chats.firstIndex { existing in
+            liveChatShouldSortBefore(chat, existing, descriptor: descriptor)
+        } ?? chats.count
+    }
+
+    private func liveChatShouldSortBefore(
+        _ lhs: CodexChat,
+        _ rhs: CodexChat,
+        descriptor: CodexFetchDescriptor<CodexChat>
+    ) -> Bool {
+        let descriptor = descriptor.sortBy.first
+        let order = descriptor?.order ?? .reverse
+        switch descriptor?.key ?? .recencyAt {
+        case .name:
+            return compare(lhs.title, rhs.title, order: order)
+        case .createdAt:
+            return compare(lhs.createdAt, rhs.createdAt, order: order)
+        case .updatedAt:
+            return compare(lhs.updatedAt, rhs.updatedAt, order: order)
+        case .recencyAt:
+            return compare(lhs.recencyAt, rhs.recencyAt, order: order)
+        }
+    }
+
+    private func compare<Value: Comparable>(
+        _ lhs: Value?,
+        _ rhs: Value?,
+        order: CodexSortOrder
+    ) -> Bool {
+        switch (lhs, rhs) {
+        case let (.some(lhs), .some(rhs)):
+            order == .forward ? lhs < rhs : lhs > rhs
+        case (.some, .none):
+            true
+        case (.none, .some):
+            false
+        case (.none, .none):
+            false
+        }
     }
 
     package func backfillCursor(after itemCount: Int, currentCursor: String?) -> String? {
@@ -1192,7 +1387,11 @@ public final class CodexModelContext: @unchecked Sendable {
     }
 
     @discardableResult
-    private func apply(_ snapshot: CodexThreadSnapshot, archived: Bool? = nil) -> CodexChat {
+    private func apply(
+        _ snapshot: CodexThreadSnapshot,
+        archived: Bool? = nil,
+        preservesExistingTurnItems: Bool = false
+    ) -> CodexChat {
         let chat = chat(for: snapshot.id)
         let workspace: CodexWorkspace?
         if snapshot.hasField(.workspace) {
@@ -1206,11 +1405,15 @@ public final class CodexModelContext: @unchecked Sendable {
         } else {
             workspace = chat.workspace
         }
-        chat.apply(snapshot, workspace: workspace)
+        chat.apply(
+            snapshot,
+            workspace: workspace,
+            preservesExistingTurnItems: preservesExistingTurnItems
+        )
         if let archived {
-            chat.setArchived(archived)
+            chat.applyContextArchived(archived)
         }
-        workspace?.addChatIfNeeded(chat)
+        workspace?.attachContextChatIfNeeded(chat)
         return chat
     }
 
@@ -1235,9 +1438,9 @@ public final class CodexModelContext: @unchecked Sendable {
             if let previousGroup = workspace.workspaceGroup,
                 previousGroup !== group
             {
-                previousGroup.setWorkspaces(previousGroup.workspaces.filter { $0 !== workspace })
+                previousGroup.replaceContextWorkspaces(previousGroup.workspaces.filter { $0 !== workspace })
             }
-            workspace.update(url: standardizedURL, name: name, workspaceGroup: group)
+            workspace.applyContextSnapshot(url: standardizedURL, name: name, workspaceGroup: group)
         } else {
             workspace = CodexWorkspace(
                 id: id,
@@ -1249,7 +1452,7 @@ public final class CodexModelContext: @unchecked Sendable {
             workspacesByID[id] = workspace
         }
         if group.workspaces.contains(where: { $0 === workspace }) == false {
-            group.setWorkspaces(sort(
+            group.replaceContextWorkspaces(sort(
                 group.workspaces + [workspace],
                 using: [CodexSortDescriptor(\.name)]
             ))
@@ -1259,7 +1462,7 @@ public final class CodexModelContext: @unchecked Sendable {
 
     private func workspaceGroup(for identity: CodexWorkspaceGroupIdentity) -> CodexWorkspaceGroup {
         if let group = workspaceGroupsByID[identity.id] {
-            group.update(name: identity.title)
+            group.applyContextSnapshot(name: identity.title)
             return group
         }
         let group = CodexWorkspaceGroup(
@@ -1289,7 +1492,16 @@ public final class CodexModelContext: @unchecked Sendable {
         loadedItems: [Model]? = nil,
         excluding excludedRegistration: (any CodexFetchedResultsRegistration)? = nil
     ) async {
-        let relationshipItems = page.relationshipItems ?? loadedItems ?? page.items
+        var relationshipItems = page.relationshipItems ?? loadedItems ?? page.items
+        if Model.self == CodexChat.self {
+            let preserved = relationshipPreservedLiveChats(
+                omittedFrom: relationshipItems,
+                descriptor: descriptor
+            )
+            if preserved.isEmpty == false {
+                relationshipItems.append(contentsOf: preserved.map { $0 as! Model })
+            }
+        }
         let relationshipIsComplete = page.relationshipIsComplete
             ?? (page.nextCursor == nil && descriptor.cursor == nil)
         await syncLoadedRelationships(
@@ -1307,12 +1519,13 @@ public final class CodexModelContext: @unchecked Sendable {
         excluding excludedRegistration: (any CodexFetchedResultsRegistration)? = nil
     ) async {
         if let chats = items as? [CodexChat] {
+            let preservingExisting = shouldPreserveExistingWorkspaceChats(
+                for: descriptor,
+                relationshipIsComplete: relationshipIsComplete
+            )
             let removedChats = syncWorkspaceChats(
                 chats,
-                preservingExisting: shouldPreserveExistingWorkspaceChats(
-                    for: descriptor,
-                    relationshipIsComplete: relationshipIsComplete
-                ),
+                preservingExisting: preservingExisting,
                 workspaceFilters: descriptor.predicate.workspaces,
                 archivedScope: descriptor.predicate.archived
             )
@@ -1347,15 +1560,16 @@ public final class CodexModelContext: @unchecked Sendable {
             if preservingExisting {
                 let fetchedIDs = Set(fetchedChats.map(\.id))
                 let remainingChats = workspace.chats.filter { fetchedIDs.contains($0.id) == false }
-                workspace.setChats(fetchedChats + remainingChats)
+                workspace.replaceContextChats(fetchedChats + remainingChats)
             } else {
                 let fetchedIDs = Set(fetchedChats.map(\.id))
                 let preservedChats = workspace.chats.filter {
                     fetchedIDs.contains($0.id) == false
-                        && shouldPreserve($0, outside: archivedScope)
+                        && (shouldPreserve($0, outside: archivedScope)
+                            || shouldPreserveLiveFetchedChat($0))
                 }
                 let currentChats = fetchedChats + preservedChats
-                workspace.setChats(currentChats)
+                workspace.replaceContextChats(currentChats)
                 let staleChats = detachStaleChats(
                     previousChats,
                     from: workspace,
@@ -1363,6 +1577,8 @@ public final class CodexModelContext: @unchecked Sendable {
                     archivedScope: archivedScope
                 )
                 let group = workspace.workspaceGroup
+                if staleChats.isEmpty == false {
+                }
                 removedChats.append(contentsOf: staleChats.map {
                     (chat: $0, workspace: workspace, group: group)
                 })
@@ -1408,7 +1624,7 @@ public final class CodexModelContext: @unchecked Sendable {
                 let remainingWorkspaces = group.workspaces.filter {
                     fetchedIDs.contains($0.id) == false
                 }
-                group.setWorkspaces(sort(
+                group.replaceContextWorkspaces(sort(
                     fetchedWorkspaces + remainingWorkspaces,
                     using: [CodexSortDescriptor(\.name)]
                 ))
@@ -1418,7 +1634,7 @@ public final class CodexModelContext: @unchecked Sendable {
                     fetchedIDs.contains($0.id) == false
                         && containsOutOfScopeChat(in: $0, archivedScope: archivedScope)
                 }
-                group.setWorkspaces(sort(
+                group.replaceContextWorkspaces(sort(
                     fetchedWorkspaces + preservedWorkspaces,
                     using: [CodexSortDescriptor(\.name)]
                 ))
@@ -1427,7 +1643,7 @@ public final class CodexModelContext: @unchecked Sendable {
     }
 
     private func detach(_ chat: CodexChat, from workspace: CodexWorkspace) {
-        workspace.setChats(workspace.chats.filter { $0 !== chat })
+        workspace.replaceContextChats(workspace.chats.filter { $0 !== chat })
         pruneWorkspaceIfEmpty(workspace)
     }
 
@@ -1441,6 +1657,7 @@ public final class CodexModelContext: @unchecked Sendable {
         let staleChats = previousChats.filter {
             refreshedIDs.contains($0.id) == false
                 && isInRefreshedScope($0, archivedScope: archivedScope)
+                && shouldPreserveLiveFetchedChat($0) == false
         }
         for chat in staleChats {
             chat.detachFromWorkspace(workspace)
@@ -1452,7 +1669,7 @@ public final class CodexModelContext: @unchecked Sendable {
         guard workspace.chats.isEmpty, let group = workspace.workspaceGroup else {
             return
         }
-        group.setWorkspaces(group.workspaces.filter { $0 !== workspace })
+        group.replaceContextWorkspaces(group.workspaces.filter { $0 !== workspace })
     }
 
     private func shouldPreserveExistingWorkspaceChats<Model: CodexObservableModel>(
@@ -1465,6 +1682,110 @@ public final class CodexModelContext: @unchecked Sendable {
             || descriptor.predicate.modelProviders?.isEmpty == false
             || descriptor.predicate.sourceKinds != nil
             || descriptor.predicate.useStateDBOnly != nil
+    }
+
+    package func preservedLiveChats<Model: CodexObservableModel>(
+        omittedFrom loadedItems: [Model],
+        descriptor: CodexFetchDescriptor<Model>
+    ) -> [CodexChat] {
+        preservedLiveChats(
+            omittedFrom: loadedItems,
+            descriptor: descriptor,
+            requiresIncludePendingChanges: true
+        )
+    }
+
+    private func relationshipPreservedLiveChats<Model: CodexObservableModel>(
+        omittedFrom loadedItems: [Model],
+        descriptor: CodexFetchDescriptor<Model>
+    ) -> [CodexChat] {
+        preservedLiveChats(
+            omittedFrom: loadedItems,
+            descriptor: descriptor,
+            requiresIncludePendingChanges: false
+        )
+    }
+
+    private func preservedLiveChats<Model: CodexObservableModel>(
+        omittedFrom loadedItems: [Model],
+        descriptor: CodexFetchDescriptor<Model>,
+        requiresIncludePendingChanges: Bool
+    ) -> [CodexChat] {
+        guard Model.self == CodexChat.self,
+            canPreserveLiveChats(
+                for: descriptor,
+                requiresIncludePendingChanges: requiresIncludePendingChanges
+            )
+        else {
+            return []
+        }
+        let loadedChatIDs = Set((loadedItems as? [CodexChat] ?? []).map(\.id))
+        let chatDescriptor = descriptor as! CodexFetchDescriptor<CodexChat>
+        return chatsByID.values.filter { chat in
+            loadedChatIDs.contains(chat.id) == false
+                && shouldPreserveLiveFetchedChat(chat)
+                && shouldIncludeLiveFetchedChat(chat, descriptor: chatDescriptor)
+        }
+    }
+
+    package func shouldPreserveLiveFetchedChat(_ chat: CodexChat) -> Bool {
+        guard chatsByID[chat.id] === chat else {
+            return false
+        }
+        if activeChatObservationsByID[chat.id]?.isFinished == false {
+            return true
+        }
+        if preparedEventThreadsByID[chat.id] != nil {
+            return true
+        }
+        if chat.status?.isActive == true {
+            return true
+        }
+        if chat.phase == .loading {
+            return true
+        }
+        return false
+    }
+
+    private func canPreserveLiveChats<Model: CodexObservableModel>(
+        for descriptor: CodexFetchDescriptor<Model>,
+        requiresIncludePendingChanges: Bool
+    ) -> Bool {
+        (requiresIncludePendingChanges == false || descriptor.includePendingChanges)
+            && descriptor.predicate.searchTerm?.isEmpty != false
+            && descriptor.predicate.modelProviders?.isEmpty != false
+            && descriptor.predicate.sourceKinds == nil
+            && descriptor.predicate.useStateDBOnly == nil
+    }
+
+    private func shouldIncludeLiveFetchedChat(
+        _ chat: CodexChat,
+        descriptor: CodexFetchDescriptor<CodexChat>
+    ) -> Bool {
+        switch descriptor.predicate.archived {
+        case .some(let expectedArchived):
+            guard expectedArchived == chat.isArchived else {
+                return false
+            }
+        case .none:
+            guard chat.isArchived == false else {
+                return false
+            }
+        }
+
+        if let workspaces = descriptor.predicate.workspaces {
+            guard let chatWorkspace = chat.workspace else {
+                return false
+            }
+            let chatPath = Self.standardizedDirectoryURL(chatWorkspace.url).path
+            guard workspaces.contains(where: {
+                Self.standardizedDirectoryURL($0).path == chatPath
+            }) else {
+                return false
+            }
+        }
+
+        return true
     }
 
     private func workspaceIfLoaded(for url: URL) -> CodexWorkspace? {
@@ -1833,6 +2154,25 @@ public final class CodexModelContext: @unchecked Sendable {
     private static func displayName(for url: URL) -> String {
         let name = url.lastPathComponent
         return name.isEmpty ? url.path : name
+    }
+}
+
+private extension CodexReviewTarget {
+    var dataKitPreview: String {
+        switch self {
+        case .uncommittedChanges:
+            return "Review the current code changes (staged, unstaged, and untracked files) and provide prioritized findings."
+        case .baseBranch(let branch):
+            return "Review the code changes against the base branch '\(branch)'."
+        case .commit(let sha, let title):
+            if let title, title.isEmpty == false {
+                return "Review the code changes introduced by commit \(sha) (\"\(title)\"). Provide prioritized, actionable findings."
+            }
+            return "Review the code changes introduced by commit \(sha). Provide prioritized, actionable findings."
+        case .custom(let instructions):
+            let preview = instructions.trimmingCharacters(in: .whitespacesAndNewlines)
+            return preview.isEmpty ? "Review code changes." : preview
+        }
     }
 }
 

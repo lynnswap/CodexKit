@@ -8,8 +8,8 @@ Use this package when app or UI code needs workspace group, workspace, and chat 
 
 - `CodexModelContainer`: Owns the `CodexAppServer` and vends the main `CodexModelContext`.
 - `CodexModelContext`: Fetches models, preserves model identity, and performs app-server actions for attached models.
-- `CodexFetchDescriptor`: SwiftData-style value description of predicate, sort order, limit, and offset.
-- `CodexFetchRequest`: CoreData-style mutable request object for predicate, sort descriptors, limit, and offset.
+- `CodexFetchDescriptor`: SwiftData-style value description of predicate, sort order, limit, offset, and pending-change inclusion.
+- `CodexFetchRequest`: CoreData-style mutable request object for predicate, sort descriptors, limit, offset, and pending-change inclusion.
 - `CodexFetchedResults`: Observable CoreData-style fetch results with items, optional sections, cursors, loading phase, and errors.
 - `CodexFetchedResultsController`: Non-UI fetched-results controller that keeps `CodexFetchedResults` as the current-value owner and exposes ordered snapshot transactions.
 - `CodexFetchedResultsSnapshot`, `CodexFetchedResultsTransaction`: Section and item ID snapshots plus section/item changes suitable for conversion to native UI update APIs.
@@ -72,6 +72,13 @@ supported CodexDataKit model field; arbitrary key paths are not silently treated
 app-server sorts. Section descriptors support the same key-path style, plus
 relationship aliases such as `.workspaceGroup` and `.workspace` for the common
 sidebar groupings.
+
+Chat fetches include pending/live context changes by default, matching SwiftData's
+`includePendingChanges` shape. A `CodexChat` created or actively observed by the
+context remains eligible for fetch results when the app-server thread list
+temporarily omits it, as long as the predicate can be decided locally. Set
+`includePendingChanges` to `false` on `CodexFetchDescriptor` or `CodexFetchRequest`
+when a fetch should report only the server-owned page membership.
 
 Fetches preserve object identity. If the same app-server thread appears in a later refresh, CodexDataKit mutates the existing `CodexChat` instance instead of replacing it.
 
@@ -168,49 +175,42 @@ Keep review-specific state, parsed findings, and review timelines outside CodexD
 
 ## Live Chat Observation
 
-Use `CodexChat.observe()` or `CodexModelContext.observe(_:)` when a detail view needs an initial transcript snapshot plus live app-server events applied to the same observable chat object.
+Use `CodexChat.observe()` or `CodexModelContext.observe(_:)` when a detail view needs the current accumulated transcript plus live app-server events applied to the same observable chat object.
 
 ```swift
 let chat = context.model(for: CodexThreadID(rawValue: "thread-1"))
 let observation = try await context.observe(chat)
 
-// Render directly from chat.turns, chat.items, chat.phase, and chat.lastErrorDescription.
-// Keep observation alive for as long as the UI should receive live updates.
+render(observation.chat.items)
+
+Task {
+    for await update in observation.updates {
+        apply(update, to: observation.chat)
+    }
+}
+
 observation.cancel()
 ```
 
-Observation first refreshes the chat with `includeTurns: true`, then consumes `CodexThread.events`. Turn, item, message, delta, usage, completion, and failure events mutate the existing `CodexChat`, `CodexChat.Turn`, and `CodexChat.Item` instances in place.
+Observation first refreshes or seeds the chat with `includeTurns: true`, then consumes `CodexThread.events`. Turn, item, message, delta, usage, completion, and failure events mutate the existing `CodexChat`, `CodexChat.Turn`, and `CodexChat.Item` instances in place.
 
-When a UI needs one turn at a time, use the turn-scoped read projections instead of filtering the whole chat in higher-level packages:
+`CodexChatObservation.chat` is the current value at observation creation and stays identical to the context-owned `CodexChat` instance. `updates` is a multicast async sequence of subsequent `CodexChatUpdate` values. The stream does not replay the current value. Consumers render the current value once, then use `updates` as invalidation or incremental hints while reading the same observable model.
 
-```swift
-if let snapshot = chat.turnSnapshot(for: turnID) {
-    render(
-        status: snapshot.status,
-        error: snapshot.errorDescription,
-        usage: snapshot.usage,
-        transcript: snapshot.transcript
-    )
-}
-```
-
-`CodexChatTurnSnapshot` keeps references to the existing observable `CodexChat.Turn` and `CodexChat.Item` objects. It is not a separate live model and does not copy ownership of transcript state.
-
-For streaming detail surfaces that render one turn at a time, fold `CodexChatChange` values through `CodexChatTurnProjection`:
+Do not keep UI-owned transcript mirrors in sync with the stream. Keep selection state as semantic IDs, read `CodexChat.turns` and `CodexChat.items` from the observed model, and build app-specific display projections in the UI package:
 
 ```swift
-var projection = CodexChatTurnProjection(selection: .latest)
+var selectedTurnID: CodexTurnID?
+render(selectedTurnID.map { chat.items(in: $0) } ?? chat.items)
 
-for await change in observation.changes {
-    let update = projection.apply(change)
-    guard update.affectsSelectedTurn, let snapshot = update.snapshot else {
+for await update in observation.updates {
+    guard selectedTurnID == nil || update.affectedTurnID == selectedTurnID else {
         continue
     }
-    render(snapshot.items)
+    render(selectedTurnID.map { chat.items(in: $0) } ?? chat.items)
 }
 ```
 
-`CodexChatTurnProjection` owns generic change folding, item identity, item order, and latest/explicit turn selection. App-specific rendering projections should stay outside CodexDataKit.
+CodexDataKit may read app-server thread snapshots internally to establish or reconcile the current value. Those reads are not part of the observation stream. Once live events have advanced an observed chat, later thread reads are merged into the existing model and must not rewind already-applied live turns or items unless an explicit model operation such as rollback requests replacement.
 
 When a higher-level package persists an app-specific operation identity, keep that identity outside CodexDataKit. Resolve it to the app-server thread ID at that layer, then observe the generic chat model:
 

@@ -1020,7 +1020,7 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
             status: status,
             ephemeral: ephemeral,
             turns: turns,
-            turnItemsAreAuthoritative: turns != nil,
+            turnItemsAreAuthoritative: turns?.allSatisfy(\.itemsAreAuthoritative) ?? false,
             presentFields: Self.presentFields(
                 workspace: workspace,
                 name: name,
@@ -1132,22 +1132,29 @@ public struct CodexTurnSnapshot: Identifiable, Equatable, Sendable {
     public var id: CodexTurnID
     public var status: CodexTurnStatus?
     public var errorMessage: String?
+    public var itemsLoadState: CodexTurnItemsLoadState
     public var items: [CodexThreadItem]
 
     public init(
         id: CodexTurnID,
         status: CodexTurnStatus? = nil,
         errorMessage: String? = nil,
+        itemsLoadState: CodexTurnItemsLoadState = .full,
         items: [CodexThreadItem] = []
     ) {
         self.id = id
         self.status = status
         self.errorMessage = errorMessage
+        self.itemsLoadState = itemsLoadState
         self.items = items
+    }
+
+    package var itemsAreAuthoritative: Bool {
+        itemsLoadState == .full
     }
 }
 
-public enum CodexTurnItemsView: String, Codable, Equatable, Sendable {
+public enum CodexTurnItemsLoadState: String, Codable, Equatable, Sendable {
     case notLoaded
     case summary
     case full
@@ -1157,18 +1164,18 @@ public struct CodexTurnQuery: Equatable, Sendable {
     public var cursor: String?
     public var limit: Int?
     public var sortDirection: CodexSortDirection?
-    public var itemsView: CodexTurnItemsView?
+    public var itemsLoadState: CodexTurnItemsLoadState?
 
     public init(
         cursor: String? = nil,
         limit: Int? = nil,
         sortDirection: CodexSortDirection? = nil,
-        itemsView: CodexTurnItemsView? = nil
+        itemsLoadState: CodexTurnItemsLoadState? = nil
     ) {
         self.cursor = cursor
         self.limit = limit
         self.sortDirection = sortDirection
-        self.itemsView = itemsView
+        self.itemsLoadState = itemsLoadState
     }
 }
 
@@ -1612,24 +1619,98 @@ public enum CodexMessagePhase: Equatable, Sendable {
 }
 
 public struct CodexCommand: Equatable, Sendable {
+    public struct Source: RawRepresentable, Hashable, Sendable, ExpressibleByStringLiteral {
+        public var rawValue: String
+
+        public init(rawValue: String) {
+            self.rawValue = rawValue
+        }
+
+        public init(stringLiteral value: String) {
+            self.rawValue = value
+        }
+
+        public static let agent = Self(rawValue: "agent")
+        public static let user = Self(rawValue: "user")
+    }
+
+    public struct Action: Equatable, Sendable {
+        public enum Kind: String, Equatable, Sendable {
+            case read
+            case listFiles
+            case search
+            case unknown
+        }
+
+        public var kind: Kind
+        public var command: String?
+        public var name: String?
+        public var path: String?
+        public var query: String?
+
+        public init(
+            kind: Kind,
+            command: String? = nil,
+            name: String? = nil,
+            path: String? = nil,
+            query: String? = nil
+        ) {
+            self.kind = kind
+            self.command = command
+            self.name = name
+            self.path = path
+            self.query = query
+        }
+    }
+
     public var command: String
     public var cwd: String?
     public var output: String?
     public var exitCode: Int?
     public var status: CodexTurnStatus?
+    public var startedAt: Date?
+    public var completedAt: Date?
+    public var duration: Duration?
+    public var processID: String?
+    public var source: Source?
+    public var commandActions: [Action]
+
+    public var durationMilliseconds: Int? {
+        guard let duration else {
+            return nil
+        }
+        let components = duration.components
+        let milliseconds = components.seconds * 1_000 + components.attoseconds / 1_000_000_000_000_000
+        guard milliseconds >= 0, milliseconds <= Int.max else {
+            return nil
+        }
+        return Int(milliseconds)
+    }
 
     public init(
         command: String,
         cwd: String? = nil,
         output: String? = nil,
         exitCode: Int? = nil,
-        status: CodexTurnStatus? = nil
+        status: CodexTurnStatus? = nil,
+        startedAt: Date? = nil,
+        completedAt: Date? = nil,
+        duration: Duration? = nil,
+        processID: String? = nil,
+        source: Source? = nil,
+        commandActions: [Action] = []
     ) {
         self.command = command
         self.cwd = cwd
         self.output = output
         self.exitCode = exitCode
         self.status = status
+        self.startedAt = startedAt
+        self.completedAt = completedAt
+        self.duration = duration
+        self.processID = processID
+        self.source = source
+        self.commandActions = commandActions
     }
 }
 

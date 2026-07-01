@@ -182,18 +182,21 @@ public struct CodexFetchDescriptor<Model: CodexObservableModel>: Sendable, Hasha
     public var sortBy: [CodexSortDescriptor<Model>]
     public var fetchLimit: Int?
     public var fetchOffset: Int
+    public var includePendingChanges: Bool
     package var cursor: String?
 
     public init(
         predicate: CodexFetchPredicate<Model> = .init(),
         sortBy: [CodexSortDescriptor<Model>] = [],
         fetchLimit: Int? = nil,
-        fetchOffset: Int = 0
+        fetchOffset: Int = 0,
+        includePendingChanges: Bool = true
     ) {
         self.predicate = predicate
         self.sortBy = sortBy
         self.fetchLimit = fetchLimit
         self.fetchOffset = max(0, fetchOffset)
+        self.includePendingChanges = includePendingChanges
         self.cursor = nil
     }
 
@@ -273,6 +276,7 @@ public final class CodexFetchRequest<Model: CodexObservableModel>: @unchecked Se
     public var sortDescriptors: [CodexSortDescriptor<Model>]
     public var fetchLimit: Int?
     public var fetchOffset: Int
+    public var includePendingChanges: Bool
     package var cursor: String?
 
     public var fetchDescriptor: CodexFetchDescriptor<Model> {
@@ -281,7 +285,8 @@ public final class CodexFetchRequest<Model: CodexObservableModel>: @unchecked Se
                 predicate: predicate,
                 sortBy: sortDescriptors,
                 fetchLimit: fetchLimit,
-                fetchOffset: fetchOffset
+                fetchOffset: fetchOffset,
+                includePendingChanges: includePendingChanges
             )
             descriptor.cursor = cursor
             return descriptor
@@ -291,6 +296,7 @@ public final class CodexFetchRequest<Model: CodexObservableModel>: @unchecked Se
             sortDescriptors = newValue.sortBy
             fetchLimit = newValue.fetchLimit
             fetchOffset = newValue.fetchOffset
+            includePendingChanges = newValue.includePendingChanges
             cursor = newValue.cursor
         }
     }
@@ -299,12 +305,14 @@ public final class CodexFetchRequest<Model: CodexObservableModel>: @unchecked Se
         predicate: CodexFetchPredicate<Model> = .init(),
         sortDescriptors: [CodexSortDescriptor<Model>] = [],
         fetchLimit: Int? = nil,
-        fetchOffset: Int = 0
+        fetchOffset: Int = 0,
+        includePendingChanges: Bool = true
     ) {
         self.predicate = predicate
         self.sortDescriptors = sortDescriptors
         self.fetchLimit = fetchLimit
         self.fetchOffset = max(0, fetchOffset)
+        self.includePendingChanges = includePendingChanges
         self.cursor = nil
     }
 
@@ -313,7 +321,8 @@ public final class CodexFetchRequest<Model: CodexObservableModel>: @unchecked Se
             predicate: descriptor.predicate,
             sortDescriptors: descriptor.sortBy,
             fetchLimit: descriptor.fetchLimit,
-            fetchOffset: descriptor.fetchOffset
+            fetchOffset: descriptor.fetchOffset,
+            includePendingChanges: descriptor.includePendingChanges
         )
         self.cursor = descriptor.cursor
     }
@@ -688,7 +697,7 @@ public final class CodexFetchedResults<Model: CodexObservableModel> {
         appending: Bool
     ) -> [Model] {
         guard appending else {
-            return page.items
+            return replacingItems(from: page)
         }
         if page.relationshipIsComplete == true, let authoritativeItems = page.relationshipItems {
             let start = min(
@@ -700,6 +709,14 @@ public final class CodexFetchedResults<Model: CodexObservableModel> {
             return Array(authoritativeItems[start..<end])
         }
         return append(page.items, to: items)
+    }
+
+    private func replacingItems(from page: CodexFetchPage<Model>) -> [Model] {
+        modelContext.fetchedItemsIncludingPendingChanges(
+            from: page,
+            descriptor: fetchDescriptor,
+            existingItems: items
+        )
     }
 
     private func append(_ incoming: [Model], to existing: [Model]) -> [Model] {
@@ -915,8 +932,8 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         if archived {
             restoreArchivedRelationships(for: chat)
         }
-        if let chat = chat as? Model {
-            return chat
+        if let chatModel = chat as? Model {
+            return chatModel
         }
         if let workspace = chat.workspace as? Model {
             return workspace
@@ -926,7 +943,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             let group = workspaceGroup as? Model
         {
             if workspaceGroup.workspaces.contains(where: { $0 === workspace }) == false {
-                workspaceGroup.setWorkspaces(workspaceGroup.workspaces + [workspace])
+                workspaceGroup.replaceContextWorkspaces(workspaceGroup.workspaces + [workspace])
             }
             return group
         }
@@ -1385,12 +1402,12 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             return
         }
         if workspace.chats.contains(where: { $0 === chat }) == false {
-            workspace.setChats([chat] + workspace.chats)
+            workspace.replaceContextChats([chat] + workspace.chats)
         }
         if let group = workspace.workspaceGroup,
             group.workspaces.contains(where: { $0 === workspace }) == false
         {
-            group.setWorkspaces(group.workspaces + [workspace])
+            group.replaceContextWorkspaces(group.workspaces + [workspace])
         }
     }
 
