@@ -477,6 +477,13 @@ public final class CodexModelContext {
         return item
     }
 
+    package func unregisterContextItem(_ item: CodexItem) {
+        guard itemsByID[item.id] === item else {
+            return
+        }
+        itemsByID.removeValue(forKey: item.id)
+    }
+
     public nonisolated(nonsending) func refresh(_ group: CodexWorkspaceGroup) async throws {
         guard group.modelContext === self else {
             throw CodexModelContextError.modelIsDetached
@@ -1102,7 +1109,8 @@ public final class CodexModelContext {
                 recencyAt: now,
                 status: .active(activeFlags: []),
                 ephemeral: input.options.ephemeral,
-                turns: [review.initialTurn]
+                turns: [review.initialTurn],
+                turnItemsAreAuthoritative: false
             ),
             eventThread: review.eventThread,
             archived: false,

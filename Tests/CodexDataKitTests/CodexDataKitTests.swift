@@ -7142,6 +7142,102 @@ struct CodexModelContextTests {
         #expect(requests.filter { $0 == "thread/list" }.count == 1)
     }
 
+    @Test("started review seed does not truncate an existing chat transcript")
+    func startedReviewSeedDoesNotTruncateExistingChatTranscript() async throws {
+        let workspaceURL = temporaryDirectory()
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let existingChat = context.model(for: CodexThreadID(rawValue: "thread-review"))
+        let existingSnapshot = CodexThreadSnapshot(
+            id: "thread-review",
+            workspace: workspaceURL,
+            turns: [
+                .init(
+                    id: "turn-existing-user",
+                    status: .completed,
+                    itemsLoadState: .full,
+                    items: [
+                        .init(
+                            id: "existing-user-message",
+                            kind: .userMessage,
+                            content: .message(.init(
+                                id: "existing-user-message",
+                                role: .user,
+                                text: "previous request"
+                            ))
+                        ),
+                    ]
+                ),
+                .init(
+                    id: "turn-existing-agent",
+                    status: .completed,
+                    itemsLoadState: .full,
+                    items: [
+                        .init(
+                            id: "existing-agent-message",
+                            kind: .agentMessage,
+                            content: .message(.init(
+                                id: "existing-agent-message",
+                                role: .assistant,
+                                text: "previous response"
+                            ))
+                        ),
+                    ]
+                ),
+            ]
+        )
+        existingChat.apply(
+            existingSnapshot,
+            workspace: nil
+        )
+
+        try await runtime.transport.enqueueThreadStart(threadID: "thread-review", model: "gpt-5")
+        try await runtime.transport.enqueueReviewStart(
+            .init(
+                id: "turn-seed",
+                status: .running,
+                itemsLoadState: .full,
+                items: [
+                    .init(
+                        id: "turn-seed",
+                        kind: .userMessage,
+                        content: .message(.init(
+                            id: "turn-seed",
+                            role: .user,
+                            text: "current changes"
+                        ))
+                    ),
+                ]
+            ),
+            reviewThreadID: "thread-review"
+        )
+
+        let started = try await context.startReview(
+            in: workspaceURL,
+            input: CodexReviewInput(
+                target: .uncommittedChanges,
+                options: .init(model: "gpt-5", ephemeral: false)
+            )
+        )
+
+        #expect(started.chat === existingChat)
+        #expect(started.chat.turns.map(\.id.rawValue) == [
+            "turn-existing-user",
+            "turn-existing-agent",
+            "turn-seed",
+        ])
+        #expect(started.chat.items.map(\.itemID) == [
+            "existing-user-message",
+            "existing-agent-message",
+            "turn-seed",
+        ])
+        #expect(started.chat.items.map(\.text) == [
+            "previous request",
+            "previous response",
+            "current changes",
+        ])
+    }
+
     @Test("model actor review start multicasts the active review to the main context")
     func modelActorReviewStartMulticastsActiveReviewToMainContext() async throws {
         let workspaceURL = temporaryDirectory()
@@ -7932,8 +8028,11 @@ struct CodexModelContextTests {
             return
         }
         #expect(commandItems.count == 1)
-        #expect(commandItem === liveCommand)
+        #expect(commandItem !== liveCommand)
+        #expect(liveCommand.modelContext == nil)
+        #expect(liveCommand.turnID == nil)
         #expect(commandItem.turnID?.rawValue == "turn-live")
+        #expect(commandItem.id.rawValue == "turn-live:call-live")
         #expect(started.chat.items(in: "turn-seed").contains { $0.kind == .commandExecution } == false)
         #expect(started.chat.items(in: "turn-live").filter { $0.kind == .commandExecution }.count == 1)
         #expect(command.startedAt == startedAt)

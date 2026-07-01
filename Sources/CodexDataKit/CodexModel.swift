@@ -499,6 +499,12 @@ public final class CodexItem: CodexPersistentModel {
         self.turn = turn
     }
 
+    package func detachFromContext() {
+        chat = nil
+        turn = nil
+        modelContext = nil
+    }
+
     fileprivate func update(
         from threadItem: CodexThreadItem,
         itemsLoadState: CodexTurnItemsLoadState
@@ -922,6 +928,7 @@ public final class CodexChat: CodexPersistentModel {
 
     private func replaceItems(with records: [CodexTurnSnapshot]) {
         let existingByKey = itemsByMergeKey
+        let previousItems = items
         items = records.flatMap { record in
             record.items.map { incomingItem in
                 let incomingKey = CodexChatItemKey(
@@ -944,6 +951,11 @@ public final class CodexChat: CodexPersistentModel {
                 )
             }
         }
+        let retainedItems = Set(items.map(ObjectIdentifier.init))
+        let removedItems = previousItems.filter {
+            retainedItems.contains(ObjectIdentifier($0)) == false
+        }
+        unregisterItemsFromContext(removedItems)
         rebuildItemIndexes()
     }
 
@@ -1246,41 +1258,44 @@ public final class CodexChat: CodexPersistentModel {
                     existing: previousItem
                 )
                 let movesAcrossTurns = previousTurnID != turnID
+                if movesAcrossTurns {
+                    let replacementItem: CodexThreadItem
+                    if accumulatesOutputDeltas,
+                        mergeOutputDelta(incomingItem, into: existing, key: previousMergeKey)
+                    {
+                        replacementItem = existing.threadItem
+                    } else {
+                        replacementItem = incomingItem
+                    }
+                    let replacement = replaceItemAcrossTurns(
+                        existing,
+                        with: replacementItem,
+                        turnID: turnID,
+                        itemsLoadState: itemsLoadState
+                    )
+                    changes.append(.itemRemoved(id: previousItem.id, turnID: previousTurnID))
+                    changes.append(.itemInserted(id: replacement.itemID, turnID: replacement.turnID))
+                    continue
+                }
                 let updateChange: CodexChatUpdate?
                 if accumulatesOutputDeltas,
                     mergeOutputDelta(incomingItem, into: existing, key: previousMergeKey)
                 {
-                    if movesAcrossTurns {
-                        moveItemInIndexes(existing, to: turnID)
-                    }
                     updateChange = changeForUpdatedItem(
                         existing,
                         previousItem: previousItem
                     )
                 } else {
-                    if movesAcrossTurns {
-                        removeItemFromIndexes(existing)
-                        existing.applyContextOwners(
-                            chat: self,
-                            turn: turnID.map { contextTurn(id: $0) }
-                        )
-                    }
                     existing.update(
                         from: incomingItem,
                         itemsLoadState: itemsLoadState
                     )
-                    if movesAcrossTurns {
-                        addItemToIndexes(existing)
-                    }
                     updateChange = changeForUpdatedItem(
                         existing,
                         previousItem: previousItem
                     )
                 }
-                if movesAcrossTurns {
-                    changes.append(.itemRemoved(id: previousItem.id, turnID: previousTurnID))
-                    changes.append(.itemInserted(id: existing.itemID, turnID: existing.turnID))
-                } else if existing.mergeKey != previousMergeKey {
+                if existing.mergeKey != previousMergeKey {
                     rebuildItemIndexes()
                     changes.appendIfPresent(updateChange)
                 } else {
@@ -1967,15 +1982,6 @@ public final class CodexChat: CodexPersistentModel {
         itemsByMergeKey[key]
     }
 
-    private func moveItemInIndexes(_ item: CodexItem, to turnID: CodexTurnID?) {
-        removeItemFromIndexes(item)
-        item.applyContextOwners(
-            chat: self,
-            turn: turnID.map { contextTurn(id: $0) }
-        )
-        addItemToIndexes(item)
-    }
-
     private func removeProvisionalSeedTurn(_ provisionalTurnID: CodexTurnID) -> [CodexItem] {
         provisionalSeedTurnID = nil
         guard let provisionalTurn = turnsByID[provisionalTurnID] else {
@@ -1991,6 +1997,7 @@ public final class CodexChat: CodexPersistentModel {
             for item in removedItems {
                 removeItemFromIndexes(item)
             }
+            unregisterItemsFromContext(removedItems)
         }
 
         turns.removeAll { $0 === provisionalTurn }
@@ -2090,6 +2097,7 @@ public final class CodexChat: CodexPersistentModel {
         for item in removedItems {
             removeItemFromIndexes(item)
         }
+        unregisterItemsFromContext(removedItems)
         liveMergeState.reasoningDeltaTextByItemKey = liveMergeState.reasoningDeltaTextByItemKey
             .filter { key, _ in
                 prefixes.contains { key.id.hasPrefix($0) } == false
@@ -2114,6 +2122,7 @@ public final class CodexChat: CodexPersistentModel {
         for item in removedItems {
             removeItemFromIndexes(item)
         }
+        unregisterItemsFromContext(removedItems)
         return removedItems.map { item in
             .itemRemoved(id: item.itemID, turnID: item.turnID)
         }
@@ -2242,6 +2251,35 @@ public final class CodexChat: CodexPersistentModel {
         addItemToIndexes(item)
     }
 
+    private func replaceItemAcrossTurns(
+        _ existing: CodexItem,
+        with incomingItem: CodexThreadItem,
+        turnID: CodexTurnID?,
+        itemsLoadState: CodexTurnItemsLoadState
+    ) -> CodexItem {
+        let replacementIndex = items.firstIndex { $0 === existing }
+        let previousMergeKey = existing.mergeKey
+        removeItemFromIndexes(existing)
+        unregisterItemsFromContext([existing])
+        let replacement = contextItem(
+            threadItem: incomingItem,
+            turnID: turnID,
+            itemsLoadState: itemsLoadState
+        )
+        if let replacementIndex {
+            items[replacementIndex] = replacement
+        } else {
+            items.append(replacement)
+        }
+        addItemToIndexes(replacement)
+        if let outputDeltaText = liveMergeState.outputDeltaTextByItemKey.removeValue(
+            forKey: previousMergeKey
+        ) {
+            liveMergeState.outputDeltaTextByItemKey[replacement.mergeKey] = outputDeltaText
+        }
+        return replacement
+    }
+
     private func addItemToIndexes(_ item: CodexItem) {
         itemsByMergeKey[item.mergeKey] = item
         if let turnID = item.turnID {
@@ -2259,6 +2297,16 @@ public final class CodexChat: CodexPersistentModel {
         turnsByID[turnID]?.detachContextItem(item)
         if itemsByTurnID[turnID]?.isEmpty == true {
             itemsByTurnID.removeValue(forKey: turnID)
+        }
+    }
+
+    private func unregisterItemsFromContext(_ items: [CodexItem]) {
+        guard let modelContext else {
+            return
+        }
+        for item in items {
+            modelContext.unregisterContextItem(item)
+            item.detachFromContext()
         }
     }
 
