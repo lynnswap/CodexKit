@@ -1347,6 +1347,61 @@ struct CodexModelContextTests {
         #expect(staleChat.workspace == nil)
     }
 
+    @Test("workspace fetch preserves live-only workspace omitted from refresh")
+    func workspaceFetchPreservesLiveOnlyWorkspaceOmittedFromRefresh() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspace = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(
+                id: "thread-running",
+                workspace: workspace,
+                name: "Running",
+                status: .active(activeFlags: [])
+            )
+        ]))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexWorkspace>.workspaces)
+        try await results.performFetch()
+        let fetchedWorkspace = try #require(results.items.first)
+        let runningChat = try #require(fetchedWorkspace.chats.first)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: []))
+        try await results.refresh()
+
+        #expect(results.items.map(\.url) == [workspace])
+        #expect(fetchedWorkspace.chats.map(\.id.rawValue) == ["thread-running"])
+        #expect(runningChat.workspace === fetchedWorkspace)
+    }
+
+    @Test("workspace group fetch preserves live-only workspace omitted from refresh")
+    func workspaceGroupFetchPreservesLiveOnlyWorkspaceOmittedFromRefresh() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let repo = try gitRepository(named: "LiveOnly")
+        let workspace = try createDirectory("App", in: repo)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(
+                id: "thread-running",
+                workspace: workspace,
+                name: "Running",
+                status: .active(activeFlags: [])
+            )
+        ]))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexWorkspaceGroup>.workspaceGroups)
+        try await results.performFetch()
+        let group = try #require(results.items.first)
+        let fetchedWorkspace = try #require(group.workspaces.first)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: []))
+        try await results.refresh()
+
+        #expect(results.items.map(\.id) == [group.id])
+        #expect(group.workspaces.map(\.url) == [workspace])
+        #expect(fetchedWorkspace.chats.map(\.id.rawValue) == ["thread-running"])
+    }
+
     @Test("started review prepared threads do not preserve stale fetched chat rows")
     func startedReviewPreparedThreadsDoNotPreserveStaleFetchedChatRows() async throws {
         let workspace = temporaryDirectory()
@@ -6075,6 +6130,57 @@ struct CodexModelContextTests {
                 "diagnostic-turn-replay-a",
                 "reasoning-turn-replay-b",
                 "diagnostic-turn-replay-b",
+            ]
+        })
+        withExtendedLifetime(changes) {}
+    }
+
+    @Test("chat observation removes reasoning parts only within the same turn")
+    func chatObservationRemovesReasoningPartsOnlyWithinSameTurn() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-reasoning-parts"))
+        try await runtime.transport.enqueueThreadRead(.init(id: "thread-reasoning-parts", turns: []))
+
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-reasoning-parts"))
+        let observation = try await chat.observe()
+        defer {
+            observation.cancel()
+        }
+        let changes = ChatUpdateRecorder(stream: observation.updates)
+
+        for turnID in ["turn-a", "turn-b"] {
+            try await runtime.transport.emitServerNotification(
+                method: "item/started",
+                params: ThreadItemParams(
+                    threadID: "thread-reasoning-parts",
+                    turnID: turnID,
+                    item: .init(
+                        id: "reasoning-parent:summary:0",
+                        type: "reasoning",
+                        text: "Checking diff"
+                    )
+                )
+            )
+        }
+        try await runtime.transport.emitServerNotification(
+            method: "item/started",
+            params: ThreadItemParams(
+                threadID: "thread-reasoning-parts",
+                turnID: "turn-b",
+                item: .init(
+                    id: "reasoning-parent",
+                    type: "reasoning",
+                    text: "Checked diff"
+                )
+            )
+        )
+
+        #expect(await eventually {
+            chat.items.map { "\($0.turnID?.rawValue ?? "nil"):\($0.itemID)" } == [
+                "turn-a:reasoning-parent:summary:0",
+                "turn-b:reasoning-parent",
             ]
         })
         withExtendedLifetime(changes) {}

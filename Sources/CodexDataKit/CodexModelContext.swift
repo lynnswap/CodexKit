@@ -1570,7 +1570,11 @@ public final class CodexModelContext {
             scopedWorkspaceURL: descriptor.predicate.singleWorkspace,
             excluding: excludedRegistration
         )
-        let workspaces = unique(chats.compactMap(\.workspace))
+        let relationshipChats = chats + preservedLiveChatsForFetchedRelationships(
+            omittedFrom: chats,
+            descriptor: descriptor,
+            requiresIncludePendingChanges: false
+        )
         let removedChats = syncWorkspaceChats(
             chats,
             preservingExisting: shouldPreserveExistingWorkspaceChats(
@@ -1581,6 +1585,7 @@ public final class CodexModelContext {
             archivedScope: descriptor.predicate.archived
         )
         await removeChatsFromRegisteredResults(removedChats, excluding: excludedRegistration)
+        let workspaces = unique(relationshipChats.compactMap(\.workspace))
         let sortedWorkspaces = sort(workspaces, using: descriptor.sortBy)
         let page = localPage(sortedWorkspaces, for: descriptor, cursor: cursor)
         return CodexFetchPage(
@@ -1603,8 +1608,11 @@ public final class CodexModelContext {
             scopedWorkspaceURL: descriptor.predicate.singleWorkspace,
             excluding: excludedRegistration
         )
-        let workspaces = unique(chats.compactMap(\.workspace))
-        let groups = unique(workspaces.compactMap(\.workspaceGroup))
+        let relationshipChats = chats + preservedLiveChatsForFetchedRelationships(
+            omittedFrom: chats,
+            descriptor: descriptor,
+            requiresIncludePendingChanges: false
+        )
         let preservingGroupWorkspaces = descriptor.predicate.workspaces != nil
             || shouldPreserveExistingWorkspaceChats(
                 for: descriptor,
@@ -1620,11 +1628,13 @@ public final class CodexModelContext {
             archivedScope: descriptor.predicate.archived
         )
         await removeChatsFromRegisteredResults(removedChats, excluding: excludedRegistration)
+        let workspaces = unique(relationshipChats.compactMap(\.workspace))
         syncGroupWorkspaces(
             workspaces,
             preservingExisting: preservingGroupWorkspaces,
             archivedScope: descriptor.predicate.archived
         )
+        let groups = unique(workspaces.compactMap(\.workspaceGroup))
         let sortedGroups = sort(groups, using: descriptor.sortBy)
         let page = localPage(sortedGroups, for: descriptor, cursor: cursor)
         return CodexFetchPage(
@@ -2042,12 +2052,29 @@ public final class CodexModelContext {
         else {
             return []
         }
-        let loadedChatIDs = Set((loadedItems as? [CodexChat] ?? []).map(\.id))
-        let chatDescriptor = descriptor as! CodexFetchDescriptor<CodexChat>
+        return preservedLiveChatsForFetchedRelationships(
+            omittedFrom: loadedItems as? [CodexChat] ?? [],
+            descriptor: descriptor,
+            requiresIncludePendingChanges: requiresIncludePendingChanges
+        )
+    }
+
+    private func preservedLiveChatsForFetchedRelationships<Model: CodexPersistentModel>(
+        omittedFrom loadedChats: [CodexChat],
+        descriptor: CodexFetchDescriptor<Model>,
+        requiresIncludePendingChanges: Bool
+    ) -> [CodexChat] {
+        guard canPreserveLiveChats(
+            for: descriptor,
+            requiresIncludePendingChanges: requiresIncludePendingChanges
+        ) else {
+            return []
+        }
+        let loadedChatIDs = Set(loadedChats.map(\.id))
         return chatsByID.values.filter { chat in
             loadedChatIDs.contains(chat.id) == false
                 && shouldPreserveLiveFetchedChat(chat)
-                && shouldIncludeLiveFetchedChat(chat, descriptor: chatDescriptor)
+                && shouldIncludeLiveFetchedChat(chat, predicate: descriptor.predicate)
         }
     }
 
@@ -2079,11 +2106,11 @@ public final class CodexModelContext {
             && descriptor.predicate.useStateDBOnly == nil
     }
 
-    private func shouldIncludeLiveFetchedChat(
+    private func shouldIncludeLiveFetchedChat<Model: CodexPersistentModel>(
         _ chat: CodexChat,
-        descriptor: CodexFetchDescriptor<CodexChat>
+        predicate: CodexFetchPredicate<Model>
     ) -> Bool {
-        switch descriptor.predicate.archived {
+        switch predicate.archived {
         case .some(let expectedArchived):
             guard expectedArchived == chat.isArchived else {
                 return false
@@ -2094,7 +2121,7 @@ public final class CodexModelContext {
             }
         }
 
-        if let workspaces = descriptor.predicate.workspaces {
+        if let workspaces = predicate.workspaces {
             guard let chatWorkspace = chat.workspace else {
                 return false
             }

@@ -1221,7 +1221,10 @@ public final class CodexChat: CodexPersistentModel {
             if incomingItem.kind == .reasoning && incomingItem.id.contains(":summary:") == false
                 && incomingItem.id.contains(":content:") == false
             {
-                changes.append(contentsOf: removeReasoningParts(parentItemID: incomingItem.id))
+                changes.append(contentsOf: removeReasoningParts(
+                    parentItemID: incomingItem.id,
+                    turnID: turnID
+                ))
             }
             let incomingKey = CodexChatItemKey(
                 threadItem: incomingItem,
@@ -2098,11 +2101,12 @@ public final class CodexChat: CodexPersistentModel {
     }
 
     private func removeReasoningParts(
-        parentItemID: String
+        parentItemID: String,
+        turnID: CodexTurnID?
     ) -> [CodexChatUpdate] {
         let prefixes = ["\(parentItemID):summary:", "\(parentItemID):content:"]
         let removedItems = items.filter { item in
-            prefixes.contains { item.itemID.hasPrefix($0) }
+            item.turnID == turnID && prefixes.contains { item.itemID.hasPrefix($0) }
         }
         guard removedItems.isEmpty == false else {
             return []
@@ -2117,7 +2121,7 @@ public final class CodexChat: CodexPersistentModel {
         unregisterItemsFromContext(removedItems)
         liveMergeState.reasoningDeltaTextByItemKey = liveMergeState.reasoningDeltaTextByItemKey
             .filter { key, _ in
-                prefixes.contains { key.id.hasPrefix($0) } == false
+                key.turnID != turnID || prefixes.contains { key.id.hasPrefix($0) } == false
             }
         return removedItems.map { item in
             .itemRemoved(id: item.itemID, turnID: item.turnID)
