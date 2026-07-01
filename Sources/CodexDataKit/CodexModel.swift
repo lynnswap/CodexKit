@@ -2172,7 +2172,7 @@ public final class CodexChat: CodexPersistentModel {
         }
         switch latestTurn.status {
         case .running:
-            phase = status?.isActive == true ? .loading : .loaded
+            phase = .loading
             lastErrorDescription = nil
         case .failed, .interrupted, .cancelled:
             fail(with: latestTurn.errorDescription ?? latestTurn.status?.rawValue ?? "Turn failed")

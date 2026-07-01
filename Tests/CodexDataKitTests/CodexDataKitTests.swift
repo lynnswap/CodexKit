@@ -3985,7 +3985,7 @@ struct CodexModelContextTests {
         #expect(command.status == .running)
         #expect(command.completedAt == nil)
         #expect(chat.status == .idle)
-        #expect(chat.phase == .loaded)
+        #expect(chat.phase == .loading)
     }
 
     @Test("fresh idle thread status wins over stale running turn snapshots")
@@ -7526,6 +7526,62 @@ struct CodexModelContextTests {
         #expect(await runtime.transport.recordedRequests(method: "thread/resume").isEmpty)
         #expect(await runtime.transport.recordedRequests(method: "thread/turns/list").count == 1)
         #expect(await runtime.transport.recordedRequests(method: "thread/read").count == 1)
+    }
+
+    @Test("started review observation replays prepared thread events received before observe")
+    func startedReviewObservationReplaysPreparedThreadEventsReceivedBeforeObserve() async throws {
+        let workspaceURL = temporaryDirectory()
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadStart(threadID: "thread-review", model: "gpt-5")
+        try await runtime.transport.enqueueReviewStart(
+            turnID: "turn-review",
+            reviewThreadID: "thread-review",
+            items: [
+                .init(
+                    id: "turn-review",
+                    kind: .userMessage,
+                    content: .message(.init(
+                        id: "turn-review",
+                        role: .user,
+                        text: "current changes"
+                    ))
+                ),
+            ]
+        )
+
+        let started = try await context.startReview(
+            in: workspaceURL,
+            input: CodexReviewInput(
+                target: .uncommittedChanges,
+                options: .init(model: "gpt-5", ephemeral: false)
+            )
+        )
+        try await runtime.transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(
+                threadID: "thread-review",
+                turnID: "turn-review",
+                itemID: "message-before-observe",
+                delta: "Buffered before observe",
+                phase: "final_answer"
+            )
+        )
+        try await runtime.transport.enqueueThreadTurns(.init(turns: []))
+        try await runtime.transport.enqueueThreadRead(.init(id: "thread-review", workspace: workspaceURL))
+
+        let observation = try await started.chat.observe()
+        defer {
+            observation.cancel()
+        }
+        let changes = ChatUpdateRecorder(stream: observation.updates)
+
+        #expect(await eventually {
+            started.chat.items.first { $0.itemID == "message-before-observe" }?.text
+                == "Buffered before observe"
+        })
+        withExtendedLifetime(changes) {}
     }
 
     @Test("started review live turn replaces provisional seed after empty history read")

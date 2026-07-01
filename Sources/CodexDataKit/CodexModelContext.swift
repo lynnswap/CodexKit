@@ -886,7 +886,6 @@ public final class CodexModelContext {
             )
             observation.eventThread = thread
             try Task.checkCancellation()
-            await thread.beginEventGeneration()
             observation.eventStream = await thread.makeCurrentGenerationEventStream()
             if let eventStream = observation.eventStream {
                 observation.eventPump = ThreadEventPump(eventStream)
