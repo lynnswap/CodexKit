@@ -817,8 +817,34 @@ public final class CodexChat: CodexPersistentModel {
         recordsByRemovingReplacedProvisionalSeed(records).map { record in
             var record = record
             record.items = itemsByReplacingFallbackAgentMessageItems(record.items)
+            if let liveTurnID = liveTurnID(adopting: record) {
+                record.id = liveTurnID
+            }
             return record
         }
+    }
+
+    // Review turns have no persisted turn boundary in the app-server rollout,
+    // so an authoritative snapshot can return a turn this chat already tracks
+    // under its live turn id using a synthesized id. Fold such records into
+    // the live turn by shared item identity so one logical turn never splits
+    // into two turn ids; live events keep routing to the live id.
+    private func liveTurnID(adopting record: CodexTurnSnapshot) -> CodexTurnID? {
+        guard turnsByID[record.id] == nil else {
+            return nil
+        }
+        for incomingItem in record.items {
+            guard let match = items.first(where: { item in
+                item.turnID != nil
+                    && item.turnID != record.id
+                    && item.kind == incomingItem.kind
+                    && item.itemID == incomingItem.id
+            }) else {
+                continue
+            }
+            return match.turnID
+        }
+        return nil
     }
 
     private func recordsByRemovingReplacedProvisionalSeed(

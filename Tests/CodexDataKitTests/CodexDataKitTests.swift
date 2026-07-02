@@ -8997,6 +8997,138 @@ struct CodexModelContextTests {
         #expect(command.source == .agent)
     }
 
+    @Test("started review refresh folds synthesized rollout turns into the live turn")
+    func startedReviewRefreshFoldsSynthesizedRolloutTurnsIntoLiveTurn() async throws {
+        let workspaceURL = temporaryDirectory()
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let startedAt = Date(timeIntervalSince1970: 10)
+
+        try await runtime.transport.enqueueThreadStart(threadID: "thread-review", model: "gpt-5")
+        try await runtime.transport.enqueueReviewStart(
+            turnID: "turn-seed",
+            reviewThreadID: "thread-review",
+            items: [
+                .init(
+                    id: "turn-seed",
+                    kind: .userMessage,
+                    content: .message(.init(
+                        id: "turn-seed",
+                        role: .user,
+                        text: "current changes"
+                    ))
+                ),
+            ]
+        )
+
+        let started = try await context.startReview(
+            in: workspaceURL,
+            input: CodexReviewInput(
+                target: .uncommittedChanges,
+                options: .init(model: "gpt-5", ephemeral: false)
+            )
+        )
+        _ = started.chat.apply(.turnStarted("turn-seed"))
+        _ = started.chat.apply(.itemStarted(
+            .init(
+                id: "reasoning-live",
+                kind: .reasoning,
+                content: .reasoning(.init(summary: "Reviewing differences"))
+            ),
+            turnID: "turn-seed"
+        ))
+        _ = started.chat.apply(.itemStarted(
+            .init(
+                id: "call-live",
+                kind: .commandExecution,
+                content: .command(.init(
+                    command: "/bin/zsh -lc 'git status --short'",
+                    cwd: workspaceURL.path,
+                    status: .running,
+                    startedAt: startedAt,
+                    processID: "123",
+                    source: .agent
+                ))
+            ),
+            turnID: "turn-seed"
+        ))
+
+        started.chat.apply(
+            .init(
+                id: "thread-review",
+                workspace: workspaceURL,
+                status: .active(activeFlags: []),
+                turns: [
+                    .init(
+                        id: "turn-rollout",
+                        status: .running,
+                        itemsLoadState: .full,
+                        items: [
+                            .init(
+                                id: "user-real",
+                                kind: .userMessage,
+                                content: .message(.init(
+                                    id: "user-real",
+                                    role: .user,
+                                    text: "current changes"
+                                ))
+                            ),
+                            .init(
+                                id: "reasoning-live",
+                                kind: .reasoning,
+                                content: .reasoning(.init(summary: "Reviewing differences"))
+                            ),
+                            .init(
+                                id: "call-live",
+                                kind: .commandExecution,
+                                content: .command(.init(
+                                    command: "/bin/zsh -lc 'git status --short'",
+                                    cwd: workspaceURL.path,
+                                    status: .running,
+                                    processID: "123",
+                                    source: .agent
+                                ))
+                            ),
+                        ]
+                    ),
+                ]
+            ),
+            workspace: started.chat.workspace,
+            preservesExistingTurnItems: true
+        )
+
+        #expect(started.chat.turns.contains { $0.id == "turn-rollout" } == false)
+        #expect(started.chat.items.filter { $0.kind == .userMessage }.count == 1)
+        #expect(started.chat.items.filter { $0.kind == .reasoning }.count == 1)
+        let commandItems = started.chat.items.filter { $0.kind == .commandExecution }
+        #expect(commandItems.count == 1)
+        #expect(commandItems.first?.turnID?.rawValue == "turn-seed")
+
+        _ = started.chat.apply(.itemCompleted(
+            .init(
+                id: "call-live",
+                kind: .commandExecution,
+                content: .command(.init(
+                    command: "/bin/zsh -lc 'git status --short'",
+                    cwd: workspaceURL.path,
+                    status: .completed,
+                    startedAt: startedAt,
+                    processID: "123",
+                    source: .agent
+                ))
+            ),
+            turnID: "turn-seed"
+        ))
+        let completedCommand = try #require(
+            started.chat.items.first { $0.kind == .commandExecution }
+        )
+        guard case .command(let completedValue) = completedCommand.content else {
+            Issue.record("Expected a command item.")
+            return
+        }
+        #expect(completedValue.status == .completed)
+    }
+
     @Test("started review preserves seeded row metadata across null metadata refresh")
     func startedReviewPreservesSeededRowMetadataAcrossNullMetadataRefresh() async throws {
         let workspaceURL = temporaryDirectory()
