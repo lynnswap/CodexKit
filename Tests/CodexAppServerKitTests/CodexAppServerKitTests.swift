@@ -800,6 +800,17 @@ struct CodexAppServerKitTests {
         #expect(turnlessSnapshot.turnItemsAreAuthoritative == false)
     }
 
+    @Test func threadStatusTreatsNonProtocolValuesAsUnknown() {
+        #expect(CodexThreadStatus(rawValue: "notLoaded") == .notLoaded)
+        #expect(CodexThreadStatus(rawValue: "idle") == .idle)
+        #expect(CodexThreadStatus(rawValue: "systemError") == .systemError)
+        #expect(CodexThreadStatus(rawValue: "active") == .active(activeFlags: []))
+        #expect(CodexThreadStatus(rawValue: "loaded") == .unknown("loaded"))
+        #expect(CodexThreadStatus(rawValue: "loaded").isActive == false)
+        #expect(CodexThreadStatus(rawValue: "running") == .unknown("running"))
+        #expect(CodexThreadStatus(rawValue: "running").isActive == false)
+    }
+
     @Test func threadSnapshotsTrackOmittedAndNullFields() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueueJSON(

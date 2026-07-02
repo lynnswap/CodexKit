@@ -2383,7 +2383,7 @@ public enum CodexThreadStatus: Equatable, Sendable {
             self = .idle
         case "systemError":
             self = .systemError
-        case "running", "loaded", "active":
+        case "active":
             self = .active(activeFlags: [])
         case let rawValue:
             self = .unknown(rawValue)
