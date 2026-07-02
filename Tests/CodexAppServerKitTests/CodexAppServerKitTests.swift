@@ -207,6 +207,40 @@ struct CodexAppServerKitTests {
         try await task.value
     }
 
+    @Test func testTransportReservesQueuedResponseBeforeGateWait() async throws {
+        struct PingResponse: Codable, Equatable, Sendable {
+            var value: String
+        }
+
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueue(PingResponse(value: "first"), for: "ping")
+        try await transport.enqueue(PingResponse(value: "second"), for: "ping")
+        let gate = CodexAppServerTestGate()
+        await transport.holdNext(method: "ping", gate: gate)
+        let client = AppServerClient(transport: transport)
+
+        let first = Task {
+            try await client.send(
+                method: "ping",
+                params: EmptyResponse(),
+                responseType: PingResponse.self
+            )
+        }
+        await transport.waitForRequest(method: "ping")
+
+        let second = Task {
+            try await client.send(
+                method: "ping",
+                params: EmptyResponse(),
+                responseType: PingResponse.self
+            )
+        }
+
+        #expect(try await second.value == PingResponse(value: "second"))
+        await gate.open()
+        #expect(try await first.value == PingResponse(value: "first"))
+    }
+
     @Test func initializeSendsHandshakeAndInitializedNotification() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueue(
@@ -910,6 +944,31 @@ struct CodexAppServerKitTests {
             limit: 2
         ))
         #expect(secondPage.threads.map(\.id.rawValue) == ["thread-c"])
+        #expect(secondPage.nextCursor == nil)
+        #expect(secondPage.backwardsCursor != nil)
+    }
+
+    @Test func threadStoreHonorsThreadTurnListPagination() async throws {
+        let turns = [
+            CodexTurnSnapshot(id: "turn-a", status: .completed),
+            CodexTurnSnapshot(id: "turn-b", status: .completed),
+            CodexTurnSnapshot(id: "turn-c", status: .completed),
+        ]
+        let runtime = try await CodexAppServerTestRuntime.start(threads: [
+            CodexThreadSnapshot(id: "thread-turns", turns: turns)
+        ])
+        let thread = try await runtime.server.resumeThread("thread-turns")
+
+        let firstPage = try await thread.listTurns(.init(limit: 2))
+        #expect(firstPage.turns.map(\.id.rawValue) == ["turn-a", "turn-b"])
+        let nextCursor = try #require(firstPage.nextCursor)
+        #expect(firstPage.backwardsCursor == nil)
+
+        let secondPage = try await thread.listTurns(.init(
+            cursor: nextCursor,
+            limit: 2
+        ))
+        #expect(secondPage.turns.map(\.id.rawValue) == ["turn-c"])
         #expect(secondPage.nextCursor == nil)
         #expect(secondPage.backwardsCursor != nil)
     }

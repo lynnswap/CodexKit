@@ -163,13 +163,38 @@ public actor CodexAppServerTestThreadStore {
         if request.sortDirection == .descending {
             turns.reverse()
         }
-        if let limit = request.limit, limit >= 0 {
-            turns = Array(turns.prefix(limit))
-        }
+        let page = page(turns, cursor: request.cursor, limit: request.limit)
         return try JSONEncoder().encode(
             AppServerAPI.Thread.Turns.List.Response(
-                data: turns.map(CodexAppServerTestTransport.apiTurn(from:))
+                data: page.turns.map(CodexAppServerTestTransport.apiTurn(from:)),
+                nextCursor: page.nextCursor,
+                backwardsCursor: page.backwardsCursor
             ))
+    }
+
+    private func page(
+        _ turns: [CodexTurnSnapshot],
+        cursor: String?,
+        limit: Int?
+    ) -> CodexTurnPage {
+        let start = min(max(offset(from: cursor), 0), turns.count)
+        guard let limit else {
+            return CodexTurnPage(
+                turns: Array(turns[start..<turns.endIndex]),
+                backwardsCursor: start > 0 ? Self.cursor(for: 0) : nil
+            )
+        }
+        guard limit > 0 else {
+            return CodexTurnPage(turns: [], nextCursor: nil, backwardsCursor: nil)
+        }
+
+        let end = min(start + limit, turns.count)
+        let previousStart = max(0, start - limit)
+        return CodexTurnPage(
+            turns: Array(turns[start..<end]),
+            nextCursor: end < turns.count ? Self.cursor(for: end) : nil,
+            backwardsCursor: start > 0 ? Self.cursor(for: previousStart) : nil
+        )
     }
 }
 
@@ -1047,11 +1072,11 @@ extension CodexAppServerTestTransport: JSONRPC.Transport {
             maxActiveByMethod[request.method] ?? 0,
             activeByMethod[request.method] ?? 0
         )
+        let queuedResponse = dequeueResponse(for: request.method)
         if let gate = dequeueOneShotGate(for: request.method) ?? gatesByMethod[request.method] {
             await gate.wait()
         }
         activeByMethod[request.method, default: 1] -= 1
-        let queuedResponse = dequeueResponse(for: request.method)
         if let queuedResponse {
             switch queuedResponse {
             case .success(let data):
