@@ -78,6 +78,43 @@ struct CodexItemIdentityPromotionTests {
         #expect(continuedItem.message?.text == "Hello world")
     }
 
+    @Test("promotion rekeys the context item registration")
+    func promotionRekeysContextItemRegistration() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-context-rekey"))
+        let turnID = CodexTurnID(rawValue: "turn-context-rekey")
+
+        _ = chat.apply(CodexThreadEvent.turnStarted(turnID))
+        _ = chat.apply(CodexThreadEvent.messageDelta(
+            CodexMessageDelta(text: "Hello"),
+            turnID: turnID
+        ))
+        let fallbackItem = try #require(chat.items.first)
+        let fallbackThreadItem = agentMessageItem(
+            id: try #require(fallbackItem.itemID),
+            text: "Hello"
+        )
+
+        _ = chat.apply(CodexResponse(
+            turnID: turnID,
+            status: .completed,
+            transcript: .init(items: [
+                agentMessageItem(id: "item-context-real", text: "Hello"),
+            ])
+        ))
+        let promotedItem = try #require(chat.items.first)
+        #expect(promotedItem.itemID == "item-context-real")
+
+        let staleLookup = context.item(
+            threadItem: fallbackThreadItem,
+            turnID: turnID,
+            in: chat,
+            itemsLoadState: .full
+        )
+        #expect(staleLookup !== promotedItem)
+    }
+
     @Test("itemID-present message delta uses authoritative item identity")
     func itemIDPresentMessageDeltaUsesAuthoritativeItemIdentity() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()

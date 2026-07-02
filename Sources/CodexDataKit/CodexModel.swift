@@ -908,7 +908,7 @@ public final class CodexChat: CodexPersistentModel {
                         from: incomingItem,
                         itemsLoadState: record.itemsLoadState
                     )
-                    migrateLiveMergeState(from: previousMergeKey, to: existing.mergeKey)
+                    migrateItemIdentity(existing, from: previousMergeKey)
                     return existing
                 }
                 return contextItem(
@@ -1261,7 +1261,7 @@ public final class CodexChat: CodexPersistentModel {
                     )
                 }
                 if existing.mergeKey != previousMergeKey {
-                    migrateLiveMergeState(from: previousMergeKey, to: existing.mergeKey)
+                    migrateItemIdentity(existing, from: previousMergeKey)
                     rebuildItemIndexes()
                     changes.appendIfPresent(updateChange)
                 } else {
@@ -1850,16 +1850,10 @@ public final class CodexChat: CodexPersistentModel {
         to incomingItem: CodexThreadItem
     ) -> [CodexChatUpdate] {
         let previousItem = item.threadItem
-        let previousModelID = previousKey.modelID(in: id)
         removeItemFromIndexes(item)
         item.update(from: incomingItem, itemsLoadState: .full)
         addItemToIndexes(item)
-        migrateLiveMergeState(from: previousKey, to: item.mergeKey)
-        modelContext?.rekeyContextItem(
-            item,
-            from: previousModelID,
-            to: item.mergeKey.modelID(in: id)
-        )
+        migrateItemIdentity(item, from: previousKey)
         guard item.threadItem != previousItem else {
             return []
         }
@@ -2332,6 +2326,21 @@ public final class CodexChat: CodexPersistentModel {
             liveMergeState.outputDeltaTextByItemKey[replacement.mergeKey] = outputDeltaText
         }
         return replacement
+    }
+
+    // Single boundary for identity changes: whenever an existing item's merge
+    // key changes, live merge state and the context-level item registration
+    // must move together, or lagging references to the old key resurrect it.
+    private func migrateItemIdentity(
+        _ item: CodexItem,
+        from previousKey: CodexChatItemKey
+    ) {
+        migrateLiveMergeState(from: previousKey, to: item.mergeKey)
+        modelContext?.rekeyContextItem(
+            item,
+            from: previousKey.modelID(in: id),
+            to: item.mergeKey.modelID(in: id)
+        )
     }
 
     private func migrateLiveMergeState(
