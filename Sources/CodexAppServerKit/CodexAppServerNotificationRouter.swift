@@ -227,6 +227,9 @@ package actor CodexAppServerNotificationRouter {
             return false
         }
         for threadID in reviewThreadIDs {
+            guard isCurrentThreadEventGenerationFinished(threadID) == false else {
+                continue
+            }
             var raw = notification.rawNotification
             raw.threadID = threadID
             appendThreadEvent(.unknown(raw), threadID: threadID)
@@ -293,15 +296,7 @@ package actor CodexAppServerNotificationRouter {
         for event in replayedHistory {
             continuation.yield(event)
         }
-        let currentGeneration = currentGenerationEvents(in: history, threadID: threadID)
-        let shouldFinish: Bool
-        switch replayPolicy {
-        case .currentGeneration:
-            shouldFinish = currentGeneration.last.map(Self.isTerminalThreadEvent) ?? false
-        case .none:
-            shouldFinish = currentGeneration.last.map(Self.isTerminalThreadEvent) ?? false
-        }
-        if shouldFinish {
+        if isCurrentThreadEventGenerationFinished(threadID) {
             continuation.finish()
             return
         }
@@ -309,6 +304,12 @@ package actor CodexAppServerNotificationRouter {
             continuation: continuation,
             replayPolicy: replayPolicy
         )
+    }
+
+    private func isCurrentThreadEventGenerationFinished(_ threadID: CodexThreadID) -> Bool {
+        let history = threadHistoryByThreadID[threadID] ?? []
+        return currentGenerationEvents(in: history, threadID: threadID)
+            .contains(where: Self.isTerminalThreadEvent)
     }
 
     private func currentGenerationEvents(
