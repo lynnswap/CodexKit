@@ -1855,7 +1855,6 @@ public final class CodexChat: CodexPersistentModel {
         item.update(from: incomingItem, itemsLoadState: .full)
         addItemToIndexes(item)
         migrateLiveMergeState(from: previousKey, to: item.mergeKey)
-        liveMergeState.promotedMessageDeltaKeyByFallbackKey[previousKey] = item.mergeKey
         modelContext?.rekeyContextItem(
             item,
             from: previousModelID,
@@ -2355,6 +2354,12 @@ public final class CodexChat: CodexPersistentModel {
             .map(\.key)
         for fallbackKey in fallbackKeysToRetarget {
             liveMergeState.promotedMessageDeltaKeyByFallbackKey[fallbackKey] = newKey
+        }
+        if oldKey.kind == .agentMessage,
+            isScopedFallbackMessageID(oldKey.id),
+            isScopedFallbackMessageID(newKey.id) == false
+        {
+            liveMergeState.promotedMessageDeltaKeyByFallbackKey[oldKey] = newKey
         }
         if let reasoningText = liveMergeState.reasoningDeltaTextByItemKey.removeValue(
             forKey: oldKey

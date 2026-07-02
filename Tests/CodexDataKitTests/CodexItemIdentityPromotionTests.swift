@@ -44,6 +44,40 @@ struct CodexItemIdentityPromotionTests {
         #expect(promotedItem.message?.phase == .finalAnswer)
     }
 
+    @Test("ID-less deltas continue snapshot-promoted fallback messages")
+    func idlessDeltasContinueSnapshotPromotedFallbackMessages() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-snapshot-promotion"))
+        let turnID = CodexTurnID(rawValue: "turn-snapshot-promotion")
+
+        _ = chat.apply(CodexThreadEvent.turnStarted(turnID))
+        _ = chat.apply(CodexThreadEvent.messageDelta(
+            CodexMessageDelta(text: "Hello"),
+            turnID: turnID
+        ))
+        _ = chat.apply(CodexResponse(
+            turnID: turnID,
+            status: .completed,
+            transcript: .init(items: [
+                agentMessageItem(id: "item-snapshot-real", text: "Hello"),
+            ])
+        ))
+        let promotedItem = try #require(chat.items.first)
+        #expect(promotedItem.itemID == "item-snapshot-real")
+
+        _ = chat.apply(CodexThreadEvent.messageDelta(
+            CodexMessageDelta(text: " world"),
+            turnID: turnID
+        ))
+
+        #expect(chat.items.count == 1)
+        let continuedItem = try #require(chat.items.first)
+        #expect(continuedItem === promotedItem)
+        #expect(continuedItem.itemID == "item-snapshot-real")
+        #expect(continuedItem.message?.text == "Hello world")
+    }
+
     @Test("itemID-present message delta uses authoritative item identity")
     func itemIDPresentMessageDeltaUsesAuthoritativeItemIdentity() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
