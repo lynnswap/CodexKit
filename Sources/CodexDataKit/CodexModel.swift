@@ -1926,16 +1926,38 @@ public final class CodexChat: CodexPersistentModel {
     private func merge(_ delta: CodexMessageDelta, turnID: CodexTurnID?) -> [CodexChatUpdate] {
         let itemID = delta.itemID ?? scopedFallbackMessageID(turnID: turnID)
         let key = CodexChatItemKey(id: itemID, kind: .agentMessage, turnID: turnID)
-        let previousAccumulatedText = liveMergeState.messageDeltaTextByItemKey[key] ?? ""
+        let fallbackKey = delta.itemID.map { _ in
+            CodexChatItemKey(
+                id: scopedFallbackMessageID(turnID: turnID),
+                kind: .agentMessage,
+                turnID: turnID
+            )
+        }
+        let existingItem = item(for: key)
+        let fallbackItem: CodexItem?
+        if existingItem == nil,
+            let fallbackKey
+        {
+            fallbackItem = item(for: fallbackKey)
+        } else {
+            fallbackItem = nil
+        }
+        let previousAccumulatedText = liveMergeState.messageDeltaTextByItemKey[key]
+            ?? fallbackKey.flatMap { liveMergeState.messageDeltaTextByItemKey[$0] }
+            ?? fallbackItem?.message?.text
+            ?? ""
         let accumulatedText = previousAccumulatedText + delta.text
 
-        let existingMessage = item(for: key)?.message
+        let existingMessage = existingItem?.message ?? fallbackItem?.message
         let merge = mergedDeltaText(
             existingText: existingMessage?.text,
             previousAccumulatedText: previousAccumulatedText,
             accumulatedText: accumulatedText,
             deltaText: delta.text
         )
+        if let fallbackKey {
+            liveMergeState.messageDeltaTextByItemKey.removeValue(forKey: fallbackKey)
+        }
         liveMergeState.messageDeltaTextByItemKey[key] = merge.accumulatedText
         let message = CodexMessage(
             id: itemID,
@@ -1943,9 +1965,36 @@ public final class CodexChat: CodexPersistentModel {
             phase: delta.phase ?? existingMessage?.phase,
             text: merge.text
         )
-        return mergeItems([
-            .init(id: itemID, kind: .agentMessage, content: .message(message)),
-        ], turnID: turnID)
+        let item = CodexThreadItem(id: itemID, kind: .agentMessage, content: .message(message))
+        if let fallbackItem,
+            let fallbackKey
+        {
+            return promoteFallbackMessageDeltaItem(
+                fallbackItem,
+                from: fallbackKey,
+                to: item
+            )
+        }
+        return mergeItems([item], turnID: turnID)
+    }
+
+    private func promoteFallbackMessageDeltaItem(
+        _ item: CodexItem,
+        from previousKey: CodexChatItemKey,
+        to incomingItem: CodexThreadItem
+    ) -> [CodexChatUpdate] {
+        let previousItem = item.threadItem
+        removeItemFromIndexes(item)
+        item.update(from: incomingItem, itemsLoadState: .full)
+        addItemToIndexes(item)
+        migrateLiveMergeState(from: previousKey, to: item.mergeKey)
+        guard item.threadItem != previousItem else {
+            return []
+        }
+        if item.itemID != previousItem.id {
+            return [.itemUpdated(id: item.itemID, turnID: item.turnID)]
+        }
+        return changeForUpdatedItem(item, previousItem: previousItem).map { [$0] } ?? []
     }
 
     private func start(_ part: CodexReasoningPart, turnID: CodexTurnID?) -> [CodexChatUpdate] {

@@ -63,6 +63,37 @@ struct CodexItemIdentityPromotionTests {
         #expect(item.id.rawValue.contains("agent-message-delta") == false)
     }
 
+    @Test("message delta promotes fallback when item ID appears")
+    func messageDeltaPromotesFallbackWhenItemIDAppears() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-delta-promotion"))
+        let turnID = CodexTurnID(rawValue: "turn-delta-promotion")
+
+        _ = chat.apply(CodexThreadEvent.turnStarted(turnID))
+        _ = chat.apply(CodexThreadEvent.messageDelta(
+            CodexMessageDelta(text: "Hello"),
+            turnID: turnID
+        ))
+        let fallbackItem = try #require(chat.items.first)
+
+        _ = chat.apply(CodexThreadEvent.messageDelta(
+            CodexMessageDelta(text: " world", itemID: "item-delta-real"),
+            turnID: turnID
+        ))
+        _ = chat.apply(CodexThreadEvent.messageDelta(
+            CodexMessageDelta(text: "!", itemID: "item-delta-real"),
+            turnID: turnID
+        ))
+
+        let promotedItem = try #require(chat.items.first)
+        #expect(chat.items.count == 1)
+        #expect(promotedItem === fallbackItem)
+        #expect(promotedItem.id == fallbackItem.id)
+        #expect(promotedItem.itemID == "item-delta-real")
+        #expect(promotedItem.message?.text == "Hello world!")
+    }
+
     @Test("live completed item promotes fallback message delta")
     func liveCompletedItemPromotesFallbackMessageDelta() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
