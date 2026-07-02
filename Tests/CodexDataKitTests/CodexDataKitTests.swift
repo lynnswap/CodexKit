@@ -973,6 +973,40 @@ struct CodexModelContextTests {
         #expect(results.backwardsCursor == nil)
     }
 
+    @Test("appended local pages preserve live chats omitted from complete relationships")
+    func appendedLocalPagesPreserveLiveChatsOmittedFromCompleteRelationships() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspace = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(
+                id: "thread-running",
+                workspace: workspace,
+                name: "A Running",
+                status: .active(activeFlags: [])
+            ),
+            .init(id: "thread-alpha", workspace: workspace, name: "Alpha"),
+            .init(id: "thread-zulu", workspace: workspace, name: "Zulu"),
+        ]))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            sortDescriptors: [CodexSortDescriptor(\.name)],
+            fetchLimit: 1
+        ))
+        try await results.performFetch()
+        #expect(results.items.map(\.id.rawValue) == ["thread-running"])
+        #expect(results.nextCursor != nil)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-alpha", workspace: workspace, name: "Alpha"),
+            .init(id: "thread-zulu", workspace: workspace, name: "Zulu"),
+        ]))
+        try await results.loadNextPage()
+
+        #expect(results.items.map(\.id.rawValue).contains("thread-running"))
+        #expect(results.items.first?.id.rawValue == "thread-running")
+    }
+
     @Test("local paged chat load reconciles stale loaded items")
     func localPagedChatLoadReconcilesStaleLoadedItems() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()

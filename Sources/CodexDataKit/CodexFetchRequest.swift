@@ -681,7 +681,18 @@ public final class CodexFetchedResults<Model: CodexPersistentModel> {
                 authoritativeItems.count
             )
             let end = min(start + items.count + page.items.count, authoritativeItems.count)
-            return Array(authoritativeItems[start..<end])
+            let windowPage = CodexFetchPage(
+                items: Array(authoritativeItems[start..<end]),
+                nextCursor: page.nextCursor,
+                backwardsCursor: page.backwardsCursor,
+                relationshipItems: page.relationshipItems,
+                relationshipIsComplete: page.relationshipIsComplete
+            )
+            return modelContext.fetchedItemsIncludingPendingChanges(
+                from: windowPage,
+                descriptor: fetchDescriptor,
+                existingItems: items
+            )
         }
         return append(page.items, to: items)
     }
