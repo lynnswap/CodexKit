@@ -1338,6 +1338,37 @@ struct CodexAppServerKitTests {
         })
     }
 
+    @Test func reviewThreadGenerationRegistrationRoutesThreadlessBroadcasts() async throws {
+        let transport = CodexAppServerTestTransport()
+        let client = AppServerClient(transport: transport)
+        let router = CodexAppServerNotificationRouter(client: client)
+        await router.start()
+        await transport.waitForNotificationStreamCount(1)
+
+        await router.beginReviewThreadEventGeneration(
+            "thread-review",
+            including: "turn-review"
+        )
+        try await transport.emitServerNotification(
+            method: "warning",
+            params: ReviewWarningParams(message: "early warning")
+        )
+        try await transport.emitServerNotification(
+            method: "thread/closed",
+            params: ThreadIDParams(threadID: "thread-review")
+        )
+
+        let thread = CodexThread(id: "thread-review", client: client, router: router)
+        let events = try await collect(thread.events)
+        #expect(events.contains { event in
+            if case .unknown(let raw) = event {
+                return raw.method == "warning"
+                    && raw.threadID == "thread-review"
+            }
+            return false
+        })
+    }
+
     @Test func reviewSessionExposesPersistableLifecycleIdentity() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         try await runtime.transport.enqueueThreadStart(threadID: "thread-source", model: "gpt-5")

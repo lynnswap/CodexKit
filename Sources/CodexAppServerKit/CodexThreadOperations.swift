@@ -155,7 +155,7 @@ extension CodexThread {
         let detachedReviewThreadID = responseReviewThreadID == id ? nil : responseReviewThreadID
         let turnID = CodexTurnID(rawValue: response.turnID)
         if let detachedReviewThreadID {
-            await router.beginThreadEventGeneration(detachedReviewThreadID, including: turnID)
+            await router.beginReviewThreadEventGeneration(detachedReviewThreadID, including: turnID)
         }
         let initialTurn = CodexAppServer.turnSnapshots(from: [response.turn])[0]
         let identity = CodexReviewIdentity(

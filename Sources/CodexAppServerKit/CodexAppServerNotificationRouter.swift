@@ -175,6 +175,14 @@ package actor CodexAppServerNotificationRouter {
         )
     }
 
+    package func beginReviewThreadEventGeneration(
+        _ reviewThreadID: CodexThreadID,
+        including turnID: CodexTurnID
+    ) {
+        seedTurn(turnID, threadID: reviewThreadID, isReviewThread: true)
+        beginThreadEventGeneration(reviewThreadID, including: turnID)
+    }
+
     private func route(_ notification: JSONRPC.Notification) {
         let reviewNotification = try? AppServerReviewNotification(
             method: notification.method,
