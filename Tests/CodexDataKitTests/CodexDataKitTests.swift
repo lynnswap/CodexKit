@@ -866,6 +866,18 @@ struct CodexModelContextTests {
         #expect(results.items.map(\.title) == ["B"])
     }
 
+    @Test("mutable fetch offsets are normalized")
+    func mutableFetchOffsetsAreNormalized() {
+        var descriptor = CodexFetchDescriptor<CodexChat>(fetchOffset: 1)
+        descriptor.fetchOffset = -1
+
+        let request = CodexFetchRequest<CodexChat>(fetchOffset: 1)
+        request.fetchOffset = -1
+
+        #expect(descriptor.fetchOffset == 0)
+        #expect(request.fetchOffset == 0)
+    }
+
     @Test("offset chat fetches do not preserve live chats omitted from the page")
     func offsetChatFetchesDoNotPreserveLiveChatsOmittedFromPage() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()

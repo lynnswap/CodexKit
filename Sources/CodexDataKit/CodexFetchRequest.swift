@@ -175,7 +175,11 @@ public struct CodexFetchDescriptor<Model: CodexPersistentModel>: Sendable, Hasha
     public var predicate: CodexFetchPredicate<Model>
     public var sortBy: [CodexSortDescriptor<Model>]
     public var fetchLimit: Int?
-    public var fetchOffset: Int
+    public var fetchOffset: Int {
+        didSet {
+            fetchOffset = max(0, fetchOffset)
+        }
+    }
     public var includePendingChanges: Bool
 
     public init(
@@ -262,7 +266,11 @@ public final class CodexFetchRequest<Model: CodexPersistentModel> {
     public var predicate: CodexFetchPredicate<Model>
     public var sortDescriptors: [CodexSortDescriptor<Model>]
     public var fetchLimit: Int?
-    public var fetchOffset: Int
+    public var fetchOffset: Int {
+        didSet {
+            fetchOffset = max(0, fetchOffset)
+        }
+    }
     public var includePendingChanges: Bool
 
     public var fetchDescriptor: CodexFetchDescriptor<Model> {
