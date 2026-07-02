@@ -336,6 +336,7 @@ package func startCodexTurn(
     client: AppServerClient,
     router: CodexAppServerNotificationRouter
 ) async throws -> CodexTurn {
+    let generationCursor = await router.threadEventGenerationCursor(threadID)
     let response = try await client.send(
         AppServerAPI.Turn.Start.Request(
             params: .init(
@@ -355,6 +356,7 @@ package func startCodexTurn(
             )
         ))
     let turnID = CodexTurnID(rawValue: response.turn.id)
+    await router.beginThreadEventGeneration(threadID, at: generationCursor)
     await router.seedTurn(turnID, threadID: threadID)
     return CodexTurn(
         id: turnID,

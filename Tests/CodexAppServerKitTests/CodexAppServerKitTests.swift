@@ -2354,6 +2354,73 @@ struct CodexAppServerKitTests {
         })
     }
 
+    @Test func streamResponseBeginsNewThreadEventGeneration() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueTurnStart(turnID: "turn-2", status: "running")
+        let gate = CodexAppServerTestGate()
+        await transport.holdNext(method: "turn/start", gate: gate)
+        let client = AppServerClient(transport: transport)
+        let router = CodexAppServerNotificationRouter(client: client)
+        await router.start()
+        await transport.waitForNotificationStreamCount(1)
+        let thread = CodexThread(id: "thread-1", client: client, router: router)
+
+        try await transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(
+                threadID: "thread-1",
+                turnID: "turn-1",
+                delta: "Previous generation"
+            )
+        )
+        try await transport.emitServerNotification(
+            method: "thread/closed",
+            params: ThreadIDParams(threadID: "thread-1")
+        )
+        let previousEvents = try await withTimeout {
+            try await collect(thread.events)
+        }
+        #expect(previousEvents.last == .closed)
+
+        let streamTask = Task {
+            try await thread.streamResponse(to: "Next turn.")
+        }
+        await transport.waitForRequest(method: "turn/start")
+        try await transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(
+                threadID: "thread-1",
+                turnID: "turn-2",
+                delta: "During start"
+            )
+        )
+        await gate.open()
+        let responseStream = try await streamTask.value
+        try await transport.emitServerNotification(
+            method: "thread/closed",
+            params: ThreadIDParams(threadID: "thread-1")
+        )
+
+        let events = try await withTimeout {
+            try await collect(thread.events)
+        }
+        #expect(events.count == 2)
+        #expect(events.contains { event in
+            if case .messageDelta(let delta, let turnID) = event {
+                return delta.text == "During start" && turnID == "turn-2"
+            }
+            return false
+        })
+        #expect(events.contains { event in
+            if case .messageDelta(let delta, let turnID) = event {
+                return delta.text == "Previous generation" && turnID == "turn-1"
+            }
+            return false
+        } == false)
+        #expect(events.last == .closed)
+        withExtendedLifetime(responseStream) {}
+    }
+
     @Test func failedResumeDoesNotAdvanceThreadEventGeneration() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         try await runtime.transport.enqueueThreadResume(.init(id: "thread-resume-failure"))
