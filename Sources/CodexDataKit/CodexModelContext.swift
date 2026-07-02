@@ -405,10 +405,18 @@ public final class CodexModelContext {
     }
 
     package func unregisterContextItem(_ item: CodexItem) {
-        guard itemsByID[item.id] === item else {
-            return
+        itemsByID = itemsByID.filter { $0.value !== item }
+    }
+
+    package func rekeyContextItem(
+        _ item: CodexItem,
+        from oldID: CodexChatItemID,
+        to newID: CodexChatItemID
+    ) {
+        if itemsByID[oldID] === item {
+            itemsByID.removeValue(forKey: oldID)
         }
-        itemsByID.removeValue(forKey: item.id)
+        itemsByID[newID] = item
     }
 
     public nonisolated(nonsending) func refresh(_ group: CodexWorkspaceGroup) async throws {

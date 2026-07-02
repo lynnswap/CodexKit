@@ -115,6 +115,36 @@ struct CodexItemIdentityPromotionTests {
         #expect(promotedItem.message?.text == "Hello world!")
     }
 
+    @Test("message delta continues promoted fallback after item ID disappears")
+    func messageDeltaContinuesPromotedFallbackAfterItemIDDisappears() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-delta-promotion-replay"))
+        let turnID = CodexTurnID(rawValue: "turn-delta-promotion-replay")
+
+        _ = chat.apply(CodexThreadEvent.turnStarted(turnID))
+        _ = chat.apply(CodexThreadEvent.messageDelta(
+            CodexMessageDelta(text: "Hello"),
+            turnID: turnID
+        ))
+        let fallbackItem = try #require(chat.items.first)
+
+        _ = chat.apply(CodexThreadEvent.messageDelta(
+            CodexMessageDelta(text: " world", itemID: "item-delta-real"),
+            turnID: turnID
+        ))
+        _ = chat.apply(CodexThreadEvent.messageDelta(
+            CodexMessageDelta(text: "!"),
+            turnID: turnID
+        ))
+
+        let promotedItem = try #require(chat.items.first)
+        #expect(chat.items.count == 1)
+        #expect(promotedItem === fallbackItem)
+        #expect(promotedItem.itemID == "item-delta-real")
+        #expect(promotedItem.message?.text == "Hello world!")
+    }
+
     @Test("live completed item promotes fallback message delta")
     func liveCompletedItemPromotesFallbackMessageDelta() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()

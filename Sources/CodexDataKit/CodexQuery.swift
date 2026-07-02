@@ -66,6 +66,18 @@ public struct CodexQuery<Model: CodexPersistentModel>: @preconcurrency DynamicPr
     }
 
     public init(
+        _ request: CodexFetchRequest<Model>,
+        animation: Animation? = nil,
+        sectionBy: CodexSectionDescriptor<Model>? = nil
+    ) {
+        self.init(
+            request.fetchDescriptor,
+            animation: animation,
+            sectionBy: sectionBy
+        )
+    }
+
+    public init(
         filter: CodexFetchPredicate<Model>? = nil,
         sort: [CodexSortDescriptor<Model>] = [],
         animation _: Animation? = nil,

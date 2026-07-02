@@ -1783,8 +1783,15 @@ public final class CodexChat: CodexPersistentModel {
     }
 
     private func merge(_ delta: CodexMessageDelta, turnID: CodexTurnID?) -> [CodexChatUpdate] {
-        let itemID = delta.itemID ?? scopedFallbackMessageID(turnID: turnID)
-        let key = CodexChatItemKey(id: itemID, kind: .agentMessage, turnID: turnID)
+        let unresolvedItemID = delta.itemID ?? scopedFallbackMessageID(turnID: turnID)
+        let unresolvedKey = CodexChatItemKey(
+            id: unresolvedItemID,
+            kind: .agentMessage,
+            turnID: turnID
+        )
+        let key = liveMergeState.promotedMessageDeltaKeyByFallbackKey[unresolvedKey]
+            ?? unresolvedKey
+        let itemID = key.id
         let fallbackKey = delta.itemID.map { _ in
             CodexChatItemKey(
                 id: scopedFallbackMessageID(turnID: turnID),
@@ -1843,10 +1850,17 @@ public final class CodexChat: CodexPersistentModel {
         to incomingItem: CodexThreadItem
     ) -> [CodexChatUpdate] {
         let previousItem = item.threadItem
+        let previousModelID = previousKey.modelID(in: id)
         removeItemFromIndexes(item)
         item.update(from: incomingItem, itemsLoadState: .full)
         addItemToIndexes(item)
         migrateLiveMergeState(from: previousKey, to: item.mergeKey)
+        liveMergeState.promotedMessageDeltaKeyByFallbackKey[previousKey] = item.mergeKey
+        modelContext?.rekeyContextItem(
+            item,
+            from: previousModelID,
+            to: item.mergeKey.modelID(in: id)
+        )
         guard item.threadItem != previousItem else {
             return []
         }
@@ -2331,6 +2345,17 @@ public final class CodexChat: CodexPersistentModel {
         if let messageText = liveMergeState.messageDeltaTextByItemKey.removeValue(forKey: oldKey) {
             liveMergeState.messageDeltaTextByItemKey[newKey] = messageText
         }
+        if let promotedKey = liveMergeState.promotedMessageDeltaKeyByFallbackKey.removeValue(
+            forKey: oldKey
+        ) {
+            liveMergeState.promotedMessageDeltaKeyByFallbackKey[newKey] = promotedKey
+        }
+        let fallbackKeysToRetarget = liveMergeState.promotedMessageDeltaKeyByFallbackKey
+            .filter { $0.value == oldKey }
+            .map(\.key)
+        for fallbackKey in fallbackKeysToRetarget {
+            liveMergeState.promotedMessageDeltaKeyByFallbackKey[fallbackKey] = newKey
+        }
         if let reasoningText = liveMergeState.reasoningDeltaTextByItemKey.removeValue(
             forKey: oldKey
         ) {
@@ -2378,6 +2403,7 @@ public final class CodexChat: CodexPersistentModel {
 
     private struct LiveMergeState {
         var messageDeltaTextByItemKey: [CodexChatItemKey: String] = [:]
+        var promotedMessageDeltaKeyByFallbackKey: [CodexChatItemKey: CodexChatItemKey] = [:]
         var reasoningDeltaTextByItemKey: [CodexChatItemKey: String] = [:]
         var outputDeltaTextByItemKey: [CodexChatItemKey: String] = [:]
     }

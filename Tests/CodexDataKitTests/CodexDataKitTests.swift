@@ -378,10 +378,12 @@ struct CodexModelContextTests {
             order: .reverse,
             sectionBy: .workspaceGroup
         )
+        let requestChatQuery = CodexQuery(CodexFetchRequest<CodexChat>.recentChats)
 
         #expect(workspaceQuery.wrappedValue.items.isEmpty)
         #expect(chatQuery.wrappedValue.items.isEmpty)
         #expect(sectionedChatQuery.wrappedValue.items.isEmpty)
+        #expect(requestChatQuery.wrappedValue.items.isEmpty)
     }
 
     @Test("fetched results controller emits an initial fetch transaction")
