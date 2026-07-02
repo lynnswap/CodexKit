@@ -3652,6 +3652,70 @@ struct CodexAppServerKitTests {
             })
     }
 
+    @Test func progressDeltaNotificationsWithoutItemIDRemainItemUpdates() async throws {
+        let transport = CodexAppServerTestTransport()
+        let client = AppServerClient(transport: transport)
+        let router = CodexAppServerNotificationRouter(client: client)
+        await router.start()
+        await transport.waitForNotificationStreamCount(1)
+
+        try await transport.emitServerNotification(
+            method: "item/commandExecution/outputDelta",
+            params: ItemOutputDeltaWithoutItemIDParams(
+                threadID: "thread-1",
+                turnID: "turn-1",
+                delta: "Compiling"
+            )
+        )
+        try await transport.emitServerNotification(
+            method: "item/fileChange/patchUpdated",
+            params: ItemPatchUpdatedWithoutItemIDParams(
+                threadID: "thread-1",
+                turnID: "turn-1",
+                changes: .array([
+                    .object([
+                        "kind": .string("update"),
+                        "path": .string("Sources/File.swift"),
+                    ]),
+                ])
+            )
+        )
+        try await transport.emitServerNotification(
+            method: "item/mcpToolCall/progress",
+            params: ItemProgressWithoutItemIDParams(
+                threadID: "thread-1",
+                turnID: "turn-1",
+                message: "Reviewing"
+            )
+        )
+        try await transport.emitServerNotification(
+            method: "thread/closed",
+            params: ThreadIDParams(threadID: "thread-1")
+        )
+
+        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let events = try await collect(thread.events)
+        let updates = events.compactMap { event -> CodexThreadItem? in
+            if case .itemUpdated(let item, let turnID) = event {
+                #expect(turnID == "turn-1")
+                return item
+            }
+            return nil
+        }
+
+        #expect(updates.count == 3)
+        #expect(updates.allSatisfy { $0.id.isEmpty == false })
+        #expect(updates.contains { $0.kind == .commandExecution && $0.text == "Compiling" })
+        #expect(updates.contains { $0.kind == .fileChange && $0.text?.contains("File.swift") == true })
+        #expect(updates.contains { $0.kind == .mcpToolCall && $0.text == "Reviewing" })
+        #expect(events.contains { event in
+            if case .unknown(let raw) = event {
+                return raw.method.hasPrefix("item/")
+            }
+            return false
+        } == false)
+    }
+
     @Test func completedFileChangeItemsPreserveChangesOutput() async throws {
         let transport = CodexAppServerTestTransport()
         let client = AppServerClient(transport: transport)
@@ -4463,6 +4527,18 @@ private struct ItemOutputDeltaParams: Encodable, Sendable {
     }
 }
 
+private struct ItemOutputDeltaWithoutItemIDParams: Encodable, Sendable {
+    var threadID: String
+    var turnID: String
+    var delta: String
+
+    enum CodingKeys: String, CodingKey {
+        case threadID = "threadId"
+        case turnID = "turnId"
+        case delta
+    }
+}
+
 private struct ItemPatchUpdatedParams: Encodable, Sendable {
     var threadID: String
     var turnID: String
@@ -4477,6 +4553,18 @@ private struct ItemPatchUpdatedParams: Encodable, Sendable {
     }
 }
 
+private struct ItemPatchUpdatedWithoutItemIDParams: Encodable, Sendable {
+    var threadID: String
+    var turnID: String
+    var changes: AppServerJSONValue
+
+    enum CodingKeys: String, CodingKey {
+        case threadID = "threadId"
+        case turnID = "turnId"
+        case changes
+    }
+}
+
 private struct ItemProgressParams: Encodable, Sendable {
     var threadID: String
     var turnID: String
@@ -4487,6 +4575,18 @@ private struct ItemProgressParams: Encodable, Sendable {
         case threadID = "threadId"
         case turnID = "turnId"
         case itemID = "itemId"
+        case message
+    }
+}
+
+private struct ItemProgressWithoutItemIDParams: Encodable, Sendable {
+    var threadID: String
+    var turnID: String
+    var message: String
+
+    enum CodingKeys: String, CodingKey {
+        case threadID = "threadId"
+        case turnID = "turnId"
         case message
     }
 }

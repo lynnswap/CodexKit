@@ -7044,6 +7044,74 @@ struct CodexModelContextTests {
         #expect(chat.items.map(\.text) == ["Authoritative interruption"])
     }
 
+    @Test("mixed snapshot merge removes stale full turn items")
+    func mixedSnapshotMergeRemovesStaleFullTurnItems() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-mixed-snapshot-stale-items"))
+        let fullTurnID = CodexTurnID(rawValue: "turn-full")
+        let summaryTurnID = CodexTurnID(rawValue: "turn-summary")
+        func messageItem(_ id: String, text: String) -> CodexThreadItem {
+            CodexThreadItem(
+                id: id,
+                kind: .agentMessage,
+                content: .message(.init(id: id, role: .assistant, text: text))
+            )
+        }
+
+        chat.apply(
+            .init(
+                id: chat.id,
+                turns: [
+                    .init(
+                        id: fullTurnID,
+                        status: .running,
+                        itemsLoadState: .full,
+                        items: [
+                            messageItem("message-kept", text: "Keep me"),
+                            messageItem("message-stale", text: "Remove me"),
+                        ]
+                    ),
+                    .init(
+                        id: summaryTurnID,
+                        status: .running,
+                        itemsLoadState: .summary,
+                        items: []
+                    ),
+                ]
+            ),
+            workspace: Optional<CodexWorkspace>.none
+        )
+        #expect(chat.items.map(\.itemID) == ["message-kept", "message-stale"])
+
+        chat.apply(
+            .init(
+                id: chat.id,
+                turns: [
+                    .init(
+                        id: fullTurnID,
+                        status: .running,
+                        itemsLoadState: .full,
+                        items: [
+                            messageItem("message-kept", text: "Still here"),
+                        ]
+                    ),
+                    .init(
+                        id: summaryTurnID,
+                        status: .running,
+                        itemsLoadState: .summary,
+                        items: []
+                    ),
+                ]
+            ),
+            workspace: Optional<CodexWorkspace>.none
+        )
+
+        #expect(chat.items.map(\.itemID) == ["message-kept"])
+        #expect(chat.items.first?.text == "Still here")
+        #expect(chat.turns.map(\.id) == [fullTurnID, summaryTurnID])
+    }
+
     @Test("not-loaded metadata fallback preserves live-streamed items omitted by turns")
     func notLoadedMetadataFallbackPreservesLiveStreamedItemsOmittedByTurns() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()

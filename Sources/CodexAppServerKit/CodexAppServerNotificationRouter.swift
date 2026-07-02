@@ -721,6 +721,7 @@ package actor CodexAppServerNotificationRouter {
             return nil
         }
         let output = payload.delta ?? payload.message ?? payload.changes?.displayText
+        let itemID = payload.itemID ?? UUID().uuidString
         let content: CodexThreadItem.Content
         switch kind {
         case .commandExecution:
@@ -732,7 +733,7 @@ package actor CodexAppServerNotificationRouter {
         case let kind:
             content = .unknown(.init(rawType: kind.rawValue, text: output, payload: data))
         }
-        return .init(id: payload.itemID, kind: kind, content: content, rawPayload: data)
+        return .init(id: itemID, kind: kind, content: content, rawPayload: data)
     }
 
     private func messageDelta(from data: Data) -> CodexMessageDelta? {
@@ -953,7 +954,7 @@ private struct ItemPayload: Decodable {
 }
 
 private struct ItemProgressPayload: Decodable {
-    var itemID: String
+    var itemID: String?
     var delta: String?
     var message: String?
     var changes: AppServerJSONValue?

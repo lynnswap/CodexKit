@@ -1010,7 +1010,10 @@ public final class CodexChat: CodexPersistentModel {
     private func mergeItems(from records: [CodexTurnSnapshot]) {
         for record in records {
             if record.itemsAreAuthoritative {
-                removeNonAuthoritativeItems(in: record.id)
+                removeItemsOmittedFromAuthoritativeSnapshot(
+                    record.items,
+                    turnID: record.id
+                )
             }
             guard record.items.isEmpty == false else {
                 continue
@@ -2270,9 +2273,28 @@ public final class CodexChat: CodexPersistentModel {
     }
 
     @discardableResult
-    private func removeNonAuthoritativeItems(in turnID: CodexTurnID) -> [CodexChatUpdate] {
+    private func removeItemsOmittedFromAuthoritativeSnapshot(
+        _ incomingItems: [CodexThreadItem],
+        turnID: CodexTurnID
+    ) -> [CodexChatUpdate] {
+        var retainedItems = Set<ObjectIdentifier>()
+        for incomingItem in incomingItems {
+            let incomingKey = CodexChatItemKey(
+                threadItem: incomingItem,
+                turnID: turnID
+            )
+            if let item = item(for: incomingKey) {
+                retainedItems.insert(ObjectIdentifier(item))
+            }
+            if let item = fallbackAgentMessageItem(matching: incomingItem, turnID: turnID) {
+                retainedItems.insert(ObjectIdentifier(item))
+            }
+            if let item = commandReplayItem(matching: incomingItem, turnID: turnID) {
+                retainedItems.insert(ObjectIdentifier(item))
+            }
+        }
         let removedItems = items.filter { item in
-            item.turnID == turnID && item.itemsLoadState != .full
+            item.turnID == turnID && retainedItems.contains(ObjectIdentifier(item)) == false
         }
         guard removedItems.isEmpty == false else {
             return []
