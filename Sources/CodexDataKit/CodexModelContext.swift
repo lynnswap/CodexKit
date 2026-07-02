@@ -436,7 +436,7 @@ public final class CodexModelContext {
             let fetchedIDs = Set(fetchedWorkspaceChats.map(\.id))
             let preservedChats = previousWorkspaceChats.filter {
                 fetchedIDs.contains($0.id) == false
-                    && shouldPreserve($0, outside: descriptor.predicate.archived)
+                    && shouldPreserveMissingRefreshChat($0, archivedScope: descriptor.predicate.archived)
             }
             let currentChats = fetchedWorkspaceChats + preservedChats
             workspace.replaceContextChats(currentChats)
@@ -455,7 +455,7 @@ public final class CodexModelContext {
         let refreshedWorkspaceIDs = Set(refreshedWorkspaces.map(\.id))
         let preservedWorkspaces = previousWorkspacesStillInGroup.filter {
             refreshedWorkspaceIDs.contains($0.id) == false
-                && containsOutOfScopeChat(in: $0, archivedScope: descriptor.predicate.archived)
+                && containsPreservedMissingRefreshChat(in: $0, archivedScope: descriptor.predicate.archived)
         }
         group.replaceContextWorkspaces(sort(refreshedWorkspaces + preservedWorkspaces, using: descriptor.sortBy))
         let currentChatIDs = Set(group.workspaces.flatMap(\.chats).map(\.id))
@@ -491,7 +491,7 @@ public final class CodexModelContext {
         let refreshedIDs = Set(chats.map(\.id))
         let preservedChats = previousChats.filter {
             refreshedIDs.contains($0.id) == false
-                && shouldPreserve($0, outside: descriptor.predicate.archived)
+                && shouldPreserveMissingRefreshChat($0, archivedScope: descriptor.predicate.archived)
         }
         let currentChats = chats + preservedChats
         workspace.replaceContextChats(currentChats)
@@ -1849,8 +1849,7 @@ public final class CodexModelContext {
                 let fetchedIDs = Set(fetchedChats.map(\.id))
                 let preservedChats = workspace.chats.filter {
                     fetchedIDs.contains($0.id) == false
-                        && (shouldPreserve($0, outside: archivedScope)
-                            || shouldPreserveLiveFetchedChat($0))
+                        && shouldPreserveMissingRefreshChat($0, archivedScope: archivedScope)
                 }
                 let currentChats = fetchedChats + preservedChats
                 workspace.replaceContextChats(currentChats)
@@ -1890,8 +1889,17 @@ public final class CodexModelContext {
         }
     }
 
-    private func containsOutOfScopeChat(in workspace: CodexWorkspace, archivedScope: Bool?) -> Bool {
-        workspace.chats.contains { shouldPreserve($0, outside: archivedScope) }
+    private func shouldPreserveMissingRefreshChat(_ chat: CodexChat, archivedScope: Bool?) -> Bool {
+        shouldPreserve(chat, outside: archivedScope) || shouldPreserveLiveFetchedChat(chat)
+    }
+
+    private func containsPreservedMissingRefreshChat(
+        in workspace: CodexWorkspace,
+        archivedScope: Bool?
+    ) -> Bool {
+        workspace.chats.contains {
+            shouldPreserveMissingRefreshChat($0, archivedScope: archivedScope)
+        }
     }
 
     private func syncGroupWorkspaces(
@@ -1916,7 +1924,7 @@ public final class CodexModelContext {
                 let fetchedIDs = Set(fetchedWorkspaces.map(\.id))
                 let preservedWorkspaces = group.workspaces.filter {
                     fetchedIDs.contains($0.id) == false
-                        && containsOutOfScopeChat(in: $0, archivedScope: archivedScope)
+                        && containsPreservedMissingRefreshChat(in: $0, archivedScope: archivedScope)
                 }
                 group.replaceContextWorkspaces(sort(
                     fetchedWorkspaces + preservedWorkspaces,

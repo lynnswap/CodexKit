@@ -2865,6 +2865,33 @@ struct CodexModelContextTests {
         #expect(workspace.chats.map(\.id.rawValue) == ["thread-remaining"])
     }
 
+    @Test("workspace refresh preserves active chats omitted from server page")
+    func workspaceRefreshPreservesActiveChatsOmittedFromServerPage() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(
+                id: "thread-active-omitted",
+                workspace: workspaceURL,
+                name: "Active",
+                status: .active(activeFlags: [])
+            )
+        ]))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>.recentChats)
+        try await results.performFetch()
+        let chat = try #require(results.items.first)
+        let workspace = try #require(chat.workspace)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: []))
+        try await context.refresh(workspace)
+
+        #expect(results.items.first === chat)
+        #expect(workspace.chats.first === chat)
+        #expect(chat.workspace === workspace)
+    }
+
     @Test("group refresh inserts newly loaded workspace fetched results")
     func groupRefreshInsertsNewlyLoadedWorkspaceFetchedResults() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -2888,6 +2915,35 @@ struct CodexModelContextTests {
 
         #expect(Set(workspaceResults.items.map(\.url)) == Set([app, tools]))
         #expect(Set(group.workspaces.map(\.url)) == Set([app, tools]))
+    }
+
+    @Test("group refresh preserves active chats omitted from server page")
+    func groupRefreshPreservesActiveChatsOmittedFromServerPage() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(
+                id: "thread-group-active-omitted",
+                workspace: workspaceURL,
+                name: "Active",
+                status: .active(activeFlags: [])
+            )
+        ]))
+        let groupResults = context.fetchedResults(for: CodexFetchRequest<CodexWorkspaceGroup>.workspaceGroups)
+        try await groupResults.performFetch()
+        let group = try #require(groupResults.items.first)
+        let workspace = try #require(group.workspaces.first)
+        let chat = try #require(workspace.chats.first)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: []))
+        try await context.refresh(group)
+
+        #expect(groupResults.items.first === group)
+        #expect(group.workspaces.first === workspace)
+        #expect(workspace.chats.first === chat)
+        #expect(chat.workspace === workspace)
     }
 
     @Test("workspace refresh preserves archived chats")
