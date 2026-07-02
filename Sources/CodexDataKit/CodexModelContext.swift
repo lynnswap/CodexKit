@@ -1755,6 +1755,9 @@ public final class CodexModelContext {
     private func remove(_ chat: CodexChat) async {
         let workspace = chat.workspace
         let group = workspace?.workspaceGroup
+        if let observation = activeChatObservationsByID[chat.id] {
+            discardChatObservation(chat.id, observation: observation)
+        }
         preparedEventThreadsByID.removeValue(forKey: chat.id)
         chatsByID.removeValue(forKey: chat.id)
         turnsByID = turnsByID.filter { $0.value.chat !== chat }

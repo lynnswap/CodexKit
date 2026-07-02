@@ -3154,6 +3154,52 @@ struct CodexModelContextTests {
         #expect(chat.modelContext == nil)
     }
 
+    @Test("deleting an observed chat cancels its active observation")
+    func deletingObservedChatCancelsActiveObservation() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-delete-observed", workspace: workspaceURL, name: "Delete")
+        ]))
+        let chatResults = context.fetchedResults(for: CodexFetchRequest<CodexChat>.recentChats)
+        try await chatResults.performFetch()
+        let chat = try #require(chatResults.items.first)
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-delete-observed"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-delete-observed",
+            workspace: workspaceURL,
+            name: "Delete"
+        ))
+        let observation = try await chat.observe()
+        let changes = ChatUpdateRecorder(stream: observation.updates)
+
+        try await runtime.transport.enqueueEmpty(for: "thread/delete")
+        try await chat.delete()
+
+        #expect(chat.modelContext == nil)
+        #expect(await eventually { changes.isFinished })
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-delete-observed"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-delete-observed",
+            workspace: workspaceURL,
+            name: "Delete Replacement"
+        ))
+        let replacement = context.model(for: CodexThreadID(rawValue: "thread-delete-observed"))
+        let replacementObservation = try await replacement.observe()
+        defer {
+            replacementObservation.cancel()
+        }
+
+        #expect(replacement.modelContext === context)
+        #expect(replacement.name == "Delete Replacement")
+        #expect(await runtime.transport.recordedRequests(method: "thread/resume").count == 2)
+        withExtendedLifetime(changes) {}
+    }
+
     @Test("server-filtered delete removes known chat when refresh fails")
     func serverFilteredDeleteRemovesKnownChatWhenRefreshFails() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
