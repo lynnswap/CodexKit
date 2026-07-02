@@ -983,6 +983,9 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
     public var status: CodexThreadStatus?
     public var ephemeral: Bool?
     public var turns: [CodexTurnSnapshot]?
+    /// True only when `turns` may replace cached transcript items. The
+    /// initializer clamps producer intent to the turns' actual load state, so
+    /// summary or not-loaded items can never be marked authoritative.
     package var turnItemsAreAuthoritative: Bool
     package var presentFields: Set<Field>
 
@@ -1025,7 +1028,7 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
             status: status,
             ephemeral: ephemeral,
             turns: turns,
-            turnItemsAreAuthoritative: turns?.allSatisfy(\.itemsAreAuthoritative) ?? false,
+            turnItemsAreAuthoritative: true,
             presentFields: Self.presentFields(
                 workspace: workspace,
                 name: name,
@@ -1068,6 +1071,7 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
         self.ephemeral = ephemeral
         self.turns = turns
         self.turnItemsAreAuthoritative = turnItemsAreAuthoritative
+            && (turns?.allSatisfy(\.itemsAreAuthoritative) ?? false)
         self.presentFields = presentFields ?? Self.presentFields(
             workspace: workspace,
             name: name,

@@ -771,6 +771,35 @@ struct CodexAppServerKitTests {
         #expect(publicSnapshot == summarySnapshot)
     }
 
+    @Test func threadSnapshotClampsTurnAuthorityToLoadedItems() {
+        let partiallyLoadedSnapshot = CodexThreadSnapshot(
+            id: "thread-1",
+            turns: [
+                CodexTurnSnapshot(id: "turn-full", status: .completed),
+                CodexTurnSnapshot(
+                    id: "turn-summary",
+                    status: .completed,
+                    itemsLoadState: .summary
+                ),
+            ],
+            turnItemsAreAuthoritative: true
+        )
+        #expect(partiallyLoadedSnapshot.turnItemsAreAuthoritative == false)
+
+        let fullyLoadedSnapshot = CodexThreadSnapshot(
+            id: "thread-1",
+            turns: [CodexTurnSnapshot(id: "turn-full", status: .completed)],
+            turnItemsAreAuthoritative: true
+        )
+        #expect(fullyLoadedSnapshot.turnItemsAreAuthoritative)
+
+        let turnlessSnapshot = CodexThreadSnapshot(
+            id: "thread-1",
+            turnItemsAreAuthoritative: true
+        )
+        #expect(turnlessSnapshot.turnItemsAreAuthoritative == false)
+    }
+
     @Test func threadSnapshotsTrackOmittedAndNullFields() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueueJSON(
