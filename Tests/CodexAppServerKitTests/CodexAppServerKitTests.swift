@@ -723,6 +723,42 @@ struct CodexAppServerKitTests {
         #expect(page.threads.first?.turns == nil)
     }
 
+    @Test func threadListTurnItemsAreNotAuthoritative() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueue(
+            AppServerAPI.Thread.List.Response(data: [
+                .init(
+                    id: "thread-summary",
+                    turns: [
+                        .init(
+                            id: "turn-summary",
+                            status: "completed",
+                            items: [
+                                .object([
+                                    "id": .string("message-summary"),
+                                    "type": .string("agentMessage"),
+                                    "text": .string("Summary"),
+                                ]),
+                            ]
+                        ),
+                    ]
+                ),
+            ]),
+            for: "thread/list"
+        )
+        let client = AppServerClient(transport: transport)
+        let server = CodexAppServer(
+            client: client,
+            router: CodexAppServerNotificationRouter(client: client)
+        )
+
+        let page = try await server.listThreads()
+
+        let snapshot = try #require(page.threads.first)
+        #expect(snapshot.turns?.first?.items.first?.id == "message-summary")
+        #expect(snapshot.turnItemsAreAuthoritative == false)
+    }
+
     @Test func threadSnapshotEqualityIgnoresTurnAuthorityFlag() {
         let turns = [CodexTurnSnapshot(id: "turn-1", status: .completed)]
         let publicSnapshot = CodexThreadSnapshot(id: "thread-1", turns: turns)
