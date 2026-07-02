@@ -1598,6 +1598,12 @@ public final class CodexChat: CodexPersistentModel {
             }
             content = .fileChange(incomingFileChange)
         case (.toolCall(var incomingToolCall), .toolCall(let existingToolCall)):
+            incomingToolCall.namespace = incomingToolCall.namespace ?? existingToolCall.namespace
+            incomingToolCall.server = incomingToolCall.server ?? existingToolCall.server
+            incomingToolCall.name = incomingToolCall.name ?? existingToolCall.name
+            incomingToolCall.arguments = incomingToolCall.arguments ?? existingToolCall.arguments
+            incomingToolCall.result = incomingToolCall.result ?? existingToolCall.result
+            incomingToolCall.error = incomingToolCall.error ?? existingToolCall.error
             incomingToolCall.status = mergedLifecycleStatus(
                 incoming: incomingToolCall.status,
                 existing: existingToolCall.status

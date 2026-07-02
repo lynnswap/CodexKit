@@ -6517,6 +6517,60 @@ struct CodexModelContextTests {
         #expect(diagnosticItems.count == 1)
     }
 
+    @Test("tool call progress updates preserve existing metadata")
+    func toolCallProgressUpdatesPreserveExistingMetadata() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-tool-progress"))
+        chat.apply(
+            CodexThreadSnapshot(
+                id: chat.id,
+                turns: [
+                    .init(
+                        id: "turn-tool-progress",
+                        status: .running,
+                        items: [
+                            .init(
+                                id: "tool-progress",
+                                kind: .mcpToolCall,
+                                content: .toolCall(.init(
+                                    namespace: "mcp",
+                                    server: "github",
+                                    name: "search_issues",
+                                    arguments: #"{"q":"is:open"}"#,
+                                    status: .running
+                                ))
+                            ),
+                        ]
+                    ),
+                ]
+            ),
+            workspace: Optional<CodexWorkspace>.none
+        )
+        let toolItem = try #require(chat.items.first { $0.itemID == "tool-progress" })
+
+        let changes = chat.apply(CodexThreadEvent.itemUpdated(
+            .init(
+                id: "tool-progress",
+                kind: .mcpToolCall,
+                content: .toolCall(.init(result: "Searching GitHub"))
+            ),
+            turnID: "turn-tool-progress"
+        ))
+
+        #expect(changes.contains(.itemUpdated(id: "tool-progress", turnID: "turn-tool-progress")))
+        guard case .toolCall(let toolCall) = toolItem.content else {
+            Issue.record("Expected tool call item")
+            return
+        }
+        #expect(toolCall.namespace == "mcp")
+        #expect(toolCall.server == "github")
+        #expect(toolCall.name == "search_issues")
+        #expect(toolCall.arguments == #"{"q":"is:open"}"#)
+        #expect(toolCall.result == "Searching GitHub")
+        #expect(toolCall.status == .running)
+    }
+
     @Test("active chat refresh emits snapshots after phase reconciliation")
     func activeChatRefreshEmitsSnapshotsAfterPhaseReconciliation() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()

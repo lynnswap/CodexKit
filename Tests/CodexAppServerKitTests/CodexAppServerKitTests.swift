@@ -3358,7 +3358,7 @@ struct CodexAppServerKitTests {
         #expect(logs.compactMap(\.messageDelta).map(\.text) == ["First", "Second"])
     }
 
-    @Test func messageDeltaWithoutItemIDDecodesAsUnknown() async throws {
+    @Test func messageDeltaWithoutItemIDDecodesWithFallbackIdentity() async throws {
         let transport = CodexAppServerTestTransport()
         let client = AppServerClient(transport: transport)
         let router = CodexAppServerNotificationRouter(client: client)
@@ -3379,18 +3379,25 @@ struct CodexAppServerKitTests {
 
         let thread = CodexThread(id: "thread-1", client: client, router: router)
         let events = try await collect(thread.events)
-        #expect(events.contains { event in
+        let deltaEvent = try #require(events.first { event in
             if case .messageDelta = event {
                 return true
             }
             return false
-        } == false)
+        })
+        guard case .messageDelta(let delta, let turnID) = deltaEvent else {
+            Issue.record("Expected message delta event")
+            return
+        }
+        #expect(delta.text == "Missing item identity")
+        #expect(delta.itemID == nil)
+        #expect(turnID == "turn-1")
         #expect(events.contains { event in
             if case .unknown(let raw) = event {
                 return raw.method == "item/agentMessage/delta"
             }
             return false
-        })
+        } == false)
     }
 
     @Test func threadItemWithoutIDDecodesAsUnknown() async throws {

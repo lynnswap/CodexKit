@@ -765,7 +765,7 @@ private struct ErrorPayload: Decodable {
 }
 
 private struct AgentMessageDeltaPayload: Decodable {
-    var itemID: String
+    var itemID: String?
     var delta: String?
     var text: String?
     var phase: String?
