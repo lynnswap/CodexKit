@@ -181,18 +181,26 @@ public struct CodexChatItemID: Hashable, Sendable, Codable, CustomStringConverti
         self.rawValue = Self.scopedRawValue(rawItemID, turnID: turnID)
     }
 
+    package init(rawItemID: String, turnID: CodexTurnID?, chatID: CodexThreadID) {
+        self.rawValue = Self.scopedRawValue(rawItemID, turnID: turnID, chatID: chatID)
+    }
+
     public var description: String {
         rawValue
     }
 
     fileprivate static func scopedRawValue(
         _ value: String,
-        turnID: CodexTurnID?
+        turnID: CodexTurnID?,
+        chatID: CodexThreadID? = nil
     ) -> String {
-        guard let turnID else {
-            return value
+        if let turnID {
+            return "\(turnID.rawValue):\(value)"
         }
-        return "\(turnID.rawValue):\(value)"
+        if let chatID {
+            return "chat:\(chatID.rawValue):\(value)"
+        }
+        return value
     }
 }
 
@@ -483,7 +491,7 @@ public final class CodexItem: CodexPersistentModel {
         modelContext: CodexModelContext,
         itemsLoadState: CodexTurnItemsLoadState
     ) {
-        self.id = CodexChatItemKey(threadItem: threadItem, turnID: turn?.id).modelID
+        self.id = CodexChatItemKey(threadItem: threadItem, turnID: turn?.id).modelID(in: chat.id)
         self.itemID = threadItem.id
         self.chat = chat
         self.turn = turn
@@ -534,6 +542,10 @@ package struct CodexChatItemKey: Hashable {
 
     var modelID: CodexChatItemID {
         CodexChatItemID(rawItemID: semanticID, turnID: turnID)
+    }
+
+    func modelID(in chatID: CodexThreadID) -> CodexChatItemID {
+        CodexChatItemID(rawItemID: semanticID, turnID: turnID, chatID: chatID)
     }
 
     package static func == (lhs: Self, rhs: Self) -> Bool {

@@ -926,6 +926,23 @@ struct CodexAppServerKitTests {
         #expect(started.model == "gpt-5")
     }
 
+    @Test func threadStoreThreadReadHonorsIncludeTurns() async throws {
+        let stored = CodexThreadSnapshot(
+            id: "thread-with-turns",
+            turns: [CodexTurnSnapshot(id: "turn-from-store", status: .completed)]
+        )
+        let runtime = try await CodexAppServerTestRuntime.start(threads: [stored])
+        let thread = try await runtime.server.resumeThread("thread-with-turns")
+
+        let metadataOnly = try await thread.read(includeTurns: false)
+        let withTurns = try await thread.read(includeTurns: true)
+
+        #expect(metadataOnly.turns == nil)
+        #expect(!metadataOnly.hasField(.turns))
+        #expect(withTurns.turns?.map(\.id.rawValue) == ["turn-from-store"])
+        #expect(withTurns.hasField(.turns))
+    }
+
     @Test func threadStoreHonorsThreadListPagination() async throws {
         let threads = [
             CodexThreadSnapshot(id: "thread-a", name: "A"),

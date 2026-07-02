@@ -72,7 +72,7 @@ public actor CodexAppServerTestThreadStore {
         let page = page(filteredThreads, cursor: request.cursor, limit: request.limit)
         return try JSONEncoder().encode(
             AppServerAPI.Thread.List.Response(
-                data: page.threads.map(CodexAppServerTestTransport.apiSnapshot(from:)),
+                data: page.threads.map { CodexAppServerTestTransport.apiSnapshot(from: $0) },
                 nextCursor: page.nextCursor,
                 backwardsCursor: page.backwardsCursor
             ))
@@ -144,7 +144,10 @@ public actor CodexAppServerTestThreadStore {
         }
         return try JSONEncoder().encode(
             AppServerAPI.Thread.Read.Response(
-                thread: CodexAppServerTestTransport.apiSnapshot(from: thread)
+                thread: CodexAppServerTestTransport.apiSnapshot(
+                    from: thread,
+                    includeTurns: request.includeTurns == true
+                )
             ))
     }
 
@@ -519,7 +522,7 @@ public actor CodexAppServerTestTransport {
     public func enqueueThreadList(_ page: CodexThreadPage) throws {
         try enqueue(
             AppServerAPI.Thread.List.Response(
-                data: page.threads.map(Self.apiSnapshot(from:)),
+                data: page.threads.map { Self.apiSnapshot(from: $0) },
                 nextCursor: page.nextCursor,
                 backwardsCursor: page.backwardsCursor
             ),
@@ -679,7 +682,10 @@ public actor CodexAppServerTestTransport {
         )
     }
 
-    fileprivate static func apiSnapshot(from snapshot: CodexThreadSnapshot) -> AppServerAPI.Thread.Snapshot {
+    fileprivate static func apiSnapshot(
+        from snapshot: CodexThreadSnapshot,
+        includeTurns: Bool = true
+    ) -> AppServerAPI.Thread.Snapshot {
         .init(
             id: snapshot.id.rawValue,
             cwd: snapshot.workspace?.path,
@@ -691,7 +697,7 @@ public actor CodexAppServerTestTransport {
             recencyAt: snapshot.recencyAt.map { Int($0.timeIntervalSince1970) },
             status: snapshot.status.map(Self.apiStatus(from:)),
             ephemeral: snapshot.ephemeral,
-            turns: snapshot.turns?.map(Self.apiTurn(from:))
+            turns: includeTurns ? snapshot.turns?.map(Self.apiTurn(from:)) : nil
         )
     }
 

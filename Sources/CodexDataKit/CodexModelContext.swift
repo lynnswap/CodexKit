@@ -461,7 +461,7 @@ public final class CodexModelContext {
         } else {
             itemTurn = nil
         }
-        let id = CodexChatItemKey(threadItem: threadItem, turnID: turnID).modelID
+        let id = CodexChatItemKey(threadItem: threadItem, turnID: turnID).modelID(in: chat.id)
         if let item = itemsByID[id] {
             item.applyContextOwners(chat: chat, turn: itemTurn)
             return item

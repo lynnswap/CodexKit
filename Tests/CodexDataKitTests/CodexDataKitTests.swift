@@ -6412,6 +6412,55 @@ struct CodexModelContextTests {
         #expect(chat.items.first { $0.itemID == "message-live" }?.text == "Rewritten")
     }
 
+    @Test("turnless item identities are scoped per chat")
+    func turnlessItemIdentitiesAreScopedPerChat() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start(threads: [
+            .init(id: "thread-turnless-alpha", status: .active(activeFlags: []), turns: []),
+            .init(id: "thread-turnless-beta", status: .active(activeFlags: []), turns: []),
+        ])
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        let alpha = context.model(for: CodexThreadID(rawValue: "thread-turnless-alpha"))
+        let beta = context.model(for: CodexThreadID(rawValue: "thread-turnless-beta"))
+        let alphaObservation = try await alpha.observe()
+        let betaObservation = try await beta.observe()
+        defer {
+            alphaObservation.cancel()
+            betaObservation.cancel()
+        }
+        let alphaChanges = ChatUpdateRecorder(stream: alphaObservation.updates)
+        let betaChanges = ChatUpdateRecorder(stream: betaObservation.updates)
+
+        try await runtime.transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: ThreadScopedDeltaParams(
+                threadID: "thread-turnless-alpha",
+                itemID: "shared-message",
+                delta: "Alpha",
+                phase: "final_answer"
+            )
+        )
+        try await runtime.transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: ThreadScopedDeltaParams(
+                threadID: "thread-turnless-beta",
+                itemID: "shared-message",
+                delta: "Beta",
+                phase: "final_answer"
+            )
+        )
+
+        #expect(await alphaChanges.itemInserted(id: "shared-message") != nil)
+        #expect(await betaChanges.itemInserted(id: "shared-message") != nil)
+        let alphaItem = try #require(alpha.items.first { $0.itemID == "shared-message" })
+        let betaItem = try #require(beta.items.first { $0.itemID == "shared-message" })
+        #expect(alphaItem !== betaItem)
+        #expect(alphaItem.chat === alpha)
+        #expect(betaItem.chat === beta)
+        #expect(alphaItem.text == "Alpha")
+        #expect(betaItem.text == "Beta")
+    }
+
     @Test("chat item identity ignores kind changes from baseline to live updates")
     func chatItemIdentityIgnoresKindChangesFromBaselineToLiveUpdates() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -8713,6 +8762,20 @@ private struct TurnDeltaParams: Encodable, Sendable {
     enum CodingKeys: String, CodingKey {
         case threadID = "threadId"
         case turnID = "turnId"
+        case itemID = "itemId"
+        case delta
+        case phase
+    }
+}
+
+private struct ThreadScopedDeltaParams: Encodable, Sendable {
+    var threadID: String
+    var itemID: String?
+    var delta: String
+    var phase: String?
+
+    enum CodingKeys: String, CodingKey {
+        case threadID = "threadId"
         case itemID = "itemId"
         case delta
         case phase
