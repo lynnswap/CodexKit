@@ -1,14 +1,7 @@
 import SwiftUI
 
-private struct CodexModelContextEnvironmentKey: EnvironmentKey {
-    static let defaultValue: CodexModelContext? = nil
-}
-
 extension EnvironmentValues {
-    public var codexModelContext: CodexModelContext? {
-        get { self[CodexModelContextEnvironmentKey.self] }
-        set { self[CodexModelContextEnvironmentKey.self] = newValue }
-    }
+    @Entry public var codexModelContext: CodexModelContext? = nil
 }
 
 extension View {
@@ -21,7 +14,7 @@ extension View {
     }
 }
 
-public struct CodexQueryResults<Model: CodexObservableModel>: RandomAccessCollection {
+public struct CodexQueryResults<Model: CodexPersistentModel>: RandomAccessCollection {
     public typealias Index = Array<Model>.Index
     public typealias Element = Model
 
@@ -57,13 +50,62 @@ public struct CodexQueryResults<Model: CodexObservableModel>: RandomAccessCollec
 
 @MainActor
 @propertyWrapper
-public struct CodexQuery<Model: CodexObservableModel>: @preconcurrency DynamicProperty {
+public struct CodexQuery<Model: CodexPersistentModel>: @preconcurrency DynamicProperty {
     @Environment(\.codexModelContext) private var modelContext
     @State private var fetchedResults: CodexFetchedResults<Model>?
-    private let request: CodexFetchRequest<Model>
+    private let fetchDescriptor: CodexFetchDescriptor<Model>
+    private let sectionBy: CodexSectionDescriptor<Model>?
 
-    public init(_ request: CodexFetchRequest<Model>) {
-        self.request = request
+    public init(
+        _ descriptor: CodexFetchDescriptor<Model> = .init(),
+        animation _: Animation? = nil,
+        sectionBy: CodexSectionDescriptor<Model>? = nil
+    ) {
+        self.fetchDescriptor = descriptor
+        self.sectionBy = sectionBy
+    }
+
+    public init(
+        filter: CodexFetchPredicate<Model>? = nil,
+        sort: [CodexSortDescriptor<Model>] = [],
+        animation _: Animation? = nil,
+        sectionBy: CodexSectionDescriptor<Model>? = nil
+    ) {
+        self.fetchDescriptor = CodexFetchDescriptor(
+            predicate: filter ?? .init(),
+            sortBy: sort
+        )
+        self.sectionBy = sectionBy
+    }
+
+    public init<Value: Comparable>(
+        filter: CodexFetchPredicate<Model>? = nil,
+        sort keyPath: KeyPath<Model, Value>,
+        order: CodexSortOrder = .forward,
+        animation: Animation? = nil,
+        sectionBy: CodexSectionDescriptor<Model>? = nil
+    ) {
+        self.init(
+            filter: filter,
+            sort: [CodexSortDescriptor(keyPath, order: order)],
+            animation: animation,
+            sectionBy: sectionBy
+        )
+    }
+
+    public init<Value: Comparable>(
+        filter: CodexFetchPredicate<Model>? = nil,
+        sort keyPath: KeyPath<Model, Value?>,
+        order: CodexSortOrder = .forward,
+        animation: Animation? = nil,
+        sectionBy: CodexSectionDescriptor<Model>? = nil
+    ) {
+        self.init(
+            filter: filter,
+            sort: [CodexSortDescriptor(keyPath, order: order)],
+            animation: animation,
+            sectionBy: sectionBy
+        )
     }
 
     public var wrappedValue: CodexQueryResults<Model> {
@@ -86,11 +128,12 @@ public struct CodexQuery<Model: CodexObservableModel>: @preconcurrency DynamicPr
 
         if let fetchedResults,
            fetchedResults.modelContext === modelContext,
-           fetchedResults.request == request {
+           fetchedResults.fetchDescriptor == fetchDescriptor,
+           fetchedResults.sectionBy == sectionBy {
             return
         }
 
-        let results = modelContext.fetchedResults(for: request)
+        let results = modelContext.fetchedResults(for: fetchDescriptor, sectionedBy: sectionBy)
         fetchedResults = results
         Task {
             try? await results.performFetch()

@@ -754,95 +754,6 @@ public enum CodexReviewEvent: Equatable, Sendable {
     }
 }
 
-/// A log-oriented review event suitable for review output views.
-public enum CodexReviewLogEntry: Identifiable, Equatable, Sendable {
-    public typealias Phase = CodexThreadLogEntry.Phase
-
-    case itemStarted(CodexThreadItem, turnID: CodexTurnID?)
-    case itemUpdated(CodexThreadItem, turnID: CodexTurnID?)
-    case itemCompleted(CodexThreadItem, turnID: CodexTurnID?)
-    case messageDelta(CodexMessageDelta, turnID: CodexTurnID?, id: String)
-    case reasoningPartStarted(CodexReasoningPart, turnID: CodexTurnID?)
-    case reasoningDelta(CodexReasoningDelta, turnID: CodexTurnID?)
-
-    package init(_ entry: CodexThreadLogEntry) {
-        switch entry {
-        case .itemStarted(let item, let turnID):
-            self = .itemStarted(item, turnID: turnID)
-        case .itemUpdated(let item, let turnID):
-            self = .itemUpdated(item, turnID: turnID)
-        case .itemCompleted(let item, let turnID):
-            self = .itemCompleted(item, turnID: turnID)
-        case .messageDelta(let delta, let turnID, let id):
-            self = .messageDelta(delta, turnID: turnID, id: id)
-        case .reasoningPartStarted(let part, let turnID):
-            self = .reasoningPartStarted(part, turnID: turnID)
-        case .reasoningDelta(let delta, let turnID):
-            self = .reasoningDelta(delta, turnID: turnID)
-        }
-    }
-
-    public var id: String {
-        switch self {
-        case .itemStarted(let item, _), .itemUpdated(let item, _), .itemCompleted(let item, _):
-            item.id
-        case .messageDelta(_, _, let id):
-            id
-        case .reasoningPartStarted(let part, _):
-            part.id
-        case .reasoningDelta(let delta, _):
-            delta.id
-        }
-    }
-
-    public var turnID: CodexTurnID? {
-        switch self {
-        case .itemStarted(_, let turnID), .itemUpdated(_, let turnID),
-             .itemCompleted(_, let turnID), .messageDelta(_, let turnID, _),
-             .reasoningPartStarted(_, let turnID), .reasoningDelta(_, let turnID):
-            turnID
-        }
-    }
-
-    public var phase: Phase {
-        switch self {
-        case .itemStarted, .reasoningPartStarted:
-            .started
-        case .itemUpdated:
-            .updated
-        case .itemCompleted:
-            .completed
-        case .messageDelta, .reasoningDelta:
-            .delta
-        }
-    }
-
-    public var item: CodexThreadItem? {
-        switch self {
-        case .itemStarted(let item, _), .itemUpdated(let item, _), .itemCompleted(let item, _):
-            item
-        case .reasoningPartStarted(let part, _):
-            .init(id: part.id, kind: .reasoning, content: .reasoning(.empty))
-        case .messageDelta, .reasoningDelta:
-            nil
-        }
-    }
-
-    public var messageDelta: CodexMessageDelta? {
-        if case .messageDelta(let delta, _, _) = self {
-            return delta
-        }
-        return nil
-    }
-
-    public var reasoningDelta: CodexReasoningDelta? {
-        if case .reasoningDelta(let delta, _) = self {
-            return delta
-        }
-        return nil
-    }
-}
-
 /// Incremental review progress derived from review-domain events.
 public struct CodexReviewProgress: Equatable, Sendable {
     public enum Phase: Equatable, Sendable {
@@ -891,16 +802,24 @@ public struct CodexReviewSession: Identifiable, Sendable {
     /// The active review thread model, when known.
     public let model: String?
 
+    /// The initial turn returned synchronously by `review/start`.
+    ///
+    /// Inline reviews may not emit a separate `turn/started` notification, and
+    /// freshly-created rollouts may not be readable yet. UI clients should seed
+    /// their transcript from this turn before consuming live events.
+    public let initialTurn: CodexTurnSnapshot
+
     /// The live response stream for the review turn.
     public let response: CodexResponseStream
 
-    private let eventThread: CodexThread
+    package let eventThread: CodexThread
 
     package init(
         threadID: CodexThreadID,
         turnID: CodexTurnID,
         reviewThreadID: CodexThreadID,
         model: String?,
+        initialTurn: CodexTurnSnapshot,
         response: CodexResponseStream,
         eventThread: CodexThread
     ) {
@@ -908,6 +827,7 @@ public struct CodexReviewSession: Identifiable, Sendable {
         self.turnID = turnID
         self.reviewThreadID = reviewThreadID
         self.model = model
+        self.initialTurn = initialTurn
         self.response = response
         self.eventThread = eventThread
     }
@@ -964,11 +884,8 @@ public struct CodexReviewSession: Identifiable, Sendable {
         eventThread.transcriptUpdates
     }
 
-    /// Log-oriented review entries.
-    ///
-    /// Review log views can be built from this sequence without depending on
-    /// raw JSON-RPC notifications.
-    public var logEntries: CodexReviewLogSequence {
+    /// Log-oriented item events emitted by the review thread.
+    public var logEntries: CodexThreadLogSequence {
         .init(events: eventThread.events, terminalTurnID: turnID)
     }
 
@@ -1049,6 +966,8 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
         case modelProvider
         case createdAt
         case updatedAt
+        case recencyAt
+        case status
         case ephemeral
         case turns
     }
@@ -1060,6 +979,8 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
     public var modelProvider: String?
     public var createdAt: Date?
     public var updatedAt: Date?
+    public var recencyAt: Date?
+    public var status: CodexThreadStatus?
     public var ephemeral: Bool?
     public var turns: [CodexTurnSnapshot]?
     package var turnItemsAreAuthoritative: Bool
@@ -1073,6 +994,8 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
             && lhs.modelProvider == rhs.modelProvider
             && lhs.createdAt == rhs.createdAt
             && lhs.updatedAt == rhs.updatedAt
+            && lhs.recencyAt == rhs.recencyAt
+            && lhs.status == rhs.status
             && lhs.ephemeral == rhs.ephemeral
             && lhs.turns == rhs.turns
     }
@@ -1085,6 +1008,8 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
         modelProvider: String? = nil,
         createdAt: Date? = nil,
         updatedAt: Date? = nil,
+        recencyAt: Date? = nil,
+        status: CodexThreadStatus? = nil,
         ephemeral: Bool? = nil,
         turns: [CodexTurnSnapshot]? = nil
     ) {
@@ -1096,9 +1021,11 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
             modelProvider: modelProvider,
             createdAt: createdAt,
             updatedAt: updatedAt,
+            recencyAt: recencyAt,
+            status: status,
             ephemeral: ephemeral,
             turns: turns,
-            turnItemsAreAuthoritative: turns != nil,
+            turnItemsAreAuthoritative: turns?.allSatisfy(\.itemsAreAuthoritative) ?? false,
             presentFields: Self.presentFields(
                 workspace: workspace,
                 name: name,
@@ -1106,6 +1033,8 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
                 modelProvider: modelProvider,
                 createdAt: createdAt,
                 updatedAt: updatedAt,
+                recencyAt: recencyAt,
+                status: status,
                 ephemeral: ephemeral,
                 turns: turns
             )
@@ -1120,6 +1049,8 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
         modelProvider: String? = nil,
         createdAt: Date? = nil,
         updatedAt: Date? = nil,
+        recencyAt: Date? = nil,
+        status: CodexThreadStatus? = nil,
         ephemeral: Bool? = nil,
         turns: [CodexTurnSnapshot]? = nil,
         turnItemsAreAuthoritative: Bool,
@@ -1132,6 +1063,8 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
         self.modelProvider = modelProvider
         self.createdAt = createdAt
         self.updatedAt = updatedAt
+        self.recencyAt = recencyAt
+        self.status = status
         self.ephemeral = ephemeral
         self.turns = turns
         self.turnItemsAreAuthoritative = turnItemsAreAuthoritative
@@ -1142,6 +1075,8 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
             modelProvider: modelProvider,
             createdAt: createdAt,
             updatedAt: updatedAt,
+            recencyAt: recencyAt,
+            status: status,
             ephemeral: ephemeral,
             turns: turns
         )
@@ -1158,6 +1093,8 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
         modelProvider: String?,
         createdAt: Date?,
         updatedAt: Date?,
+        recencyAt: Date?,
+        status: CodexThreadStatus?,
         ephemeral: Bool?,
         turns: [CodexTurnSnapshot]?
     ) -> Set<Field> {
@@ -1180,6 +1117,12 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
         if updatedAt != nil {
             fields.insert(.updatedAt)
         }
+        if recencyAt != nil {
+            fields.insert(.recencyAt)
+        }
+        if status != nil {
+            fields.insert(.status)
+        }
         if ephemeral != nil {
             fields.insert(.ephemeral)
         }
@@ -1194,25 +1137,88 @@ public struct CodexTurnSnapshot: Identifiable, Equatable, Sendable {
     public var id: CodexTurnID
     public var status: CodexTurnStatus?
     public var errorMessage: String?
+    public var itemsLoadState: CodexTurnItemsLoadState
     public var items: [CodexThreadItem]
 
     public init(
         id: CodexTurnID,
         status: CodexTurnStatus? = nil,
         errorMessage: String? = nil,
+        itemsLoadState: CodexTurnItemsLoadState = .full,
         items: [CodexThreadItem] = []
     ) {
         self.id = id
         self.status = status
         self.errorMessage = errorMessage
+        self.itemsLoadState = itemsLoadState
         self.items = items
+    }
+
+    package var itemsAreAuthoritative: Bool {
+        itemsLoadState == .full
+    }
+}
+
+public enum CodexTurnItemsLoadState: String, Codable, Equatable, Sendable {
+    case notLoaded
+    case summary
+    case full
+}
+
+public struct CodexTurnQuery: Equatable, Sendable {
+    public var cursor: String?
+    public var limit: Int?
+    public var sortDirection: CodexSortDirection?
+    public var itemsLoadState: CodexTurnItemsLoadState?
+
+    public init(
+        cursor: String? = nil,
+        limit: Int? = nil,
+        sortDirection: CodexSortDirection? = nil,
+        itemsLoadState: CodexTurnItemsLoadState? = nil
+    ) {
+        self.cursor = cursor
+        self.limit = limit
+        self.sortDirection = sortDirection
+        self.itemsLoadState = itemsLoadState
+    }
+}
+
+public struct CodexTurnPage: Equatable, Sendable {
+    public var turns: [CodexTurnSnapshot]
+    public var nextCursor: String?
+    public var backwardsCursor: String?
+
+    public init(
+        turns: [CodexTurnSnapshot],
+        nextCursor: String? = nil,
+        backwardsCursor: String? = nil
+    ) {
+        self.turns = turns
+        self.nextCursor = nextCursor
+        self.backwardsCursor = backwardsCursor
     }
 }
 
 public struct CodexThreadQuery: Equatable, Sendable {
     public var archived: Bool?
     public var cursor: String?
-    public var workspace: URL?
+    public var workspaces: [URL]? {
+        get {
+            _workspaces
+        }
+        set {
+            _workspaces = Self.normalizedWorkspaces(newValue)
+        }
+    }
+    public var workspace: URL? {
+        get {
+            workspaces?.first
+        }
+        set {
+            _workspaces = Self.normalizedWorkspaces(newValue.map { [$0] })
+        }
+    }
     public var limit: Int?
     public var searchTerm: String?
     public var modelProviders: [String]?
@@ -1220,11 +1226,13 @@ public struct CodexThreadQuery: Equatable, Sendable {
     public var sortKey: CodexThreadSortKey?
     public var sourceKinds: [CodexThreadSourceKind]?
     public var useStateDBOnly: Bool?
+    private var _workspaces: [URL]?
 
     public init(
         archived: Bool? = nil,
         cursor: String? = nil,
         workspace: URL? = nil,
+        workspaces: [URL]? = nil,
         limit: Int? = nil,
         searchTerm: String? = nil,
         modelProviders: [String]? = nil,
@@ -1235,7 +1243,7 @@ public struct CodexThreadQuery: Equatable, Sendable {
     ) {
         self.archived = archived
         self.cursor = cursor
-        self.workspace = workspace
+        self._workspaces = Self.normalizedWorkspaces(workspaces ?? workspace.map { [$0] })
         self.limit = limit
         self.searchTerm = searchTerm
         self.modelProviders = modelProviders
@@ -1243,6 +1251,14 @@ public struct CodexThreadQuery: Equatable, Sendable {
         self.sortKey = sortKey
         self.sourceKinds = sourceKinds
         self.useStateDBOnly = useStateDBOnly
+    }
+
+    private static func normalizedWorkspaces(_ workspaces: [URL]?) -> [URL]? {
+        guard let workspaces else {
+            return nil
+        }
+        let normalized = workspaces.filter { $0.path.isEmpty == false }
+        return normalized.isEmpty ? nil : normalized
     }
 }
 
@@ -1331,9 +1347,11 @@ public struct CodexTranscript: Equatable, Sendable {
 }
 
 public struct CodexThreadItem: Identifiable, Equatable, Sendable {
-    public enum Kind: Equatable, Sendable {
+    public enum Kind: Hashable, Sendable {
         case userMessage
         case agentMessage
+        case enteredReviewMode
+        case exitedReviewMode
         case plan
         case reasoning
         case commandExecution
@@ -1357,6 +1375,10 @@ public struct CodexThreadItem: Identifiable, Equatable, Sendable {
                 self = .userMessage
             case "agentMessage":
                 self = .agentMessage
+            case "enteredReviewMode":
+                self = .enteredReviewMode
+            case "exitedReviewMode":
+                self = .exitedReviewMode
             case "plan":
                 self = .plan
             case "reasoning":
@@ -1398,6 +1420,10 @@ public struct CodexThreadItem: Identifiable, Equatable, Sendable {
                 "userMessage"
             case .agentMessage:
                 "agentMessage"
+            case .enteredReviewMode:
+                "enteredReviewMode"
+            case .exitedReviewMode:
+                "exitedReviewMode"
             case .plan:
                 "plan"
             case .reasoning:
@@ -1494,29 +1520,52 @@ public struct CodexThreadItem: Identifiable, Equatable, Sendable {
 }
 
 public struct CodexReasoning: Equatable, Sendable {
-    public var summary: [String]
-    public var content: [String]
+    public var summary: [String] {
+        didSet {
+            summary = Self.normalizedFragments(summary)
+        }
+    }
+    public var content: [String] {
+        didSet {
+            content = Self.normalizedFragments(content)
+        }
+    }
 
     public static let empty = Self(summary: [], content: [])
 
     public init(summary: [String] = [], content: [String] = []) {
-        self.summary = summary
-        self.content = content
+        self.summary = Self.normalizedFragments(summary)
+        self.content = Self.normalizedFragments(content)
     }
 
     public init(summary: String, content: String? = nil) {
-        self.summary = [summary]
-        self.content = content.map { [$0] } ?? []
+        self.init(
+            summary: [summary],
+            content: content.map { [$0] } ?? []
+        )
     }
 
     public init(content: String) {
-        self.summary = []
-        self.content = [content]
+        self.init(summary: [], content: [content])
     }
 
     public var text: String {
         let preferred = summary.isEmpty ? content : summary
-        return preferred.joined(separator: "\n")
+        return preferred.joined(separator: "\n\n")
+    }
+
+    private static func normalizedFragments(_ fragments: [String]) -> [String] {
+        var seen = Set<String>()
+        var normalized: [String] = []
+        normalized.reserveCapacity(fragments.count)
+        for fragment in fragments {
+            let key = fragment.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard key.isEmpty == false, seen.insert(key).inserted else {
+                continue
+            }
+            normalized.append(fragment)
+        }
+        return normalized
     }
 }
 
@@ -1606,24 +1655,98 @@ public enum CodexMessagePhase: Equatable, Sendable {
 }
 
 public struct CodexCommand: Equatable, Sendable {
+    public struct Source: RawRepresentable, Hashable, Sendable, ExpressibleByStringLiteral {
+        public var rawValue: String
+
+        public init(rawValue: String) {
+            self.rawValue = rawValue
+        }
+
+        public init(stringLiteral value: String) {
+            self.rawValue = value
+        }
+
+        public static let agent = Self(rawValue: "agent")
+        public static let user = Self(rawValue: "user")
+    }
+
+    public struct Action: Equatable, Sendable {
+        public enum Kind: String, Equatable, Sendable {
+            case read
+            case listFiles
+            case search
+            case unknown
+        }
+
+        public var kind: Kind
+        public var command: String?
+        public var name: String?
+        public var path: String?
+        public var query: String?
+
+        public init(
+            kind: Kind,
+            command: String? = nil,
+            name: String? = nil,
+            path: String? = nil,
+            query: String? = nil
+        ) {
+            self.kind = kind
+            self.command = command
+            self.name = name
+            self.path = path
+            self.query = query
+        }
+    }
+
     public var command: String
     public var cwd: String?
     public var output: String?
     public var exitCode: Int?
     public var status: CodexTurnStatus?
+    public var startedAt: Date?
+    public var completedAt: Date?
+    public var duration: Duration?
+    public var processID: String?
+    public var source: Source?
+    public var commandActions: [Action]
+
+    public var durationMilliseconds: Int? {
+        guard let duration else {
+            return nil
+        }
+        let components = duration.components
+        let milliseconds = components.seconds * 1_000 + components.attoseconds / 1_000_000_000_000_000
+        guard milliseconds >= 0, milliseconds <= Int.max else {
+            return nil
+        }
+        return Int(milliseconds)
+    }
 
     public init(
         command: String,
         cwd: String? = nil,
         output: String? = nil,
         exitCode: Int? = nil,
-        status: CodexTurnStatus? = nil
+        status: CodexTurnStatus? = nil,
+        startedAt: Date? = nil,
+        completedAt: Date? = nil,
+        duration: Duration? = nil,
+        processID: String? = nil,
+        source: Source? = nil,
+        commandActions: [Action] = []
     ) {
         self.command = command
         self.cwd = cwd
         self.output = output
         self.exitCode = exitCode
         self.status = status
+        self.startedAt = startedAt
+        self.completedAt = completedAt
+        self.duration = duration
+        self.processID = processID
+        self.source = source
+        self.commandActions = commandActions
     }
 }
 
@@ -2226,31 +2349,79 @@ public enum CodexThreadLogEntry: Identifiable, Equatable, Sendable {
     }
 }
 
+public struct CodexThreadActiveFlag: RawRepresentable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public var rawValue: String
+
+    public init(rawValue: String) {
+        self.rawValue = rawValue
+    }
+
+    public init(stringLiteral value: String) {
+        self.rawValue = value
+    }
+
+    public static let waitingOnApproval = Self(rawValue: "waitingOnApproval")
+    public static let waitingOnUserInput = Self(rawValue: "waitingOnUserInput")
+}
+
 public enum CodexThreadStatus: Equatable, Sendable {
-    case running
-    case closed
+    case notLoaded
+    case idle
+    case systemError
+    case active(activeFlags: [CodexThreadActiveFlag])
     case unknown(String)
 
     public init(rawValue: String) {
         switch rawValue {
-        case "running", "loaded", "active", "idle":
-            self = .running
-        case "closed", "notLoaded":
-            self = .closed
+        case "notLoaded", "closed":
+            self = .notLoaded
+        case "idle":
+            self = .idle
+        case "systemError":
+            self = .systemError
+        case "running", "loaded", "active":
+            self = .active(activeFlags: [])
         case let rawValue:
             self = .unknown(rawValue)
         }
     }
 
+    package init(type: String, activeFlags: [String]? = nil) {
+        switch type {
+        case "active":
+            self = .active(activeFlags: activeFlags?.map(CodexThreadActiveFlag.init(rawValue:)) ?? [])
+        default:
+            self.init(rawValue: type)
+        }
+    }
+
     public var rawValue: String {
         switch self {
-        case .running:
-            "running"
-        case .closed:
-            "closed"
+        case .notLoaded:
+            "notLoaded"
+        case .idle:
+            "idle"
+        case .systemError:
+            "systemError"
+        case .active:
+            "active"
         case .unknown(let rawValue):
             rawValue
         }
+    }
+
+    public var isActive: Bool {
+        if case .active = self {
+            return true
+        }
+        return false
+    }
+
+    public var activeFlags: [CodexThreadActiveFlag] {
+        if case .active(let activeFlags) = self {
+            return activeFlags
+        }
+        return []
     }
 }
 
