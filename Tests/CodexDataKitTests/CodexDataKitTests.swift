@@ -6090,8 +6090,8 @@ struct CodexModelContextTests {
         #expect(await runtime.transport.recordedRequests(method: "thread/resume").count == 1)
     }
 
-    @Test("chat observation coalesces duplicate narrative snapshot items")
-    func chatObservationCoalescesDuplicateNarrativeSnapshotItems() async throws {
+    @Test("chat observation preserves distinct repeated narrative snapshot items")
+    func chatObservationPreservesDistinctRepeatedNarrativeSnapshotItems() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         let context = CodexModelContainer(appServer: runtime.server).mainContext
 
@@ -6118,6 +6118,21 @@ struct CodexModelContextTests {
                             ))
                         ),
                         .init(
+                            id: "answer-a",
+                            kind: .agentMessage,
+                            content: .message(.init(
+                                id: "answer-a",
+                                role: .assistant,
+                                phase: .finalAnswer,
+                                text: "OK"
+                            ))
+                        ),
+                        .init(
+                            id: "diagnostic-a",
+                            kind: .diagnostic,
+                            content: .diagnostic("Repeated diagnostic")
+                        ),
+                        .init(
                             id: "reasoning-a",
                             kind: .reasoning,
                             content: .reasoning(.init(summary: "Checking diff"))
@@ -6128,11 +6143,6 @@ struct CodexModelContextTests {
                             content: .command(.init(command: "/bin/zsh -lc"))
                         ),
                         .init(
-                            id: "review-b",
-                            kind: .enteredReviewMode,
-                            content: .log("current changes")
-                        ),
-                        .init(
                             id: "user-b",
                             kind: .userMessage,
                             content: .message(.init(
@@ -6140,6 +6150,21 @@ struct CodexModelContextTests {
                                 role: .user,
                                 text: "Review current changes"
                             ))
+                        ),
+                        .init(
+                            id: "answer-b",
+                            kind: .agentMessage,
+                            content: .message(.init(
+                                id: "answer-b",
+                                role: .assistant,
+                                phase: .finalAnswer,
+                                text: "OK"
+                            ))
+                        ),
+                        .init(
+                            id: "diagnostic-b",
+                            kind: .diagnostic,
+                            content: .diagnostic("Repeated diagnostic")
                         ),
                         .init(
                             id: "reasoning-b",
@@ -6165,8 +6190,14 @@ struct CodexModelContextTests {
         #expect(chat.items.map(\.itemID) == [
             "review-a",
             "user-a",
+            "answer-a",
+            "diagnostic-a",
             "reasoning-a",
             "command-a",
+            "user-b",
+            "answer-b",
+            "diagnostic-b",
+            "reasoning-b",
             "command-b",
         ])
     }
@@ -6409,8 +6440,8 @@ struct CodexModelContextTests {
         #expect(removedTurnID == "turn-b")
     }
 
-    @Test("chat observation coalesces duplicate narrative live items")
-    func chatObservationCoalescesDuplicateNarrativeLiveItems() async throws {
+    @Test("chat observation preserves distinct repeated narrative live items")
+    func chatObservationPreservesDistinctRepeatedNarrativeLiveItems() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         let context = CodexModelContainer(appServer: runtime.server).mainContext
 
@@ -6442,6 +6473,18 @@ struct CodexModelContextTests {
                 threadID: "thread-duplicate-live",
                 turnID: "turn-duplicate-live",
                 item: .init(
+                    id: "diagnostic-a",
+                    type: "diagnostic",
+                    text: "Repeated diagnostic"
+                )
+            )
+        )
+        try await runtime.transport.emitServerNotification(
+            method: "item/started",
+            params: ThreadItemParams(
+                threadID: "thread-duplicate-live",
+                turnID: "turn-duplicate-live",
+                item: .init(
                     id: "reasoning-a",
                     type: "reasoning",
                     text: "Checking diff"
@@ -6454,9 +6497,9 @@ struct CodexModelContextTests {
                 threadID: "thread-duplicate-live",
                 turnID: "turn-duplicate-live",
                 item: .init(
-                    id: "command-a",
-                    type: "commandExecution",
-                    command: "/bin/zsh -lc"
+                    id: "diagnostic-b",
+                    type: "diagnostic",
+                    text: "Repeated diagnostic"
                 )
             )
         )
@@ -6466,9 +6509,9 @@ struct CodexModelContextTests {
                 threadID: "thread-duplicate-live",
                 turnID: "turn-duplicate-live",
                 item: .init(
-                    id: "review-b",
-                    type: "enteredReviewMode",
-                    text: "current changes"
+                    id: "command-a",
+                    type: "commandExecution",
+                    command: "/bin/zsh -lc"
                 )
             )
         )
@@ -6497,14 +6540,20 @@ struct CodexModelContextTests {
             )
         )
 
+        let expectedItemIDs = [
+            "review-a",
+            "reasoning-a",
+            "diagnostic-a",
+            "command-a",
+            "reasoning-b",
+            "diagnostic-b",
+            "command-b",
+        ]
         #expect(await eventually {
-            chat.items.map(\.itemID) == [
-                "review-a",
-                "reasoning-a",
-                "command-a",
-                "command-b",
-            ]
+            chat.items.count >= expectedItemIDs.count
         })
+        #expect(chat.items.count == expectedItemIDs.count)
+        #expect(Set(chat.items.map(\.itemID)) == Set(expectedItemIDs))
         withExtendedLifetime(changes) {}
     }
 

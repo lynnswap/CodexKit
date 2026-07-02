@@ -50,8 +50,7 @@ private extension Array where Element == CodexChatUpdate {
     }
 }
 
-private struct CodexNarrativeItemSignature: Hashable {
-    var kind: CodexThreadItem.Kind
+private struct CodexFallbackAgentMessageSignature: Hashable {
     var text: String
 }
 
@@ -73,82 +72,14 @@ private extension CodexThreadItem {
         kind == .agentMessage && isScopedFallbackMessageID(id)
     }
 
-    var duplicateNarrativeSignature: CodexNarrativeItemSignature? {
-        guard let text, text.isEmpty == false else {
+    var fallbackAgentMessageSignature: CodexFallbackAgentMessageSignature? {
+        guard kind == .agentMessage,
+            let text,
+            text.isEmpty == false
+        else {
             return nil
         }
-        switch kind {
-        case .agentMessage,
-            .userMessage,
-            .enteredReviewMode,
-            .exitedReviewMode,
-            .reasoning,
-            .diagnostic,
-            .error:
-            return .init(kind: kind, text: text)
-        case .plan,
-            .commandExecution,
-            .fileChange,
-            .mcpToolCall,
-            .dynamicToolCall,
-            .collabAgentToolCall,
-            .subAgentActivity,
-            .webSearch,
-            .imageView,
-            .sleep,
-            .imageGeneration,
-            .contextCompaction,
-            .unknown:
-            return nil
-        }
-    }
-
-    var replayNarrativeSignature: CodexNarrativeItemSignature? {
-        switch kind {
-        case .reasoning:
-            guard let text = reasoningReplaySignatureText else {
-                return nil
-            }
-            return .init(kind: kind, text: text)
-        case .enteredReviewMode,
-            .exitedReviewMode,
-            .diagnostic,
-            .error:
-            guard let text, text.isEmpty == false else {
-                return nil
-            }
-            return .init(kind: kind, text: text)
-        case .agentMessage,
-            .userMessage,
-            .plan,
-            .commandExecution,
-            .fileChange,
-            .mcpToolCall,
-            .dynamicToolCall,
-            .collabAgentToolCall,
-            .subAgentActivity,
-            .webSearch,
-            .imageView,
-            .sleep,
-            .imageGeneration,
-            .contextCompaction,
-            .unknown:
-            return nil
-        }
-    }
-
-    private var reasoningReplaySignatureText: String? {
-        guard case .reasoning(let reasoning) = content else {
-            return nil
-        }
-        let parts = [
-            reasoning.summary.joined(separator: "\n"),
-            reasoning.content.joined(separator: "\n"),
-        ].filter { $0.isEmpty == false }
-        guard parts.isEmpty == false else {
-            return nil
-        }
-        return parts.joined(separator: "\u{0}")
+        return .init(text: text)
     }
 
     var command: CodexCommand? {
@@ -883,12 +814,11 @@ public final class CodexChat: CodexPersistentModel {
     private func normalizedIncomingTurnRecords(
         _ records: [CodexTurnSnapshot]
     ) -> [CodexTurnSnapshot] {
-        let records = recordsByRemovingReplacedProvisionalSeed(records).map { record in
+        recordsByRemovingReplacedProvisionalSeed(records).map { record in
             var record = record
-            record.items = itemsByCoalescingDuplicateNarrativeItems(record.items)
+            record.items = itemsByReplacingFallbackAgentMessageItems(record.items)
             return record
         }
-        return recordsByCoalescingReplayNarrativeItems(records)
     }
 
     private func recordsByRemovingReplacedProvisionalSeed(
@@ -906,47 +836,36 @@ public final class CodexChat: CodexPersistentModel {
         return records.filter { $0.id != provisionalTurnID }
     }
 
-    private func itemsByCoalescingDuplicateNarrativeItems(
+    private func itemsByReplacingFallbackAgentMessageItems(
         _ incomingItems: [CodexThreadItem]
     ) -> [CodexThreadItem] {
-        var seenSignatures = Set<CodexNarrativeItemSignature>()
+        var fallbackIndexBySignature: [CodexFallbackAgentMessageSignature: Int] = [:]
+        var authoritativeSignatures = Set<CodexFallbackAgentMessageSignature>()
         var items: [CodexThreadItem] = []
         items.reserveCapacity(incomingItems.count)
         for item in incomingItems {
-            guard let signature = item.duplicateNarrativeSignature else {
+            guard let signature = item.fallbackAgentMessageSignature else {
                 items.append(item)
                 continue
             }
-            guard seenSignatures.insert(signature).inserted else {
-                if let existingIndex = items.firstIndex(where: {
-                    $0.duplicateNarrativeSignature == signature
-                }),
-                    items[existingIndex].isFallbackAgentMessageDelta,
-                    item.isFallbackAgentMessageDelta == false
-                {
-                    items[existingIndex] = item
+            if item.isFallbackAgentMessageDelta {
+                guard authoritativeSignatures.contains(signature) == false,
+                    fallbackIndexBySignature[signature] == nil
+                else {
+                    continue
                 }
-                continue
+                fallbackIndexBySignature[signature] = items.count
+                items.append(item)
+            } else {
+                if let fallbackIndex = fallbackIndexBySignature.removeValue(forKey: signature) {
+                    items[fallbackIndex] = item
+                } else {
+                    items.append(item)
+                }
+                authoritativeSignatures.insert(signature)
             }
-            items.append(item)
         }
         return items
-    }
-
-    private func recordsByCoalescingReplayNarrativeItems(
-        _ records: [CodexTurnSnapshot]
-    ) -> [CodexTurnSnapshot] {
-        return records.map { record in
-            var seenSignatures = Set<CodexNarrativeItemSignature>()
-            var record = record
-            record.items = record.items.filter { item in
-                guard let signature = item.replayNarrativeSignature else {
-                    return true
-                }
-                return seenSignatures.insert(signature).inserted
-            }
-            return record
-        }
     }
 
     private func mergeTurns(with records: [CodexTurnSnapshot]) {
@@ -1282,26 +1201,9 @@ public final class CodexChat: CodexPersistentModel {
                 turnID: turnID
             )
             let directlyMatchedItem = item(for: incomingKey)
-            if let existing = directlyMatchedItem,
-                isDuplicateNarrativeReplay(incomingItem, replacing: existing.threadItem)
-            {
-                continue
-            }
             let fallbackItem = directlyMatchedItem == nil
                 ? fallbackAgentMessageItem(matching: incomingItem, turnID: turnID)
                 : nil
-            if directlyMatchedItem == nil,
-                fallbackItem == nil,
-                hasNarrativeItem(matching: incomingItem, turnID: turnID)
-            {
-                continue
-            }
-            if directlyMatchedItem == nil,
-                fallbackItem == nil,
-                hasReplayNarrativeItem(matching: incomingItem, turnID: turnID)
-            {
-                continue
-            }
             let indexedItem = itemsByMergeKey[incomingKey]
             let replayItem = indexedItem == nil
                 && fallbackItem == nil
@@ -1381,59 +1283,13 @@ public final class CodexChat: CodexPersistentModel {
         return changes
     }
 
-    private func isDuplicateNarrativeReplay(
-        _ incomingItem: CodexThreadItem,
-        replacing existingItem: CodexThreadItem
-    ) -> Bool {
-        guard let incomingSignature = incomingItem.duplicateNarrativeSignature else {
-            return false
-        }
-        return existingItem.duplicateNarrativeSignature == incomingSignature
-    }
-
-    private func hasNarrativeItem(
-        matching incomingItem: CodexThreadItem,
-        turnID: CodexTurnID?
-    ) -> Bool {
-        guard let incomingSignature = incomingItem.duplicateNarrativeSignature else {
-            return false
-        }
-        if let turnID {
-            return itemsByTurnID[turnID]?.contains {
-                $0.threadItem.duplicateNarrativeSignature == incomingSignature
-            } == true
-        } else {
-            return items.contains {
-                $0.turnID == nil && $0.threadItem.duplicateNarrativeSignature == incomingSignature
-            }
-        }
-    }
-
-    private func hasReplayNarrativeItem(
-        matching incomingItem: CodexThreadItem,
-        turnID: CodexTurnID?
-    ) -> Bool {
-        guard let incomingSignature = incomingItem.replayNarrativeSignature else {
-            return false
-        }
-        if let turnID {
-            return itemsByTurnID[turnID]?.contains {
-                $0.threadItem.replayNarrativeSignature == incomingSignature
-            } == true
-        } else {
-            return items.contains {
-                $0.turnID == nil && $0.threadItem.replayNarrativeSignature == incomingSignature
-            }
-        }
-    }
-
     private func fallbackAgentMessageItem(
         matching incomingItem: CodexThreadItem,
         turnID: CodexTurnID?
     ) -> CodexItem? {
         guard incomingItem.isFallbackAgentMessageDelta == false,
             incomingItem.kind == .agentMessage,
-            let incomingSignature = incomingItem.duplicateNarrativeSignature
+            let incomingSignature = incomingItem.fallbackAgentMessageSignature
         else {
             return nil
         }
@@ -1445,7 +1301,7 @@ public final class CodexChat: CodexPersistentModel {
         }
         return candidates.first { item in
             item.threadItem.isFallbackAgentMessageDelta
-                && item.threadItem.duplicateNarrativeSignature == incomingSignature
+                && item.threadItem.fallbackAgentMessageSignature == incomingSignature
         }
     }
 

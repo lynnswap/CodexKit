@@ -63,6 +63,27 @@ struct CodexItemIdentityPromotionTests {
         #expect(item.id.rawValue.contains("agent-message-delta") == false)
     }
 
+    @Test("live merge preserves distinct repeated agent messages")
+    func liveMergePreservesDistinctRepeatedAgentMessages() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-repeated-agent-messages"))
+        let turnID = CodexTurnID(rawValue: "turn-repeated-agent-messages")
+
+        _ = chat.apply(CodexThreadEvent.turnStarted(turnID))
+        _ = chat.apply(CodexThreadEvent.itemCompleted(
+            agentMessageItem(id: "message-a", text: "OK"),
+            turnID: turnID
+        ))
+        _ = chat.apply(CodexThreadEvent.itemCompleted(
+            agentMessageItem(id: "message-b", text: "OK"),
+            turnID: turnID
+        ))
+
+        #expect(chat.items.map(\.itemID) == ["message-a", "message-b"])
+        #expect(chat.items.map(\.text) == ["OK", "OK"])
+    }
+
     @Test("message delta promotes fallback when item ID appears")
     func messageDeltaPromotesFallbackWhenItemIDAppears() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
