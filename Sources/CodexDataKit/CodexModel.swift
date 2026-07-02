@@ -1515,6 +1515,10 @@ public final class CodexChat: CodexPersistentModel {
                 incoming: incomingFileChange.status,
                 existing: existingFileChange.status
             )
+            if isOutputDeltaUpdate(incomingItem) == false {
+                incomingFileChange.path = incomingFileChange.path ?? existingFileChange.path
+                incomingFileChange.output = incomingFileChange.output ?? existingFileChange.output
+            }
             content = .fileChange(incomingFileChange)
         case (.toolCall(var incomingToolCall), .toolCall(let existingToolCall)):
             incomingToolCall.status = mergedLifecycleStatus(

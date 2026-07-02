@@ -7122,7 +7122,28 @@ struct CodexModelContextTests {
             observation.cancel()
         }
         let changes = ChatUpdateRecorder(stream: observation.updates)
+        func fileChangePath() -> String? {
+            guard let item = chat.items.first(where: { $0.itemID == "file-patch" }),
+                case .fileChange(let fileChange) = item.content
+            else {
+                return nil
+            }
+            return fileChange.path
+        }
 
+        try await runtime.transport.emitServerNotification(
+            method: "item/started",
+            params: ThreadItemParams(
+                threadID: "thread-patch-replacement",
+                turnID: "turn-patch-replacement",
+                item: .init(
+                    id: "file-patch",
+                    type: "fileChange",
+                    text: "Initial patch",
+                    path: "Sources/File.swift"
+                )
+            )
+        )
         try await runtime.transport.emitServerNotification(
             method: "item/fileChange/patchUpdated",
             params: FileChangePatchUpdatedParams(
@@ -7135,6 +7156,7 @@ struct CodexModelContextTests {
         #expect(await eventually {
             chat.items.first { $0.itemID == "file-patch" }?.text == "Patch one"
         })
+        #expect(fileChangePath() == "Sources/File.swift")
 
         try await runtime.transport.emitServerNotification(
             method: "item/fileChange/patchUpdated",
@@ -7149,6 +7171,7 @@ struct CodexModelContextTests {
         #expect(await eventually {
             chat.items.first { $0.itemID == "file-patch" }?.text == "Patch two"
         })
+        #expect(fileChangePath() == "Sources/File.swift")
         withExtendedLifetime(changes) {}
     }
 
@@ -8628,6 +8651,7 @@ private struct ThreadItemParams: Encodable, Sendable {
         var phase: String? = nil
         var command: String? = nil
         var cwd: String? = nil
+        var path: String? = nil
         var output: String? = nil
         var exitCode: Int? = nil
         var status: String? = nil
