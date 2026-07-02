@@ -60,11 +60,26 @@ public final class CodexModelContainer: @unchecked Sendable {
         }
         let context = CodexModelContext(self)
         _mainContext = context
+        if pendingMainContextTransactions.isEmpty == false {
+            Task { @MainActor in
+                await self.deliverPendingMainContextTransactions(to: context)
+            }
+        }
         return context
     }
 
     @MainActor
     private var _mainContext: CodexModelContext?
+
+    private struct PendingMainContextTransaction {
+        var transaction: CodexModelContextTransaction
+        var sourceContextID: CodexModelContextID
+    }
+
+    // Transactions multicast before the main context is materialized; replayed
+    // once it exists so early actor-side changes are not dropped.
+    @MainActor
+    private var pendingMainContextTransactions: [PendingMainContextTransaction] = []
 
     public init(appServer: CodexAppServer) {
         self.appServer = appServer
@@ -82,13 +97,28 @@ public final class CodexModelContainer: @unchecked Sendable {
         _ transaction: CodexModelContextTransaction,
         from sourceContextID: CodexModelContextID
     ) async {
-        guard transaction.isEmpty == false,
-            let context = _mainContext,
-            context.contextID != sourceContextID
-        else {
+        guard transaction.isEmpty == false else {
             return
         }
-        await context.merge(transaction)
+        pendingMainContextTransactions.append(.init(
+            transaction: transaction,
+            sourceContextID: sourceContextID
+        ))
+        guard let context = _mainContext else {
+            return
+        }
+        await deliverPendingMainContextTransactions(to: context)
+    }
+
+    @MainActor
+    private func deliverPendingMainContextTransactions(to context: CodexModelContext) async {
+        while pendingMainContextTransactions.isEmpty == false {
+            let pending = pendingMainContextTransactions.removeFirst()
+            guard pending.sourceContextID != context.contextID else {
+                continue
+            }
+            await context.merge(pending.transaction)
+        }
     }
 }
 

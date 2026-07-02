@@ -154,6 +154,38 @@ struct CodexModelContextTests {
         await modelActor.cancelChatObservation()
     }
 
+    @Test("main context replays reviews started before it materializes")
+    func mainContextReplaysReviewsStartedBeforeItMaterializes() async throws {
+        let workspaceURL = temporaryDirectory()
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let container = CodexModelContainer(appServer: runtime.server)
+        let modelActor = TestCodexModelActor(modelContainer: container)
+
+        try await runtime.transport.enqueueThreadStart(
+            threadID: "thread-early-review",
+            model: "gpt-5"
+        )
+        try await runtime.transport.enqueueReviewStart(
+            turnID: "turn-early-review",
+            reviewThreadID: "thread-early-review"
+        )
+
+        let reviewChatID = try await modelActor.startReviewID(
+            in: workspaceURL,
+            input: CodexReviewInput(
+                target: .uncommittedChanges,
+                options: .init(model: "gpt-5", ephemeral: false)
+            )
+        )
+
+        let mainContext = container.mainContext
+        #expect(await eventually {
+            mainContext.registeredModel(for: reviewChatID) != nil
+        })
+        let mainChat = try #require(mainContext.registeredModel(for: reviewChatID))
+        #expect(mainChat.workspace?.url.path == workspaceURL.path)
+    }
+
     @Test("parent model refreshes throw after detaching from context")
     func parentModelRefreshesThrowAfterDetachingFromContext() async throws {
         var detachedWorkspace: CodexWorkspace?
