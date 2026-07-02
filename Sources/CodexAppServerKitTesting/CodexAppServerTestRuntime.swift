@@ -9,19 +9,14 @@ import CodexAppServerKit
 public actor CodexAppServerTestThreadStore {
     private var snapshotsByID: [String: CodexThreadSnapshot]
     private var snapshotOrder: [String]
-    private let nextCursor: String?
-    private let backwardsCursor: String?
+    private static let cursorPrefix = "test-thread-store:"
 
     /// Creates an in-memory thread snapshot store.
     public init(
-        threads: [CodexThreadSnapshot] = [],
-        nextCursor: String? = nil,
-        backwardsCursor: String? = nil
+        threads: [CodexThreadSnapshot] = []
     ) {
         self.snapshotsByID = Dictionary(uniqueKeysWithValues: threads.map { ($0.id.rawValue, $0) })
         self.snapshotOrder = threads.map(\.id.rawValue)
-        self.nextCursor = nextCursor
-        self.backwardsCursor = backwardsCursor
     }
 
     /// Returns the stored snapshot for `id`.
@@ -74,12 +69,52 @@ public actor CodexAppServerTestThreadStore {
             snapshots,
             for: request
         )
+        let page = page(filteredThreads, cursor: request.cursor, limit: request.limit)
         return try JSONEncoder().encode(
             AppServerAPI.Thread.List.Response(
-                data: filteredThreads.map(CodexAppServerTestTransport.apiSnapshot(from:)),
-                nextCursor: nextCursor,
-                backwardsCursor: backwardsCursor
+                data: page.threads.map(CodexAppServerTestTransport.apiSnapshot(from:)),
+                nextCursor: page.nextCursor,
+                backwardsCursor: page.backwardsCursor
             ))
+    }
+
+    private func page(
+        _ threads: [CodexThreadSnapshot],
+        cursor: String?,
+        limit: Int?
+    ) -> CodexThreadPage {
+        let start = min(max(offset(from: cursor), 0), threads.count)
+        guard let limit else {
+            return CodexThreadPage(
+                threads: Array(threads[start..<threads.endIndex]),
+                backwardsCursor: start > 0 ? Self.cursor(for: 0) : nil
+            )
+        }
+        guard limit > 0 else {
+            return CodexThreadPage(threads: [], nextCursor: nil, backwardsCursor: nil)
+        }
+
+        let end = min(start + limit, threads.count)
+        let previousStart = max(0, start - limit)
+        return CodexThreadPage(
+            threads: Array(threads[start..<end]),
+            nextCursor: end < threads.count ? Self.cursor(for: end) : nil,
+            backwardsCursor: start > 0 ? Self.cursor(for: previousStart) : nil
+        )
+    }
+
+    private func offset(from cursor: String?) -> Int {
+        guard let cursor else {
+            return 0
+        }
+        if cursor.hasPrefix(Self.cursorPrefix) {
+            return Int(cursor.dropFirst(Self.cursorPrefix.count)) ?? 0
+        }
+        return Int(cursor) ?? 0
+    }
+
+    private static func cursor(for offset: Int) -> String {
+        "\(cursorPrefix)\(offset)"
     }
 
     func resumeThreadResponse(for params: Data) throws -> Data {
@@ -211,17 +246,11 @@ public struct CodexAppServerTestRuntime: Sendable {
     /// ```
     public static func start(
         threads: [CodexThreadSnapshot],
-        nextCursor: String? = nil,
-        backwardsCursor: String? = nil,
         transport: CodexAppServerTestTransport = CodexAppServerTestTransport(),
         codexHome: String? = nil,
         userAgent: String? = nil
     ) async throws -> CodexAppServerTestRuntime {
-        let threadStore = CodexAppServerTestThreadStore(
-            threads: threads,
-            nextCursor: nextCursor,
-            backwardsCursor: backwardsCursor
-        )
+        let threadStore = CodexAppServerTestThreadStore(threads: threads)
         return try await start(
             threadStore: threadStore,
             transport: transport,
@@ -498,15 +527,9 @@ public actor CodexAppServerTestTransport {
     /// This is useful for UI previews and tests that should exercise the same
     /// app-server/DataKit path repeatedly without launching a real app-server.
     public func stubThreads(
-        _ threads: [CodexThreadSnapshot],
-        nextCursor: String? = nil,
-        backwardsCursor: String? = nil
+        _ threads: [CodexThreadSnapshot]
     ) throws {
-        let store = CodexAppServerTestThreadStore(
-            threads: threads,
-            nextCursor: nextCursor,
-            backwardsCursor: backwardsCursor
-        )
+        let store = CodexAppServerTestThreadStore(threads: threads)
         try stubThreads(store)
     }
 

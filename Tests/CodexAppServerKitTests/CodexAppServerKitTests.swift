@@ -848,17 +848,13 @@ struct CodexAppServerKitTests {
             name: "A",
             modelProvider: "openai"
         )
-        let store = CodexAppServerTestThreadStore(
-            threads: [initial],
-            nextCursor: "next",
-            backwardsCursor: "back"
-        )
+        let store = CodexAppServerTestThreadStore(threads: [initial])
         let runtime = try await CodexAppServerTestRuntime.start(threadStore: store)
 
         let firstPage = try await runtime.server.listThreads()
         #expect(firstPage.threads == [initial])
-        #expect(firstPage.nextCursor == "next")
-        #expect(firstPage.backwardsCursor == "back")
+        #expect(firstPage.nextCursor == nil)
+        #expect(firstPage.backwardsCursor == nil)
 
         let updated = CodexThreadSnapshot(
             id: "thread-b",
@@ -894,6 +890,28 @@ struct CodexAppServerKitTests {
         #expect(startedSnapshot.modelProvider == "openai")
         #expect(startedSnapshot.ephemeral == true)
         #expect(started.model == "gpt-5")
+    }
+
+    @Test func threadStoreHonorsThreadListPagination() async throws {
+        let threads = [
+            CodexThreadSnapshot(id: "thread-a", name: "A"),
+            CodexThreadSnapshot(id: "thread-b", name: "B"),
+            CodexThreadSnapshot(id: "thread-c", name: "C"),
+        ]
+        let runtime = try await CodexAppServerTestRuntime.start(threads: threads)
+
+        let firstPage = try await runtime.server.listThreads(.init(limit: 2))
+        #expect(firstPage.threads.map(\.id.rawValue) == ["thread-a", "thread-b"])
+        let nextCursor = try #require(firstPage.nextCursor)
+        #expect(firstPage.backwardsCursor == nil)
+
+        let secondPage = try await runtime.server.listThreads(.init(
+            cursor: nextCursor,
+            limit: 2
+        ))
+        #expect(secondPage.threads.map(\.id.rawValue) == ["thread-c"])
+        #expect(secondPage.nextCursor == nil)
+        #expect(secondPage.backwardsCursor != nil)
     }
 
     @Test func transportStubThreadsAcceptsMutableThreadStore() async throws {
