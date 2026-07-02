@@ -1436,6 +1436,43 @@ struct CodexModelContextTests {
         #expect(fetchedWorkspace.chats.map(\.id.rawValue) == ["thread-running"])
     }
 
+    @Test("workspace fetch excludes live-only relationships when pending changes are disabled")
+    func workspaceFetchExcludesLiveOnlyRelationshipsWhenPendingChangesAreDisabled() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let repo = try gitRepository(named: "NoPending")
+        let workspace = try createDirectory("App", in: repo)
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(
+                id: "thread-running",
+                workspace: workspace,
+                name: "Running",
+                status: .active(activeFlags: [])
+            )
+        ]))
+        let seedResults = context.fetchedResults(for: CodexFetchRequest<CodexWorkspace>.workspaces)
+        try await seedResults.performFetch()
+        let runningChat = try #require(
+            context.registeredModel(for: CodexThreadID(rawValue: "thread-running"))
+        )
+
+        try await runtime.transport.enqueueThreadList(.init(threads: []))
+        let workspaceResults = context.fetchedResults(for: CodexFetchRequest<CodexWorkspace>(
+            includePendingChanges: false
+        ))
+        try await workspaceResults.performFetch()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: []))
+        let groupResults = context.fetchedResults(for: CodexFetchRequest<CodexWorkspaceGroup>(
+            includePendingChanges: false
+        ))
+        try await groupResults.performFetch()
+
+        #expect(workspaceResults.items.isEmpty)
+        #expect(groupResults.items.isEmpty)
+        #expect(runningChat.workspace?.url == workspace)
+    }
+
     @Test("started review prepared threads do not preserve stale fetched chat rows")
     func startedReviewPreparedThreadsDoNotPreserveStaleFetchedChatRows() async throws {
         let workspace = temporaryDirectory()
@@ -3506,6 +3543,37 @@ struct CodexModelContextTests {
 
         #expect(results.items.first === chat)
         #expect(results.sections.first?.items.first === chat)
+    }
+
+    @Test("starting a chat excludes it from fetched results when pending changes are disabled")
+    func startingChatExcludesItFromFetchedResultsWhenPendingChangesAreDisabled() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+        let existing = CodexThreadSnapshot(
+            id: "thread-existing",
+            workspace: workspaceURL,
+            name: "Existing",
+            updatedAt: Date(timeIntervalSince1970: 1_000)
+        )
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [existing]))
+        let workspaceResults = context.fetchedResults(for: CodexFetchRequest<CodexWorkspace>.workspaces)
+        try await workspaceResults.performFetch()
+        let workspace = try #require(workspaceResults.items.first)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [existing]))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            includePendingChanges: false
+        ))
+        try await results.performFetch()
+
+        try await runtime.transport.enqueueThreadStart(threadID: "thread-new")
+        try await runtime.transport.enqueueThreadList(.init(threads: [existing]))
+        let chat = try await workspace.startChat()
+
+        #expect(chat.id == "thread-new")
+        #expect(results.items.map(\.id.rawValue) == ["thread-existing"])
     }
 
     @Test("starting a chat preserves requested provider for filtered results")

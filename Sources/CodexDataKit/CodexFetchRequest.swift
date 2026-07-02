@@ -982,6 +982,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
 
     private var canInsertLiveModel: Bool {
         canEvaluateFilterLocally
+            && fetchDescriptor.includePendingChanges
             && fetchDescriptor.fetchOffset == 0
             && (nextCursor == nil || fetchDescriptor.fetchLimit == nil)
     }

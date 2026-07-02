@@ -1521,7 +1521,7 @@ public final class CodexModelContext {
         let relationshipChats = chats + preservedLiveChatsForFetchedRelationships(
             omittedFrom: chats,
             descriptor: descriptor,
-            requiresIncludePendingChanges: false
+            requiresIncludePendingChanges: true
         )
         let removedChats = syncWorkspaceChats(
             chats,
@@ -1559,7 +1559,7 @@ public final class CodexModelContext {
         let relationshipChats = chats + preservedLiveChatsForFetchedRelationships(
             omittedFrom: chats,
             descriptor: descriptor,
-            requiresIncludePendingChanges: false
+            requiresIncludePendingChanges: true
         )
         let preservingGroupWorkspaces = descriptor.predicate.workspaces != nil
             || shouldPreserveExistingWorkspaceChats(
