@@ -6217,7 +6217,14 @@ struct CodexModelContextTests {
                 "turn-b:reasoning-parent",
             ]
         })
-        withExtendedLifetime(changes) {}
+        guard case .itemRemoved(let removedID, let removedTurnID) =
+            await changes.itemRemoved(id: "reasoning-parent:summary:0")
+        else {
+            Issue.record("Expected reasoning part removal.")
+            return
+        }
+        #expect(removedID == "reasoning-parent:summary:0")
+        #expect(removedTurnID == "turn-b")
     }
 
     @Test("chat observation coalesces duplicate narrative live items")
@@ -8976,6 +8983,15 @@ private final class ChatUpdateRecorder {
     func itemUpdated(id: String) async -> CodexChatUpdate? {
         await next { change in
             if case .itemUpdated(let changeID, _) = change {
+                return changeID == id
+            }
+            return false
+        }
+    }
+
+    func itemRemoved(id: String) async -> CodexChatUpdate? {
+        await next { change in
+            if case .itemRemoved(let changeID, _) = change {
                 return changeID == id
             }
             return false

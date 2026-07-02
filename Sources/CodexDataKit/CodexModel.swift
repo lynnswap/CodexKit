@@ -2018,13 +2018,16 @@ public final class CodexChat: CodexPersistentModel {
         itemsByMergeKey[key]
     }
 
-    private func removeProvisionalSeedTurn(_ provisionalTurnID: CodexTurnID) -> [CodexItem] {
+    private func removeProvisionalSeedTurn(_ provisionalTurnID: CodexTurnID) -> [CodexChatUpdate] {
         provisionalSeedTurnID = nil
         guard let provisionalTurn = turnsByID[provisionalTurnID] else {
             return []
         }
 
         let removedItems = items.filter { $0.turnID == provisionalTurnID }
+        let removedChanges = removedItems.map { item in
+            CodexChatUpdate.itemRemoved(id: item.itemID, turnID: item.turnID)
+        }
         let removedKeys = Set(removedItems.map(\.mergeKey))
         if removedKeys.isEmpty == false {
             items.removeAll { item in
@@ -2040,7 +2043,7 @@ public final class CodexChat: CodexPersistentModel {
         turnsByID.removeValue(forKey: provisionalTurnID)
         itemsByTurnID.removeValue(forKey: provisionalTurnID)
         provisionalTurn.replaceContextItems([])
-        return removedItems
+        return removedChanges
     }
 
     @discardableResult
@@ -2060,10 +2063,7 @@ public final class CodexChat: CodexPersistentModel {
             return false
         }
 
-        let removedItems = removeProvisionalSeedTurn(provisionalTurnID)
-        changes.append(contentsOf: removedItems.map { item in
-            .itemRemoved(id: item.itemID, turnID: item.turnID)
-        })
+        changes.append(contentsOf: removeProvisionalSeedTurn(provisionalTurnID))
         changes.append(.turnUpdated(id: provisionalTurnID))
         return true
     }
@@ -2127,6 +2127,9 @@ public final class CodexChat: CodexPersistentModel {
         guard removedItems.isEmpty == false else {
             return []
         }
+        let removedChanges = removedItems.map { item in
+            CodexChatUpdate.itemRemoved(id: item.itemID, turnID: item.turnID)
+        }
         let removedKeys = Set(removedItems.map(\.mergeKey))
         items.removeAll { item in
             removedKeys.contains(item.mergeKey)
@@ -2139,9 +2142,7 @@ public final class CodexChat: CodexPersistentModel {
             .filter { key, _ in
                 key.turnID != turnID || prefixes.contains { key.id.hasPrefix($0) } == false
             }
-        return removedItems.map { item in
-            .itemRemoved(id: item.itemID, turnID: item.turnID)
-        }
+        return removedChanges
     }
 
     @discardableResult
@@ -2152,6 +2153,9 @@ public final class CodexChat: CodexPersistentModel {
         guard removedItems.isEmpty == false else {
             return []
         }
+        let removedChanges = removedItems.map { item in
+            CodexChatUpdate.itemRemoved(id: item.itemID, turnID: item.turnID)
+        }
         let removedKeys = Set(removedItems.map(\.mergeKey))
         items.removeAll { item in
             removedKeys.contains(item.mergeKey)
@@ -2160,9 +2164,7 @@ public final class CodexChat: CodexPersistentModel {
             removeItemFromIndexes(item)
         }
         unregisterItemsFromContext(removedItems)
-        return removedItems.map { item in
-            .itemRemoved(id: item.itemID, turnID: item.turnID)
-        }
+        return removedChanges
     }
 
     private func markRunningIfNeeded() -> CodexChatUpdate? {
