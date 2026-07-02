@@ -910,6 +910,44 @@ struct CodexAppServerKitTests {
         #expect(snapshot.turnItemsAreAuthoritative == false)
     }
 
+    @Test func threadReadPreservesItemsWithoutStableIDs() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueJSON(
+            """
+            {
+              "thread": {
+                "id": "thread-missing-item-id",
+                "turns": [
+                  {
+                    "id": "turn-missing-item-id",
+                    "items": [
+                      {
+                        "type": "diagnostic",
+                        "text": "Legacy diagnostic"
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+            """,
+            for: "thread/read"
+        )
+        let client = AppServerClient(transport: transport)
+        let thread = CodexThread(
+            id: .init(rawValue: "thread-missing-item-id"),
+            client: client,
+            router: CodexAppServerNotificationRouter(client: client)
+        )
+
+        let snapshot = try await thread.read(includeTurns: true)
+        let item = try #require(snapshot.turns?.first?.items.first)
+
+        #expect(item.id.hasPrefix("missing-id:diagnostic:"))
+        #expect(item.text == "Legacy diagnostic")
+        #expect(item.rawPayload != nil)
+    }
+
     @Test func threadStoreDrivesRuntimeThreadStubsAfterStart() async throws {
         let workspace = URL(fileURLWithPath: "/tmp/project", isDirectory: true)
         let initial = CodexThreadSnapshot(
@@ -2425,6 +2463,71 @@ struct CodexAppServerKitTests {
         #expect(currentGeneration.contains { event in
             if case .messageDelta(let delta, let turnID) = event {
                 return delta.text == "Current" && turnID == "turn-2"
+            }
+            return false
+        })
+        #expect(currentGeneration.last == .closed)
+    }
+
+    @Test func threadGenerationIncludingTurnStartsAfterPriorTerminalTurn() async throws {
+        let transport = CodexAppServerTestTransport()
+        let client = AppServerClient(transport: transport)
+        let router = CodexAppServerNotificationRouter(client: client)
+        await router.start()
+        await transport.waitForNotificationStreamCount(1)
+        try await transport.emitServerNotification(
+            method: "turn/started",
+            params: TurnStartedParams(threadID: "thread-review", turnID: "turn-old")
+        )
+        try await transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(
+                threadID: "thread-review",
+                turnID: "turn-old",
+                delta: "Old"
+            )
+        )
+        try await transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(id: "turn-old", status: "completed"))
+        )
+        try await transport.emitServerNotification(
+            method: "turn/started",
+            params: TurnStartedParams(threadID: "thread-review", turnID: "turn-current")
+        )
+        try await transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(
+                threadID: "thread-review",
+                turnID: "turn-current",
+                delta: "Current"
+            )
+        )
+        try await transport.emitServerNotification(
+            method: "thread/closed",
+            params: ThreadIDParams(threadID: "thread-review")
+        )
+
+        await router.beginThreadEventGeneration("thread-review", including: "turn-current")
+        let currentGeneration = try await withTimeout {
+            try await collect(await router.observationEvents(for: "thread-review"))
+        }
+
+        #expect(currentGeneration.contains { event in
+            if case .messageDelta(let delta, let turnID) = event {
+                return delta.text == "Old" || turnID == "turn-old"
+            }
+            return false
+        } == false)
+        #expect(currentGeneration.contains { event in
+            if case .turnStarted(let turnID) = event {
+                return turnID == "turn-current"
+            }
+            return false
+        })
+        #expect(currentGeneration.contains { event in
+            if case .messageDelta(let delta, let turnID) = event {
+                return delta.text == "Current" && turnID == "turn-current"
             }
             return false
         })

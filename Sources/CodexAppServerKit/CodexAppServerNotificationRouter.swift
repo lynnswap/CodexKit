@@ -1,8 +1,13 @@
 import Foundation
 
 package actor CodexAppServerNotificationRouter {
-    private struct Subscriber<Event> {
-        var continuation: AsyncThrowingStream<Event, Error>.Continuation
+    private struct TurnSubscriber {
+        var continuation: AsyncThrowingStream<CodexTurnEvent, Error>.Continuation
+    }
+
+    private struct ThreadSubscriber {
+        var continuation: AsyncThrowingStream<CodexThreadEvent, Error>.Continuation
+        var replayPolicy: ThreadEventReplayPolicy
     }
 
     private struct NotificationContext {
@@ -16,14 +21,18 @@ package actor CodexAppServerNotificationRouter {
     private var reviewThreadIDs: Set<CodexThreadID> = []
     private var turnHistoryByTurnID: [CodexTurnID: [CodexTurnEvent]] = [:]
     private var threadHistoryByThreadID: [CodexThreadID: [CodexThreadEvent]] = [:]
-    private var threadGenerationStartIndexByThreadID: [CodexThreadID: Int] = [:]
-    private var turnSubscribersByTurnID: [CodexTurnID: [UUID: Subscriber<CodexTurnEvent>]] = [:]
-    private var threadSubscribersByThreadID: [CodexThreadID: [UUID: Subscriber<CodexThreadEvent>]] =
-        [:]
+    private var threadGenerationStartByThreadID: [CodexThreadID: ThreadGenerationStart] = [:]
+    private var turnSubscribersByTurnID: [CodexTurnID: [UUID: TurnSubscriber]] = [:]
+    private var threadSubscribersByThreadID: [CodexThreadID: [UUID: ThreadSubscriber]] = [:]
 
     private enum ThreadEventReplayPolicy {
         case currentGeneration
         case none
+    }
+
+    private enum ThreadGenerationStart {
+        case cursor(Int)
+        case includingTurn(CodexTurnID, fallbackCursor: Int)
     }
     private let decoder = JSONDecoder()
 
@@ -145,7 +154,9 @@ package actor CodexAppServerNotificationRouter {
     }
 
     package func beginThreadEventGeneration(_ threadID: CodexThreadID) {
-        threadGenerationStartIndexByThreadID[threadID] = threadHistoryByThreadID[threadID]?.count ?? 0
+        threadGenerationStartByThreadID[threadID] = .cursor(
+            threadHistoryByThreadID[threadID]?.count ?? 0
+        )
     }
 
     package func threadEventGenerationCursor(_ threadID: CodexThreadID) -> Int {
@@ -154,19 +165,14 @@ package actor CodexAppServerNotificationRouter {
 
     package func beginThreadEventGeneration(_ threadID: CodexThreadID, at cursor: Int) {
         let historyCount = threadHistoryByThreadID[threadID]?.count ?? 0
-        threadGenerationStartIndexByThreadID[threadID] = min(cursor, historyCount)
+        threadGenerationStartByThreadID[threadID] = .cursor(min(cursor, historyCount))
     }
 
     package func beginThreadEventGeneration(_ threadID: CodexThreadID, including turnID: CodexTurnID) {
-        let history = threadHistoryByThreadID[threadID] ?? []
-        let firstTurnEventIndex = history.firstIndex { Self.threadEvent($0, matches: turnID) }
-        let searchEnd = firstTurnEventIndex ?? history.endIndex
-        let precedingHistory = history[..<searchEnd]
-        let generationStart =
-            precedingHistory.lastIndex(where: Self.isTerminalThreadEvent).map {
-                history.index(after: $0)
-            } ?? history.startIndex
-        threadGenerationStartIndexByThreadID[threadID] = generationStart
+        threadGenerationStartByThreadID[threadID] = .includingTurn(
+            turnID,
+            fallbackCursor: threadHistoryByThreadID[threadID]?.count ?? 0
+        )
     }
 
     private func route(_ notification: JSONRPC.Notification) {
@@ -222,8 +228,20 @@ package actor CodexAppServerNotificationRouter {
 
     private func appendThreadEvent(_ event: CodexThreadEvent, threadID: CodexThreadID) {
         threadHistoryByThreadID[threadID, default: []].append(event)
+        let history = threadHistoryByThreadID[threadID] ?? []
+        let eventIndex = history.index(before: history.endIndex)
         if let subscribers = threadSubscribersByThreadID[threadID] {
             for subscriber in subscribers.values {
+                guard
+                    shouldYieldThreadEvent(
+                        at: eventIndex,
+                        in: history,
+                        threadID: threadID,
+                        replayPolicy: subscriber.replayPolicy
+                    )
+                else {
+                    continue
+                }
                 subscriber.continuation.yield(event)
             }
         }
@@ -246,7 +264,8 @@ package actor CodexAppServerNotificationRouter {
             return
         }
         turnSubscribersByTurnID[turnID, default: [:]][subscriptionID] = .init(
-            continuation: continuation)
+            continuation: continuation
+        )
     }
 
     private func addThreadSubscriber(
@@ -256,7 +275,7 @@ package actor CodexAppServerNotificationRouter {
         replayPolicy: ThreadEventReplayPolicy = .currentGeneration
     ) {
         let history = threadHistoryByThreadID[threadID] ?? []
-        let replayedHistory: ArraySlice<CodexThreadEvent>
+        let replayedHistory: [CodexThreadEvent]
         switch replayPolicy {
         case .currentGeneration:
             replayedHistory = currentGenerationEvents(in: history, threadID: threadID)
@@ -279,18 +298,116 @@ package actor CodexAppServerNotificationRouter {
             return
         }
         threadSubscribersByThreadID[threadID, default: [:]][subscriptionID] = .init(
-            continuation: continuation)
+            continuation: continuation,
+            replayPolicy: replayPolicy
+        )
     }
 
     private func currentGenerationEvents(
         in history: [CodexThreadEvent],
         threadID: CodexThreadID
-    ) -> ArraySlice<CodexThreadEvent> {
-        if let generationStart = threadGenerationStartIndexByThreadID[threadID] {
-            let clampedStart = min(generationStart, history.count)
-            return history[clampedStart...]
+    ) -> [CodexThreadEvent] {
+        guard let generationStart = threadGenerationStartByThreadID[threadID] else {
+            return history
         }
-        return history[...]
+
+        let startIndex = currentGenerationStartIndex(generationStart, in: history)
+        let events = Array(history[startIndex...])
+        if case .includingTurn(let turnID, _) = generationStart,
+           events.contains(where: { Self.threadEvent($0, matches: turnID) }) == false {
+            return events.filter { Self.threadEventTurnID($0).map { $0 == turnID } ?? true }
+        }
+        return events
+    }
+
+    private func shouldYieldThreadEvent(
+        at eventIndex: Int,
+        in history: [CodexThreadEvent],
+        threadID: CodexThreadID,
+        replayPolicy: ThreadEventReplayPolicy
+    ) -> Bool {
+        switch replayPolicy {
+        case .none:
+            return true
+        case .currentGeneration:
+            guard let generationStart = threadGenerationStartByThreadID[threadID] else {
+                return true
+            }
+            if case .includingTurn(let turnID, _) = generationStart,
+                history[...eventIndex].contains(where: { Self.threadEvent($0, matches: turnID) })
+                    == false,
+                Self.threadEventTurnID(history[eventIndex]).map({ $0 != turnID }) == true
+            {
+                return false
+            }
+            return eventIndex >= currentGenerationStartIndex(generationStart, in: history)
+        }
+    }
+
+    private nonisolated func currentGenerationStartIndex(
+        _ generationStart: ThreadGenerationStart,
+        in history: [CodexThreadEvent]
+    ) -> Int {
+        switch generationStart {
+        case .cursor(let cursor):
+            return min(cursor, history.count)
+        case .includingTurn(let turnID, let fallbackCursor):
+            return Self.generationStartIndex(
+                in: history,
+                including: turnID,
+                fallbackCursor: fallbackCursor
+            )
+        }
+    }
+
+    private nonisolated static func generationStartIndex(
+        in history: [CodexThreadEvent],
+        including turnID: CodexTurnID,
+        fallbackCursor: Int
+    ) -> Int {
+        if let firstTurnEventIndex = history.firstIndex(where: { threadEvent($0, matches: turnID) }) {
+            let precedingHistory = history[..<firstTurnEventIndex]
+            if let boundaryIndex = precedingHistory.lastIndex(where: isThreadEventGenerationBoundary) {
+                return history.index(after: boundaryIndex)
+            }
+            return firstTurnEventIndex
+        }
+
+        let clampedFallback = min(fallbackCursor, history.count)
+        let fallbackHistory = history[clampedFallback...]
+        if let boundaryIndex = fallbackHistory.lastIndex(where: isPendingTurnGenerationBoundary) {
+            return history.index(after: boundaryIndex)
+        }
+        return clampedFallback
+    }
+
+    private nonisolated static func isPendingTurnGenerationBoundary(_ event: CodexThreadEvent) -> Bool {
+        switch event {
+        case .turnCompleted, .turnFailed:
+            true
+        case .closed, .turnStarted, .statusChanged, .itemStarted, .itemUpdated, .itemCompleted,
+             .message, .messageDelta, .reasoningSummaryPartAdded, .reasoningDelta,
+             .tokenUsageUpdated, .unknown:
+            false
+        }
+    }
+
+    private nonisolated static func threadEventTurnID(_ event: CodexThreadEvent) -> CodexTurnID? {
+        switch event {
+        case .turnStarted(let turnID):
+            turnID
+        case .turnCompleted(let response):
+            response.turnID
+        case .turnFailed(let turnID, _), .itemStarted(_, let turnID),
+             .itemUpdated(_, let turnID), .itemCompleted(_, let turnID), .message(_, let turnID),
+             .messageDelta(_, let turnID), .reasoningSummaryPartAdded(_, let turnID),
+             .reasoningDelta(_, let turnID), .tokenUsageUpdated(_, let turnID):
+            turnID
+        case .unknown(let raw):
+            raw.turnID
+        case .statusChanged, .closed:
+            nil
+        }
     }
 
     private nonisolated static func isTerminalTurnEvent(_ event: CodexTurnEvent) -> Bool {
@@ -308,6 +425,17 @@ package actor CodexAppServerNotificationRouter {
             return true
         }
         return false
+    }
+
+    private nonisolated static func isThreadEventGenerationBoundary(_ event: CodexThreadEvent) -> Bool {
+        switch event {
+        case .closed, .turnCompleted, .turnFailed:
+            true
+        case .turnStarted, .statusChanged, .itemStarted, .itemUpdated, .itemCompleted,
+            .message, .messageDelta, .reasoningSummaryPartAdded, .reasoningDelta,
+            .tokenUsageUpdated, .unknown:
+            false
+        }
     }
 
     private nonisolated static func threadEvent(
@@ -582,7 +710,7 @@ package actor CodexAppServerNotificationRouter {
         guard let payload = try? decoder.decode(ItemPayload.self, from: data) else {
             return nil
         }
-        return payload.item.threadItem(
+        return payload.item.makeThreadItem(
             startedAt: payload.startedAtMS.map(Self.date(millisecondsSince1970:)),
             completedAt: payload.completedAtMS.map(Self.date(millisecondsSince1970:))
         )
@@ -862,7 +990,7 @@ package enum AppServerThreadItemMapping {
         else {
             return nil
         }
-        return item.threadItem
+        return item.makeThreadItem(startedAt: nil, completedAt: nil, allowsFallbackID: true)
     }
 }
 
@@ -1043,13 +1171,17 @@ private struct RawThreadItem: Decodable {
     }
 
     var threadItem: CodexThreadItem? {
-        threadItem(startedAt: nil, completedAt: nil)
+        makeThreadItem(startedAt: nil, completedAt: nil)
     }
 
-    func threadItem(startedAt: Date?, completedAt: Date?) -> CodexThreadItem? {
+    func makeThreadItem(
+        startedAt: Date?,
+        completedAt: Date?,
+        allowsFallbackID: Bool = false
+    ) -> CodexThreadItem? {
         let rawType = type ?? kind ?? "unknown"
         let kind = CodexThreadItem.Kind(rawValue: rawType)
-        guard let itemID = id else {
+        guard let itemID = id ?? fallbackItemID(rawType: rawType, allowed: allowsFallbackID) else {
             return nil
         }
         return .init(
@@ -1064,6 +1196,13 @@ private struct RawThreadItem: Decodable {
             ),
             rawPayload: rawPayload
         )
+    }
+
+    private func fallbackItemID(rawType: String, allowed: Bool) -> String? {
+        guard allowed else {
+            return nil
+        }
+        return "missing-id:\(rawType):\(UUID().uuidString)"
     }
 
     private func content(
