@@ -9,6 +9,8 @@ private actor TestCodexModelActor: CodexModelActor {
     nonisolated let modelContainer: CodexModelContainer
     nonisolated let modelExecutor: any CodexModelExecutor
 
+    private var chatObservation: CodexChatObservation?
+
     init(modelContainer: CodexModelContainer) {
         self.modelContainer = modelContainer
         self.modelExecutor = CodexDefaultSerialModelExecutor(modelContainer: modelContainer)
@@ -22,6 +24,20 @@ private actor TestCodexModelActor: CodexModelActor {
     func startReviewID(in workspace: URL, input: CodexReviewInput) async throws -> CodexThreadID {
         let started = try await modelContext.startReview(in: workspace, input: input)
         return started.chat.id
+    }
+
+    func observeChat(_ chatID: CodexThreadID) async throws {
+        let chat = modelContext.model(for: chatID)
+        chatObservation = try await chat.observe()
+    }
+
+    func observedItemTexts(_ chatID: CodexThreadID) -> [String] {
+        modelContext.model(for: chatID).items.compactMap(\.text)
+    }
+
+    func cancelChatObservation() {
+        chatObservation?.cancel()
+        chatObservation = nil
     }
 }
 
@@ -91,6 +107,51 @@ struct CodexModelContextTests {
 
         #expect(chatIDs == [CodexThreadID("model-actor-chat")])
         #expect(container.mainContext.registeredModel(for: CodexThreadID("model-actor-chat")) == nil)
+    }
+
+    @Test("model actor observations apply live events on the actor context")
+    func modelActorObservationAppliesLiveEvents() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let container = CodexModelContainer(appServer: runtime.server)
+        let modelActor = TestCodexModelActor(modelContainer: container)
+        let chatID = CodexThreadID("thread-actor-live")
+
+        try await runtime.transport.enqueueThreadResume(.init(id: chatID))
+        try await runtime.transport.enqueueThreadTurns(.init(turns: []))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: chatID,
+            workspace: temporaryDirectory(),
+            name: "Actor Live"
+        ))
+
+        try await modelActor.observeChat(chatID)
+
+        try await runtime.transport.emitServerNotification(
+            method: "turn/started",
+            params: TurnStartedParams(
+                threadID: "thread-actor-live",
+                turnID: "turn-actor-live"
+            )
+        )
+        try await runtime.transport.emitServerNotification(
+            method: "item/completed",
+            params: ThreadItemParams(
+                threadID: "thread-actor-live",
+                turnID: "turn-actor-live",
+                item: .init(
+                    id: "message-actor-live",
+                    type: "agentMessage",
+                    text: "Live",
+                    phase: "final_answer"
+                )
+            )
+        )
+
+        #expect(await eventually {
+            await modelActor.observedItemTexts(chatID).contains("Live")
+        })
+        #expect(container.mainContext.registeredModel(for: chatID) == nil)
+        await modelActor.cancelChatObservation()
     }
 
     @Test("parent model refreshes throw after detaching from context")

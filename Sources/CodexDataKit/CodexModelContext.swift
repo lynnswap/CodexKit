@@ -184,7 +184,8 @@ public final class CodexModelContext {
             context: CodexModelContext,
             chatID: CodexThreadID,
             observation: ActiveChatObservation,
-            stream: AsyncThrowingStream<CodexThreadEvent, Error>
+            stream: AsyncThrowingStream<CodexThreadEvent, Error>,
+            isolation: (any Actor)?
         ) {
             let target = ThreadEventPumpTarget(
                 context: context,
@@ -194,13 +195,13 @@ public final class CodexModelContext {
             task = Task {
                 do {
                     for try await event in stream {
-                        await target.process(event)
+                        await target.process(event, isolation: isolation)
                     }
-                    await target.finish()
+                    await target.finish(isolation: isolation)
                 } catch is CancellationError {
-                    await target.discard()
+                    await target.discard(isolation: isolation)
                 } catch {
-                    await target.fail(with: error)
+                    await target.fail(with: error, isolation: isolation)
                 }
             }
         }
@@ -210,7 +211,10 @@ public final class CodexModelContext {
         }
     }
 
-    // The raw event stream is consumed off-actor, but model mutation stays on MainActor.
+    // The raw event stream is consumed off-actor; model mutation hops to the
+    // isolation the observation was started from, which is the context owner's
+    // isolation (MainActor for the main context, the model executor for
+    // model-actor contexts).
     private final class ThreadEventPumpTarget: @unchecked Sendable {
         private weak var context: CodexModelContext?
         private let chatID: CodexThreadID
@@ -226,23 +230,19 @@ public final class CodexModelContext {
             self.observation = observation
         }
 
-        @MainActor
-        func process(_ event: CodexThreadEvent) async {
+        func process(_ event: CodexThreadEvent, isolation: isolated (any Actor)?) async {
             await context?.processObservedEvent(event, chatID: chatID, observation: observation)
         }
 
-        @MainActor
-        func finish() {
+        func finish(isolation: isolated (any Actor)?) {
             context?.finishChatObservationIfIdle(chatID, observation: observation)
         }
 
-        @MainActor
-        func discard() {
+        func discard(isolation: isolated (any Actor)?) {
             context?.discardChatObservation(chatID, observation: observation)
         }
 
-        @MainActor
-        func fail(with error: Error) async {
+        func fail(with error: Error, isolation: isolated (any Actor)?) async {
             await context?.failChatObservation(chatID, observation: observation, error: error)
         }
     }
@@ -866,7 +866,8 @@ public final class CodexModelContext {
                 context: self,
                 chatID: thread.id,
                 observation: observation,
-                stream: eventStream
+                stream: eventStream,
+                isolation: #isolation
             )
         }
     }
