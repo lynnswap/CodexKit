@@ -157,6 +157,18 @@ package actor CodexAppServerNotificationRouter {
         threadGenerationStartIndexByThreadID[threadID] = min(cursor, historyCount)
     }
 
+    package func beginThreadEventGeneration(_ threadID: CodexThreadID, including turnID: CodexTurnID) {
+        let history = threadHistoryByThreadID[threadID] ?? []
+        let firstTurnEventIndex = history.firstIndex { Self.threadEvent($0, matches: turnID) }
+        let searchEnd = firstTurnEventIndex ?? history.endIndex
+        let precedingHistory = history[..<searchEnd]
+        let generationStart =
+            precedingHistory.lastIndex(where: Self.isTerminalThreadEvent).map {
+                history.index(after: $0)
+            } ?? history.startIndex
+        threadGenerationStartIndexByThreadID[threadID] = generationStart
+    }
+
     private func route(_ notification: JSONRPC.Notification) {
         let reviewNotification = try? AppServerReviewNotification(
             method: notification.method,
@@ -278,25 +290,6 @@ package actor CodexAppServerNotificationRouter {
             let clampedStart = min(generationStart, history.count)
             return history[clampedStart...]
         }
-        return Self.inferredCurrentGenerationEvents(in: history)
-    }
-
-    private nonisolated static func inferredCurrentGenerationEvents(
-        in history: [CodexThreadEvent]
-    ) -> ArraySlice<CodexThreadEvent> {
-        guard let lastIndex = history.indices.last else {
-            return history[...]
-        }
-        if isTerminalThreadEvent(history[lastIndex]) {
-            let precedingHistory = history[..<lastIndex]
-            if let previousTerminalIndex = precedingHistory.lastIndex(where: isTerminalThreadEvent) {
-                return history[history.index(after: previousTerminalIndex)...]
-            }
-            return history[...]
-        }
-        if let terminalIndex = history.lastIndex(where: isTerminalThreadEvent) {
-            return history[history.index(after: terminalIndex)...]
-        }
         return history[...]
     }
 
@@ -315,6 +308,29 @@ package actor CodexAppServerNotificationRouter {
             return true
         }
         return false
+    }
+
+    private nonisolated static func threadEvent(
+        _ event: CodexThreadEvent,
+        matches turnID: CodexTurnID
+    ) -> Bool {
+        switch event {
+        case .turnStarted(let eventTurnID):
+            eventTurnID == turnID
+        case .turnCompleted(let response):
+            response.turnID == turnID
+        case .turnFailed(let eventTurnID, _), .itemStarted(_, let eventTurnID),
+             .itemUpdated(_, let eventTurnID), .itemCompleted(_, let eventTurnID),
+             .message(_, let eventTurnID), .messageDelta(_, let eventTurnID),
+             .reasoningSummaryPartAdded(_, let eventTurnID),
+             .reasoningDelta(_, let eventTurnID),
+             .tokenUsageUpdated(_, let eventTurnID):
+            eventTurnID == turnID
+        case .unknown(let raw):
+            raw.turnID == turnID
+        case .statusChanged, .closed:
+            false
+        }
     }
 
     private nonisolated static func threadEvent(
@@ -577,7 +593,6 @@ package actor CodexAppServerNotificationRouter {
             return nil
         }
         let output = payload.delta ?? payload.message ?? payload.changes?.displayText
-        let itemID = payload.itemID ?? UUID().uuidString
         let content: CodexThreadItem.Content
         switch kind {
         case .commandExecution:
@@ -589,7 +604,7 @@ package actor CodexAppServerNotificationRouter {
         case let kind:
             content = .unknown(.init(rawType: kind.rawValue, text: output, payload: data))
         }
-        return .init(id: itemID, kind: kind, content: content, rawPayload: data)
+        return .init(id: payload.itemID, kind: kind, content: content, rawPayload: data)
     }
 
     private func messageDelta(from data: Data) -> CodexMessageDelta? {
@@ -750,7 +765,7 @@ private struct ErrorPayload: Decodable {
 }
 
 private struct AgentMessageDeltaPayload: Decodable {
-    var itemID: String?
+    var itemID: String
     var delta: String?
     var text: String?
     var phase: String?
@@ -810,7 +825,7 @@ private struct ItemPayload: Decodable {
 }
 
 private struct ItemProgressPayload: Decodable {
-    var itemID: String?
+    var itemID: String
     var delta: String?
     var message: String?
     var changes: AppServerJSONValue?
@@ -1027,14 +1042,16 @@ private struct RawThreadItem: Decodable {
         changes = try? container.decodeIfPresent(AppServerJSONValue.self, forKey: .changes)
     }
 
-    var threadItem: CodexThreadItem {
+    var threadItem: CodexThreadItem? {
         threadItem(startedAt: nil, completedAt: nil)
     }
 
-    func threadItem(startedAt: Date?, completedAt: Date?) -> CodexThreadItem {
+    func threadItem(startedAt: Date?, completedAt: Date?) -> CodexThreadItem? {
         let rawType = type ?? kind ?? "unknown"
         let kind = CodexThreadItem.Kind(rawValue: rawType)
-        let itemID = id ?? UUID().uuidString
+        guard let itemID = id else {
+            return nil
+        }
         return .init(
             id: itemID,
             kind: kind,

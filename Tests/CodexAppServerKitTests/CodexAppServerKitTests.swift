@@ -2465,7 +2465,6 @@ struct CodexAppServerKitTests {
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(
-                threadID: "thread-1",
                 turnID: "turn-2",
                 delta: "During start"
             )
@@ -2495,6 +2494,294 @@ struct CodexAppServerKitTests {
         } == false)
         #expect(events.last == .closed)
         withExtendedLifetime(responseStream) {}
+    }
+
+    @Test func startReviewBeginsNewThreadEventGeneration() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueReviewStart(turnID: "turn-review", status: .running)
+        let gate = CodexAppServerTestGate()
+        await transport.holdNext(method: "review/start", gate: gate)
+        let client = AppServerClient(transport: transport)
+        let router = CodexAppServerNotificationRouter(client: client)
+        await router.start()
+        await transport.waitForNotificationStreamCount(1)
+        let thread = CodexThread(id: "thread-1", client: client, router: router)
+
+        try await transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(
+                threadID: "thread-1",
+                turnID: "turn-previous",
+                delta: "Previous generation"
+            )
+        )
+        try await transport.emitServerNotification(
+            method: "thread/closed",
+            params: ThreadIDParams(threadID: "thread-1")
+        )
+        let previousEvents = try await withTimeout {
+            try await collect(thread.events)
+        }
+        #expect(previousEvents.last == .closed)
+
+        let reviewTask = Task {
+            try await thread.startReview(target: .baseBranch("main"))
+        }
+        await transport.waitForRequest(method: "review/start")
+        try await transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(
+                turnID: "turn-review",
+                delta: "During review start"
+            )
+        )
+        await gate.open()
+        let review = try await reviewTask.value
+        let eventsTask = Task {
+            try await collect(thread.events)
+        }
+        #expect(await eventually {
+            await router.threadSubscriberCountForTesting(for: "thread-1") == 1
+        })
+
+        try await transport.emitServerNotification(
+            method: "thread/closed",
+            params: ThreadIDParams(threadID: "thread-1")
+        )
+
+        let events = try await withTimeout {
+            try await eventsTask.value
+        }
+        #expect(events.contains { event in
+            if case .messageDelta(let delta, let turnID) = event {
+                return delta.text == "During review start" && turnID == "turn-review"
+            }
+            return false
+        })
+        #expect(events.contains { event in
+            if case .messageDelta(let delta, let turnID) = event {
+                return delta.text == "Previous generation" && turnID == "turn-previous"
+            }
+            return false
+        } == false)
+        #expect(events.last == .closed)
+        withExtendedLifetime(review) {}
+    }
+
+    @Test func detachedStartReviewBeginsReviewThreadEventGeneration() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueReviewStart(
+            turnID: "turn-review",
+            reviewThreadID: "thread-review",
+            status: .running
+        )
+        let gate = CodexAppServerTestGate()
+        await transport.holdNext(method: "review/start", gate: gate)
+        let client = AppServerClient(transport: transport)
+        let router = CodexAppServerNotificationRouter(client: client)
+        await router.start()
+        await transport.waitForNotificationStreamCount(1)
+        let thread = CodexThread(id: "thread-source", client: client, router: router)
+        let reviewThread = CodexThread(id: "thread-review", client: client, router: router)
+
+        try await transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(
+                threadID: "thread-review",
+                turnID: "turn-previous",
+                delta: "Previous detached generation"
+            )
+        )
+        try await transport.emitServerNotification(
+            method: "thread/closed",
+            params: ThreadIDParams(threadID: "thread-review")
+        )
+        let previousEvents = try await withTimeout {
+            try await collect(reviewThread.events)
+        }
+        #expect(previousEvents.last == .closed)
+
+        let reviewTask = Task {
+            try await thread.startReview(target: .baseBranch("main"), delivery: .detached)
+        }
+        await transport.waitForRequest(method: "review/start")
+        await transport.emitServerNotificationJSON(
+            method: "thread/status/changed",
+            json: #"{"threadId":"thread-review","status":{"type":"active","activeFlags":[]}}"#
+        )
+        try await transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(
+                threadID: "thread-review",
+                turnID: "turn-review",
+                delta: "During detached review start"
+            )
+        )
+        await gate.open()
+        let review = try await reviewTask.value
+        let eventsTask = Task {
+            try await collect(review.events)
+        }
+        #expect(await eventually {
+            await router.threadSubscriberCountForTesting(for: "thread-review") == 1
+        })
+
+        try await transport.emitServerNotification(
+            method: "thread/closed",
+            params: ThreadIDParams(threadID: "thread-review")
+        )
+
+        let events = try await withTimeout {
+            try await eventsTask.value
+        }
+        #expect(events.contains(.statusChanged(.active(activeFlags: []))))
+        #expect(events.contains { event in
+            if case .messageDelta(let delta, let turnID) = event {
+                return delta.text == "During detached review start" && turnID == "turn-review"
+            }
+            return false
+        })
+        #expect(events.contains { event in
+            if case .messageDelta(let delta, let turnID) = event {
+                return delta.text == "Previous detached generation" && turnID == "turn-previous"
+            }
+            return false
+        } == false)
+        #expect(events.last == .closed)
+    }
+
+    @Test func compactBeginsNewThreadEventGeneration() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueEmpty(for: "thread/compact/start")
+        let client = AppServerClient(transport: transport)
+        let router = CodexAppServerNotificationRouter(client: client)
+        await router.start()
+        await transport.waitForNotificationStreamCount(1)
+        let thread = CodexThread(id: "thread-1", client: client, router: router)
+
+        try await transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(
+                threadID: "thread-1",
+                turnID: "turn-previous",
+                delta: "Previous generation"
+            )
+        )
+        try await transport.emitServerNotification(
+            method: "thread/closed",
+            params: ThreadIDParams(threadID: "thread-1")
+        )
+        let previousEvents = try await withTimeout {
+            try await collect(thread.events)
+        }
+        #expect(previousEvents.last == .closed)
+
+        try await thread.compact()
+        let eventsTask = Task {
+            try await collect(thread.events)
+        }
+        #expect(await eventually {
+            await router.threadSubscriberCountForTesting(for: "thread-1") == 1
+        })
+
+        try await transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(
+                threadID: "thread-1",
+                turnID: "turn-compact",
+                delta: "Current compact generation"
+            )
+        )
+        try await transport.emitServerNotification(
+            method: "thread/closed",
+            params: ThreadIDParams(threadID: "thread-1")
+        )
+
+        let events = try await withTimeout {
+            try await eventsTask.value
+        }
+        #expect(events.contains { event in
+            if case .messageDelta(let delta, let turnID) = event {
+                return delta.text == "Current compact generation" && turnID == "turn-compact"
+            }
+            return false
+        })
+        #expect(events.contains { event in
+            if case .messageDelta(let delta, let turnID) = event {
+                return delta.text == "Previous generation" && turnID == "turn-previous"
+            }
+            return false
+        } == false)
+        #expect(events.last == .closed)
+    }
+
+    @Test func failedReviewStartDoesNotAdvanceThreadEventGeneration() async throws {
+        let transport = CodexAppServerTestTransport()
+        await transport.enqueueFailure(
+            code: -32_000,
+            message: "review start failed",
+            for: "review/start"
+        )
+        let gate = CodexAppServerTestGate()
+        await transport.holdNext(method: "review/start", gate: gate)
+        let client = AppServerClient(transport: transport)
+        let router = CodexAppServerNotificationRouter(client: client)
+        await router.start()
+        await transport.waitForNotificationStreamCount(1)
+        let thread = CodexThread(id: "thread-1", client: client, router: router)
+
+        try await transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(
+                threadID: "thread-1",
+                turnID: "turn-previous",
+                delta: "Previous generation"
+            )
+        )
+        try await transport.emitServerNotification(
+            method: "thread/closed",
+            params: ThreadIDParams(threadID: "thread-1")
+        )
+        let previousEvents = try await withTimeout {
+            try await collect(thread.events)
+        }
+        #expect(previousEvents.last == .closed)
+
+        let reviewTask = Task {
+            try await thread.startReview(target: .baseBranch("main"))
+        }
+        await transport.waitForRequest(method: "review/start")
+        try await transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(
+                turnID: "turn-failed-review",
+                delta: "Failed review start"
+            )
+        )
+        await gate.open()
+        do {
+            _ = try await reviewTask.value
+            Issue.record("Expected review start failure.")
+        } catch {
+            // Expected failure; the existing generation must remain replayable.
+        }
+
+        let events = try await withTimeout {
+            try await collect(thread.events)
+        }
+        #expect(events.contains { event in
+            if case .messageDelta(let delta, let turnID) = event {
+                return delta.text == "Previous generation" && turnID == "turn-previous"
+            }
+            return false
+        })
+        #expect(events.contains { event in
+            if case .messageDelta(let delta, let turnID) = event {
+                return delta.text == "Failed review start" && turnID == "turn-failed-review"
+            }
+            return false
+        } == false)
+        #expect(events.last == .closed)
     }
 
     @Test func failedResumeDoesNotAdvanceThreadEventGeneration() async throws {
@@ -2712,7 +2999,7 @@ struct CodexAppServerKitTests {
         #expect(transcripts.last?.items.first?.text == "hello\nworld")
     }
 
-    @Test func threadTranscriptScopesFallbackMessageDeltaIDsByTurn() async throws {
+    @Test func threadTranscriptKeepsDistinctMessageDeltaItemIDs() async throws {
         let transport = CodexAppServerTestTransport()
         let client = AppServerClient(transport: transport)
         let router = CodexAppServerNotificationRouter(client: client)
@@ -2724,7 +3011,7 @@ struct CodexAppServerKitTests {
         )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
-            params: TurnDeltaParams(turnID: "turn-1", delta: "First")
+            params: TurnDeltaParams(turnID: "turn-1", itemID: "message-1", delta: "First")
         )
         try await transport.emitServerNotification(
             method: "turn/completed",
@@ -2736,7 +3023,7 @@ struct CodexAppServerKitTests {
         )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
-            params: TurnDeltaParams(turnID: "turn-2", delta: "Second")
+            params: TurnDeltaParams(turnID: "turn-2", itemID: "message-2", delta: "Second")
         )
         try await transport.emitServerNotification(
             method: "turn/completed",
@@ -3038,7 +3325,7 @@ struct CodexAppServerKitTests {
 
         let thread = CodexThread(id: "thread-1", client: client, router: router)
         let logs = try await collect(thread.logEntries)
-        #expect(logs.map(\.id) == ["agent-message-delta:0", "agent-message-delta:1"])
+        #expect(logs.map(\.id) == ["message-1:0", "message-1:1"])
         #expect(logs.compactMap(\.messageDelta).map(\.text) == ["First", "Second"])
     }
 
@@ -3067,8 +3354,78 @@ struct CodexAppServerKitTests {
 
         let thread = CodexThread(id: "thread-1", client: client, router: router)
         let logs = try await collect(thread.logEntries)
-        #expect(logs.map(\.id) == ["agent-message-delta:0", "agent-message-delta:1"])
+        #expect(logs.map(\.id) == ["message-1:0", "message-1:1"])
         #expect(logs.compactMap(\.messageDelta).map(\.text) == ["First", "Second"])
+    }
+
+    @Test func messageDeltaWithoutItemIDDecodesAsUnknown() async throws {
+        let transport = CodexAppServerTestTransport()
+        let client = AppServerClient(transport: transport)
+        let router = CodexAppServerNotificationRouter(client: client)
+        await router.start()
+        await transport.waitForNotificationStreamCount(1)
+        try await transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: MessageDeltaWithoutItemIDParams(
+                threadID: "thread-1",
+                turnID: "turn-1",
+                delta: "Missing item identity"
+            )
+        )
+        try await transport.emitServerNotification(
+            method: "thread/closed",
+            params: ThreadIDParams(threadID: "thread-1")
+        )
+
+        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let events = try await collect(thread.events)
+        #expect(events.contains { event in
+            if case .messageDelta = event {
+                return true
+            }
+            return false
+        } == false)
+        #expect(events.contains { event in
+            if case .unknown(let raw) = event {
+                return raw.method == "item/agentMessage/delta"
+            }
+            return false
+        })
+    }
+
+    @Test func threadItemWithoutIDDecodesAsUnknown() async throws {
+        let transport = CodexAppServerTestTransport()
+        let client = AppServerClient(transport: transport)
+        let router = CodexAppServerNotificationRouter(client: client)
+        await router.start()
+        await transport.waitForNotificationStreamCount(1)
+        try await transport.emitServerNotification(
+            method: "item/completed",
+            params: ThreadItemWithoutIDParams(
+                threadID: "thread-1",
+                turnID: "turn-1",
+                item: .init(type: "agentMessage", text: "Missing item identity")
+            )
+        )
+        try await transport.emitServerNotification(
+            method: "thread/closed",
+            params: ThreadIDParams(threadID: "thread-1")
+        )
+
+        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let events = try await collect(thread.events)
+        #expect(events.contains { event in
+            if case .itemCompleted = event {
+                return true
+            }
+            return false
+        } == false)
+        #expect(events.contains { event in
+            if case .unknown(let raw) = event {
+                return raw.method == "item/completed"
+            }
+            return false
+        })
     }
 
     @Test func threadLogEntriesIncludeProgressDeltaNotifications() async throws {
@@ -3913,6 +4270,20 @@ private struct ReviewErrorParams: Encodable, Sendable {
 private struct TurnDeltaParams: Encodable, Sendable {
     var threadID: String? = nil
     var turnID: String
+    var itemID: String = "message-1"
+    var delta: String
+
+    enum CodingKeys: String, CodingKey {
+        case threadID = "threadId"
+        case turnID = "turnId"
+        case itemID = "itemId"
+        case delta
+    }
+}
+
+private struct MessageDeltaWithoutItemIDParams: Encodable, Sendable {
+    var threadID: String
+    var turnID: String
     var delta: String
 
     enum CodingKeys: String, CodingKey {
@@ -4073,6 +4444,23 @@ private struct ThreadItemParams: Encodable, Sendable {
             var type = "text"
             var text: String
         }
+    }
+}
+
+private struct ThreadItemWithoutIDParams: Encodable, Sendable {
+    var threadID: String
+    var turnID: String
+    var item: Item
+
+    enum CodingKeys: String, CodingKey {
+        case threadID = "threadId"
+        case turnID = "turnId"
+        case item
+    }
+
+    struct Item: Encodable, Sendable {
+        var type: String
+        var text: String?
     }
 }
 

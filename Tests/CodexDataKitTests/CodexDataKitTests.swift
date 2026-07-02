@@ -6468,56 +6468,53 @@ struct CodexModelContextTests {
         #expect(betaItem.text == "Beta")
     }
 
-    @Test("chat item identity ignores kind changes from baseline to live updates")
-    func chatItemIdentityIgnoresKindChangesFromBaselineToLiveUpdates() async throws {
+    @Test("chat item identity preserves kind changes from baseline to live updates")
+    func chatItemIdentityPreservesKindChangesFromBaselineToLiveUpdates() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         let context = CodexModelContainer(appServer: runtime.server).mainContext
 
-        try await runtime.transport.enqueueThreadResume(.init(id: "thread-kind-change"))
-        try await runtime.transport.enqueueThreadRead(.init(
-            id: "thread-kind-change",
-            turns: [
-                .init(
-                    id: "turn-kind-change",
-                    status: .running,
-                    items: [
-                        .init(
-                            id: "item-kind-change",
-                            kind: .unknown("progress"),
-                            content: .diagnostic("Initial")
-                        ),
-                    ]
-                ),
-            ]
-        ))
-
         let chat = context.model(for: CodexThreadID(rawValue: "thread-kind-change"))
-        let observation = try await chat.observe()
-        defer {
-            observation.cancel()
-        }
-        let changes = ChatUpdateRecorder(stream: observation.updates)
+        chat.apply(
+            CodexThreadSnapshot(
+                id: chat.id,
+                turns: [
+                    .init(
+                        id: "turn-kind-change",
+                        status: .running,
+                        items: [
+                            .init(
+                                id: "item-kind-change",
+                                kind: .unknown("progress"),
+                                content: .diagnostic("Initial")
+                            ),
+                        ]
+                    ),
+                ]
+            ),
+            workspace: Optional<CodexWorkspace>.none
+        )
         let originalItem = try #require(chat.items.first)
 
-        try await runtime.transport.emitServerNotification(
-            method: "item/updated",
-            params: ThreadItemParams(
-                threadID: "thread-kind-change",
-                turnID: "turn-kind-change",
-                item: .init(
-                    id: "item-kind-change",
-                    type: "diagnostic",
-                    text: "Updated"
-                )
-            )
-        )
+        let changes = chat.apply(CodexThreadEvent.itemUpdated(
+            .init(
+                id: "item-kind-change",
+                kind: .diagnostic,
+                content: .diagnostic("Updated")
+            ),
+            turnID: "turn-kind-change"
+        ))
 
-        let updatedChange = await changes.itemUpdated(id: "item-kind-change")
-        #expect(updatedChange != nil)
-        #expect(chat.items.count == 1)
-        #expect(chat.items.first === originalItem)
-        #expect(chat.items.first?.kind == .diagnostic)
-        #expect(chat.items.first?.text == "Updated")
+        #expect(changes.contains(.itemInserted(id: "item-kind-change", turnID: "turn-kind-change")))
+        #expect(chat.items.count == 2)
+        let originalItems = chat.items.filter {
+            $0.kind == .unknown("progress") && $0.text == "Initial"
+        }
+        let diagnosticItems = chat.items.filter {
+            $0.kind == .diagnostic && $0.text == "Updated"
+        }
+        #expect(originalItems.count == 1)
+        #expect(originalItems.first === originalItem)
+        #expect(diagnosticItems.count == 1)
     }
 
     @Test("active chat refresh emits snapshots after phase reconciliation")
@@ -8543,7 +8540,8 @@ struct CodexModelContextTests {
         #expect(liveCommand.modelContext == nil)
         #expect(liveCommand.turnID == nil)
         #expect(commandItem.turnID?.rawValue == "turn-live")
-        #expect(commandItem.id.rawValue == "turn-live:call-live")
+        #expect(commandItem.itemID == "call-live")
+        #expect(commandItem.id.rawValue == "turn-live:commandExecution:call-live")
         #expect(started.chat.items(in: "turn-seed").contains { $0.kind == .commandExecution } == false)
         #expect(started.chat.items(in: "turn-live").filter { $0.kind == .commandExecution }.count == 1)
         #expect(command.startedAt == startedAt)

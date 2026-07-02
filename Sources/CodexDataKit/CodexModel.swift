@@ -55,6 +55,10 @@ private struct CodexNarrativeItemSignature: Hashable {
     var text: String
 }
 
+private func isScopedFallbackMessageID(_ id: String) -> Bool {
+    id == "agent-message-delta" || id.hasPrefix("agent-message-delta:")
+}
+
 private extension CodexThreadItem {
     var isReviewModeMarker: Bool {
         switch kind {
@@ -63,6 +67,10 @@ private extension CodexThreadItem {
         default:
             false
         }
+    }
+
+    var isFallbackAgentMessageDelta: Bool {
+        kind == .agentMessage && isScopedFallbackMessageID(id)
     }
 
     var duplicateNarrativeSignature: CodexNarrativeItemSignature? {
@@ -527,11 +535,13 @@ public final class CodexItem: CodexPersistentModel {
 
 package struct CodexChatItemKey: Hashable {
     var id: String
+    var kind: CodexThreadItem.Kind?
     var semanticID: String
     var turnID: CodexTurnID?
 
     init(id: String, kind: CodexThreadItem.Kind? = nil, turnID: CodexTurnID?) {
         self.id = id
+        self.kind = kind
         self.semanticID = Self.semanticID(rawItemID: id, kind: kind)
         self.turnID = turnID
     }
@@ -549,10 +559,13 @@ package struct CodexChatItemKey: Hashable {
     }
 
     package static func == (lhs: Self, rhs: Self) -> Bool {
-        lhs.semanticID == rhs.semanticID && lhs.turnID == rhs.turnID
+        lhs.kind == rhs.kind
+            && lhs.semanticID == rhs.semanticID
+            && lhs.turnID == rhs.turnID
     }
 
     package func hash(into hasher: inout Hasher) {
+        hasher.combine(kind)
         hasher.combine(semanticID)
         hasher.combine(turnID)
     }
@@ -566,6 +579,8 @@ package struct CodexChatItemKey: Hashable {
             "review-marker:enteredReviewMode"
         case .exitedReviewMode:
             "review-marker:exitedReviewMode"
+        case .some(let kind):
+            "\(kind.rawValue):\(rawItemID)"
         default:
             rawItemID
         }
@@ -903,6 +918,14 @@ public final class CodexChat: CodexPersistentModel {
                 continue
             }
             guard seenSignatures.insert(signature).inserted else {
+                if let existingIndex = items.firstIndex(where: {
+                    $0.duplicateNarrativeSignature == signature
+                }),
+                    items[existingIndex].isFallbackAgentMessageDelta,
+                    item.isFallbackAgentMessageDelta == false
+                {
+                    items[existingIndex] = item
+                }
                 continue
             }
             items.append(item)
@@ -941,6 +964,7 @@ public final class CodexChat: CodexPersistentModel {
     private func replaceItems(with records: [CodexTurnSnapshot]) {
         let existingByKey = itemsByMergeKey
         let previousItems = items
+        var reusedItems = Set<ObjectIdentifier>()
         items = records.flatMap { record in
             record.items.map { incomingItem in
                 let incomingKey = CodexChatItemKey(
@@ -948,12 +972,24 @@ public final class CodexChat: CodexPersistentModel {
                     turnID: record.id
                 )
                 let turn = contextTurn(id: record.id)
-                if let existing = existingByKey[incomingKey] {
+                if let existing = existingByKey[incomingKey]
+                    ?? fallbackAgentMessageItem(matching: incomingItem, turnID: record.id)
+                {
+                    let identifier = ObjectIdentifier(existing)
+                    guard reusedItems.insert(identifier).inserted else {
+                        return contextItem(
+                            threadItem: incomingItem,
+                            turnID: record.id,
+                            itemsLoadState: record.itemsLoadState
+                        )
+                    }
+                    let previousMergeKey = existing.mergeKey
                     existing.applyContextOwners(chat: self, turn: turn)
                     existing.update(
                         from: incomingItem,
                         itemsLoadState: record.itemsLoadState
                     )
+                    migrateLiveMergeState(from: previousMergeKey, to: existing.mergeKey)
                     return existing
                 }
                 return contextItem(
@@ -1248,21 +1284,27 @@ public final class CodexChat: CodexPersistentModel {
             {
                 continue
             }
+            let fallbackItem = directlyMatchedItem == nil
+                ? fallbackAgentMessageItem(matching: incomingItem, turnID: turnID)
+                : nil
             if directlyMatchedItem == nil,
+                fallbackItem == nil,
                 hasNarrativeItem(matching: incomingItem, turnID: turnID)
             {
                 continue
             }
             if directlyMatchedItem == nil,
+                fallbackItem == nil,
                 hasReplayNarrativeItem(matching: incomingItem, turnID: turnID)
             {
                 continue
             }
             let indexedItem = itemsByMergeKey[incomingKey]
             let replayItem = indexedItem == nil
+                && fallbackItem == nil
                 ? commandReplayItem(matching: incomingItem, turnID: turnID)
                 : nil
-            let existingItem = indexedItem ?? replayItem
+            let existingItem = indexedItem ?? fallbackItem ?? replayItem
             if let existing = existingItem
             {
                 let previousItem = existing.threadItem
@@ -1314,6 +1356,7 @@ public final class CodexChat: CodexPersistentModel {
                     )
                 }
                 if existing.mergeKey != previousMergeKey {
+                    migrateLiveMergeState(from: previousMergeKey, to: existing.mergeKey)
                     rebuildItemIndexes()
                     changes.appendIfPresent(updateChange)
                 } else {
@@ -1378,6 +1421,28 @@ public final class CodexChat: CodexPersistentModel {
             return items.contains {
                 $0.turnID == nil && $0.threadItem.replayNarrativeSignature == incomingSignature
             }
+        }
+    }
+
+    private func fallbackAgentMessageItem(
+        matching incomingItem: CodexThreadItem,
+        turnID: CodexTurnID?
+    ) -> CodexItem? {
+        guard incomingItem.isFallbackAgentMessageDelta == false,
+            incomingItem.kind == .agentMessage,
+            let incomingSignature = incomingItem.duplicateNarrativeSignature
+        else {
+            return nil
+        }
+        let candidates: [CodexItem]
+        if let turnID {
+            candidates = itemsByTurnID[turnID] ?? []
+        } else {
+            candidates = items.filter { $0.turnID == nil }
+        }
+        return candidates.first { item in
+            item.threadItem.isFallbackAgentMessageDelta
+                && item.threadItem.duplicateNarrativeSignature == incomingSignature
         }
     }
 
@@ -1854,7 +1919,7 @@ public final class CodexChat: CodexPersistentModel {
 
     private func merge(_ delta: CodexMessageDelta, turnID: CodexTurnID?) -> [CodexChatUpdate] {
         let itemID = delta.itemID ?? scopedFallbackMessageID(turnID: turnID)
-        let key = CodexChatItemKey(id: itemID, turnID: turnID)
+        let key = CodexChatItemKey(id: itemID, kind: .agentMessage, turnID: turnID)
         let previousAccumulatedText = liveMergeState.messageDeltaTextByItemKey[key] ?? ""
         let accumulatedText = previousAccumulatedText + delta.text
 
@@ -1878,7 +1943,7 @@ public final class CodexChat: CodexPersistentModel {
     }
 
     private func start(_ part: CodexReasoningPart, turnID: CodexTurnID?) -> [CodexChatUpdate] {
-        let key = CodexChatItemKey(id: part.id, turnID: turnID)
+        let key = CodexChatItemKey(id: part.id, kind: .reasoning, turnID: turnID)
         guard item(for: key) == nil else {
             return []
         }
@@ -1923,11 +1988,15 @@ public final class CodexChat: CodexPersistentModel {
         for delta: CodexReasoningDelta,
         turnID: CodexTurnID?
     ) -> CodexChatItemKey {
-        let parentKey = CodexChatItemKey(id: delta.part.itemID, turnID: turnID)
+        let parentKey = CodexChatItemKey(
+            id: delta.part.itemID,
+            kind: .reasoning,
+            turnID: turnID
+        )
         if item(for: parentKey)?.reasoning != nil {
             return parentKey
         }
-        return CodexChatItemKey(id: delta.id, turnID: turnID)
+        return CodexChatItemKey(id: delta.id, kind: .reasoning, turnID: turnID)
     }
 
     private func mergedDeltaText(
@@ -2317,6 +2386,26 @@ public final class CodexChat: CodexPersistentModel {
             liveMergeState.outputDeltaTextByItemKey[replacement.mergeKey] = outputDeltaText
         }
         return replacement
+    }
+
+    private func migrateLiveMergeState(
+        from oldKey: CodexChatItemKey,
+        to newKey: CodexChatItemKey
+    ) {
+        guard oldKey != newKey else {
+            return
+        }
+        if let messageText = liveMergeState.messageDeltaTextByItemKey.removeValue(forKey: oldKey) {
+            liveMergeState.messageDeltaTextByItemKey[newKey] = messageText
+        }
+        if let reasoningText = liveMergeState.reasoningDeltaTextByItemKey.removeValue(
+            forKey: oldKey
+        ) {
+            liveMergeState.reasoningDeltaTextByItemKey[newKey] = reasoningText
+        }
+        if let outputText = liveMergeState.outputDeltaTextByItemKey.removeValue(forKey: oldKey) {
+            liveMergeState.outputDeltaTextByItemKey[newKey] = outputText
+        }
     }
 
     private func addItemToIndexes(_ item: CodexItem) {
