@@ -8,6 +8,9 @@ package enum AppServerAPI {
         package enum Fork {}
         package enum List {}
         package enum Read {}
+        package enum Turns {
+            package enum List {}
+        }
         package enum Archive {}
         package enum Unarchive {}
         package enum Name {
@@ -86,8 +89,11 @@ extension AppServerAPI.Review.Start {
 
 extension AppServerAPI.Review.Start {
     package struct Response: Codable, Equatable, Sendable {
-        package var turnID: String
+        package var turn: AppServerAPI.Turn.Payload
         package var reviewThreadID: String?
+        package var turnID: String {
+            turn.id
+        }
 
         enum CodingKeys: String, CodingKey {
             case turn
@@ -95,20 +101,27 @@ extension AppServerAPI.Review.Start {
         }
 
         package init(turnID: String, reviewThreadID: String? = nil) {
-            self.turnID = turnID
+            self.init(turn: AppServerAPI.Turn.Payload(id: turnID), reviewThreadID: reviewThreadID)
+        }
+
+        package init(
+            turn: AppServerAPI.Turn.Payload,
+            reviewThreadID: String? = nil
+        ) {
+            self.turn = turn
             self.reviewThreadID = reviewThreadID
         }
 
         package init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
-            self.turnID = try container.decode(AppServerAPI.Turn.Payload.self, forKey: .turn).id
+            self.turn = try container.decode(AppServerAPI.Turn.Payload.self, forKey: .turn)
             self.reviewThreadID = try container.decodeIfPresent(
                 String.self, forKey: .reviewThreadID)
         }
 
         package func encode(to encoder: Encoder) throws {
             var container = encoder.container(keyedBy: CodingKeys.self)
-            try container.encode(AppServerAPI.Turn.Payload(id: turnID), forKey: .turn)
+            try container.encode(turn, forKey: .turn)
             try container.encodeIfPresent(reviewThreadID, forKey: .reviewThreadID)
         }
     }
@@ -476,8 +489,20 @@ extension AppServerAPI.Thread {
             case modelProvider
             case createdAt
             case updatedAt
+            case recencyAt
+            case status
             case ephemeral
             case turns
+        }
+
+        package struct Status: Codable, Equatable, Sendable {
+            package var type: String
+            package var activeFlags: [String]?
+
+            package init(type: String, activeFlags: [String]? = nil) {
+                self.type = type
+                self.activeFlags = activeFlags
+            }
         }
 
         package var id: String
@@ -487,6 +512,8 @@ extension AppServerAPI.Thread {
         package var modelProvider: String?
         package var createdAt: Int?
         package var updatedAt: Int?
+        package var recencyAt: Int?
+        package var status: Status?
         package var ephemeral: Bool?
         package var turns: [AppServerAPI.Turn.Payload]?
         package var presentFields: Set<Field>
@@ -499,6 +526,8 @@ extension AppServerAPI.Thread {
             case modelProvider
             case createdAt
             case updatedAt
+            case recencyAt
+            case status
             case ephemeral
             case turns
         }
@@ -511,6 +540,8 @@ extension AppServerAPI.Thread {
             modelProvider: String? = nil,
             createdAt: Int? = nil,
             updatedAt: Int? = nil,
+            recencyAt: Int? = nil,
+            status: Status? = nil,
             ephemeral: Bool? = nil,
             turns: [AppServerAPI.Turn.Payload]? = nil,
             presentFields: Set<Field>? = nil
@@ -522,6 +553,8 @@ extension AppServerAPI.Thread {
             self.modelProvider = modelProvider
             self.createdAt = createdAt
             self.updatedAt = updatedAt
+            self.recencyAt = recencyAt
+            self.status = status
             self.ephemeral = ephemeral
             self.turns = turns
             self.presentFields = presentFields ?? Self.presentFields(
@@ -531,6 +564,8 @@ extension AppServerAPI.Thread {
                 modelProvider: modelProvider,
                 createdAt: createdAt,
                 updatedAt: updatedAt,
+                recencyAt: recencyAt,
+                status: status,
                 ephemeral: ephemeral,
                 turns: turns
             )
@@ -545,6 +580,8 @@ extension AppServerAPI.Thread {
             modelProvider = try container.decodeIfPresent(String.self, forKey: .modelProvider)
             createdAt = try container.decodeIfPresent(Int.self, forKey: .createdAt)
             updatedAt = try container.decodeIfPresent(Int.self, forKey: .updatedAt)
+            recencyAt = try container.decodeIfPresent(Int.self, forKey: .recencyAt)
+            status = try container.decodeIfPresent(Status.self, forKey: .status)
             ephemeral = try container.decodeIfPresent(Bool.self, forKey: .ephemeral)
             turns = try container.decodeIfPresent([AppServerAPI.Turn.Payload].self, forKey: .turns)
             presentFields = Self.presentFields(from: container)
@@ -559,6 +596,8 @@ extension AppServerAPI.Thread {
             try encode(modelProvider, forKey: .modelProvider, into: &container)
             try encode(createdAt, forKey: .createdAt, into: &container)
             try encode(updatedAt, forKey: .updatedAt, into: &container)
+            try encode(recencyAt, forKey: .recencyAt, into: &container)
+            try encode(status, forKey: .status, into: &container)
             try encode(ephemeral, forKey: .ephemeral, into: &container)
             try encode(turns, forKey: .turns, into: &container)
         }
@@ -585,6 +624,8 @@ extension AppServerAPI.Thread {
             modelProvider: String?,
             createdAt: Int?,
             updatedAt: Int?,
+            recencyAt: Int?,
+            status: AppServerAPI.Thread.Snapshot.Status?,
             ephemeral: Bool?,
             turns: [AppServerAPI.Turn.Payload]?
         ) -> Set<Field> {
@@ -606,6 +647,12 @@ extension AppServerAPI.Thread {
             }
             if updatedAt != nil {
                 fields.insert(.updatedAt)
+            }
+            if recencyAt != nil {
+                fields.insert(.recencyAt)
+            }
+            if status != nil {
+                fields.insert(.status)
             }
             if ephemeral != nil {
                 fields.insert(.ephemeral)
@@ -647,6 +694,10 @@ private extension AppServerAPI.Thread.Snapshot.Field {
             self = .createdAt
         case .updatedAt:
             self = .updatedAt
+        case .recencyAt:
+            self = .recencyAt
+        case .status:
+            self = .status
         case .ephemeral:
             self = .ephemeral
         case .turns:
@@ -721,6 +772,7 @@ extension AppServerAPI.Turn {
         package var startedAt: Int?
         package var completedAt: Int?
         package var durationMS: Int?
+        package var itemsLoadState: CodexTurnItemsLoadState?
         package var items: [AppServerJSONValue]?
 
         enum CodingKeys: String, CodingKey {
@@ -730,6 +782,7 @@ extension AppServerAPI.Turn {
             case startedAt
             case completedAt
             case durationMS = "durationMs"
+            case itemsLoadState = "itemsView"
             case items
         }
 
@@ -740,6 +793,7 @@ extension AppServerAPI.Turn {
             startedAt: Int? = nil,
             completedAt: Int? = nil,
             durationMS: Int? = nil,
+            itemsLoadState: CodexTurnItemsLoadState? = nil,
             items: [AppServerJSONValue]? = nil
         ) {
             self.id = id
@@ -748,6 +802,7 @@ extension AppServerAPI.Turn {
             self.startedAt = startedAt
             self.completedAt = completedAt
             self.durationMS = durationMS
+            self.itemsLoadState = itemsLoadState
             self.items = items
         }
     }
@@ -870,6 +925,68 @@ extension AppServerAPI.Thread.Read {
         }
 
         package init(params: AppServerAPI.Thread.Read.Params) {
+            self.params = params
+        }
+    }
+}
+
+extension AppServerAPI.Thread.Turns.List {
+    package struct Params: Codable, Equatable, Sendable {
+        package var threadID: String
+        package var cursor: String?
+        package var limit: Int?
+        package var sortDirection: CodexSortDirection?
+        package var itemsLoadState: CodexTurnItemsLoadState?
+
+        enum CodingKeys: String, CodingKey {
+            case threadID = "threadId"
+            case cursor
+            case limit
+            case sortDirection
+            case itemsLoadState = "itemsView"
+        }
+
+        package init(
+            threadID: String,
+            cursor: String? = nil,
+            limit: Int? = nil,
+            sortDirection: CodexSortDirection? = nil,
+            itemsLoadState: CodexTurnItemsLoadState? = nil
+        ) {
+            self.threadID = threadID
+            self.cursor = cursor
+            self.limit = limit
+            self.sortDirection = sortDirection
+            self.itemsLoadState = itemsLoadState
+        }
+    }
+
+    package struct Response: Codable, Equatable, Sendable {
+        package var data: [AppServerAPI.Turn.Payload]
+        package var nextCursor: String?
+        package var backwardsCursor: String?
+
+        package init(
+            data: [AppServerAPI.Turn.Payload],
+            nextCursor: String? = nil,
+            backwardsCursor: String? = nil
+        ) {
+            self.data = data
+            self.nextCursor = nextCursor
+            self.backwardsCursor = backwardsCursor
+        }
+    }
+
+    package struct Request: AppServerAPI.Request {
+        package typealias Response = AppServerAPI.Thread.Turns.List.Response
+
+        package static let method = "thread/turns/list"
+        package var params: AppServerAPI.Thread.Turns.List.Params
+        package var scope: AppServerAPI.RequestScope? {
+            .thread(params.threadID)
+        }
+
+        package init(params: AppServerAPI.Thread.Turns.List.Params) {
             self.params = params
         }
     }

@@ -1,6 +1,206 @@
 import Foundation
 import CodexAppServerKit
 
+/// An in-memory store for app-server thread snapshots used by test stubs.
+///
+/// Use this store when tests or previews need to mutate the same authoritative
+/// snapshots that back `thread/list`, `thread/read`, `thread/resume`, and
+/// `thread/start` in ``CodexAppServerTestTransport``.
+public actor CodexAppServerTestThreadStore {
+    private var snapshotsByID: [String: CodexThreadSnapshot]
+    private var snapshotOrder: [String]
+    private static let cursorPrefix = "test-thread-store:"
+
+    /// Creates an in-memory thread snapshot store.
+    public init(
+        threads: [CodexThreadSnapshot] = []
+    ) {
+        self.snapshotsByID = Dictionary(uniqueKeysWithValues: threads.map { ($0.id.rawValue, $0) })
+        self.snapshotOrder = threads.map(\.id.rawValue)
+    }
+
+    /// Returns the stored snapshot for `id`.
+    public func snapshot(id: CodexThreadID) -> CodexThreadSnapshot? {
+        snapshotsByID[id.rawValue]
+    }
+
+    /// Returns all stored snapshots in the order returned by `thread/list`.
+    public func snapshots() -> [CodexThreadSnapshot] {
+        snapshotOrder.compactMap { snapshotsByID[$0] }
+    }
+
+    /// Inserts or replaces a stored snapshot and moves it to the front of list results.
+    public func upsert(_ snapshot: CodexThreadSnapshot) {
+        snapshotsByID[snapshot.id.rawValue] = snapshot
+        snapshotOrder.removeAll { $0 == snapshot.id.rawValue }
+        snapshotOrder.insert(snapshot.id.rawValue, at: 0)
+    }
+
+    /// Removes and returns the stored snapshot for `id`, if one exists.
+    @discardableResult
+    public func remove(id: CodexThreadID) -> CodexThreadSnapshot? {
+        snapshotOrder.removeAll { $0 == id.rawValue }
+        return snapshotsByID.removeValue(forKey: id.rawValue)
+    }
+
+    func startThreadResponse(for params: Data) throws -> Data {
+        let request = try JSONDecoder().decode(AppServerAPI.Thread.Start.Params.self, from: params)
+        let threadID = request.threadID ?? "thread-\(UUID().uuidString)"
+        let now = Date()
+        let snapshot = CodexThreadSnapshot(
+            id: CodexThreadID(rawValue: threadID),
+            workspace: request.cwd.map { URL(fileURLWithPath: $0, isDirectory: true) },
+            modelProvider: request.modelProvider,
+            createdAt: now,
+            updatedAt: now,
+            recencyAt: now,
+            ephemeral: request.ephemeral
+        )
+        upsert(snapshot)
+        return try JSONEncoder().encode(
+            AppServerAPI.Thread.Start.Response(threadID: threadID, model: request.model)
+        )
+    }
+
+    func listThreadResponse(for params: Data) throws -> Data {
+        let request = try JSONDecoder().decode(AppServerAPI.Thread.List.Params.self, from: params)
+        let snapshots = snapshotOrder.compactMap { snapshotsByID[$0] }
+        let filteredThreads = CodexAppServerTestTransport.filteredThreadSnapshots(
+            snapshots,
+            for: request
+        )
+        let page = page(filteredThreads, cursor: request.cursor, limit: request.limit)
+        return try JSONEncoder().encode(
+            AppServerAPI.Thread.List.Response(
+                data: page.threads.map { CodexAppServerTestTransport.apiSnapshot(from: $0) },
+                nextCursor: page.nextCursor,
+                backwardsCursor: page.backwardsCursor
+            ))
+    }
+
+    private func page(
+        _ threads: [CodexThreadSnapshot],
+        cursor: String?,
+        limit: Int?
+    ) -> CodexThreadPage {
+        let start = min(max(offset(from: cursor), 0), threads.count)
+        guard let limit else {
+            return CodexThreadPage(
+                threads: Array(threads[start..<threads.endIndex]),
+                backwardsCursor: start > 0 ? Self.cursor(for: 0) : nil
+            )
+        }
+        guard limit > 0 else {
+            return CodexThreadPage(threads: [], nextCursor: nil, backwardsCursor: nil)
+        }
+
+        let end = min(start + limit, threads.count)
+        let previousStart = max(0, start - limit)
+        return CodexThreadPage(
+            threads: Array(threads[start..<end]),
+            nextCursor: end < threads.count ? Self.cursor(for: end) : nil,
+            backwardsCursor: start > 0 ? Self.cursor(for: previousStart) : nil
+        )
+    }
+
+    private func offset(from cursor: String?) -> Int {
+        guard let cursor else {
+            return 0
+        }
+        if cursor.hasPrefix(Self.cursorPrefix) {
+            return Int(cursor.dropFirst(Self.cursorPrefix.count)) ?? 0
+        }
+        return Int(cursor) ?? 0
+    }
+
+    private static func cursor(for offset: Int) -> String {
+        "\(cursorPrefix)\(offset)"
+    }
+
+    func resumeThreadResponse(for params: Data) throws -> Data {
+        let request = try JSONDecoder().decode(AppServerAPI.Thread.Resume.Params.self, from: params)
+        guard let threadID = request.threadID,
+            let thread = snapshotsByID[threadID]
+        else {
+            throw JSONRPC.Error.responseError(
+                code: -32004,
+                message: "No stubbed thread matches thread/resume."
+            )
+        }
+        return try JSONEncoder().encode(
+            AppServerAPI.Thread.Resume.Response(
+                thread: CodexAppServerTestTransport.apiSnapshot(from: thread),
+                model: thread.modelProvider
+            ))
+    }
+
+    func readThreadResponse(for params: Data) throws -> Data {
+        let request = try JSONDecoder().decode(AppServerAPI.Thread.Read.Params.self, from: params)
+        guard let thread = snapshotsByID[request.threadID] else {
+            throw JSONRPC.Error.responseError(
+                code: -32004,
+                message: "No stubbed thread matches thread/read."
+            )
+        }
+        return try JSONEncoder().encode(
+            AppServerAPI.Thread.Read.Response(
+                thread: CodexAppServerTestTransport.apiSnapshot(
+                    from: thread,
+                    includeTurns: request.includeTurns == true
+                )
+            ))
+    }
+
+    func listThreadTurnsResponse(for params: Data) throws -> Data {
+        let request = try JSONDecoder().decode(
+            AppServerAPI.Thread.Turns.List.Params.self,
+            from: params
+        )
+        guard let thread = snapshotsByID[request.threadID] else {
+            throw JSONRPC.Error.responseError(
+                code: -32004,
+                message: "No stubbed thread matches thread/turns/list."
+            )
+        }
+        var turns = thread.turns ?? []
+        if request.sortDirection == .descending {
+            turns.reverse()
+        }
+        let page = page(turns, cursor: request.cursor, limit: request.limit)
+        return try JSONEncoder().encode(
+            AppServerAPI.Thread.Turns.List.Response(
+                data: page.turns.map(CodexAppServerTestTransport.apiTurn(from:)),
+                nextCursor: page.nextCursor,
+                backwardsCursor: page.backwardsCursor
+            ))
+    }
+
+    private func page(
+        _ turns: [CodexTurnSnapshot],
+        cursor: String?,
+        limit: Int?
+    ) -> CodexTurnPage {
+        let start = min(max(offset(from: cursor), 0), turns.count)
+        guard let limit else {
+            return CodexTurnPage(
+                turns: Array(turns[start..<turns.endIndex]),
+                backwardsCursor: start > 0 ? Self.cursor(for: 0) : nil
+            )
+        }
+        guard limit > 0 else {
+            return CodexTurnPage(turns: [], nextCursor: nil, backwardsCursor: nil)
+        }
+
+        let end = min(start + limit, turns.count)
+        let previousStart = max(0, start - limit)
+        return CodexTurnPage(
+            turns: Array(turns[start..<end]),
+            nextCursor: end < turns.count ? Self.cursor(for: end) : nil,
+            backwardsCursor: start > 0 ? Self.cursor(for: previousStart) : nil
+        )
+    }
+}
+
 /// A Codex app-server test runtime backed by an in-memory transport.
 ///
 /// This type does not launch `codex` or any external process. Tests enqueue
@@ -37,6 +237,54 @@ public struct CodexAppServerTestRuntime: Sendable {
         try await transport.enqueueInitialize(codexHome: codexHome, userAgent: userAgent)
         let server = try await CodexAppServer.testing(transport: transport)
         return .init(server: server, transport: transport)
+    }
+
+    /// Creates a test runtime whose app-server thread APIs are backed by a mutable store.
+    ///
+    /// The returned runtime still exercises the public ``CodexAppServer`` API,
+    /// while callers can mutate `threadStore` after startup:
+    ///
+    /// ```swift
+    /// let store = CodexAppServerTestThreadStore(threads: threads)
+    /// let runtime = try await CodexAppServerTestRuntime.start(threadStore: store)
+    /// await store.upsert(updatedThread)
+    /// ```
+    public static func start(
+        threadStore: CodexAppServerTestThreadStore,
+        transport: CodexAppServerTestTransport = CodexAppServerTestTransport(),
+        codexHome: String? = nil,
+        userAgent: String? = nil
+    ) async throws -> CodexAppServerTestRuntime {
+        try await transport.stubThreads(threadStore)
+        return try await start(
+            transport: transport,
+            codexHome: codexHome,
+            userAgent: userAgent
+        )
+    }
+
+    /// Creates a test runtime whose app-server thread APIs are backed by in-memory snapshots.
+    ///
+    /// The returned runtime still exercises the public ``CodexAppServer`` API.
+    /// Higher-level code can build its normal data container from ``server``:
+    ///
+    /// ```swift
+    /// let runtime = try await CodexAppServerTestRuntime.start(threads: threads)
+    /// let container = CodexModelContainer(appServer: runtime.server)
+    /// ```
+    public static func start(
+        threads: [CodexThreadSnapshot],
+        transport: CodexAppServerTestTransport = CodexAppServerTestTransport(),
+        codexHome: String? = nil,
+        userAgent: String? = nil
+    ) async throws -> CodexAppServerTestRuntime {
+        let threadStore = CodexAppServerTestThreadStore(threads: threads)
+        return try await start(
+            threadStore: threadStore,
+            transport: transport,
+            codexHome: codexHome,
+            userAgent: userAgent
+        )
     }
 }
 
@@ -169,7 +417,10 @@ public actor CodexAppServerTestTransport {
         case failure(JSONRPC.Error)
     }
 
+    private typealias ResponseHandler = @Sendable (Data) async throws -> Data
+
     private var responses: [String: [QueuedResponse]] = [:]
+    private var responseHandlers: [String: ResponseHandler] = [:]
     private var requests: [JSONRPC.Request] = []
     private var notifications: [JSONRPC.Notification] = []
     private var serverNotificationContinuations:
@@ -198,9 +449,40 @@ public actor CodexAppServerTestTransport {
         responses[method, default: []].append(.success(try JSONEncoder().encode(response)))
     }
 
+    /// Registers a reusable response handler for `method`.
+    ///
+    /// Queued responses still take precedence. Use handlers for in-memory
+    /// app-server fixtures that must answer the same request multiple times.
+    public func handle(
+        method: String,
+        handler: @escaping @Sendable (Data) async throws -> Data
+    ) {
+        responseHandlers[method] = handler
+    }
+
+    /// Clears the reusable response handler for `method`.
+    public func clearHandler(method: String) {
+        responseHandlers[method] = nil
+    }
+
+    /// Registers a reusable Encodable response for `method`.
+    public func stub<Response: Encodable & Sendable>(
+        _ response: Response,
+        for method: String
+    ) throws {
+        let encoded = try JSONEncoder().encode(response)
+        handle(method: method) { _ in encoded }
+    }
+
     /// Enqueues a JSON string response for `method`.
     public func enqueueJSON(_ json: String, for method: String) throws {
         responses[method, default: []].append(.success(Data(json.utf8)))
+    }
+
+    /// Registers a reusable JSON object response for `method`.
+    public func stubJSON(_ json: String, for method: String) {
+        let encoded = Data(json.utf8)
+        handle(method: method) { _ in encoded }
     }
 
     /// Enqueues a JSON-RPC response error for `method`.
@@ -240,7 +522,7 @@ public actor CodexAppServerTestTransport {
     public func enqueueThreadList(_ page: CodexThreadPage) throws {
         try enqueue(
             AppServerAPI.Thread.List.Response(
-                data: page.threads.map(Self.apiSnapshot(from:)),
+                data: page.threads.map { Self.apiSnapshot(from: $0) },
                 nextCursor: page.nextCursor,
                 backwardsCursor: page.backwardsCursor
             ),
@@ -254,6 +536,51 @@ public actor CodexAppServerTestTransport {
             AppServerAPI.Thread.Read.Response(thread: Self.apiSnapshot(from: thread)),
             for: "thread/read"
         )
+    }
+
+    /// Enqueues a thread-turns-list response.
+    public func enqueueThreadTurns(_ page: CodexTurnPage) throws {
+        try enqueue(
+            AppServerAPI.Thread.Turns.List.Response(
+                data: page.turns.map(Self.apiTurn(from:)),
+                nextCursor: page.nextCursor,
+                backwardsCursor: page.backwardsCursor
+            ),
+            for: "thread/turns/list"
+        )
+    }
+
+    /// Stubs thread start, list, resume, and read requests from in-memory thread snapshots.
+    ///
+    /// This is useful for UI previews and tests that should exercise the same
+    /// app-server/DataKit path repeatedly without launching a real app-server.
+    public func stubThreads(
+        _ threads: [CodexThreadSnapshot]
+    ) throws {
+        let store = CodexAppServerTestThreadStore(threads: threads)
+        try stubThreads(store)
+    }
+
+    /// Stubs thread requests from an in-memory store that callers can mutate later.
+    ///
+    /// The store remains the authoritative source for `thread/list`,
+    /// `thread/read`, `thread/resume`, and `thread/start` responses.
+    public func stubThreads(_ store: CodexAppServerTestThreadStore) throws {
+        handle(method: "thread/start") { params in
+            try await store.startThreadResponse(for: params)
+        }
+        handle(method: "thread/list") { params in
+            try await store.listThreadResponse(for: params)
+        }
+        handle(method: "thread/resume") { params in
+            try await store.resumeThreadResponse(for: params)
+        }
+        handle(method: "thread/read") { params in
+            try await store.readThreadResponse(for: params)
+        }
+        handle(method: "thread/turns/list") { params in
+            try await store.listThreadTurnsResponse(for: params)
+        }
     }
 
     /// Enqueues a thread-unarchive response.
@@ -273,9 +600,28 @@ public actor CodexAppServerTestTransport {
     }
 
     /// Enqueues a review-start response.
-    public func enqueueReviewStart(turnID: String, reviewThreadID: String? = nil) throws {
+    public func enqueueReviewStart(
+        turnID: String,
+        reviewThreadID: String? = nil,
+        status: CodexTurnStatus? = .running,
+        items: [CodexThreadItem] = []
+    ) throws {
+        try enqueueReviewStart(
+            .init(id: .init(rawValue: turnID), status: status, items: items),
+            reviewThreadID: reviewThreadID
+        )
+    }
+
+    /// Enqueues a review-start response.
+    public func enqueueReviewStart(
+        _ turn: CodexTurnSnapshot,
+        reviewThreadID: String? = nil
+    ) throws {
         try enqueue(
-            AppServerAPI.Review.Start.Response(turnID: turnID, reviewThreadID: reviewThreadID),
+            AppServerAPI.Review.Start.Response(
+                turn: Self.apiTurn(from: turn),
+                reviewThreadID: reviewThreadID
+            ),
             for: "review/start"
         )
     }
@@ -336,7 +682,10 @@ public actor CodexAppServerTestTransport {
         )
     }
 
-    private static func apiSnapshot(from snapshot: CodexThreadSnapshot) -> AppServerAPI.Thread.Snapshot {
+    fileprivate static func apiSnapshot(
+        from snapshot: CodexThreadSnapshot,
+        includeTurns: Bool = true
+    ) -> AppServerAPI.Thread.Snapshot {
         .init(
             id: snapshot.id.rawValue,
             cwd: snapshot.workspace?.path,
@@ -345,16 +694,74 @@ public actor CodexAppServerTestTransport {
             modelProvider: snapshot.modelProvider,
             createdAt: snapshot.createdAt.map { Int($0.timeIntervalSince1970) },
             updatedAt: snapshot.updatedAt.map { Int($0.timeIntervalSince1970) },
+            recencyAt: snapshot.recencyAt.map { Int($0.timeIntervalSince1970) },
+            status: snapshot.status.map(Self.apiStatus(from:)),
             ephemeral: snapshot.ephemeral,
-            turns: snapshot.turns?.map(Self.apiTurn(from:))
+            turns: includeTurns ? snapshot.turns?.map(Self.apiTurn(from:)) : nil
         )
     }
 
-    private static func apiTurn(from snapshot: CodexTurnSnapshot) -> AppServerAPI.Turn.Payload {
+    fileprivate static func filteredThreadSnapshots(
+        _ snapshots: [CodexThreadSnapshot],
+        for request: AppServerAPI.Thread.List.Params
+    ) -> [CodexThreadSnapshot] {
+        let workspacePaths: Set<String>?
+        switch request.cwd {
+        case .paths(let paths):
+            workspacePaths = Set(paths)
+        case nil:
+            workspacePaths = nil
+        }
+
+        return snapshots.filter { snapshot in
+            if let workspacePaths {
+                guard let path = snapshot.workspace?.path,
+                    workspacePaths.contains(path)
+                else {
+                    return false
+                }
+            }
+            if let modelProviders = request.modelProviders,
+                modelProviders.isEmpty == false,
+                modelProviders.contains(snapshot.modelProvider ?? "") == false
+            {
+                return false
+            }
+            if let searchTerm = request.searchTerm?.lowercased(),
+                searchTerm.isEmpty == false
+            {
+                let haystack = [
+                    snapshot.name,
+                    snapshot.preview,
+                    snapshot.workspace?.lastPathComponent,
+                ]
+                .compactMap { $0?.lowercased() }
+                .joined(separator: "\n")
+                guard haystack.contains(searchTerm) else {
+                    return false
+                }
+            }
+            return true
+        }
+    }
+
+    private static func apiStatus(
+        from status: CodexThreadStatus
+    ) -> AppServerAPI.Thread.Snapshot.Status {
+        switch status {
+        case .active(let activeFlags):
+            .init(type: status.rawValue, activeFlags: activeFlags.map(\.rawValue))
+        case .notLoaded, .idle, .systemError, .unknown:
+            .init(type: status.rawValue)
+        }
+    }
+
+    fileprivate static func apiTurn(from snapshot: CodexTurnSnapshot) -> AppServerAPI.Turn.Payload {
         .init(
             id: snapshot.id.rawValue,
             status: snapshot.status?.rawValue,
             error: snapshot.errorMessage.map { .init(message: $0) },
+            itemsLoadState: snapshot.itemsLoadState,
             items: snapshot.items.map(Self.apiItem(from:))
         )
     }
@@ -364,14 +771,66 @@ public actor CodexAppServerTestTransport {
             "id": .string(item.id),
             "type": .string(item.kind.rawValue),
         ]
-        if let text = item.text {
+        switch item.content {
+        case .message(let message):
+            object["text"] = .string(message.text)
+            if let phase = message.phase?.rawValue {
+                object["phase"] = .string(phase)
+            }
+        case .plan(let text):
             object["text"] = .string(text)
-        }
-        if let message = item.message,
-           let phase = message.phase?.rawValue {
-            object["phase"] = .string(phase)
+        case .reasoning(let reasoning):
+            object["type"] = .string(CodexThreadItem.Kind.reasoning.rawValue)
+            object["summary"] = .array(reasoning.summary.map(AppServerJSONValue.string))
+            object["content"] = .array(reasoning.content.map(AppServerJSONValue.string))
+        case .command(let command):
+            object["command"] = .string(command.command)
+            set(command.cwd, forKey: "cwd", in: &object)
+            set(command.output, forKey: "output", in: &object)
+            set(command.exitCode, forKey: "exitCode", in: &object)
+            set(command.status?.rawValue, forKey: "status", in: &object)
+        case .fileChange(let fileChange):
+            set(fileChange.path, forKey: "path", in: &object)
+            set(fileChange.output, forKey: "output", in: &object)
+            set(fileChange.status?.rawValue, forKey: "status", in: &object)
+        case .toolCall(let toolCall):
+            set(toolCall.namespace, forKey: "namespace", in: &object)
+            set(toolCall.server, forKey: "server", in: &object)
+            set(toolCall.name, forKey: "name", in: &object)
+            set(toolCall.arguments, forKey: "arguments", in: &object)
+            set(toolCall.result, forKey: "result", in: &object)
+            set(toolCall.error, forKey: "error", in: &object)
+            set(toolCall.status?.rawValue, forKey: "status", in: &object)
+        case .contextCompaction(let text):
+            set(text, forKey: "text", in: &object)
+        case .diagnostic(let text), .log(let text):
+            object["text"] = .string(text)
+        case .unknown(let raw):
+            set(raw.text, forKey: "text", in: &object)
         }
         return .object(object)
+    }
+
+    private static func set(
+        _ value: String?,
+        forKey key: String,
+        in object: inout [String: AppServerJSONValue]
+    ) {
+        guard let value else {
+            return
+        }
+        object[key] = .string(value)
+    }
+
+    private static func set(
+        _ value: Int?,
+        forKey key: String,
+        in object: inout [String: AppServerJSONValue]
+    ) {
+        guard let value else {
+            return
+        }
+        object[key] = .int(value)
     }
 
     /// Enqueues a ChatGPT browser login response.
@@ -631,6 +1090,9 @@ extension CodexAppServerTestTransport: JSONRPC.Transport {
             case .failure(let error):
                 throw error
             }
+        }
+        if let responseHandler = responseHandlers[request.method] {
+            return try await responseHandler(request.params)
         }
         return try JSONEncoder().encode(EmptyResponse())
     }

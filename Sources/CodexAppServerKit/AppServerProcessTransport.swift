@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 import OSLog
+import Synchronization
 
 private let logger = Logger(subsystem: "CodexAppServerKit", category: "app-server-transport")
 
@@ -548,8 +549,7 @@ private final class AppServerPipeReadEventSource: @unchecked Sendable {
 
     private let fileHandle: FileHandle
     private let queue: DispatchQueue
-    private let continuationLock = NSLock()
-    private var continuation: AsyncStream<AppServerPipeReadEvent>.Continuation?
+    private let continuation = Mutex<AsyncStream<AppServerPipeReadEvent>.Continuation?>(nil)
 
     init(fileHandle: FileHandle, label: String) {
         self.fileHandle = fileHandle
@@ -558,7 +558,9 @@ private final class AppServerPipeReadEventSource: @unchecked Sendable {
         self.events = AsyncStream(bufferingPolicy: .unbounded) { streamContinuation in
             continuation = streamContinuation
         }
-        self.continuation = continuation
+        self.continuation.withLock { storedContinuation in
+            storedContinuation = continuation
+        }
     }
 
     func start() {
@@ -583,17 +585,16 @@ private final class AppServerPipeReadEventSource: @unchecked Sendable {
     }
 
     private func yield(_ event: AppServerPipeReadEvent) {
-        continuationLock.lock()
-        let continuation = continuation
-        continuationLock.unlock()
+        let continuation = continuation.withLock { $0 }
         continuation?.yield(event)
     }
 
     private func finish(with finalEvent: AppServerPipeReadEvent? = nil) {
-        continuationLock.lock()
-        let continuation = continuation
-        self.continuation = nil
-        continuationLock.unlock()
+        let continuation = continuation.withLock { continuation in
+            let storedContinuation = continuation
+            continuation = nil
+            return storedContinuation
+        }
         if let finalEvent {
             continuation?.yield(finalEvent)
         }
@@ -605,8 +606,7 @@ private final class AppServerSpawnedProcess: @unchecked Sendable {
     let processIdentifier: pid_t
 
     private let processGroupID: pid_t
-    private let stateLock = NSLock()
-    private var didReap = false
+    private let didReap = Mutex(false)
 
     private init(processIdentifier: pid_t) {
         self.processIdentifier = processIdentifier
@@ -813,22 +813,22 @@ private final class AppServerSpawnedProcess: @unchecked Sendable {
     }
 
     private func reapIfExited() -> Bool {
-        stateLock.lock()
-        defer { stateLock.unlock() }
-        if didReap {
-            return true
+        didReap.withLock { didReap in
+            if didReap {
+                return true
+            }
+            var status: Int32 = 0
+            let result = waitpid(processIdentifier, &status, WNOHANG)
+            if result == processIdentifier {
+                didReap = true
+                return true
+            }
+            if result == -1, errno == ECHILD {
+                didReap = true
+                return true
+            }
+            return false
         }
-        var status: Int32 = 0
-        let result = waitpid(processIdentifier, &status, WNOHANG)
-        if result == processIdentifier {
-            didReap = true
-            return true
-        }
-        if result == -1, errno == ECHILD {
-            didReap = true
-            return true
-        }
-        return false
     }
 
     private static func check(_ result: Int32) throws {

@@ -25,11 +25,19 @@ let package = Package(
             targets: ["CodexDataKit"]
         ),
     ],
+    dependencies: [
+        .package(url: "https://github.com/apple/swift-async-algorithms", from: "1.1.0"),
+    ],
     targets: [
         .target(
             name: "CodexKit",
+            dependencies: [
+                "CodexAppServerKit",
+                "CodexDataKit",
+            ],
             swiftSettings: [
                 .enableUpcomingFeature("ApproachableConcurrency"),
+                .enableUpcomingFeature("NonisolatedNonsendingByDefault"),
             ],
         ),
         .target(
@@ -52,10 +60,12 @@ let package = Package(
             name: "CodexDataKit",
             dependencies: [
                 "CodexAppServerKit",
+                .product(name: "AsyncAlgorithms", package: "swift-async-algorithms"),
             ],
             exclude: ["README.md"],
             swiftSettings: [
                 .swiftLanguageMode(.v6),
+                .enableUpcomingFeature("NonisolatedNonsendingByDefault"),
             ],
         ),
         .testTarget(
@@ -83,6 +93,7 @@ let package = Package(
             ],
             swiftSettings: [
                 .swiftLanguageMode(.v6),
+                .enableUpcomingFeature("NonisolatedNonsendingByDefault"),
             ],
         ),
     ]

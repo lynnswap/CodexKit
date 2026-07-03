@@ -369,11 +369,16 @@ public actor CodexAppServer {
         _ id: CodexThreadID,
         options: CodexThread.ResumeOptions = .init()
     ) async throws -> CodexThread {
-        let response = try await client.send(
-            AppServerAPI.Thread.Resume.Request(
-                threadID: id.rawValue,
-                params: threadStartParams(options: options)
-            ))
+        let response: AppServerAPI.Thread.Resume.Response = try await withThreadEventGeneration(
+            id,
+            router: router
+        ) {
+            try await client.send(
+                AppServerAPI.Thread.Resume.Request(
+                    threadID: id.rawValue,
+                    params: threadStartParams(options: options)
+                ))
+        }
         return thread(from: response.thread, model: response.model ?? options.model)
     }
 
@@ -644,7 +649,7 @@ public actor CodexAppServer {
                 params: .init(
                     archived: query.archived,
                     cursor: query.cursor,
-                    cwd: query.workspace.map { .paths([$0.path]) },
+                    cwd: query.workspaces.map { .paths($0.map(\.path)) },
                     limit: query.limit,
                     modelProviders: query.modelProviders,
                     searchTerm: query.searchTerm,
@@ -959,6 +964,10 @@ public actor CodexAppServer {
             modelProvider: snapshot.modelProvider,
             createdAt: snapshot.createdAt.map { Date(timeIntervalSince1970: TimeInterval($0)) },
             updatedAt: snapshot.updatedAt.map { Date(timeIntervalSince1970: TimeInterval($0)) },
+            recencyAt: snapshot.recencyAt.map { Date(timeIntervalSince1970: TimeInterval($0)) },
+            status: snapshot.status.map {
+                CodexThreadStatus(type: $0.type, activeFlags: $0.activeFlags)
+            },
             ephemeral: snapshot.ephemeral,
             turns: turns,
             turnItemsAreAuthoritative: includesTurns,
@@ -985,6 +994,10 @@ public actor CodexAppServer {
                 fields.insert(.createdAt)
             case .updatedAt:
                 fields.insert(.updatedAt)
+            case .recencyAt:
+                fields.insert(.recencyAt)
+            case .status:
+                fields.insert(.status)
             case .ephemeral:
                 fields.insert(.ephemeral)
             case .turns:
@@ -999,6 +1012,20 @@ public actor CodexAppServer {
         return fields
     }
 
+    package nonisolated static func turnSnapshots(
+        from turns: [AppServerAPI.Turn.Payload]
+    ) -> [CodexTurnSnapshot] {
+        turns.map {
+            CodexTurnSnapshot(
+                id: .init(rawValue: $0.id),
+                status: $0.status.map(CodexTurnStatus.init(rawValue:)),
+                errorMessage: $0.error?.message,
+                itemsLoadState: $0.itemsLoadState ?? ($0.items == nil ? .notLoaded : .full),
+                items: AppServerThreadItemMapping.threadItems(from: $0.items)
+            )
+        }
+    }
+
     private nonisolated static func turnSnapshots(
         from turns: [AppServerAPI.Turn.Payload]?,
         includesTurns: Bool
@@ -1009,14 +1036,7 @@ public actor CodexAppServer {
         guard includesTurns || turns.isEmpty == false else {
             return nil
         }
-        return turns.map {
-            CodexTurnSnapshot(
-                id: .init(rawValue: $0.id),
-                status: $0.status.map(CodexTurnStatus.init(rawValue:)),
-                errorMessage: $0.error?.message,
-                items: AppServerThreadItemMapping.threadItems(from: $0.items)
-            )
-        }
+        return turnSnapshots(from: turns)
     }
 
     private nonisolated static func account(from snapshot: AppServerAPI.Account.Snapshot) -> CodexAccount {

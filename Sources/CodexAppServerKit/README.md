@@ -241,8 +241,8 @@ not yet model directly.
 it as a high-level `CodexAppServer` operation and as a lower-level thread
 operation for callers that already own a thread. A review session provides the
 review turn response and review-domain streams. If app-server detaches the
-review into a separate thread, `events`, `logEntries`, `progress`, and
-`transcriptUpdates` are bound to that review thread automatically. Detached
+review into a separate thread, `events`, `progress`, and `transcriptUpdates`
+are bound to that review thread automatically. Detached
 review notification routing is owned by CodexAppServerKit, so callers do not
 need to parse JSON-RPC notifications or track app-server thread event details.
 
@@ -253,10 +253,10 @@ let review = try await appServer.startReview(
     options: .init(model: "gpt-5")
 )
 
-for try await entry in review.logEntries {
-    switch entry {
+for try await event in review.events {
+    switch event {
     case .itemCompleted(let item, _):
-        renderReviewLog(item)
+        renderReviewItem(item)
     case .reasoningDelta(let delta, _):
         renderReasoningDelta(delta)
     default:
@@ -291,12 +291,11 @@ try await appServer.startReview(in: workspaceURL, target: .custom(instructions: 
 ```
 
 `CodexReviewSession.events` yields `CodexReviewEvent`, preserving unknown
-schema-new notifications as `CodexRawNotification`. `logEntries` yields
-`CodexReviewLogEntry` values for command, reasoning, tool, file-change, message,
-and delta output. `progress` yields `CodexReviewProgress` snapshots until the
-review turn completes or fails. `transcriptUpdates` remains the transcript
-sequence for the review thread itself, which is useful when a UI wants
-thread-bound transcript snapshots rather than review progress phases.
+schema-new notifications as `CodexRawNotification`. `progress` yields
+`CodexReviewProgress` snapshots until the review turn completes or fails.
+`transcriptUpdates` remains the transcript sequence for the review thread
+itself, which is useful when a UI wants thread-bound transcript snapshots rather
+than review progress phases.
 
 `CodexReviewSession` also owns the app-server lifecycle identity for a review.
 Use `sourceThreadID`, `activeTurnThreadID`, `associatedThreadIDs`, and
@@ -483,10 +482,8 @@ The public boundary is:
 - `CodexReviewRestartToken`
 - `CodexReviewResumeOptions`
 - `CodexReviewEvent`
-- `CodexReviewLogEntry`
 - `CodexReviewProgress`
 - `CodexReviewEventSequence`
-- `CodexReviewLogSequence`
 - `CodexReviewProgressSequence`
 - `CodexResponse`
 - `CodexResponseStream`

@@ -27,6 +27,16 @@ extension CodexThread {
         }
     }
 
+    package func beginEventGeneration() async {
+        await router.beginThreadEventGeneration(id)
+    }
+
+    package func makeCurrentGenerationEventStream() async -> AsyncThrowingStream<
+        CodexThreadEvent, Error
+    > {
+        await router.observationEvents(for: id)
+    }
+
     /// Agent messages emitted by this thread.
     ///
     /// This sequence is derived from `events` and is useful when callers only
@@ -43,7 +53,7 @@ extension CodexThread {
     /// Log-oriented item events for this thread.
     ///
     /// This includes command, tool, file-change, diagnostic, and unknown
-    /// app-server items that are useful for review logs or progress views.
+    /// app-server items that are useful for output logs or progress views.
     public var logEntries: CodexThreadLogSequence {
         .init(events: events)
     }
@@ -133,12 +143,21 @@ extension CodexThread {
         delivery: CodexReviewDelivery = .inline,
         transcriptErrorHandlingPolicy: CodexTranscriptErrorHandlingPolicy = .preserveTranscript
     ) async throws -> CodexReviewSession {
-        let response = try await client.send(AppServerAPI.Review.Start.Request(
-            params: .init(threadID: id.rawValue, target: target, delivery: delivery)
-        ))
+        let response: AppServerAPI.Review.Start.Response = try await withThreadEventGeneration(
+            id,
+            router: router
+        ) {
+            try await client.send(AppServerAPI.Review.Start.Request(
+                params: .init(threadID: id.rawValue, target: target, delivery: delivery)
+            ))
+        }
         let responseReviewThreadID = response.reviewThreadID.map(CodexThreadID.init(rawValue:))
         let detachedReviewThreadID = responseReviewThreadID == id ? nil : responseReviewThreadID
         let turnID = CodexTurnID(rawValue: response.turnID)
+        if let detachedReviewThreadID {
+            await router.beginReviewThreadEventGeneration(detachedReviewThreadID, including: turnID)
+        }
+        let initialTurn = CodexAppServer.turnSnapshots(from: [response.turn])[0]
         let identity = CodexReviewIdentity(
             threadID: id,
             turnID: turnID,
@@ -147,6 +166,7 @@ extension CodexThread {
         )
         return await reviewSession(
             identity,
+            initialTurn: initialTurn,
             transcriptErrorHandlingPolicy: transcriptErrorHandlingPolicy
         )
     }
@@ -154,6 +174,7 @@ extension CodexThread {
     package func reviewSession(
         _ identity: CodexReviewIdentity,
         model: String? = nil,
+        initialTurn: CodexTurnSnapshot? = nil,
         transcriptErrorHandlingPolicy: CodexTranscriptErrorHandlingPolicy = .preserveTranscript
     ) async -> CodexReviewSession {
         let reviewThreadID = identity.activeTurnThreadID
@@ -177,6 +198,7 @@ extension CodexThread {
             turnID: turn.id,
             reviewThreadID: reviewThreadID,
             model: model,
+            initialTurn: initialTurn ?? CodexTurnSnapshot(id: turn.id, status: .running),
             response: .init(
                 turn: turn,
                 transcriptErrorHandlingPolicy: transcriptErrorHandlingPolicy
@@ -236,6 +258,29 @@ extension CodexThread {
         return CodexAppServer.threadSnapshot(from: response.thread, includesTurns: includeTurns)
     }
 
+    /// Lists this thread's turns.
+    ///
+    /// This endpoint can include the app-server's current in-memory active turn
+    /// snapshot, so it is the preferred source for UI detail panes that need an
+    /// initial transcript before consuming live item events.
+    public func listTurns(_ query: CodexTurnQuery = .init()) async throws -> CodexTurnPage {
+        let response = try await client.send(
+            AppServerAPI.Thread.Turns.List.Request(
+                params: .init(
+                    threadID: id.rawValue,
+                    cursor: query.cursor,
+                    limit: query.limit,
+                    sortDirection: query.sortDirection,
+                    itemsLoadState: query.itemsLoadState
+                )
+            ))
+        return .init(
+            turns: CodexAppServer.turnSnapshots(from: response.data),
+            nextCursor: response.nextCursor,
+            backwardsCursor: response.backwardsCursor
+        )
+    }
+
     /// Renames this thread.
     ///
     /// - Parameter name: The new user-visible thread name.
@@ -248,10 +293,12 @@ extension CodexThread {
 
     /// Starts app-server context compaction for this thread.
     public func compact() async throws {
-        let _: EmptyResponse = try await client.send(
-            AppServerAPI.Thread.Compact.Start.Request(
-                params: .init(threadID: id.rawValue)
-            ))
+        let _: EmptyResponse = try await withThreadEventGeneration(id, router: router) {
+            try await client.send(
+                AppServerAPI.Thread.Compact.Start.Request(
+                    params: .init(threadID: id.rawValue)
+                ))
+        }
     }
 
     /// Archives this thread.
@@ -299,24 +346,29 @@ package func startCodexTurn(
     client: AppServerClient,
     router: CodexAppServerNotificationRouter
 ) async throws -> CodexTurn {
-    let response = try await client.send(
-        AppServerAPI.Turn.Start.Request(
-            params: .init(
-                threadID: threadID.rawValue,
-                input: prompt.appServerInput,
-                approvalPolicy: options.approvalMode?.approvalPolicy,
-                approvalsReviewer: options.approvalMode?.approvalsReviewer,
-                clientUserMessageID: options.clientUserMessageID,
-                cwd: options.cwd?.path,
-                effort: options.effort?.rawValue,
-                model: options.model,
-                outputSchema: options.outputSchema?.appServerJSONValue,
-                personality: options.personality?.rawValue,
-                sandboxPolicy: options.sandbox?.turnSandboxPolicy,
-                serviceTier: options.serviceTier,
-                summary: options.summary?.rawValue
-            )
-        ))
+    let response: AppServerAPI.Turn.Start.Response = try await withThreadEventGeneration(
+        threadID,
+        router: router
+    ) {
+        try await client.send(
+            AppServerAPI.Turn.Start.Request(
+                params: .init(
+                    threadID: threadID.rawValue,
+                    input: prompt.appServerInput,
+                    approvalPolicy: options.approvalMode?.approvalPolicy,
+                    approvalsReviewer: options.approvalMode?.approvalsReviewer,
+                    clientUserMessageID: options.clientUserMessageID,
+                    cwd: options.cwd?.path,
+                    effort: options.effort?.rawValue,
+                    model: options.model,
+                    outputSchema: options.outputSchema?.appServerJSONValue,
+                    personality: options.personality?.rawValue,
+                    sandboxPolicy: options.sandbox?.turnSandboxPolicy,
+                    serviceTier: options.serviceTier,
+                    summary: options.summary?.rawValue
+                )
+            ))
+    }
     let turnID = CodexTurnID(rawValue: response.turn.id)
     await router.seedTurn(turnID, threadID: threadID)
     return CodexTurn(
@@ -325,6 +377,17 @@ package func startCodexTurn(
         client: client,
         router: router
     )
+}
+
+package func withThreadEventGeneration<Response: Sendable>(
+    _ threadID: CodexThreadID,
+    router: CodexAppServerNotificationRouter,
+    operation: @Sendable () async throws -> Response
+) async throws -> Response {
+    let generationCursor = await router.threadEventGenerationCursor(threadID)
+    let response = try await operation()
+    await router.beginThreadEventGeneration(threadID, at: generationCursor)
+    return response
 }
 
 extension CodexTurn {
