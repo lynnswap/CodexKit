@@ -9129,6 +9129,313 @@ struct CodexModelContextTests {
         #expect(completedValue.status == .completed)
     }
 
+    @Test("started review adopts rollout records with fully synthesized identities")
+    func startedReviewAdoptsRolloutRecordsWithFullySynthesizedIdentities() async throws {
+        let workspaceURL = temporaryDirectory()
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let startedAt = Date(timeIntervalSince1970: 10)
+
+        try await runtime.transport.enqueueThreadStart(threadID: "thread-review", model: "gpt-5")
+        try await runtime.transport.enqueueReviewStart(
+            turnID: "turn-seed",
+            reviewThreadID: "thread-review",
+            items: [
+                .init(
+                    id: "turn-seed",
+                    kind: .userMessage,
+                    content: .message(.init(
+                        id: "turn-seed",
+                        role: .user,
+                        text: "current changes"
+                    ))
+                ),
+            ]
+        )
+
+        let started = try await context.startReview(
+            in: workspaceURL,
+            input: CodexReviewInput(
+                target: .uncommittedChanges,
+                options: .init(model: "gpt-5", ephemeral: false)
+            )
+        )
+        _ = started.chat.apply(.turnStarted("turn-seed"))
+
+        // Early refresh: the rollout materializes the running review turn
+        // under a synthesized turn id whose only item is the index-named user
+        // message — no identity is shared with the seeded turn.
+        started.chat.apply(
+            .init(
+                id: "thread-review",
+                workspace: workspaceURL,
+                status: .active(activeFlags: []),
+                turns: [
+                    .init(
+                        id: "rollout-read-1",
+                        status: .running,
+                        itemsLoadState: .full,
+                        items: [
+                            .init(
+                                id: "item-1",
+                                kind: .userMessage,
+                                content: .message(.init(
+                                    id: "item-1",
+                                    role: .user,
+                                    text: "current changes"
+                                ))
+                            ),
+                        ]
+                    ),
+                ]
+            ),
+            workspace: started.chat.workspace,
+            preservesExistingTurnItems: true
+        )
+        #expect(started.chat.turns.map(\.id) == ["turn-seed"])
+        #expect(started.chat.items.filter { $0.kind == .userMessage }.count == 1)
+
+        _ = started.chat.apply(.itemStarted(
+            .init(
+                id: "call-live",
+                kind: .commandExecution,
+                content: .command(.init(
+                    command: "/bin/zsh -lc 'swift test'",
+                    cwd: workspaceURL.path,
+                    status: .running,
+                    startedAt: startedAt,
+                    processID: "42",
+                    source: .agent
+                ))
+            ),
+            turnID: "turn-seed"
+        ))
+
+        // The next read regenerates the synthesized turn id.
+        started.chat.apply(
+            .init(
+                id: "thread-review",
+                workspace: workspaceURL,
+                status: .active(activeFlags: []),
+                turns: [
+                    .init(
+                        id: "rollout-read-2",
+                        status: .running,
+                        itemsLoadState: .full,
+                        items: [
+                            .init(
+                                id: "item-1",
+                                kind: .userMessage,
+                                content: .message(.init(
+                                    id: "item-1",
+                                    role: .user,
+                                    text: "current changes"
+                                ))
+                            ),
+                            .init(
+                                id: "item-2",
+                                kind: .enteredReviewMode,
+                                content: .log("current changes")
+                            ),
+                            .init(
+                                id: "call-live",
+                                kind: .commandExecution,
+                                content: .command(.init(
+                                    command: "/bin/zsh -lc 'swift test'",
+                                    cwd: workspaceURL.path,
+                                    status: .running,
+                                    processID: "42",
+                                    source: .agent
+                                ))
+                            ),
+                        ]
+                    ),
+                ]
+            ),
+            workspace: started.chat.workspace,
+            preservesExistingTurnItems: true
+        )
+        #expect(started.chat.turns.map(\.id) == ["turn-seed"])
+        #expect(started.chat.items.filter { $0.kind == .userMessage }.count == 1)
+        #expect(started.chat.items.filter { $0.kind == .commandExecution }.count == 1)
+
+        _ = started.chat.apply(.itemCompleted(
+            .init(
+                id: "call-live",
+                kind: .commandExecution,
+                content: .command(.init(
+                    command: "/bin/zsh -lc 'swift test'",
+                    cwd: workspaceURL.path,
+                    status: .completed,
+                    startedAt: startedAt,
+                    processID: "42",
+                    source: .agent
+                ))
+            ),
+            turnID: "turn-seed"
+        ))
+        let liveCommand = try #require(
+            started.chat.items.first { $0.kind == .commandExecution }
+        )
+        guard case .command(let liveValue) = liveCommand.content else {
+            Issue.record("Expected a command item.")
+            return
+        }
+        #expect(liveValue.status == .completed)
+    }
+
+    @Test("review mode markers merge across live and rollout identities")
+    func reviewModeMarkersMergeAcrossLiveAndRolloutIdentities() async throws {
+        let workspaceURL = temporaryDirectory()
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadStart(threadID: "thread-review", model: "gpt-5")
+        try await runtime.transport.enqueueReviewStart(
+            turnID: "turn-seed",
+            reviewThreadID: "thread-review",
+            items: [
+                .init(
+                    id: "turn-seed",
+                    kind: .userMessage,
+                    content: .message(.init(
+                        id: "turn-seed",
+                        role: .user,
+                        text: "current changes"
+                    ))
+                ),
+            ]
+        )
+
+        let started = try await context.startReview(
+            in: workspaceURL,
+            input: CodexReviewInput(
+                target: .uncommittedChanges,
+                options: .init(model: "gpt-5", ephemeral: false)
+            )
+        )
+        _ = started.chat.apply(.turnStarted("turn-seed"))
+        _ = started.chat.apply(.itemStarted(
+            .init(
+                id: "marker-live",
+                kind: .enteredReviewMode,
+                content: .log("current changes")
+            ),
+            turnID: "turn-seed"
+        ))
+
+        started.chat.apply(
+            .init(
+                id: "thread-review",
+                workspace: workspaceURL,
+                status: .active(activeFlags: []),
+                turns: [
+                    .init(
+                        id: "rollout-read-1",
+                        status: .running,
+                        itemsLoadState: .full,
+                        items: [
+                            .init(
+                                id: "item-1",
+                                kind: .userMessage,
+                                content: .message(.init(
+                                    id: "item-1",
+                                    role: .user,
+                                    text: "current changes"
+                                ))
+                            ),
+                            .init(
+                                id: "item-2",
+                                kind: .enteredReviewMode,
+                                content: .log("current changes")
+                            ),
+                        ]
+                    ),
+                ]
+            ),
+            workspace: started.chat.workspace,
+            preservesExistingTurnItems: true
+        )
+
+        #expect(started.chat.turns.map(\.id) == ["turn-seed"])
+        #expect(started.chat.items.filter { $0.kind == .enteredReviewMode }.count == 1)
+        #expect(started.chat.items.filter { $0.kind == .userMessage }.count == 1)
+    }
+
+    @Test("started review keeps prior review turns out of the live seed")
+    func startedReviewKeepsPriorReviewTurnsOutOfLiveSeed() async throws {
+        let workspaceURL = temporaryDirectory()
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadStart(threadID: "thread-review", model: "gpt-5")
+        try await runtime.transport.enqueueReviewStart(
+            turnID: "turn-seed",
+            reviewThreadID: "thread-review",
+            items: [
+                .init(
+                    id: "turn-seed",
+                    kind: .userMessage,
+                    content: .message(.init(
+                        id: "turn-seed",
+                        role: .user,
+                        text: "current changes"
+                    ))
+                ),
+            ]
+        )
+
+        let started = try await context.startReview(
+            in: workspaceURL,
+            input: CodexReviewInput(
+                target: .uncommittedChanges,
+                options: .init(model: "gpt-5", ephemeral: false)
+            )
+        )
+        _ = started.chat.apply(.turnStarted("turn-seed"))
+
+        // A prior review's turn re-materializes with a never-seen synthesized
+        // id; its exitedReviewMode item marks it as finished history that must
+        // not be adopted into the live seeded turn.
+        started.chat.apply(
+            .init(
+                id: "thread-review",
+                workspace: workspaceURL,
+                status: .active(activeFlags: []),
+                turns: [
+                    .init(
+                        id: "rollout-old-review",
+                        status: .completed,
+                        itemsLoadState: .full,
+                        items: [
+                            .init(
+                                id: "item-1",
+                                kind: .userMessage,
+                                content: .message(.init(
+                                    id: "item-1",
+                                    role: .user,
+                                    text: "previous changes"
+                                ))
+                            ),
+                            .init(
+                                id: "item-2",
+                                kind: .exitedReviewMode,
+                                content: .log("Review finished")
+                            ),
+                        ]
+                    ),
+                ]
+            ),
+            workspace: started.chat.workspace,
+            preservesExistingTurnItems: true
+        )
+
+        #expect(started.chat.turns.contains { $0.id == "rollout-old-review" })
+        #expect(started.chat.turns.contains { $0.id == "turn-seed" })
+        #expect(started.chat.items(in: "turn-seed").count == 1)
+        #expect(started.chat.items(in: "rollout-old-review").count == 2)
+    }
+
     @Test("started review preserves seeded row metadata across null metadata refresh")
     func startedReviewPreservesSeededRowMetadataAcrossNullMetadataRefresh() async throws {
         let workspaceURL = temporaryDirectory()

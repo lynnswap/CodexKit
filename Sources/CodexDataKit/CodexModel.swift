@@ -559,6 +559,11 @@ public final class CodexChat: CodexPersistentModel {
     private var itemsByTurnID: [CodexTurnID: [CodexItem]] = [:]
     @ObservationIgnored
     private var provisionalSeedTurnID: CodexTurnID?
+    // Unlike provisionalSeedTurnID (single-shot, consumed by the first live
+    // event), this survives for the whole review turn so authoritative
+    // records with fully synthesized identities can still be adopted into it.
+    @ObservationIgnored
+    private var seededReviewTurnID: CodexTurnID?
 
     @ObservationIgnored
     public private(set) weak var modelContext: CodexModelContext?
@@ -676,6 +681,9 @@ public final class CodexChat: CodexPersistentModel {
 
     package func markProvisionalSeedTurn(_ turnID: CodexTurnID?) {
         provisionalSeedTurnID = turnID
+        if let turnID {
+            seededReviewTurnID = turnID
+        }
     }
 
     package func detachFromContext() {
@@ -844,7 +852,26 @@ public final class CodexChat: CodexPersistentModel {
             }
             return match.turnID
         }
-        return nil
+        return liveSeededReviewTurnID(adopting: record)
+    }
+
+    // The rollout materializes a running review turn with fully synthesized
+    // identities: the turn id is regenerated per read and narrative items get
+    // index-based ids, so the record can share nothing with the seeded/live
+    // turn. While the seeded review turn is non-terminal, adopt never-seen
+    // records into it. Records carrying an exitedReviewMode item are prior
+    // reviews' turns and stay separate; their re-reads are stabilized by the
+    // shared-item fold above.
+    private func liveSeededReviewTurnID(adopting record: CodexTurnSnapshot) -> CodexTurnID? {
+        guard let reviewTurnID = seededReviewTurnID,
+            reviewTurnID != record.id,
+            let reviewTurn = turnsByID[reviewTurnID],
+            reviewTurn.status?.isTerminal != true,
+            record.items.contains(where: { $0.kind == .exitedReviewMode }) == false
+        else {
+            return nil
+        }
+        return reviewTurnID
     }
 
     private func recordsByRemovingReplacedProvisionalSeed(
@@ -919,6 +946,7 @@ public final class CodexChat: CodexPersistentModel {
                 let turn = contextTurn(id: record.id)
                 if let existing = existingByKey[incomingKey]
                     ?? fallbackAgentMessageItem(matching: incomingItem, turnID: record.id)
+                    ?? reviewModeMarkerItem(matching: incomingItem, turnID: record.id)
                 {
                     let identifier = ObjectIdentifier(existing)
                     guard reusedItems.insert(identifier).inserted else {
@@ -1235,7 +1263,12 @@ public final class CodexChat: CodexPersistentModel {
                 && fallbackItem == nil
                 ? commandReplayItem(matching: incomingItem, turnID: turnID)
                 : nil
-            let existingItem = indexedItem ?? fallbackItem ?? replayItem
+            let markerItem = indexedItem == nil
+                && fallbackItem == nil
+                && replayItem == nil
+                ? reviewModeMarkerItem(matching: incomingItem, turnID: turnID)
+                : nil
+            let existingItem = indexedItem ?? fallbackItem ?? replayItem ?? markerItem
             if let existing = existingItem
             {
                 let previousItem = existing.threadItem
@@ -1307,6 +1340,23 @@ public final class CodexChat: CodexPersistentModel {
             }
         }
         return changes
+    }
+
+    // A turn enters and exits review mode at most once, but the live
+    // notification and the rollout materialization carry different item ids
+    // for the same marker (real item id vs index-synthesized id). Resolve
+    // review-mode markers as per-turn singletons so both identities merge
+    // into one item.
+    private func reviewModeMarkerItem(
+        matching incomingItem: CodexThreadItem,
+        turnID: CodexTurnID?
+    ) -> CodexItem? {
+        guard incomingItem.isReviewModeMarker, let turnID else {
+            return nil
+        }
+        return items.first { item in
+            item.kind == incomingItem.kind && item.turnID == turnID
+        }
     }
 
     private func fallbackAgentMessageItem(
@@ -2179,6 +2229,9 @@ public final class CodexChat: CodexPersistentModel {
                 retainedItems.insert(ObjectIdentifier(item))
             }
             if let item = commandReplayItem(matching: incomingItem, turnID: turnID) {
+                retainedItems.insert(ObjectIdentifier(item))
+            }
+            if let item = reviewModeMarkerItem(matching: incomingItem, turnID: turnID) {
                 retainedItems.insert(ObjectIdentifier(item))
             }
         }
