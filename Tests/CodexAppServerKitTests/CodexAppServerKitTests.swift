@@ -1657,9 +1657,52 @@ struct CodexAppServerKitTests {
         #expect(reviewEvents.contains(.statusChanged(.active(activeFlags: []))))
         #expect(progress.count == 3)
         #expect(progress.last?.result?.turnID == "turn-current")
+        #expect(progress.last?.result?.finalAnswer == "Current review")
         #expect(progress.last?.transcript.responseText == "Current review")
+        if case .turnCompleted(let response) = reviewEvents.last {
+            #expect(response.finalAnswer == "Current review")
+            #expect(response.transcript.responseText == "Current review")
+        } else {
+            Issue.record("Expected a terminal review response.")
+        }
         #expect(logs.map(\.id) == ["current-message"])
         #expect(logs.allSatisfy { $0.turnID == "turn-current" })
+    }
+
+    @Test func reviewEventSequenceFinalizesCompletedResponseFromMessageDelta() async throws {
+        let events = [
+            CodexThreadEvent.messageDelta(
+                .init(text: "Final", itemID: "message-1", phase: .finalAnswer),
+                turnID: "turn-review"
+            ),
+            .turnCompleted(.init(turnID: "turn-review", status: .completed)),
+        ]
+        let eventSequence = CodexThreadEventSequence {
+            AsyncThrowingStream { continuation in
+                for event in events {
+                    continuation.yield(event)
+                }
+                continuation.finish()
+            }
+        }
+
+        let reviewEvents = try await collect(CodexReviewEventSequence(
+            events: eventSequence,
+            terminalTurnID: "turn-review"
+        ))
+        let progress = try await collect(CodexReviewProgressSequence(
+            events: eventSequence,
+            terminalTurnID: "turn-review"
+        ))
+
+        if case .turnCompleted(let response) = reviewEvents.last {
+            #expect(response.finalAnswer == "Final")
+            #expect(response.transcript.finalAnswer == "Final")
+        } else {
+            Issue.record("Expected a terminal review response.")
+        }
+        #expect(progress.last?.result?.finalAnswer == "Final")
+        #expect(progress.last?.transcript.finalAnswer == "Final")
     }
 
     @Test func threadTurnsListRequestUsesThreadScope() {

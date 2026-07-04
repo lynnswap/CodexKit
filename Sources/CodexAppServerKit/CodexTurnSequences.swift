@@ -191,6 +191,7 @@ public struct CodexReviewEventSequence: AsyncSequence, Sendable {
     public struct Iterator: AsyncIteratorProtocol {
         private var events: AsyncThrowingStream<CodexThreadEvent, Error>.Iterator
         private let terminalTurnID: CodexTurnID?
+        private var accumulator = CodexResponseAccumulator()
         private var finished = false
 
         fileprivate init(
@@ -209,10 +210,20 @@ public struct CodexReviewEventSequence: AsyncSequence, Sendable {
                 guard reviewEventMatches(event, terminalTurnID: terminalTurnID) else {
                     continue
                 }
-                if isTerminal(event) {
+                switch event {
+                case .turnCompleted(let response) where isTerminal(event):
                     finished = true
+                    return .turnCompleted(accumulator.finalized(response))
+                case .turnFailed where isTerminal(event),
+                    .closed where isTerminal(event):
+                    finished = true
+                    return CodexReviewEvent(event)
+                case .turnCompleted:
+                    continue
+                default:
+                    _ = accumulator.apply(event)
+                    return CodexReviewEvent(event)
                 }
-                return CodexReviewEvent(event)
             }
             finished = true
             return nil
@@ -254,8 +265,7 @@ public struct CodexReviewProgressSequence: AsyncSequence, Sendable {
     public struct Iterator: AsyncIteratorProtocol {
         private var events: AsyncThrowingStream<CodexThreadEvent, Error>.Iterator
         private let terminalTurnID: CodexTurnID?
-        private var accumulator = CodexTranscriptAccumulator()
-        private var usage: CodexTokenUsage?
+        private var accumulator = CodexResponseAccumulator()
         private var finished = false
 
         fileprivate init(
@@ -276,20 +286,20 @@ public struct CodexReviewProgressSequence: AsyncSequence, Sendable {
                 }
                 switch event {
                 case .turnStarted, .unknown:
-                    return .init(phase: .running, transcript: accumulator.transcript, usage: usage)
+                    return .init(phase: .running, transcript: accumulator.transcript, usage: accumulator.usage)
                 case .itemStarted, .itemUpdated, .itemCompleted, .message, .messageDelta,
                     .reasoningSummaryPartAdded, .reasoningDelta:
                     _ = accumulator.apply(event)
-                    return .init(phase: .running, transcript: accumulator.transcript, usage: usage)
-                case .tokenUsageUpdated(let newUsage, _):
-                    usage = newUsage
-                    return .init(phase: .running, transcript: accumulator.transcript, usage: usage)
-                case .turnCompleted(var result):
+                    return .init(phase: .running, transcript: accumulator.transcript, usage: accumulator.usage)
+                case .tokenUsageUpdated:
+                    _ = accumulator.apply(event)
+                    return .init(phase: .running, transcript: accumulator.transcript, usage: accumulator.usage)
+                case .turnCompleted(let result):
                     guard isTerminal(event) else {
                         continue
                     }
                     finished = true
-                    result = finalizedResult(result)
+                    let result = accumulator.finalized(result)
                     if result.errorMessage != nil || result.status?.isFailure == true {
                         return .init(
                             phase: .failed(.turnFailedWithResponse(result)),
@@ -312,10 +322,10 @@ public struct CodexReviewProgressSequence: AsyncSequence, Sendable {
                     return .init(
                         phase: .failed(.turnFailed(message)),
                         transcript: accumulator.transcript,
-                        usage: usage
+                        usage: accumulator.usage
                     )
                 case .statusChanged:
-                    return .init(phase: .running, transcript: accumulator.transcript, usage: usage)
+                    return .init(phase: .running, transcript: accumulator.transcript, usage: accumulator.usage)
                 case .closed:
                     finished = true
                     return nil
@@ -323,20 +333,6 @@ public struct CodexReviewProgressSequence: AsyncSequence, Sendable {
             }
             finished = true
             return nil
-        }
-
-        private func finalizedResult(_ result: CodexResponse) -> CodexResponse {
-            var result = result
-            if result.finalAnswer == nil {
-                result.finalAnswer = accumulator.transcript.finalAnswer
-            }
-            if result.transcript.items.isEmpty {
-                result.transcript = accumulator.transcript
-            }
-            if result.usage == nil {
-                result.usage = usage
-            }
-            return result
         }
 
         private func isTerminal(_ event: CodexThreadEvent) -> Bool {
@@ -411,8 +407,7 @@ package struct CodexTurnProgressSequence: AsyncSequence, Sendable {
 
     package struct Iterator: AsyncIteratorProtocol {
         private var events: AsyncThrowingStream<CodexTurnEvent, Error>.Iterator
-        private var accumulator = CodexTranscriptAccumulator()
-        private var usage: CodexTokenUsage?
+        private var accumulator = CodexResponseAccumulator()
 
         fileprivate init(events: AsyncThrowingStream<CodexTurnEvent, Error>.Iterator) {
             self.events = events
@@ -424,16 +419,16 @@ package struct CodexTurnProgressSequence: AsyncSequence, Sendable {
             }
             switch event {
             case .started, .unknown:
-                return .init(phase: .running, transcript: accumulator.transcript, usage: usage)
+                return .init(phase: .running, transcript: accumulator.transcript, usage: accumulator.usage)
             case .itemStarted, .itemUpdated, .itemCompleted, .messageDelta,
                 .reasoningSummaryPartAdded, .reasoningDelta:
                 _ = accumulator.apply(event)
-                return .init(phase: .running, transcript: accumulator.transcript, usage: usage)
-            case .tokenUsageUpdated(let newUsage):
-                usage = newUsage
-                return .init(phase: .running, transcript: accumulator.transcript, usage: usage)
-            case .completed(var result):
-                result = finalizedResult(result)
+                return .init(phase: .running, transcript: accumulator.transcript, usage: accumulator.usage)
+            case .tokenUsageUpdated:
+                _ = accumulator.apply(event)
+                return .init(phase: .running, transcript: accumulator.transcript, usage: accumulator.usage)
+            case .completed(let result):
+                let result = accumulator.finalized(result)
                 if result.errorMessage != nil {
                     return .init(
                         phase: .failed(.turnFailedWithResponse(result)),
@@ -460,31 +455,16 @@ package struct CodexTurnProgressSequence: AsyncSequence, Sendable {
                 return .init(
                     phase: .failed(.turnFailed(message)),
                     transcript: accumulator.transcript,
-                    usage: usage
+                    usage: accumulator.usage
                 )
             }
-        }
-
-        private func finalizedResult(_ result: CodexResponse) -> CodexResponse {
-            var result = result
-            if result.finalAnswer == nil {
-                result.finalAnswer = accumulator.transcript.finalAnswer
-            }
-            if result.transcript.items.isEmpty {
-                result.transcript = accumulator.transcript
-            }
-            if result.usage == nil {
-                result.usage = usage
-            }
-            return result
         }
     }
 }
 
 package struct CodexResponseCollector {
     static func collect(from events: CodexTurnEventSequence) async throws -> CodexResponse {
-        var accumulator = CodexTranscriptAccumulator()
-        var usage: CodexTokenUsage?
+        var accumulator = CodexResponseAccumulator()
         for try await event in events {
             switch event {
             case .started, .unknown:
@@ -492,18 +472,10 @@ package struct CodexResponseCollector {
             case .itemStarted, .itemUpdated, .itemCompleted, .messageDelta,
                 .reasoningSummaryPartAdded, .reasoningDelta:
                 _ = accumulator.apply(event)
-            case .tokenUsageUpdated(let newUsage):
-                usage = newUsage
-            case .completed(var result):
-                if result.finalAnswer == nil {
-                    result.finalAnswer = accumulator.transcript.finalAnswer
-                }
-                if result.transcript.items.isEmpty {
-                    result.transcript = accumulator.transcript
-                }
-                if result.usage == nil {
-                    result.usage = usage
-                }
+            case .tokenUsageUpdated:
+                _ = accumulator.apply(event)
+            case .completed(let response):
+                let result = accumulator.finalized(response)
                 if result.errorMessage != nil {
                     throw CodexAppServerError.turnFailedWithResponse(result)
                 }
@@ -516,6 +488,55 @@ package struct CodexResponseCollector {
             }
         }
         throw CodexAppServerError.transportClosed
+    }
+}
+
+private struct CodexResponseAccumulator {
+    private var transcriptAccumulator = CodexTranscriptAccumulator()
+    private(set) var usage: CodexTokenUsage?
+
+    var transcript: CodexTranscript {
+        transcriptAccumulator.transcript
+    }
+
+    mutating func apply(_ event: CodexTurnEvent) -> Bool {
+        switch event {
+        case .tokenUsageUpdated(let newUsage):
+            usage = newUsage
+            return true
+        case .started, .completed, .failed, .unknown:
+            return false
+        case .itemStarted, .itemUpdated, .itemCompleted, .messageDelta,
+            .reasoningSummaryPartAdded, .reasoningDelta:
+            return transcriptAccumulator.apply(event)
+        }
+    }
+
+    mutating func apply(_ event: CodexThreadEvent) -> Bool {
+        switch event {
+        case .tokenUsageUpdated(let newUsage, _):
+            usage = newUsage
+            return true
+        case .turnStarted, .turnCompleted, .turnFailed, .statusChanged, .closed, .unknown:
+            return false
+        case .itemStarted, .itemUpdated, .itemCompleted, .message, .messageDelta,
+            .reasoningSummaryPartAdded, .reasoningDelta:
+            return transcriptAccumulator.apply(event)
+        }
+    }
+
+    func finalized(_ response: CodexResponse) -> CodexResponse {
+        var response = response
+        if response.finalAnswer == nil {
+            response.finalAnswer = transcript.finalAnswer
+        }
+        if response.transcript.items.isEmpty {
+            response.transcript = transcript
+        }
+        if response.usage == nil {
+            response.usage = usage
+        }
+        return response
     }
 }
 

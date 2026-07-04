@@ -291,8 +291,12 @@ try await appServer.startReview(in: workspaceURL, target: .custom(instructions: 
 ```
 
 `CodexReviewSession.events` yields `CodexReviewEvent`, preserving unknown
-schema-new notifications as `CodexRawNotification`. `progress` yields
-`CodexReviewProgress` snapshots until the review turn completes or fails.
+schema-new notifications as `CodexRawNotification`. The terminal
+`.turnCompleted` response is finalized with the same transcript fallback used
+by `progress` and `collect()`, so `finalAnswer` is available when the live
+transcript contains a final-answer message even if the terminal app-server
+payload is sparse. `progress` yields `CodexReviewProgress` snapshots until the
+review turn completes or fails.
 `transcriptUpdates` remains the transcript sequence for the review thread
 itself, which is useful when a UI wants thread-bound transcript snapshots rather
 than review progress phases.
