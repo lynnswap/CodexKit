@@ -405,6 +405,18 @@ for try await event in accountEvents {
 }
 ```
 
+Native apps can ask the app-server to shape the ChatGPT login URL for an
+`ASWebAuthenticationSession`, then complete the login with the returned callback
+URL:
+
+```swift
+let login = try await appServer.loginChatGPT(
+    nativeWebAuthentication: .init(callbackURLScheme: "com.example.app.auth")
+)
+let callbackURL = try await webAuthenticationSession(login.authenticationURL)
+try await appServer.completeLogin(id: login.id, callbackURL: callbackURL)
+```
+
 API key and device-code login are also available:
 
 ```swift

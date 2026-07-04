@@ -4174,6 +4174,7 @@ struct CodexAppServerKitTests {
         let loginParams = try loginRequest.decodeParams(AppServerAPI.Account.Login.Params.self)
         #expect(loginParams.type == "chatgpt")
         #expect(loginParams.codexStreamlinedLogin == true)
+        #expect(loginParams.nativeWebAuthentication == nil)
 
         try await server.cancelLogin(handle)
         let cancelRequest = try #require(await transport.recordedRequests().last)
@@ -4195,6 +4196,55 @@ struct CodexAppServerKitTests {
         #expect(await transport.recordedRequests().map(\.method) == [
             "account/login/start",
             "account/login/cancel",
+        ])
+    }
+
+    @Test func nativeChatGPTLoginSendsCallbackSchemeAndCompletesWithCallbackURL() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueChatGPTLogin(
+            loginID: "login-1",
+            authenticationURL: URL(string: "https://chatgpt.com/auth")!,
+            nativeWebAuthentication: .init(callbackURLScheme: "lynnpd.CodexReviewMonitor.auth")
+        )
+        try await transport.enqueue(EmptyResponse(), for: "account/login/complete")
+        let client = AppServerClient(transport: transport)
+        let server = CodexAppServer(
+            client: client,
+            router: CodexAppServerNotificationRouter(client: client)
+        )
+
+        let login = try await server.loginChatGPT(
+            nativeWebAuthentication: .init(callbackURLScheme: "lynnpd.CodexReviewMonitor.auth")
+        )
+
+        #expect(login == CodexChatGPTLogin(
+            id: "login-1",
+            authenticationURL: URL(string: "https://chatgpt.com/auth")!,
+            nativeWebAuthentication: .init(callbackURLScheme: "lynnpd.CodexReviewMonitor.auth")
+        ))
+        let loginRequest = try #require(await transport.recordedRequests().first)
+        #expect(loginRequest.method == "account/login/start")
+        let loginParams = try loginRequest.decodeParams(AppServerAPI.Account.Login.Params.self)
+        #expect(loginParams.type == "chatgpt")
+        #expect(loginParams.codexStreamlinedLogin == true)
+        #expect(loginParams.nativeWebAuthentication == .init(
+            callbackURLScheme: "lynnpd.CodexReviewMonitor.auth"
+        ))
+
+        try await server.completeLogin(
+            id: login.id,
+            callbackURL: URL(string: "lynnpd.CodexReviewMonitor.auth://callback?code=abc")!
+        )
+        let completeRequest = try #require(await transport.recordedRequests().last)
+        #expect(completeRequest.method == "account/login/complete")
+        let completeParams = try completeRequest.decodeParams(
+            AppServerAPI.Account.Login.Complete.Params.self
+        )
+        #expect(completeParams.loginID == "login-1")
+        #expect(completeParams.callbackURL == "lynnpd.CodexReviewMonitor.auth://callback?code=abc")
+        #expect(await transport.recordedRequests().map(\.method) == [
+            "account/login/start",
+            "account/login/complete",
         ])
     }
 

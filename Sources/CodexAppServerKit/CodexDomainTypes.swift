@@ -2725,6 +2725,42 @@ public enum CodexAccountEvent: Equatable, Sendable {
     case unknown(CodexRawNotification)
 }
 
+/// Native web-authentication options for a ChatGPT login flow.
+public struct CodexNativeWebAuthentication: Equatable, Sendable {
+    /// The custom URL scheme the native host expects in the authentication callback.
+    public var callbackURLScheme: String
+
+    public init(callbackURLScheme: String) {
+        self.callbackURLScheme = callbackURLScheme
+    }
+}
+
+/// A ChatGPT browser login flow started by the app-server.
+public struct CodexChatGPTLogin: Equatable, Sendable {
+    /// The app-server login identifier.
+    public var id: CodexLoginHandle.ID
+
+    /// The URL the host should open in a browser or native web-authentication session.
+    public var authenticationURL: URL
+
+    /// Native web-authentication information returned by the app-server, when available.
+    public var nativeWebAuthentication: CodexNativeWebAuthentication?
+
+    public init(
+        id: CodexLoginHandle.ID,
+        authenticationURL: URL,
+        nativeWebAuthentication: CodexNativeWebAuthentication? = nil
+    ) {
+        self.id = id
+        self.authenticationURL = authenticationURL
+        self.nativeWebAuthentication = nativeWebAuthentication
+    }
+
+    public var handle: CodexLoginHandle {
+        .chatGPT(id: id, authenticationURL: authenticationURL)
+    }
+}
+
 public enum CodexLoginHandle: Equatable, Sendable {
     public struct ID: RawRepresentable, Hashable, Codable, Sendable, ExpressibleByStringLiteral {
         public var rawValue: String
