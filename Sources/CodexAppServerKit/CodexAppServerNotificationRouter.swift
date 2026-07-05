@@ -21,6 +21,7 @@ package actor CodexAppServerNotificationRouter {
     private var turnHistoryByTurnID: [CodexTurnID: [CodexTurnEvent]] = [:]
     private var threadHistoryByThreadID: [CodexThreadID: [CodexThreadEvent]] = [:]
     private var threadGenerationStartByThreadID: [CodexThreadID: ThreadGenerationStart] = [:]
+    private var reviewDiagnosticRouting = ReviewDiagnosticRoutingState()
     private var turnSubscribersByTurnID: [CodexTurnID: [UUID: TurnSubscriber]] = [:]
     private var threadSubscribersByThreadID: [CodexThreadID: [UUID: ThreadSubscriber]] = [:]
 
@@ -32,6 +33,47 @@ package actor CodexAppServerNotificationRouter {
     private enum ThreadGenerationStart {
         case cursor(Int)
         case includingTurn(CodexTurnID, fallbackCursor: Int)
+    }
+
+    private struct ReviewDiagnosticRoutingState {
+        private var startupThreadIDs: Set<CodexThreadID> = []
+        private var turnIDByThreadID: [CodexThreadID: CodexTurnID] = [:]
+
+        mutating func beginStartup(in threadID: CodexThreadID) {
+            startupThreadIDs.insert(threadID)
+        }
+
+        mutating func activate(in threadID: CodexThreadID, until turnID: CodexTurnID) {
+            startupThreadIDs.remove(threadID)
+            turnIDByThreadID[threadID] = turnID
+        }
+
+        mutating func stop(in threadID: CodexThreadID) {
+            startupThreadIDs.remove(threadID)
+            turnIDByThreadID.removeValue(forKey: threadID)
+        }
+
+        mutating func stopActive(in threadID: CodexThreadID) {
+            turnIDByThreadID.removeValue(forKey: threadID)
+        }
+
+        func activeTurnID(in threadID: CodexThreadID) -> CodexTurnID? {
+            turnIDByThreadID[threadID]
+        }
+
+        mutating func activeThreadIDs(
+            isStillActive: (CodexThreadID, CodexTurnID) -> Bool
+        ) -> [CodexThreadID] {
+            turnIDByThreadID = turnIDByThreadID.filter {
+                isStillActive($0.key, $0.value)
+            }
+            return Array(Set(turnIDByThreadID.keys).union(startupThreadIDs))
+        }
+
+        mutating func reset() {
+            startupThreadIDs.removeAll()
+            turnIDByThreadID.removeAll()
+        }
     }
     private let decoder = JSONDecoder()
 
@@ -159,12 +201,88 @@ package actor CodexAppServerNotificationRouter {
         )
     }
 
+    package func beginReviewDiagnosticStartup(in threadID: CodexThreadID) {
+        reviewDiagnosticRouting.beginStartup(in: threadID)
+    }
+
+    package func activateReviewDiagnostics(
+        in threadID: CodexThreadID,
+        until turnID: CodexTurnID
+    ) {
+        reviewDiagnosticRouting.activate(in: threadID, until: turnID)
+    }
+
+    package func stopReviewDiagnostics(in threadID: CodexThreadID) {
+        reviewDiagnosticRouting.stop(in: threadID)
+    }
+
+    package func beginDetachedReviewEventGeneration(
+        _ reviewThreadID: CodexThreadID,
+        including turnID: CodexTurnID,
+        replacingStartupIn sourceThreadID: CodexThreadID
+    ) {
+        threadGenerationStartByThreadID[reviewThreadID] = .includingTurn(
+            turnID,
+            fallbackCursor: threadHistoryByThreadID[reviewThreadID]?.count ?? 0
+        )
+        reviewDiagnosticRouting.activate(in: reviewThreadID, until: turnID)
+        moveThreadlessReviewStartupDiagnostics(from: sourceThreadID, to: reviewThreadID)
+        seedTurn(turnID, threadID: reviewThreadID)
+        if sourceThreadID != reviewThreadID {
+            reviewDiagnosticRouting.stop(in: sourceThreadID)
+        }
+    }
+
+    private func moveThreadlessReviewStartupDiagnostics(
+        from sourceThreadID: CodexThreadID,
+        to reviewThreadID: CodexThreadID
+    ) {
+        guard sourceThreadID != reviewThreadID else {
+            return
+        }
+        let sourceHistory = threadHistoryByThreadID[sourceThreadID] ?? []
+        var movedEventIndices: [Array<CodexThreadEvent>.Index] = []
+        for eventIndex in currentGenerationEventIndices(in: sourceHistory, threadID: sourceThreadID) {
+            let event = sourceHistory[eventIndex]
+            guard case .unknown(var raw) = event,
+                raw.turnID == nil,
+                Self.isThreadlessReviewDiagnosticNotification(raw.method)
+            else {
+                continue
+            }
+            raw.threadID = reviewThreadID
+            let replayedEvent = CodexThreadEvent.unknown(raw)
+            movedEventIndices.append(eventIndex)
+            appendThreadEvent(replayedEvent, threadID: reviewThreadID)
+        }
+        if movedEventIndices.isEmpty == false {
+            var updatedSourceHistory = threadHistoryByThreadID[sourceThreadID] ?? []
+            for eventIndex in movedEventIndices.sorted(by: >) {
+                updatedSourceHistory.remove(at: eventIndex)
+            }
+            threadHistoryByThreadID[sourceThreadID] = updatedSourceHistory
+        }
+    }
+
     private func route(_ notification: JSONRPC.Notification) {
         var context = Self.context(from: notification.params)
         if let threadID = context.threadID, let turnID = context.turnID {
             threadIDByTurnID[turnID] = threadID
         } else if let turnID = context.turnID, let threadID = threadIDByTurnID[turnID] {
             context.threadID = threadID
+        }
+        if context.threadID == nil,
+            context.turnID == nil,
+            Self.isThreadlessReviewDiagnosticNotification(notification.method)
+        {
+            for threadID in activeThreadlessReviewNotificationThreadIDs() {
+                routeNotification(
+                    method: notification.method,
+                    params: notification.params,
+                    context: .init(threadID: threadID)
+                )
+            }
+            return
         }
         routeNotification(method: notification.method, params: notification.params, context: context)
     }
@@ -213,7 +331,12 @@ package actor CodexAppServerNotificationRouter {
             }
         }
         if case .closed = event {
+            reviewDiagnosticRouting.stop(in: threadID)
             finishThreadSubscribers(threadID: threadID)
+        } else if let trackedTurnID = reviewDiagnosticRouting.activeTurnID(in: threadID),
+            Self.isTerminalThreadEvent(event, for: trackedTurnID)
+        {
+            reviewDiagnosticRouting.stopActive(in: threadID)
         }
     }
 
@@ -272,17 +395,27 @@ package actor CodexAppServerNotificationRouter {
         in history: [CodexThreadEvent],
         threadID: CodexThreadID
     ) -> [CodexThreadEvent] {
+        currentGenerationEventIndices(in: history, threadID: threadID).map { history[$0] }
+    }
+
+    private func currentGenerationEventIndices(
+        in history: [CodexThreadEvent],
+        threadID: CodexThreadID
+    ) -> [Array<CodexThreadEvent>.Index] {
         guard let generationStart = threadGenerationStartByThreadID[threadID] else {
-            return history
+            return Array(history.indices)
         }
 
         let startIndex = currentGenerationStartIndex(generationStart, in: history)
-        let events = Array(history[startIndex...])
+        let eventIndices = Array(history.indices.filter { $0 >= startIndex })
         if case .includingTurn(let turnID, _) = generationStart,
-           events.contains(where: { Self.threadEvent($0, matches: turnID) }) == false {
-            return events.filter { Self.threadEventTurnID($0).map { $0 == turnID } ?? true }
+            eventIndices.contains(where: { Self.threadEvent(history[$0], matches: turnID) }) == false
+        {
+            return eventIndices.filter {
+                Self.threadEventTurnID(history[$0]).map { $0 == turnID } ?? true
+            }
         }
-        return events
+        return eventIndices
     }
 
     private func shouldYieldThreadEvent(
@@ -335,7 +468,8 @@ package actor CodexAppServerNotificationRouter {
             if let boundaryIndex = precedingHistory.lastIndex(where: isThreadEventGenerationBoundary) {
                 return history.index(after: boundaryIndex)
             }
-            return firstTurnEventIndex
+            let clampedFallback = min(fallbackCursor, history.count)
+            return min(clampedFallback, firstTurnEventIndex)
         }
 
         let clampedFallback = min(fallbackCursor, history.count)
@@ -392,6 +526,24 @@ package actor CodexAppServerNotificationRouter {
         return false
     }
 
+    private func activeThreadlessReviewNotificationThreadIDs() -> [CodexThreadID] {
+        reviewDiagnosticRouting.activeThreadIDs { threadID, turnID in
+            isCurrentThreadEventGenerationFinished(threadID) == false
+                && hasTerminalTurnEvent(threadID: threadID, turnID: turnID) == false
+        }
+    }
+
+    private nonisolated static func isThreadlessReviewDiagnosticNotification(
+        _ method: String
+    ) -> Bool {
+        switch method {
+        case "warning", "configWarning", "error":
+            true
+        default:
+            false
+        }
+    }
+
     private nonisolated static func isThreadEventGenerationBoundary(_ event: CodexThreadEvent) -> Bool {
         switch event {
         case .closed, .turnCompleted, .turnFailed:
@@ -399,6 +551,31 @@ package actor CodexAppServerNotificationRouter {
         case .turnStarted, .statusChanged, .itemStarted, .itemUpdated, .itemCompleted,
             .message, .messageDelta, .reasoningSummaryPartAdded, .reasoningDelta,
             .tokenUsageUpdated, .unknown:
+            false
+        }
+    }
+
+    private func hasTerminalTurnEvent(threadID: CodexThreadID, turnID: CodexTurnID) -> Bool {
+        if turnHistoryByTurnID[turnID]?.contains(where: Self.isTerminalTurnEvent) == true {
+            return true
+        }
+        return threadHistoryByThreadID[threadID]?.contains {
+            Self.isTerminalThreadEvent($0, for: turnID)
+        } == true
+    }
+
+    private nonisolated static func isTerminalThreadEvent(
+        _ event: CodexThreadEvent,
+        for turnID: CodexTurnID
+    ) -> Bool {
+        switch event {
+        case .turnCompleted(let response):
+            response.turnID == turnID
+        case .turnFailed(let eventTurnID, _):
+            eventTurnID == turnID
+        case .turnStarted, .statusChanged, .closed, .itemStarted, .itemUpdated, .itemCompleted,
+             .message, .messageDelta, .reasoningSummaryPartAdded, .reasoningDelta,
+             .tokenUsageUpdated, .unknown:
             false
         }
     }
@@ -686,6 +863,7 @@ package actor CodexAppServerNotificationRouter {
     private func finishAll(throwing error: Error) {
         let turnSubscribers = turnSubscribersByTurnID.values.flatMap(\.values)
         let threadSubscribers = threadSubscribersByThreadID.values.flatMap(\.values)
+        reviewDiagnosticRouting.reset()
         turnSubscribersByTurnID.removeAll()
         threadSubscribersByThreadID.removeAll()
         for subscriber in turnSubscribers {

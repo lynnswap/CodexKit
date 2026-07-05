@@ -9019,6 +9019,14 @@ struct CodexModelContextTests {
         _ = started.chat.apply(.turnStarted("turn-review"))
         _ = started.chat.apply(.itemStarted(
             .init(
+                id: "review-start",
+                kind: .enteredReviewMode,
+                content: .log("Review started.")
+            ),
+            turnID: "turn-review"
+        ))
+        _ = started.chat.apply(.itemStarted(
+            .init(
                 id: "command-live",
                 kind: .commandExecution,
                 content: .command(.init(
@@ -9031,6 +9039,11 @@ struct CodexModelContextTests {
             ),
             turnID: "turn-review"
         ))
+        _ = started.chat.apply(.turnCompleted(.init(
+            turnID: "turn-review",
+            status: .completed,
+            completedAt: Date(timeIntervalSince1970: 10)
+        )))
 
         started.chat.apply(
             .init(
@@ -9057,6 +9070,19 @@ struct CodexModelContextTests {
 
         #expect(started.chat.items(in: "turn-review").contains { $0.itemID == "command-live" })
         #expect(started.chat.items(in: "turn-review").contains { $0.kind == .exitedReviewMode })
+
+        started.chat.apply(
+            .init(
+                id: "thread-review",
+                workspace: workspaceURL,
+                status: .idle,
+                turns: []
+            ),
+            workspace: started.chat.workspace
+        )
+
+        #expect(started.chat.turn(id: "turn-review") == nil)
+        #expect(started.chat.items(in: "turn-review").isEmpty)
     }
 
     @Test("started review refresh folds synthesized rollout turns into the live turn")

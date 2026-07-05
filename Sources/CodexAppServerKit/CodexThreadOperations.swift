@@ -143,20 +143,27 @@ extension CodexThread {
         delivery: CodexReviewDelivery = .inline,
         transcriptErrorHandlingPolicy: CodexTranscriptErrorHandlingPolicy = .preserveTranscript
     ) async throws -> CodexReviewSession {
-        let response: AppServerAPI.Review.Start.Response = try await withThreadEventGeneration(
-            id,
-            router: router
-        ) {
-            try await client.send(AppServerAPI.Review.Start.Request(
-                params: .init(threadID: id.rawValue, target: target, delivery: delivery)
-            ))
+        await router.beginReviewDiagnosticStartup(in: id)
+        let response: AppServerAPI.Review.Start.Response
+        do {
+            response = try await withThreadEventGeneration(id, router: router) {
+                try await client.send(AppServerAPI.Review.Start.Request(
+                    params: .init(threadID: id.rawValue, target: target, delivery: delivery)
+                ))
+            }
+        } catch {
+            await router.stopReviewDiagnostics(in: id)
+            throw error
         }
         let responseReviewThreadID = response.reviewThreadID.map(CodexThreadID.init(rawValue:))
         let detachedReviewThreadID = responseReviewThreadID == id ? nil : responseReviewThreadID
         let turnID = CodexTurnID(rawValue: response.turnID)
         if let detachedReviewThreadID {
-            await router.seedTurn(turnID, threadID: detachedReviewThreadID)
-            await router.beginThreadEventGeneration(detachedReviewThreadID, including: turnID)
+            await router.beginDetachedReviewEventGeneration(
+                detachedReviewThreadID,
+                including: turnID,
+                replacingStartupIn: id
+            )
         }
         let initialTurn = CodexAppServer.turnSnapshots(from: [response.turn])[0]
         let identity = CodexReviewIdentity(
@@ -180,6 +187,7 @@ extension CodexThread {
     ) async -> CodexReviewSession {
         let reviewThreadID = identity.activeTurnThreadID
         await router.seedTurn(identity.turnID, threadID: reviewThreadID)
+        await router.activateReviewDiagnostics(in: reviewThreadID, until: identity.turnID)
         let model = model ?? identity.model
         let turn = CodexTurn(
             id: identity.turnID,

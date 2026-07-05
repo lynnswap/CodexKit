@@ -68,6 +68,10 @@ private extension CodexThreadItem {
         }
     }
 
+    var isExitedReviewModeMarker: Bool {
+        kind == .exitedReviewMode
+    }
+
     var isFallbackAgentMessageDelta: Bool {
         kind == .agentMessage && isScopedFallbackMessageID(id)
     }
@@ -421,6 +425,10 @@ public final class CodexItem: CodexPersistentModel {
 
     fileprivate var mergeKey: CodexChatItemKey {
         .init(id: itemID, kind: kind, turnID: turnID)
+    }
+
+    fileprivate var isExitedReviewModeMarker: Bool {
+        threadItem.isExitedReviewModeMarker
     }
 
     package init(
@@ -1253,11 +1261,15 @@ public final class CodexChat: CodexPersistentModel {
     private var shouldPreserveSeededReviewTurnItemsWhenReconcilingSnapshot: Bool {
         guard let seededReviewTurnID,
             hasAppliedLiveTurnItemUpdates,
-            itemsByTurnID[seededReviewTurnID]?.isEmpty == false
+            let seededReviewTurnItems = itemsByTurnID[seededReviewTurnID],
+            seededReviewTurnItems.isEmpty == false
         else {
             return false
         }
-        return true
+        guard turnsByID[seededReviewTurnID]?.status?.isTerminal == true else {
+            return true
+        }
+        return seededReviewTurnItems.contains(where: \.isExitedReviewModeMarker) == false
     }
 
     private func markAppliedLiveTurnItemUpdatesIfNeeded(_ changes: [CodexChatUpdate]) {
