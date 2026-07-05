@@ -2808,14 +2808,14 @@ struct CodexAppServerKitTests {
         })
     }
 
-    @Test func threadGenerationStartPreservesActiveReviewDiagnostics() async throws {
+    @Test func threadGenerationStartPreservesActiveUnscopedDiagnostics() async throws {
         let transport = CodexAppServerTestTransport()
         let client = AppServerClient(transport: transport)
         let router = CodexAppServerNotificationRouter(client: client)
         await router.start()
         await transport.waitForNotificationStreamCount(1)
 
-        await router.activateReviewDiagnostics(in: "thread-review", until: "turn-review")
+        await router.activateUnscopedDiagnosticRouting(in: "thread-review", until: "turn-review")
         let cursor = await router.threadEventGenerationCursor("thread-review")
         await router.beginThreadEventGeneration("thread-review", at: cursor)
         try await transport.emitServerNotification(
@@ -3014,7 +3014,7 @@ struct CodexAppServerKitTests {
         #expect(await eventually {
             await router.threadSubscriberCountForTesting(for: "thread-source") == 1
         })
-        await router.beginReviewDiagnosticStartup(in: "thread-source")
+        await router.beginUnscopedDiagnosticRouting(in: "thread-source")
         try await transport.emitServerNotification(
             method: "configWarning",
             params: repeatedDiagnostic
@@ -3094,7 +3094,7 @@ struct CodexAppServerKitTests {
             try await eventsTask.value
         }
         #expect(events.contains(.statusChanged(.active(activeFlags: []))))
-        let reviewDiagnostics = events.filter { event in
+        let diagnostics = events.filter { event in
             if case .unknown(let raw) = event {
                 return raw.method == "configWarning"
                     && raw.threadID == "thread-review"
@@ -3102,7 +3102,7 @@ struct CodexAppServerKitTests {
             }
             return false
         }
-        #expect(reviewDiagnostics.count == 2)
+        #expect(diagnostics.count == 2)
         #expect(events.contains { event in
             if case .messageDelta(let delta, let turnID) = event {
                 return delta.text == "During detached review start" && turnID == "turn-review"

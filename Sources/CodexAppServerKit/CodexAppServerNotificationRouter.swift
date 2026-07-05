@@ -21,7 +21,7 @@ package actor CodexAppServerNotificationRouter {
     private var turnHistoryByTurnID: [CodexTurnID: [CodexTurnEvent]] = [:]
     private var threadHistoryByThreadID: [CodexThreadID: [CodexThreadEvent]] = [:]
     private var threadGenerationStartByThreadID: [CodexThreadID: ThreadGenerationStart] = [:]
-    private var reviewDiagnosticRouting = ReviewDiagnosticRoutingState()
+    private var unscopedDiagnosticRouting = UnscopedDiagnosticRoutingState()
     private var turnSubscribersByTurnID: [CodexTurnID: [UUID: TurnSubscriber]] = [:]
     private var threadSubscribersByThreadID: [CodexThreadID: [UUID: ThreadSubscriber]] = [:]
 
@@ -35,7 +35,7 @@ package actor CodexAppServerNotificationRouter {
         case includingTurn(CodexTurnID, fallbackCursor: Int)
     }
 
-    private struct ReviewDiagnosticRoutingState {
+    private struct UnscopedDiagnosticRoutingState {
         private var startupThreadIDs: Set<CodexThreadID> = []
         private var turnIDByThreadID: [CodexThreadID: CodexTurnID] = [:]
 
@@ -201,43 +201,43 @@ package actor CodexAppServerNotificationRouter {
         )
     }
 
-    package func beginReviewDiagnosticStartup(in threadID: CodexThreadID) {
-        reviewDiagnosticRouting.beginStartup(in: threadID)
+    package func beginUnscopedDiagnosticRouting(in threadID: CodexThreadID) {
+        unscopedDiagnosticRouting.beginStartup(in: threadID)
     }
 
-    package func activateReviewDiagnostics(
+    package func activateUnscopedDiagnosticRouting(
         in threadID: CodexThreadID,
         until turnID: CodexTurnID
     ) {
-        reviewDiagnosticRouting.activate(in: threadID, until: turnID)
+        unscopedDiagnosticRouting.activate(in: threadID, until: turnID)
     }
 
-    package func stopReviewDiagnostics(in threadID: CodexThreadID) {
-        reviewDiagnosticRouting.stop(in: threadID)
+    package func stopUnscopedDiagnosticRouting(in threadID: CodexThreadID) {
+        unscopedDiagnosticRouting.stop(in: threadID)
     }
 
-    package func beginDetachedReviewEventGeneration(
-        _ reviewThreadID: CodexThreadID,
+    package func beginDetachedThreadEventGeneration(
+        _ threadID: CodexThreadID,
         including turnID: CodexTurnID,
-        replacingStartupIn sourceThreadID: CodexThreadID
+        replacingUnscopedDiagnosticsIn sourceThreadID: CodexThreadID
     ) {
-        threadGenerationStartByThreadID[reviewThreadID] = .includingTurn(
+        threadGenerationStartByThreadID[threadID] = .includingTurn(
             turnID,
-            fallbackCursor: threadHistoryByThreadID[reviewThreadID]?.count ?? 0
+            fallbackCursor: threadHistoryByThreadID[threadID]?.count ?? 0
         )
-        reviewDiagnosticRouting.activate(in: reviewThreadID, until: turnID)
-        moveThreadlessReviewStartupDiagnostics(from: sourceThreadID, to: reviewThreadID)
-        seedTurn(turnID, threadID: reviewThreadID)
-        if sourceThreadID != reviewThreadID {
-            reviewDiagnosticRouting.stop(in: sourceThreadID)
+        unscopedDiagnosticRouting.activate(in: threadID, until: turnID)
+        moveUnscopedDiagnostics(from: sourceThreadID, to: threadID)
+        seedTurn(turnID, threadID: threadID)
+        if sourceThreadID != threadID {
+            unscopedDiagnosticRouting.stop(in: sourceThreadID)
         }
     }
 
-    private func moveThreadlessReviewStartupDiagnostics(
+    private func moveUnscopedDiagnostics(
         from sourceThreadID: CodexThreadID,
-        to reviewThreadID: CodexThreadID
+        to destinationThreadID: CodexThreadID
     ) {
-        guard sourceThreadID != reviewThreadID else {
+        guard sourceThreadID != destinationThreadID else {
             return
         }
         let sourceHistory = threadHistoryByThreadID[sourceThreadID] ?? []
@@ -246,14 +246,14 @@ package actor CodexAppServerNotificationRouter {
             let event = sourceHistory[eventIndex]
             guard case .unknown(var raw) = event,
                 raw.turnID == nil,
-                Self.isThreadlessReviewDiagnosticNotification(raw.method)
+                Self.isUnscopedDiagnosticNotification(raw.method)
             else {
                 continue
             }
-            raw.threadID = reviewThreadID
+            raw.threadID = destinationThreadID
             let replayedEvent = CodexThreadEvent.unknown(raw)
             movedEventIndices.append(eventIndex)
-            appendThreadEvent(replayedEvent, threadID: reviewThreadID)
+            appendThreadEvent(replayedEvent, threadID: destinationThreadID)
         }
         if movedEventIndices.isEmpty == false {
             var updatedSourceHistory = threadHistoryByThreadID[sourceThreadID] ?? []
@@ -273,9 +273,9 @@ package actor CodexAppServerNotificationRouter {
         }
         if context.threadID == nil,
             context.turnID == nil,
-            Self.isThreadlessReviewDiagnosticNotification(notification.method)
+            Self.isUnscopedDiagnosticNotification(notification.method)
         {
-            for threadID in activeThreadlessReviewNotificationThreadIDs() {
+            for threadID in activeUnscopedDiagnosticThreadIDs() {
                 routeNotification(
                     method: notification.method,
                     params: notification.params,
@@ -331,12 +331,12 @@ package actor CodexAppServerNotificationRouter {
             }
         }
         if case .closed = event {
-            reviewDiagnosticRouting.stop(in: threadID)
+            unscopedDiagnosticRouting.stop(in: threadID)
             finishThreadSubscribers(threadID: threadID)
-        } else if let trackedTurnID = reviewDiagnosticRouting.activeTurnID(in: threadID),
+        } else if let trackedTurnID = unscopedDiagnosticRouting.activeTurnID(in: threadID),
             Self.isTerminalThreadEvent(event, for: trackedTurnID)
         {
-            reviewDiagnosticRouting.stopActive(in: threadID)
+            unscopedDiagnosticRouting.stopActive(in: threadID)
         }
     }
 
@@ -526,14 +526,14 @@ package actor CodexAppServerNotificationRouter {
         return false
     }
 
-    private func activeThreadlessReviewNotificationThreadIDs() -> [CodexThreadID] {
-        reviewDiagnosticRouting.activeThreadIDs { threadID, turnID in
+    private func activeUnscopedDiagnosticThreadIDs() -> [CodexThreadID] {
+        unscopedDiagnosticRouting.activeThreadIDs { threadID, turnID in
             isCurrentThreadEventGenerationFinished(threadID) == false
                 && hasTerminalTurnEvent(threadID: threadID, turnID: turnID) == false
         }
     }
 
-    private nonisolated static func isThreadlessReviewDiagnosticNotification(
+    private nonisolated static func isUnscopedDiagnosticNotification(
         _ method: String
     ) -> Bool {
         switch method {
@@ -863,7 +863,7 @@ package actor CodexAppServerNotificationRouter {
     private func finishAll(throwing error: Error) {
         let turnSubscribers = turnSubscribersByTurnID.values.flatMap(\.values)
         let threadSubscribers = threadSubscribersByThreadID.values.flatMap(\.values)
-        reviewDiagnosticRouting.reset()
+        unscopedDiagnosticRouting.reset()
         turnSubscribersByTurnID.removeAll()
         threadSubscribersByThreadID.removeAll()
         for subscriber in turnSubscribers {
