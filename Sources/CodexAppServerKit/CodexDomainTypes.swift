@@ -2090,7 +2090,7 @@ public struct CodexResponseStream: AsyncSequence, Sendable {
                 }
             case .failed(let message):
                 throw CodexAppServerError.turnFailed(message)
-            case .started, .itemStarted, .itemUpdated, .itemCompleted, .messageDelta,
+            case .started, .itemStarted, .itemUpdated, .itemCompleted, .message, .messageDelta,
                 .reasoningSummaryPartAdded, .reasoningDelta, .tokenUsageUpdated, .unknown:
                 continue
             }
@@ -2265,6 +2265,7 @@ package enum CodexTurnEvent: Equatable, Sendable {
     case itemStarted(CodexThreadItem)
     case itemUpdated(CodexThreadItem)
     case itemCompleted(CodexThreadItem)
+    case message(CodexMessage)
     case messageDelta(CodexMessageDelta)
     case reasoningSummaryPartAdded(CodexReasoningPart)
     case reasoningDelta(CodexReasoningDelta)

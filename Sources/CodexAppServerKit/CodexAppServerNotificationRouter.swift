@@ -379,7 +379,7 @@ package actor CodexAppServerNotificationRouter {
         switch event {
         case .completed, .failed:
             true
-        case .started, .itemStarted, .itemUpdated, .itemCompleted, .messageDelta,
+        case .started, .itemStarted, .itemUpdated, .itemCompleted, .message, .messageDelta,
             .reasoningSummaryPartAdded, .reasoningDelta, .tokenUsageUpdated, .unknown:
             false
         }
@@ -440,6 +440,8 @@ package actor CodexAppServerNotificationRouter {
             return .itemUpdated(item, turnID: turnID)
         case .itemCompleted(let item):
             return .itemCompleted(item, turnID: turnID)
+        case .message(let message):
+            return .message(message, turnID: turnID)
         case .messageDelta(let delta):
             return .messageDelta(delta, turnID: turnID)
         case .reasoningSummaryPartAdded(let part):
@@ -514,8 +516,8 @@ package actor CodexAppServerNotificationRouter {
             }
             return .unknown(raw)
         case "agent/message":
-            if let delta = agentMessageDelta(from: params, context: context) {
-                return .messageDelta(delta)
+            if let message = agentMessage(from: params, context: context) {
+                return .message(message)
             }
             return .unknown(raw)
         case "item/reasoning/summaryPartAdded":
@@ -739,19 +741,6 @@ package actor CodexAppServerNotificationRouter {
             role: .assistant,
             phase: payload.phase.map(CodexMessagePhase.init(rawValue:)),
             text: text
-        )
-    }
-
-    private func agentMessageDelta(from data: Data, context: NotificationContext) -> CodexMessageDelta? {
-        guard let payload = try? decoder.decode(AgentMessagePayload.self, from: data),
-              let text = nonEmpty(payload.message ?? payload.text)
-        else {
-            return nil
-        }
-        return .init(
-            text: text,
-            itemID: agentMessageID(payload.itemID, context: context),
-            phase: payload.phase.map(CodexMessagePhase.init(rawValue:))
         )
     }
 

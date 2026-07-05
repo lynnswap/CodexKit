@@ -3325,6 +3325,38 @@ struct CodexAppServerKitTests {
             ])
     }
 
+    @Test func responseStreamDoesNotAppendCompleteAgentMessageAsDelta() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueue(
+            AppServerAPI.Turn.Start.Response(turn: .init(id: "turn-1", status: "running")),
+            for: "turn/start"
+        )
+        let client = AppServerClient(transport: transport)
+        let router = CodexAppServerNotificationRouter(client: client)
+        await router.start()
+        await transport.waitForNotificationStreamCount(1)
+        let thread = CodexThread(id: "thread-1", client: client, router: router)
+
+        let stream = try await thread.streamResponse(to: "Summarize this.")
+        try await transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(turnID: "turn-1", itemID: "message-1", delta: "Final")
+        )
+        try await transport.emitServerNotification(
+            method: "agent/message",
+            params: AgentMessageParams(turnID: "turn-1", itemID: "message-1", message: "Final")
+        )
+        try await transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(id: "turn-1", status: "completed"))
+        )
+
+        let response = try await stream.collect()
+
+        #expect(response.finalAnswer == "Final")
+        #expect(response.transcript.items.first?.text == "Final")
+    }
+
     @Test func responseStreamCollectsTranscriptFromCompletedTurnItems() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueue(
@@ -4631,6 +4663,20 @@ private struct TurnDeltaParams: Encodable, Sendable {
         case turnID = "turnId"
         case itemID = "itemId"
         case delta
+    }
+}
+
+private struct AgentMessageParams: Encodable, Sendable {
+    var threadID: String? = nil
+    var turnID: String
+    var itemID: String = "message-1"
+    var message: String
+
+    enum CodingKeys: String, CodingKey {
+        case threadID = "threadId"
+        case turnID = "turnId"
+        case itemID = "itemId"
+        case message
     }
 }
 

@@ -420,7 +420,7 @@ package struct CodexTurnProgressSequence: AsyncSequence, Sendable {
             switch event {
             case .started, .unknown:
                 return .init(phase: .running, transcript: accumulator.transcript, usage: accumulator.usage)
-            case .itemStarted, .itemUpdated, .itemCompleted, .messageDelta,
+            case .itemStarted, .itemUpdated, .itemCompleted, .message, .messageDelta,
                 .reasoningSummaryPartAdded, .reasoningDelta:
                 _ = accumulator.apply(event)
                 return .init(phase: .running, transcript: accumulator.transcript, usage: accumulator.usage)
@@ -469,7 +469,7 @@ package struct CodexResponseCollector {
             switch event {
             case .started, .unknown:
                 continue
-            case .itemStarted, .itemUpdated, .itemCompleted, .messageDelta,
+            case .itemStarted, .itemUpdated, .itemCompleted, .message, .messageDelta,
                 .reasoningSummaryPartAdded, .reasoningDelta:
                 _ = accumulator.apply(event)
             case .tokenUsageUpdated:
@@ -506,7 +506,7 @@ private struct CodexResponseAccumulator {
             return true
         case .started, .completed, .failed, .unknown:
             return false
-        case .itemStarted, .itemUpdated, .itemCompleted, .messageDelta,
+        case .itemStarted, .itemUpdated, .itemCompleted, .message, .messageDelta,
             .reasoningSummaryPartAdded, .reasoningDelta:
             return transcriptAccumulator.apply(event)
         }
@@ -585,6 +585,14 @@ private struct CodexTranscriptAccumulator {
         switch event {
         case .itemStarted(let item), .itemUpdated(let item), .itemCompleted(let item):
             upsert(item)
+            return true
+        case .message(let message):
+            upsert(
+                .init(
+                    id: message.id,
+                    kind: message.role == .user ? .userMessage : .agentMessage,
+                    content: .message(message)
+                ))
             return true
         case .messageDelta(let delta):
             append(delta)
