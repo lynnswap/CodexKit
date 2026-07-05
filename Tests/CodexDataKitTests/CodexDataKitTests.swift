@@ -8997,6 +8997,68 @@ struct CodexModelContextTests {
         #expect(command.source == .agent)
     }
 
+    @Test("started review sparse terminal refresh preserves live command log items")
+    func startedReviewSparseTerminalRefreshPreservesLiveCommandLogItems() async throws {
+        let workspaceURL = temporaryDirectory()
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadStart(threadID: "thread-review", model: "gpt-5")
+        try await runtime.transport.enqueueReviewStart(
+            turnID: "turn-review",
+            reviewThreadID: "thread-review"
+        )
+
+        let started = try await context.startReview(
+            in: workspaceURL,
+            input: CodexReviewInput(
+                target: .uncommittedChanges,
+                options: .init(model: "gpt-5", ephemeral: false)
+            )
+        )
+        _ = started.chat.apply(.turnStarted("turn-review"))
+        _ = started.chat.apply(.itemStarted(
+            .init(
+                id: "command-live",
+                kind: .commandExecution,
+                content: .command(.init(
+                    command: "/bin/zsh -lc 'git status --short'",
+                    cwd: workspaceURL.path,
+                    output: " M Package.swift",
+                    status: .completed,
+                    source: .agent
+                ))
+            ),
+            turnID: "turn-review"
+        ))
+
+        started.chat.apply(
+            .init(
+                id: "thread-review",
+                workspace: workspaceURL,
+                status: .idle,
+                turns: [
+                    .init(
+                        id: "turn-review",
+                        status: .completed,
+                        itemsLoadState: .full,
+                        items: [
+                            .init(
+                                id: "review-output",
+                                kind: .exitedReviewMode,
+                                content: .log("No issues found.")
+                            ),
+                        ]
+                    ),
+                ]
+            ),
+            workspace: started.chat.workspace
+        )
+
+        #expect(started.chat.items(in: "turn-review").contains { $0.itemID == "command-live" })
+        #expect(started.chat.items(in: "turn-review").contains { $0.kind == .exitedReviewMode })
+    }
+
     @Test("started review refresh folds synthesized rollout turns into the live turn")
     func startedReviewRefreshFoldsSynthesizedRolloutTurnsIntoLiveTurn() async throws {
         let workspaceURL = temporaryDirectory()

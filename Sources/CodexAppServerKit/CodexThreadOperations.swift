@@ -155,7 +155,8 @@ extension CodexThread {
         let detachedReviewThreadID = responseReviewThreadID == id ? nil : responseReviewThreadID
         let turnID = CodexTurnID(rawValue: response.turnID)
         if let detachedReviewThreadID {
-            await router.beginReviewThreadEventGeneration(detachedReviewThreadID, including: turnID)
+            await router.seedTurn(turnID, threadID: detachedReviewThreadID)
+            await router.beginThreadEventGeneration(detachedReviewThreadID, including: turnID)
         }
         let initialTurn = CodexAppServer.turnSnapshots(from: [response.turn])[0]
         let identity = CodexReviewIdentity(
@@ -178,7 +179,7 @@ extension CodexThread {
         transcriptErrorHandlingPolicy: CodexTranscriptErrorHandlingPolicy = .preserveTranscript
     ) async -> CodexReviewSession {
         let reviewThreadID = identity.activeTurnThreadID
-        await router.seedReviewTurn(identity.turnID, reviewThreadID: reviewThreadID)
+        await router.seedTurn(identity.turnID, threadID: reviewThreadID)
         let model = model ?? identity.model
         let turn = CodexTurn(
             id: identity.turnID,

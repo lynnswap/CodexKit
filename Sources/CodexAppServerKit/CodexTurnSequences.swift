@@ -172,7 +172,7 @@ public struct CodexThreadLogSequence: AsyncSequence, Sendable {
     }
 }
 
-/// Review-scoped event stream for a `CodexReviewSession`.
+/// Projection over a thread event stream for a `CodexReviewSession`.
 public struct CodexReviewEventSequence: AsyncSequence, Sendable {
     public typealias Element = CodexReviewEvent
 
@@ -246,7 +246,7 @@ public struct CodexReviewEventSequence: AsyncSequence, Sendable {
     }
 }
 
-/// Incremental progress stream for a `CodexReviewSession`.
+/// Incremental review progress projected from the thread event stream.
 public struct CodexReviewProgressSequence: AsyncSequence, Sendable {
     public typealias Element = CodexReviewProgress
 
@@ -527,8 +527,9 @@ private struct CodexResponseAccumulator {
 
     func finalized(_ response: CodexResponse) -> CodexResponse {
         var response = response
-        if response.finalAnswer == nil {
+        if response.finalAnswer?.isEmpty != false {
             response.finalAnswer = transcript.finalAnswer
+                ?? response.transcript.finalAnswer
         }
         if response.transcript.items.isEmpty {
             response.transcript = transcript

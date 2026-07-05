@@ -652,13 +652,20 @@ public final class CodexChat: CodexPersistentModel {
         }
         if let turns = snapshot.turns {
             let turns = normalizedIncomingTurnRecords(turns)
-            if snapshot.turnItemsAreAuthoritative && preservesExistingTurnItems == false {
+            let preservesSeededReviewTurnItems = shouldPreserveSeededReviewTurnItemsWhenReconcilingSnapshot
+            if snapshot.turnItemsAreAuthoritative
+                && preservesExistingTurnItems == false
+                && preservesSeededReviewTurnItems == false
+            {
                 replaceTurns(with: turns)
                 replaceItems(with: turns)
                 hasAppliedLiveTurnItemUpdates = false
             } else {
                 mergeTurns(with: turns)
-                mergeItems(from: turns)
+                mergeItems(
+                    from: turns,
+                    preservesSeededReviewTurnItems: preservesSeededReviewTurnItems
+                )
             }
             for turn in turns {
                 if let status = turn.status, status.isTerminal {
@@ -980,12 +987,19 @@ public final class CodexChat: CodexPersistentModel {
         rebuildItemIndexes()
     }
 
-    private func mergeItems(from records: [CodexTurnSnapshot]) {
+    private func mergeItems(
+        from records: [CodexTurnSnapshot],
+        preservesSeededReviewTurnItems: Bool = false
+    ) {
         for record in records {
             if record.itemsAreAuthoritative {
                 removeItemsOmittedFromAuthoritativeSnapshot(
                     record.items,
-                    turnID: record.id
+                    turnID: record.id,
+                    preservesOmittedSeededReviewLogItems: shouldPreserveOmittedSeededReviewLogItems(
+                        in: record,
+                        enabled: preservesSeededReviewTurnItems
+                    )
                 )
             }
             guard record.items.isEmpty == false else {
@@ -997,6 +1011,19 @@ public final class CodexChat: CodexPersistentModel {
                 itemsLoadState: record.itemsLoadState
             )
         }
+    }
+
+    private func shouldPreserveOmittedSeededReviewLogItems(
+        in record: CodexTurnSnapshot,
+        enabled: Bool
+    ) -> Bool {
+        guard enabled,
+            let seededReviewTurnID,
+            record.id == seededReviewTurnID
+        else {
+            return false
+        }
+        return true
     }
 
     @discardableResult
@@ -1221,6 +1248,16 @@ public final class CodexChat: CodexPersistentModel {
 
     package var shouldPreserveTurnItemsWhenReconcilingSnapshot: Bool {
         hasAppliedLiveTurnItemUpdates
+    }
+
+    private var shouldPreserveSeededReviewTurnItemsWhenReconcilingSnapshot: Bool {
+        guard let seededReviewTurnID,
+            hasAppliedLiveTurnItemUpdates,
+            itemsByTurnID[seededReviewTurnID]?.isEmpty == false
+        else {
+            return false
+        }
+        return true
     }
 
     private func markAppliedLiveTurnItemUpdatesIfNeeded(_ changes: [CodexChatUpdate]) {
@@ -2214,7 +2251,8 @@ public final class CodexChat: CodexPersistentModel {
     @discardableResult
     private func removeItemsOmittedFromAuthoritativeSnapshot(
         _ incomingItems: [CodexThreadItem],
-        turnID: CodexTurnID
+        turnID: CodexTurnID,
+        preservesOmittedSeededReviewLogItems: Bool = false
     ) -> [CodexChatUpdate] {
         var retainedItems = Set<ObjectIdentifier>()
         for incomingItem in incomingItems {
@@ -2232,6 +2270,11 @@ public final class CodexChat: CodexPersistentModel {
                 retainedItems.insert(ObjectIdentifier(item))
             }
             if let item = reviewModeMarkerItem(matching: incomingItem, turnID: turnID) {
+                retainedItems.insert(ObjectIdentifier(item))
+            }
+        }
+        if preservesOmittedSeededReviewLogItems {
+            for item in itemsByTurnID[turnID] ?? [] where item.kind.isSeededReviewLogItem {
                 retainedItems.insert(ObjectIdentifier(item))
             }
         }
@@ -2510,6 +2553,35 @@ public final class CodexChat: CodexPersistentModel {
         var delta: String?
     }
 
+}
+
+private extension CodexThreadItem.Kind {
+    var isSeededReviewLogItem: Bool {
+        switch self {
+        case .userMessage:
+            false
+        case .agentMessage,
+             .enteredReviewMode,
+             .exitedReviewMode,
+             .plan,
+             .reasoning,
+             .commandExecution,
+             .fileChange,
+             .mcpToolCall,
+             .dynamicToolCall,
+             .collabAgentToolCall,
+             .subAgentActivity,
+             .webSearch,
+             .imageView,
+             .sleep,
+             .imageGeneration,
+             .contextCompaction,
+             .diagnostic,
+             .error,
+             .unknown:
+            true
+        }
+    }
 }
 
 @available(
