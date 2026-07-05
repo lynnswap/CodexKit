@@ -1637,6 +1637,62 @@ struct CodexAppServerKitTests {
         #expect(progress.last?.transcript.reviewOutputText == "No issues found.")
     }
 
+    @Test func reviewEventSequencePreservesLiveReviewOutputWithSparseCompletionTranscript() async throws {
+        let terminalMessage = CodexMessage(
+            id: "terminal-message",
+            role: .assistant,
+            text: "Terminal summary"
+        )
+        let events = [
+            CodexThreadEvent.itemCompleted(
+                .init(
+                    id: "review-output",
+                    kind: .exitedReviewMode,
+                    content: .log("No issues found.")
+                ),
+                turnID: "turn-review"
+            ),
+            .turnCompleted(.init(
+                turnID: "turn-review",
+                status: .completed,
+                transcript: .init(items: [
+                    .init(
+                        id: terminalMessage.id,
+                        kind: .agentMessage,
+                        content: .message(terminalMessage)
+                    ),
+                ])
+            )),
+        ]
+        let eventSequence = CodexThreadEventSequence {
+            AsyncThrowingStream { continuation in
+                for event in events {
+                    continuation.yield(event)
+                }
+                continuation.finish()
+            }
+        }
+
+        let reviewEvents = try await collect(CodexReviewEventSequence(
+            events: eventSequence,
+            terminalTurnID: "turn-review"
+        ))
+        let progress = try await collect(CodexReviewProgressSequence(
+            events: eventSequence,
+            terminalTurnID: "turn-review"
+        ))
+
+        if case .turnCompleted(let response) = reviewEvents.last {
+            #expect(response.transcript.finalAnswer == "Terminal summary")
+            #expect(response.transcript.reviewOutputText == "No issues found.")
+            #expect(response.transcript.items.map(\.kind) == [.agentMessage, .exitedReviewMode])
+        } else {
+            Issue.record("Expected a terminal review response.")
+        }
+        #expect(progress.last?.result?.transcript.reviewOutputText == "No issues found.")
+        #expect(progress.last?.transcript.reviewOutputText == "No issues found.")
+    }
+
     @Test func threadTurnsListRequestUsesThreadScope() {
         let request = AppServerAPI.Thread.Turns.List.Request(params: .init(threadID: "thread-1"))
 

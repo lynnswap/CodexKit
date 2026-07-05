@@ -527,17 +527,47 @@ private struct CodexResponseAccumulator {
 
     func finalized(_ response: CodexResponse) -> CodexResponse {
         var response = response
+        let finalizedTranscript = finalizedTranscript(for: response.transcript)
         if response.finalAnswer?.isEmpty != false {
             response.finalAnswer = transcript.finalAnswer
-                ?? response.transcript.finalAnswer
+                ?? finalizedTranscript.finalAnswer
         }
-        if response.transcript.items.isEmpty {
-            response.transcript = transcript
-        }
+        response.transcript = finalizedTranscript
         if response.usage == nil {
             response.usage = usage
         }
         return response
+    }
+
+    private func finalizedTranscript(for terminalTranscript: CodexTranscript) -> CodexTranscript {
+        let liveTranscript = transcript
+        guard terminalTranscript.items.isEmpty == false else {
+            return liveTranscript
+        }
+        guard terminalTranscript.reviewOutputText == nil else {
+            return terminalTranscript
+        }
+
+        var mergedItems = terminalTranscript.items
+        var didMerge = false
+        for liveItem in liveTranscript.items where liveItem.kind == .exitedReviewMode {
+            guard liveItem.text?.isEmpty == false else {
+                continue
+            }
+            if let index = mergedItems.firstIndex(where: { $0.id == liveItem.id && $0.kind == liveItem.kind }) {
+                guard mergedItems[index].text?.isEmpty != false else {
+                    continue
+                }
+                mergedItems[index] = liveItem
+            } else {
+                mergedItems.append(liveItem)
+            }
+            didMerge = true
+        }
+        guard didMerge else {
+            return terminalTranscript
+        }
+        return CodexTranscript(items: mergedItems)
     }
 }
 
