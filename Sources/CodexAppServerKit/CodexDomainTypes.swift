@@ -2218,6 +2218,23 @@ public struct CodexMessageDelta: Equatable, Sendable {
     }
 }
 
+package enum CodexAgentMessageFallbackID {
+    package static let unscoped = "agent-message-delta"
+
+    package static func scoped(turnID: CodexTurnID?) -> String {
+        turnID.map { "\(unscoped):\($0.rawValue)" } ?? unscoped
+    }
+
+    package static func scopedMessage(_ message: CodexMessage, turnID: CodexTurnID?) -> CodexMessage {
+        guard message.id == unscoped else {
+            return message
+        }
+        var message = message
+        message.id = scoped(turnID: turnID)
+        return message
+    }
+}
+
 /// A reasoning summary or raw reasoning text part emitted by app-server.
 public struct CodexReasoningPart: Identifiable, Equatable, Sendable {
     public enum Kind: Equatable, Sendable {

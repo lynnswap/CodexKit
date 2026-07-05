@@ -3276,6 +3276,40 @@ struct CodexAppServerKitTests {
         #expect(transcripts.last?.items.compactMap(\.text) == ["First", "Second"])
     }
 
+    @Test func threadTranscriptReconcilesCompleteAgentMessageWithoutItemIDWithPriorDelta() async throws {
+        let transport = CodexAppServerTestTransport()
+        let client = AppServerClient(transport: transport)
+        let router = CodexAppServerNotificationRouter(client: client)
+        await router.start()
+        await transport.waitForNotificationStreamCount(1)
+        try await transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: MessageDeltaWithoutItemIDParams(
+                threadID: "thread-1",
+                turnID: "turn-1",
+                delta: "Final"
+            )
+        )
+        try await transport.emitServerNotification(
+            method: "agent/message",
+            params: AgentMessageParams(
+                threadID: "thread-1",
+                turnID: "turn-1",
+                itemID: nil,
+                message: "Final"
+            )
+        )
+        try await transport.emitServerNotification(
+            method: "thread/closed",
+            params: ThreadIDParams(threadID: "thread-1")
+        )
+        let thread = CodexThread(id: "thread-1", client: client, router: router)
+
+        let transcripts = try await collect(thread.transcriptUpdates)
+
+        #expect(transcripts.last?.items.compactMap(\.text) == ["Final"])
+    }
+
     @Test func responseStreamYieldsSnapshotsAndCollectsFinalResponse() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueue(
@@ -3355,6 +3389,38 @@ struct CodexAppServerKitTests {
 
         #expect(response.finalAnswer == "Final")
         #expect(response.transcript.items.first?.text == "Final")
+    }
+
+    @Test func responseStreamReconcilesCompleteAgentMessageWithoutItemIDWithPriorDelta() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueue(
+            AppServerAPI.Turn.Start.Response(turn: .init(id: "turn-1", status: "running")),
+            for: "turn/start"
+        )
+        let client = AppServerClient(transport: transport)
+        let router = CodexAppServerNotificationRouter(client: client)
+        await router.start()
+        await transport.waitForNotificationStreamCount(1)
+        let thread = CodexThread(id: "thread-1", client: client, router: router)
+
+        let stream = try await thread.streamResponse(to: "Summarize this.")
+        try await transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: MessageDeltaWithoutItemIDParams(turnID: "turn-1", delta: "Final")
+        )
+        try await transport.emitServerNotification(
+            method: "agent/message",
+            params: AgentMessageParams(turnID: "turn-1", itemID: nil, message: "Final")
+        )
+        try await transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(id: "turn-1", status: "completed"))
+        )
+
+        let response = try await stream.collect()
+
+        #expect(response.finalAnswer == "Final")
+        #expect(response.transcript.items.compactMap(\.text) == ["Final"])
     }
 
     @Test func responseStreamCollectsTranscriptFromCompletedTurnItems() async throws {
@@ -4669,7 +4735,7 @@ private struct TurnDeltaParams: Encodable, Sendable {
 private struct AgentMessageParams: Encodable, Sendable {
     var threadID: String? = nil
     var turnID: String
-    var itemID: String = "message-1"
+    var itemID: String? = "message-1"
     var message: String
 
     enum CodingKeys: String, CodingKey {
@@ -4681,7 +4747,7 @@ private struct AgentMessageParams: Encodable, Sendable {
 }
 
 private struct MessageDeltaWithoutItemIDParams: Encodable, Sendable {
-    var threadID: String
+    var threadID: String? = nil
     var turnID: String
     var delta: String
 

@@ -441,7 +441,10 @@ package actor CodexAppServerNotificationRouter {
         case .itemCompleted(let item):
             return .itemCompleted(item, turnID: turnID)
         case .message(let message):
-            return .message(message, turnID: turnID)
+            return .message(
+                CodexAgentMessageFallbackID.scopedMessage(message, turnID: turnID),
+                turnID: turnID
+            )
         case .messageDelta(let delta):
             return .messageDelta(delta, turnID: turnID)
         case .reasoningSummaryPartAdded(let part):
@@ -516,7 +519,11 @@ package actor CodexAppServerNotificationRouter {
             }
             return .unknown(raw)
         case "agent/message":
-            if let message = agentMessage(from: params, context: context) {
+            if let message = agentMessage(
+                from: params,
+                context: context,
+                fallbackItemID: CodexAgentMessageFallbackID.unscoped
+            ) {
                 return .message(message)
             }
             return .unknown(raw)
@@ -602,7 +609,11 @@ package actor CodexAppServerNotificationRouter {
             }
             return .unknown(raw)
         case "agent/message":
-            if let message = agentMessage(from: params, context: context) {
+            if let message = agentMessage(
+                from: params,
+                context: context,
+                fallbackItemID: CodexAgentMessageFallbackID.scoped(turnID: context.turnID)
+            ) {
                 return .message(message, turnID: context.turnID)
             }
             return .unknown(raw)
@@ -730,28 +741,29 @@ package actor CodexAppServerNotificationRouter {
         )
     }
 
-    private func agentMessage(from data: Data, context: NotificationContext) -> CodexMessage? {
+    private func agentMessage(
+        from data: Data,
+        context: NotificationContext,
+        fallbackItemID: String
+    ) -> CodexMessage? {
         guard let payload = try? decoder.decode(AgentMessagePayload.self, from: data),
               let text = nonEmpty(payload.message ?? payload.text)
         else {
             return nil
         }
         return .init(
-            id: agentMessageID(payload.itemID, context: context),
+            id: agentMessageID(payload.itemID, fallbackItemID: fallbackItemID),
             role: .assistant,
             phase: payload.phase.map(CodexMessagePhase.init(rawValue:)),
             text: text
         )
     }
 
-    private func agentMessageID(_ itemID: String?, context: NotificationContext) -> String {
+    private func agentMessageID(_ itemID: String?, fallbackItemID: String) -> String {
         if let itemID = nonEmpty(itemID) {
             return itemID
         }
-        if let turnID = nonEmpty(context.turnID?.rawValue) {
-            return "agent-message:\(turnID)"
-        }
-        return "agent-message"
+        return fallbackItemID
     }
 
     private func nonEmpty(_ value: String?) -> String? {

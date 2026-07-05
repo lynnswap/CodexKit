@@ -652,7 +652,7 @@ private struct CodexTranscriptAccumulator {
 
     private mutating func append(
         _ delta: CodexMessageDelta,
-        fallbackItemID: String = "agent-message-delta"
+        fallbackItemID: String = CodexAgentMessageFallbackID.unscoped
     ) {
         let itemID = delta.itemID ?? fallbackItemID
         let text = (messageDeltaTextByItemID[itemID] ?? "") + delta.text
@@ -667,7 +667,7 @@ private struct CodexTranscriptAccumulator {
     }
 
     private func scopedFallbackMessageID(turnID: CodexTurnID?) -> String {
-        turnID.map { "agent-message-delta:\($0.rawValue)" } ?? "agent-message-delta"
+        CodexAgentMessageFallbackID.scoped(turnID: turnID)
     }
 
     private mutating func start(_ part: CodexReasoningPart) {
