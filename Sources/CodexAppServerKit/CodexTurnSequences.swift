@@ -592,7 +592,11 @@ private struct CodexTranscriptAccumulator {
                     id: message.id,
                     kind: message.role == .user ? .userMessage : .agentMessage,
                     content: .message(message)
-                ))
+                ),
+                replacingFallbackID: message.role == .assistant
+                    ? CodexAgentMessageFallbackID.unscoped
+                    : nil
+            )
             return true
         case .messageDelta(let delta):
             append(delta)
@@ -613,13 +617,17 @@ private struct CodexTranscriptAccumulator {
         case .itemStarted(let item, _), .itemUpdated(let item, _), .itemCompleted(let item, _):
             upsert(item)
             return true
-        case .message(let message, _):
+        case .message(let message, let turnID):
             upsert(
                 .init(
                     id: message.id,
                     kind: message.role == .user ? .userMessage : .agentMessage,
                     content: .message(message)
-                ))
+                ),
+                replacingFallbackID: message.role == .assistant
+                    ? scopedFallbackMessageID(turnID: turnID)
+                    : nil
+            )
             return true
         case .messageDelta(let delta, let turnID):
             append(delta, fallbackItemID: scopedFallbackMessageID(turnID: turnID))
@@ -636,11 +644,25 @@ private struct CodexTranscriptAccumulator {
         }
     }
 
-    private mutating func upsert(_ item: CodexThreadItem) {
+    private mutating func upsert(
+        _ item: CodexThreadItem,
+        replacingFallbackID fallbackID: String? = nil
+    ) {
         if item.kind == .reasoning && item.id.contains(":summary:") == false
             && item.id.contains(":content:") == false
         {
             removeReasoningParts(parentItemID: item.id)
+        }
+        if let fallbackID,
+           fallbackID != item.id,
+           item.kind == .agentMessage,
+           itemIndexesByID[item.id] == nil,
+           let fallbackIndex = itemIndexesByID.removeValue(forKey: fallbackID)
+        {
+            messageDeltaTextByItemID.removeValue(forKey: fallbackID)
+            itemIndexesByID[item.id] = fallbackIndex
+            items[fallbackIndex] = item
+            return
         }
         if let index = itemIndexesByID[item.id] {
             items[index] = item
