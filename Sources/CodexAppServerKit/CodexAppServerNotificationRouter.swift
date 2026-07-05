@@ -537,7 +537,7 @@ package actor CodexAppServerNotificationRouter {
         _ method: String
     ) -> Bool {
         switch method {
-        case "warning", "configWarning", "error":
+        case "warning", "deprecationNotice", "configWarning", "error":
             true
         default:
             false

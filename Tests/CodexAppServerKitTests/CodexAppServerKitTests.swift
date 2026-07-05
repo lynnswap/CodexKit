@@ -2378,7 +2378,7 @@ struct CodexAppServerKitTests {
             delivery: .detached
         )
         try await transport.emitServerNotification(
-            method: "configWarning",
+            method: "deprecationNotice",
             params: ThreadlessDiagnosticParams(message: "using defaults")
         )
         try await transport.emitServerNotification(
@@ -2386,7 +2386,7 @@ struct CodexAppServerKitTests {
             params: TurnCompletedParams(turn: .init(id: "turn-review", status: "completed"))
         )
         try await transport.emitServerNotification(
-            method: "configWarning",
+            method: "deprecationNotice",
             params: ThreadlessDiagnosticParams(message: "late warning")
         )
         try await transport.emitServerNotification(
@@ -2397,7 +2397,7 @@ struct CodexAppServerKitTests {
         let events = try await collect(review.events)
         let diagnostics = events.filter {
             if case .unknown(let raw) = $0 {
-                return raw.method == "configWarning"
+                return raw.method == "deprecationNotice"
                     && raw.threadID == "thread-review"
                     && raw.turnID == nil
             }
