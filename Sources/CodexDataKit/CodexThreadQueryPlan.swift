@@ -162,11 +162,12 @@ package struct CodexFetchDescriptorSignature: Hashable, Sendable {
 package struct CodexSortPlanSignature: Hashable, Sendable {
     package var key: CodexSortKey
     package var order: SortOrder
+    package var comparison: String?
 }
 
 extension CodexSortPlan {
     package var signature: CodexSortPlanSignature {
-        .init(key: key, order: order)
+        .init(key: key, order: order, comparison: comparisonSignature)
     }
 }
 
@@ -245,6 +246,12 @@ package indirect enum CodexChatPredicateSignature: Hashable, Sendable {
 }
 
 private struct CodexThreadServerFilter: Hashable, Sendable {
+    private enum ArchiveScope: Equatable {
+        case unscoped
+        case scoped(Bool)
+        case ambiguous
+    }
+
     var archived: Bool?
     var workspaces: [URL]?
     var searchTerm: String?
@@ -255,24 +262,38 @@ private struct CodexThreadServerFilter: Hashable, Sendable {
     init() {}
 
     init(signature: CodexChatPredicateSignature) {
-        let referencesArchived = signature.references(.isArchived)
+        let archiveScope = Self.archiveScope(from: signature)
         guard var filter = Self.filter(from: signature) else {
-            if referencesArchived {
+            switch archiveScope {
+            case .scoped(let archived):
+                self = Self(isComplete: false)
+                self.archived = archived
+            case .unscoped:
+                self = Self.defaultChatFilter
+                self.isComplete = false
+            case .ambiguous:
                 preconditionFailure(
                     "CodexChat predicates with isArchived must lower to one archived scope."
                 )
             }
-            self = Self.defaultChatFilter
-            self.isComplete = false
             return
         }
-        if filter.archived == nil {
-            if referencesArchived {
+        switch archiveScope {
+        case .scoped(let archived):
+            if let filterArchived = filter.archived, filterArchived != archived {
                 preconditionFailure(
                     "CodexChat predicates with isArchived must lower to one archived scope."
                 )
             }
-            filter.archived = false
+            filter.archived = archived
+        case .unscoped:
+            if filter.archived == nil {
+                filter.archived = false
+            }
+        case .ambiguous:
+            preconditionFailure(
+                "CodexChat predicates with isArchived must lower to one archived scope."
+            )
         }
         self = filter
     }
@@ -294,18 +315,128 @@ private struct CodexThreadServerFilter: Hashable, Sendable {
             || isComplete == false
     }
 
+    private static func archiveScope(from signature: CodexChatPredicateSignature) -> ArchiveScope {
+        switch signature {
+        case .bool(.key(.isArchived)):
+            return .scoped(true)
+        case .bool:
+            return .unscoped
+        case .equal(let lhs, let rhs):
+            return equalityArchiveScope(lhs, rhs)
+        case .notEqual(let lhs, let rhs):
+            return inequalityArchiveScope(lhs, rhs)
+        case .localizedStandardContains, .contains:
+            return .unscoped
+        case .conjunction(let lhs, let rhs):
+            if lhs.boolConstant == false || rhs.boolConstant == false {
+                return .unscoped
+            }
+            if lhs.boolConstant == true {
+                return archiveScope(from: rhs)
+            }
+            if rhs.boolConstant == true {
+                return archiveScope(from: lhs)
+            }
+            return mergeConjunctionArchiveScope(archiveScope(from: lhs), archiveScope(from: rhs))
+        case .disjunction(let lhs, let rhs):
+            if lhs.boolConstant == true || rhs.boolConstant == true {
+                return .unscoped
+            }
+            if lhs.boolConstant == false {
+                return archiveScope(from: rhs)
+            }
+            if rhs.boolConstant == false {
+                return archiveScope(from: lhs)
+            }
+            return mergeDisjunctionArchiveScope(archiveScope(from: lhs), archiveScope(from: rhs))
+        case .negation(let signature):
+            return negatedArchiveScope(from: signature)
+        }
+    }
+
+    private static func equalityArchiveScope(
+        _ lhs: CodexChatPredicateValue,
+        _ rhs: CodexChatPredicateValue
+    ) -> ArchiveScope {
+        switch (lhs, rhs) {
+        case (.key(.isArchived), .bool(let value)), (.bool(let value), .key(.isArchived)):
+            return .scoped(value)
+        default:
+            return .unscoped
+        }
+    }
+
+    private static func inequalityArchiveScope(
+        _ lhs: CodexChatPredicateValue,
+        _ rhs: CodexChatPredicateValue
+    ) -> ArchiveScope {
+        switch (lhs, rhs) {
+        case (.key(.isArchived), .bool(let value)), (.bool(let value), .key(.isArchived)):
+            return .scoped(!value)
+        default:
+            return .unscoped
+        }
+    }
+
+    private static func negatedArchiveScope(
+        from signature: CodexChatPredicateSignature
+    ) -> ArchiveScope {
+        switch archiveScope(from: signature) {
+        case .scoped(let archived):
+            return .scoped(!archived)
+        case .unscoped:
+            return .unscoped
+        case .ambiguous:
+            return .ambiguous
+        }
+    }
+
+    private static func mergeConjunctionArchiveScope(
+        _ lhs: ArchiveScope,
+        _ rhs: ArchiveScope
+    ) -> ArchiveScope {
+        switch (lhs, rhs) {
+        case (.ambiguous, _), (_, .ambiguous):
+            return .ambiguous
+        case (.unscoped, let scope), (let scope, .unscoped):
+            return scope
+        case (.scoped(let lhs), .scoped(let rhs)):
+            return lhs == rhs ? .scoped(lhs) : .ambiguous
+        }
+    }
+
+    private static func mergeDisjunctionArchiveScope(
+        _ lhs: ArchiveScope,
+        _ rhs: ArchiveScope
+    ) -> ArchiveScope {
+        switch (lhs, rhs) {
+        case (.ambiguous, _), (_, .ambiguous):
+            return .ambiguous
+        case (.unscoped, .unscoped):
+            return .unscoped
+        case (.scoped(let lhs), .scoped(let rhs)) where lhs == rhs:
+            return .scoped(lhs)
+        default:
+            return .ambiguous
+        }
+    }
+
     private static func filter(from signature: CodexChatPredicateSignature) -> Self? {
         switch signature {
         case .bool(.key(.isArchived)):
             var filter = Self()
             filter.archived = true
             return filter
+        case .bool(.bool(let value)):
+            return Self(isComplete: value)
         case .bool:
             return nil
         case .negation(.bool(.key(.isArchived))):
             var filter = Self()
             filter.archived = false
             return filter
+        case .negation(.bool(.bool(let value))):
+            return Self(isComplete: value == false)
         case .negation:
             return nil
         case .equal(let lhs, let rhs):
@@ -317,6 +448,15 @@ private struct CodexThreadServerFilter: Hashable, Sendable {
         case .contains(let lhs, let rhs):
             return containsFilter(lhs, rhs)
         case .conjunction(let lhs, let rhs):
+            if lhs.boolConstant == true {
+                return filter(from: rhs)
+            }
+            if rhs.boolConstant == true {
+                return filter(from: lhs)
+            }
+            if lhs.boolConstant == false || rhs.boolConstant == false {
+                return Self(isComplete: false)
+            }
             guard var lhsFilter = filter(from: lhs),
                 let rhsFilter = filter(from: rhs),
                 lhsFilter.merge(rhsFilter)
@@ -325,6 +465,15 @@ private struct CodexThreadServerFilter: Hashable, Sendable {
             }
             return lhsFilter
         case .disjunction(let lhs, let rhs):
+            if lhs.boolConstant == false {
+                return filter(from: rhs)
+            }
+            if rhs.boolConstant == false {
+                return filter(from: lhs)
+            }
+            if lhs.boolConstant == true || rhs.boolConstant == true {
+                return Self()
+            }
             return disjunctionFilter(lhs, rhs)
         }
     }
@@ -433,18 +582,25 @@ private struct CodexThreadServerFilter: Hashable, Sendable {
     ) -> Self? {
         switch (lhs, rhs) {
         case (.stringArray(let values), .key(.modelProvider)):
+            guard values.isEmpty == false else {
+                return Self(isComplete: false)
+            }
             var filter = Self()
-            filter.modelProviders = values.isEmpty ? nil : values
+            filter.modelProviders = values
             return filter
         case (.sourceKindArray(let values), .key(.sourceKind)):
+            guard values.isEmpty == false else {
+                return Self(isComplete: false)
+            }
             var filter = Self()
-            filter.sourceKinds = values.isEmpty ? nil : values
+            filter.sourceKinds = values
             return filter
         case (.workspaceIDArray(let values), .key(.workspaceID)):
+            guard values.isEmpty == false else {
+                return Self(isComplete: false)
+            }
             var filter = Self()
-            filter.workspaces = values.isEmpty
-                ? nil
-                : values.map { URL(fileURLWithPath: $0.rawValue, isDirectory: true) }
+            filter.workspaces = values.map { URL(fileURLWithPath: $0.rawValue, isDirectory: true) }
             return filter
         default:
             return nil
@@ -526,28 +682,19 @@ private struct CodexChatPredicateLowering: Sendable {
     var signature: CodexChatPredicateSignature
 }
 
-private extension CodexChatPredicateValue {
-    func references(_ key: CodexChatPredicateKey) -> Bool {
-        self == .key(key)
+private extension CodexChatPredicateSignature {
+    var boolConstant: Bool? {
+        guard case .bool(.bool(let value)) = self else {
+            return nil
+        }
+        return value
     }
 }
 
-private extension CodexChatPredicateSignature {
-    func references(_ key: CodexChatPredicateKey) -> Bool {
-        switch self {
-        case .bool(let value):
-            value.references(key)
-        case .equal(let lhs, let rhs),
-            .notEqual(let lhs, let rhs),
-            .localizedStandardContains(let lhs, let rhs),
-            .contains(let lhs, let rhs):
-            lhs.references(key) || rhs.references(key)
-        case .conjunction(let lhs, let rhs),
-            .disjunction(let lhs, let rhs):
-            lhs.references(key) || rhs.references(key)
-        case .negation(let signature):
-            signature.references(key)
-        }
+extension PredicateExpressions.Value: CodexChatRecordPredicateExpression where Output == Bool {
+    fileprivate func codexChatRecordPredicate() -> CodexChatPredicateLowering {
+        let expression = codexChatBoolExpression()
+        return .init(predicate: expression.evaluate, signature: .bool(expression.signature))
     }
 }
 

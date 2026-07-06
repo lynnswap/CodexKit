@@ -45,6 +45,24 @@ private func archivedNilModelProviderChatPredicate() -> Predicate<CodexChat> {
     }
 }
 
+private func archivedDoubleSearchChatPredicate(
+    archived: Bool,
+    first: String,
+    second: String
+) -> Predicate<CodexChat> {
+    #Predicate<CodexChat> { chat in
+        chat.isArchived == archived
+            && chat.searchableText.localizedStandardContains(first)
+            && chat.searchableText.localizedStandardContains(second)
+    }
+}
+
+private func constantChatPredicate(_ value: Bool) -> Predicate<CodexChat> {
+    #Predicate<CodexChat> { _ in
+        value
+    }
+}
+
 private func sourceKindChatPredicate(_ sourceKinds: [CodexThreadSourceKind]) -> Predicate<CodexChat> {
     #Predicate<CodexChat> { chat in
         chat.sourceKind != nil && sourceKinds.contains(chat.sourceKind!)
@@ -582,6 +600,35 @@ struct CodexModelContextTests {
         #expect(params.sortKey == "updated_at")
     }
 
+    @Test("string sort descriptors honor their comparator")
+    func stringSortDescriptorsHonorTheirComparator() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-a2", name: "a2"),
+            .init(id: "thread-a10", name: "a10"),
+        ]))
+
+        let results = try await context.fetch(CodexFetchRequest<CodexChat>(
+            sortDescriptors: [SortDescriptor(\.title, comparator: .lexical)]
+        ))
+
+        #expect(results.map(\.id.rawValue) == ["thread-a10", "thread-a2"])
+    }
+
+    @Test("string sort descriptor comparators affect query signatures")
+    func stringSortDescriptorComparatorsAffectQuerySignatures() {
+        let localized = CodexFetchDescriptor<CodexChat>(
+            sortBy: [SortDescriptor(\.title, comparator: .localizedStandard)]
+        )
+        let lexical = CodexFetchDescriptor<CodexChat>(
+            sortBy: [SortDescriptor(\.title, comparator: .lexical)]
+        )
+
+        #expect(localized.querySignature != lexical.querySignature)
+    }
+
     @Test("non-nil predicates are filtered before applying local fetch limits")
     func nonNilPredicatesFilterBeforeApplyingLocalFetchLimits() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -604,6 +651,61 @@ struct CodexModelContextTests {
         let params = try recorded.decodeParams(ThreadListParams.self)
         #expect(params.archived == false)
         #expect(params.limit == nil)
+    }
+
+    @Test("empty membership predicates are filtered before applying local fetch limits")
+    func emptyMembershipPredicatesFilterBeforeApplyingLocalFetchLimits() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-openai", name: "OpenAI", modelProvider: "openai"),
+            .init(id: "thread-anthropic", name: "Anthropic", modelProvider: "anthropic"),
+        ]))
+
+        let results = try await context.fetch(CodexFetchRequest<CodexChat>(
+            predicate: modelProviderChatPredicate([]),
+            fetchLimit: 1
+        ))
+
+        #expect(results.isEmpty)
+        let recorded = try #require(
+            await runtime.transport.recordedRequests(method: "thread/list").first)
+        let params = try recorded.decodeParams(ThreadListParams.self)
+        #expect(params.archived == false)
+        #expect(params.limit == nil)
+        #expect(params.modelProviders == nil)
+    }
+
+    @Test("boolean value predicates are evaluated locally")
+    func booleanValuePredicatesAreEvaluatedLocally() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-visible", name: "Visible")
+        ]))
+
+        let trueResults = try await context.fetch(CodexFetchRequest<CodexChat>(
+            predicate: constantChatPredicate(true)
+        ))
+
+        #expect(trueResults.map(\.id.rawValue) == ["thread-visible"])
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-hidden", name: "Hidden")
+        ]))
+
+        let falseResults = try await context.fetch(CodexFetchRequest<CodexChat>(
+            predicate: constantChatPredicate(false),
+            fetchLimit: 1
+        ))
+
+        #expect(falseResults.isEmpty)
+        let recorded = await runtime.transport.recordedRequests(method: "thread/list")
+        let falseParams = try #require(recorded.last).decodeParams(ThreadListParams.self)
+        #expect(falseParams.archived == false)
+        #expect(falseParams.limit == nil)
     }
 
     @Test("archive inequality predicates translate to archived thread list scope")
@@ -646,6 +748,33 @@ struct CodexModelContextTests {
             await runtime.transport.recordedRequests(method: "thread/list").first)
         let params = try recorded.decodeParams(ThreadListParams.self)
         #expect(params.archived == true)
+        #expect(params.limit == nil)
+    }
+
+    @Test("archive scopes merge with locally filtered predicates")
+    func archiveScopesMergeWithLocallyFilteredPredicates() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-match", name: "foo bar"),
+            .init(id: "thread-partial", name: "foo")
+        ]))
+
+        let results = try await context.fetch(CodexFetchRequest<CodexChat>(
+            predicate: archivedDoubleSearchChatPredicate(
+                archived: false,
+                first: "foo",
+                second: "bar"
+            )
+        ))
+
+        #expect(results.map(\.id.rawValue) == ["thread-match"])
+        let recorded = try #require(
+            await runtime.transport.recordedRequests(method: "thread/list").first)
+        let params = try recorded.decodeParams(ThreadListParams.self)
+        #expect(params.archived == false)
+        #expect(params.searchTerm == nil)
         #expect(params.limit == nil)
     }
 

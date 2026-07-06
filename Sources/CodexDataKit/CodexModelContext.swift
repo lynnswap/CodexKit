@@ -1466,18 +1466,10 @@ public final class CodexModelContext {
         _ rhs: CodexChat,
         descriptor: CodexFetchDescriptor<CodexChat>
     ) -> Bool {
-        let sortPlan = descriptor.sortPlans.first
-        let order = sortPlan?.order ?? .reverse
-        switch sortPlan?.key ?? .recencyAt {
-        case .name:
-            return compare(lhs.title, rhs.title, order: order)
-        case .createdAt:
-            return compare(lhs.createdAt, rhs.createdAt, order: order)
-        case .updatedAt:
-            return compare(lhs.updatedAt, rhs.updatedAt, order: order)
-        case .recencyAt:
-            return compare(lhs.recencyAt, rhs.recencyAt, order: order)
+        guard let sortDescriptor = descriptor.sortBy.first else {
+            return compare(lhs.recencyAt, rhs.recencyAt, order: .reverse)
         }
+        return sortDescriptor.compare(lhs, rhs) == .orderedAscending
     }
 
     private func compare<Value: Comparable>(
@@ -2429,17 +2421,11 @@ public final class CodexModelContext {
         guard localSortPlans.isEmpty == false else {
             return chats
         }
-        return sortModels(chats, using: localSortPlans) { sortPlan, lhs, rhs in
-            switch sortPlan.key {
-            case .name:
-                compare(lhs.title, rhs.title, order: sortPlan.order)
-            case .createdAt:
-                compare(lhs.createdAt, rhs.createdAt, order: sortPlan.order)
-            case .updatedAt:
-                compare(lhs.updatedAt, rhs.updatedAt, order: sortPlan.order)
-            case .recencyAt:
-                compare(lhs.recencyAt, rhs.recencyAt, order: sortPlan.order)
-            }
+        let localDescriptors = zip(descriptors, sortPlans).compactMap { descriptor, sortPlan in
+            sortPlan.key == .recencyAt ? nil : descriptor
+        }
+        return sortModels(chats, using: localDescriptors) { descriptor, lhs, rhs in
+            descriptor.compare(lhs, rhs)
         }
     }
 
@@ -2447,11 +2433,9 @@ public final class CodexModelContext {
         _ workspaces: [CodexWorkspace],
         using descriptors: [SortDescriptor<CodexWorkspace>]
     ) -> [CodexWorkspace] {
-        sortModels(workspaces, using: descriptors.map(CodexSortPlan<CodexWorkspace>.init(descriptor:))) { sortPlan, lhs, rhs in
-            switch sortPlan.key {
-            case .name, .createdAt, .updatedAt, .recencyAt:
-                compare(lhs.name, rhs.name, order: sortPlan.order)
-            }
+        _ = descriptors.map(CodexSortPlan<CodexWorkspace>.init(descriptor:))
+        return sortModels(workspaces, using: descriptors) { descriptor, lhs, rhs in
+            descriptor.compare(lhs, rhs)
         }
     }
 
@@ -2459,11 +2443,9 @@ public final class CodexModelContext {
         _ groups: [CodexWorkspaceGroup],
         using descriptors: [SortDescriptor<CodexWorkspaceGroup>]
     ) -> [CodexWorkspaceGroup] {
-        sortModels(groups, using: descriptors.map(CodexSortPlan<CodexWorkspaceGroup>.init(descriptor:))) { sortPlan, lhs, rhs in
-            switch sortPlan.key {
-            case .name, .createdAt, .updatedAt, .recencyAt:
-                compare(lhs.name, rhs.name, order: sortPlan.order)
-            }
+        _ = descriptors.map(CodexSortPlan<CodexWorkspaceGroup>.init(descriptor:))
+        return sortModels(groups, using: descriptors) { descriptor, lhs, rhs in
+            descriptor.compare(lhs, rhs)
         }
     }
 
@@ -2488,11 +2470,6 @@ public final class CodexModelContext {
             }
             return false
         }
-    }
-
-    private func compare(_ lhs: String, _ rhs: String, order: SortOrder) -> ComparisonResult {
-        let result = lhs.localizedStandardCompare(rhs)
-        return order == .forward ? result : result.reversed
     }
 
     private func compare(_ lhs: Date?, _ rhs: Date?, order: SortOrder) -> ComparisonResult {

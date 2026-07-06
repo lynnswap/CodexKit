@@ -12,10 +12,12 @@ package enum CodexSortKey: Sendable, Hashable {
 package struct CodexSortPlan<Model: CodexPersistentModel>: Sendable, Hashable {
     package var key: CodexSortKey
     package var order: SortOrder
+    package var comparisonSignature: String?
 
     package init(key: CodexSortKey, order: SortOrder) {
         self.key = key
         self.order = order
+        self.comparisonSignature = nil
     }
 
     package init(descriptor: SortDescriptor<Model>) {
@@ -28,6 +30,7 @@ package struct CodexSortPlan<Model: CodexPersistentModel>: Sendable, Hashable {
         }
         self.key = key
         self.order = descriptor.order
+        self.comparisonSignature = Self.comparisonSignature(for: descriptor)
     }
 
     package var threadSortDirection: CodexSortDirection {
@@ -49,6 +52,14 @@ package struct CodexSortPlan<Model: CodexPersistentModel>: Sendable, Hashable {
             return .recencyAt
         case .name:
             return nil
+        }
+    }
+
+    private static func comparisonSignature(for descriptor: SortDescriptor<Model>) -> String? {
+        Mirror(reflecting: descriptor).children.first { child in
+            child.label == "comparison"
+        }.map { child in
+            String(describing: child.value)
         }
     }
 }
