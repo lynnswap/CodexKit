@@ -104,7 +104,11 @@ extension CodexSectionDescriptor where Model == CodexChat {
 }
 
 public struct CodexFetchDescriptor<Model: CodexPersistentModel>: Sendable {
-    public var predicate: Predicate<Model>?
+    public var predicate: Predicate<Model>? {
+        didSet {
+            Self.validate(predicate: predicate)
+        }
+    }
     public var sortBy: [SortDescriptor<Model>]
     public var fetchLimit: Int? {
         didSet {
@@ -125,6 +129,7 @@ public struct CodexFetchDescriptor<Model: CodexPersistentModel>: Sendable {
         fetchOffset: Int? = nil,
         includePendingChanges: Bool = true
     ) {
+        Self.validate(predicate: predicate)
         Self.validate(fetchLimit: fetchLimit)
         Self.validate(fetchOffset: fetchOffset)
         self.predicate = predicate
@@ -152,6 +157,13 @@ public struct CodexFetchDescriptor<Model: CodexPersistentModel>: Sendable {
         if let fetchOffset {
             precondition(fetchOffset >= 0, "CodexFetchDescriptor fetchOffset must be non-negative.")
         }
+    }
+
+    private static func validate(predicate: Predicate<Model>?) {
+        guard predicate != nil, Model.self != CodexChat.self else {
+            return
+        }
+        preconditionFailure("CodexFetchDescriptor does not support predicates for \(Model.self).")
     }
 }
 
@@ -220,7 +232,11 @@ package enum CodexKnownKeyPaths {
 }
 
 public final class CodexFetchRequest<Model: CodexPersistentModel> {
-    public var predicate: Predicate<Model>?
+    public var predicate: Predicate<Model>? {
+        didSet {
+            Self.validate(predicate: predicate)
+        }
+    }
     public var sortDescriptors: [SortDescriptor<Model>]
     public var fetchLimit: Int? {
         didSet {
@@ -260,6 +276,7 @@ public final class CodexFetchRequest<Model: CodexPersistentModel> {
         fetchOffset: Int? = nil,
         includePendingChanges: Bool = true
     ) {
+        Self.validate(predicate: predicate)
         Self.validate(fetchLimit: fetchLimit)
         Self.validate(fetchOffset: fetchOffset)
         self.predicate = predicate
@@ -293,6 +310,13 @@ public final class CodexFetchRequest<Model: CodexPersistentModel> {
         if let fetchOffset {
             precondition(fetchOffset >= 0, "CodexFetchRequest fetchOffset must be non-negative.")
         }
+    }
+
+    private static func validate(predicate: Predicate<Model>?) {
+        guard predicate != nil, Model.self != CodexChat.self else {
+            return
+        }
+        preconditionFailure("CodexFetchRequest does not support predicates for \(Model.self).")
     }
 }
 

@@ -183,9 +183,6 @@ extension CodexFetchDescriptor {
         } else {
             preconditionFailure("CodexFetchDescriptor does not support fetching \(Model.self).")
         }
-        if predicate != nil {
-            preconditionFailure("CodexFetchDescriptor does not support predicates for \(Model.self).")
-        }
         return CodexFetchDescriptorSignature(
             modelKind: kind,
             predicate: nil,

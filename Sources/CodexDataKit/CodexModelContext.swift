@@ -2271,9 +2271,6 @@ public final class CodexModelContext {
         for descriptor: CodexFetchDescriptor<Model>
     ) -> CodexThreadQueryPlan? {
         guard Model.self == CodexChat.self else {
-            if descriptor.predicate != nil {
-                preconditionFailure("CodexFetchDescriptor does not support predicates for \(Model.self).")
-            }
             return nil
         }
         return CodexThreadQueryPlan(descriptor: descriptor as! CodexFetchDescriptor<CodexChat>)
