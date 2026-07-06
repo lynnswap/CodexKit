@@ -255,7 +255,26 @@ private struct CodexThreadServerFilter: Hashable, Sendable {
     init() {}
 
     init(signature: CodexChatPredicateSignature) {
-        self = Self.filter(from: signature) ?? Self(isComplete: false)
+        let referencesArchived = signature.references(.isArchived)
+        guard var filter = Self.filter(from: signature) else {
+            if referencesArchived {
+                preconditionFailure(
+                    "CodexChat predicates with isArchived must lower to one archived scope."
+                )
+            }
+            self = Self.defaultChatFilter
+            self.isComplete = false
+            return
+        }
+        if filter.archived == nil {
+            if referencesArchived {
+                preconditionFailure(
+                    "CodexChat predicates with isArchived must lower to one archived scope."
+                )
+            }
+            filter.archived = false
+        }
+        self = filter
     }
 
     private init(isComplete: Bool) {
@@ -506,6 +525,31 @@ private enum CodexChatSequenceValue: Sendable {
 private struct CodexChatPredicateLowering: Sendable {
     var predicate: CodexThreadQueryPlan.RecordPredicate
     var signature: CodexChatPredicateSignature
+}
+
+private extension CodexChatPredicateValue {
+    func references(_ key: CodexChatPredicateKey) -> Bool {
+        self == .key(key)
+    }
+}
+
+private extension CodexChatPredicateSignature {
+    func references(_ key: CodexChatPredicateKey) -> Bool {
+        switch self {
+        case .bool(let value):
+            value.references(key)
+        case .equal(let lhs, let rhs),
+            .notEqual(let lhs, let rhs),
+            .localizedStandardContains(let lhs, let rhs),
+            .contains(let lhs, let rhs):
+            lhs.references(key) || rhs.references(key)
+        case .conjunction(let lhs, let rhs),
+            .disjunction(let lhs, let rhs):
+            lhs.references(key) || rhs.references(key)
+        case .negation(let signature):
+            signature.references(key)
+        }
+    }
 }
 
 private protocol CodexChatRecordPredicateExpression {

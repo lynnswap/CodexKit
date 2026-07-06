@@ -596,6 +596,7 @@ struct CodexModelContextTests {
         let recorded = try #require(
             await runtime.transport.recordedRequests(method: "thread/list").first)
         let params = try recorded.decodeParams(ThreadListParams.self)
+        #expect(params.archived == false)
         #expect(params.limit == nil)
     }
 
