@@ -83,6 +83,19 @@ private func workspaceChatPredicate(_ workspaces: [URL]) -> Predicate<CodexChat>
     }
 }
 
+private func nonOptionalFieldEqualityChatPredicate(
+    workspace: URL,
+    modelProvider: String,
+    sourceKind: CodexThreadSourceKind
+) -> Predicate<CodexChat> {
+    let workspaceID = testWorkspaceID(for: workspace)
+    return #Predicate<CodexChat> { chat in
+        chat.workspaceID == workspaceID
+            && chat.modelProvider == modelProvider
+            && chat.sourceKind == sourceKind
+    }
+}
+
 private func archivedSourceKindChatPredicate(
     archived: Bool,
     sourceKinds: [CodexThreadSourceKind]
@@ -577,6 +590,54 @@ struct CodexModelContextTests {
             await runtime.transport.recordedRequests(method: "thread/list").first)
         let params = try recorded.decodeParams(ThreadListParams.self)
         #expect(params.cwd == .paths([app.path, tools.path]))
+    }
+
+    @Test("non-optional captured values match optional chat fields")
+    func nonOptionalCapturedValuesMatchOptionalChatFields() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspace = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(
+                id: "thread-match",
+                workspace: workspace,
+                name: "Match",
+                modelProvider: "openai",
+                sourceKind: .appServer
+            ),
+            .init(
+                id: "thread-other-provider",
+                workspace: workspace,
+                name: "Other Provider",
+                modelProvider: "anthropic",
+                sourceKind: .appServer
+            ),
+            .init(
+                id: "thread-other-source",
+                workspace: workspace,
+                name: "Other Source",
+                modelProvider: "openai",
+                sourceKind: .subAgent
+            ),
+        ]))
+
+        let results = try await context.fetch(CodexFetchRequest<CodexChat>(
+            predicate: nonOptionalFieldEqualityChatPredicate(
+                workspace: workspace,
+                modelProvider: "openai",
+                sourceKind: .appServer
+            )
+        ))
+
+        #expect(results.map(\.id.rawValue) == ["thread-match"])
+        let recorded = try #require(
+            await runtime.transport.recordedRequests(method: "thread/list").first)
+        let params = try recorded.decodeParams(ThreadListParams.self)
+        #expect(params.archived == false)
+        #expect(params.cwd == .paths([workspace.path]))
+        #expect(params.modelProviders == ["openai"])
+        #expect(params.sourceKinds == ["appServer"])
     }
 
     @Test("key path sort descriptors translate known chat dates to thread list params")

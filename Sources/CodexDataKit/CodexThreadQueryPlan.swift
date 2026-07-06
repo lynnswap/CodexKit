@@ -228,6 +228,15 @@ extension CodexChatPredicateValue {
             (.nilLiteral, .optionalSourceKind(.none)),
             (.optionalSourceKind(.none), .nilLiteral):
             return true
+        case (.optionalString(.some(let lhs)), .string(let rhs)),
+            (.string(let rhs), .optionalString(.some(let lhs))):
+            return lhs == rhs
+        case (.optionalWorkspaceID(.some(let lhs)), .workspaceID(let rhs)),
+            (.workspaceID(let rhs), .optionalWorkspaceID(.some(let lhs))):
+            return lhs == rhs
+        case (.optionalSourceKind(.some(let lhs)), .sourceKind(let rhs)),
+            (.sourceKind(let rhs), .optionalSourceKind(.some(let lhs))):
+            return lhs == rhs
         default:
             return self == other
         }
@@ -512,17 +521,23 @@ private struct CodexThreadServerFilter: Hashable, Sendable {
             filter.archived = value
             return filter
         case (.key(.workspaceID), .optionalWorkspaceID(.some(let id))),
-            (.optionalWorkspaceID(.some(let id)), .key(.workspaceID)):
+            (.optionalWorkspaceID(.some(let id)), .key(.workspaceID)),
+            (.key(.workspaceID), .workspaceID(let id)),
+            (.workspaceID(let id), .key(.workspaceID)):
             var filter = Self()
             filter.workspaces = [URL(fileURLWithPath: id.rawValue, isDirectory: true)]
             return filter
         case (.key(.modelProvider), .optionalString(.some(let provider))),
-            (.optionalString(.some(let provider)), .key(.modelProvider)):
+            (.optionalString(.some(let provider)), .key(.modelProvider)),
+            (.key(.modelProvider), .string(let provider)),
+            (.string(let provider), .key(.modelProvider)):
             var filter = Self()
             filter.modelProviders = [provider]
             return filter
         case (.key(.sourceKind), .optionalSourceKind(.some(let sourceKind))),
-            (.optionalSourceKind(.some(let sourceKind)), .key(.sourceKind)):
+            (.optionalSourceKind(.some(let sourceKind)), .key(.sourceKind)),
+            (.key(.sourceKind), .sourceKind(let sourceKind)),
+            (.sourceKind(let sourceKind), .key(.sourceKind)):
             var filter = Self()
             filter.sourceKinds = [sourceKind]
             return filter
