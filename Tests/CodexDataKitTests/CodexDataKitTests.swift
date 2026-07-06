@@ -634,6 +634,7 @@ struct CodexModelContextTests {
         ))
 
         #expect(results.map(\.id.rawValue) == ["thread-legacy"])
+        #expect(results.first?.sourceKind == .appServer)
         let recorded = try #require(
             await runtime.transport.recordedRequests(method: "thread/list").first)
         let params = try recorded.decodeParams(ThreadListParams.self)

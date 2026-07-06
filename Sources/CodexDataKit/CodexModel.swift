@@ -626,6 +626,7 @@ public final class CodexChat: CodexPersistentModel {
         self.id = id
         self.turns = []
         self.items = []
+        self.sourceKind = .appServer
         self.isArchived = false
         self.modelContext = modelContext
     }

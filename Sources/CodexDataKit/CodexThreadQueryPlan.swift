@@ -27,7 +27,7 @@ package struct CodexChatRecord: Hashable, Sendable {
         workspaceID = chat.workspaceID
         workspaceURL = chat.workspace?.url
         workspaceGroupID = chat.workspaceGroupID
-        sourceKind = chat.sourceKind ?? .appServer
+        sourceKind = chat.sourceKind
         searchableText = chat.searchableText
         createdAt = chat.createdAt
         updatedAt = chat.updatedAt
