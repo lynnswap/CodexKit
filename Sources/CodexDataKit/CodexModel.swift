@@ -532,6 +532,7 @@ public final class CodexChat: CodexPersistentModel {
     public private(set) var name: String?
     public private(set) var preview: String?
     public private(set) var modelProvider: String?
+    public private(set) var sourceKind: CodexThreadSourceKind?
     public private(set) var isArchived: Bool
     public private(set) var createdAt: Date?
     public private(set) var updatedAt: Date?
@@ -593,6 +594,17 @@ public final class CodexChat: CodexPersistentModel {
         .init(items: items.map(\.threadItem))
     }
 
+    public var searchableText: String {
+        [
+            name,
+            preview,
+            workspace?.name,
+            title,
+        ]
+        .compactMap { $0 }
+        .joined(separator: "\n")
+    }
+
     public func turn(id: CodexTurnID) -> CodexTurn? {
         // Keep Observation dependency tracking on the ordered current value while
         // serving the lookup from the ignored index.
@@ -639,6 +651,9 @@ public final class CodexChat: CodexPersistentModel {
             shouldApplyOptionalMetadata(snapshot.modelProvider, existing: modelProvider)
         {
             modelProvider = snapshot.modelProvider
+        }
+        if snapshot.hasField(.sourceKind) {
+            sourceKind = snapshot.sourceKind
         }
         if receivedAuthoritativeTitleMetadata {
             preservesSeededMetadataUntilAuthoritativeSnapshot = false

@@ -1005,6 +1005,7 @@ public actor CodexAppServer {
             name: snapshot.name,
             preview: snapshot.preview,
             modelProvider: snapshot.modelProvider,
+            sourceKind: snapshot.sourceKind.map(CodexThreadSourceKind.init(rawValue:)),
             createdAt: snapshot.createdAt.map { Date(timeIntervalSince1970: TimeInterval($0)) },
             updatedAt: snapshot.updatedAt.map { Date(timeIntervalSince1970: TimeInterval($0)) },
             recencyAt: snapshot.recencyAt.map { Date(timeIntervalSince1970: TimeInterval($0)) },
@@ -1033,6 +1034,8 @@ public actor CodexAppServer {
                 fields.insert(.preview)
             case .modelProvider:
                 fields.insert(.modelProvider)
+            case .sourceKind:
+                fields.insert(.sourceKind)
             case .createdAt:
                 fields.insert(.createdAt)
             case .updatedAt:

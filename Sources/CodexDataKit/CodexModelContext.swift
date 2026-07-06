@@ -129,6 +129,7 @@ public final class CodexModelContext {
         var name: String?
         var preview: String?
         var modelProvider: String?
+        var sourceKind: CodexThreadSourceKind?
         var isArchived: Bool
         var createdAt: Date?
         var updatedAt: Date?
@@ -455,15 +456,15 @@ public final class CodexModelContext {
         }
 
         let descriptor = CodexFetchDescriptor<CodexWorkspace>(
-            sortBy: [CodexSortDescriptor(\.name)]
+            sortBy: [SortDescriptor(\.name)]
         )
         let previousWorkspaces = group.workspaces
         let previousChats = group.workspaces.flatMap(\.chats)
         let snapshots = try await fetchAllThreadSnapshots(matching: descriptor)
         let fetchedChats = await applyFetchedSnapshots(
             snapshots,
-            archived: descriptor.predicate.archived == true,
-            scopedWorkspaceURL: descriptor.predicate.singleWorkspace
+            archived: archivedScope(for: descriptor) == true,
+            scopedWorkspaceURL: singleWorkspaceScope(for: descriptor)
         )
         let fetchedChatIDs = Set(fetchedChats.map(\.id))
         let chats = fetchedChats.filter { $0.workspace?.workspaceGroup?.id == group.id }
@@ -474,7 +475,7 @@ public final class CodexModelContext {
             let fetchedIDs = Set(fetchedWorkspaceChats.map(\.id))
             let preservedChats = previousWorkspaceChats.filter {
                 fetchedIDs.contains($0.id) == false
-                    && shouldPreserveMissingRefreshChat($0, archivedScope: descriptor.predicate.archived)
+                    && shouldPreserveMissingRefreshChat($0, archivedScope: archivedScope(for: descriptor))
             }
             let currentChats = fetchedWorkspaceChats + preservedChats
             workspace.replaceContextChats(currentChats)
@@ -483,7 +484,7 @@ public final class CodexModelContext {
                 previousWorkspaceChats,
                 from: workspace,
                 keeping: currentChats,
-                archivedScope: descriptor.predicate.archived
+                archivedScope: archivedScope(for: descriptor)
             )
         }
         let previousWorkspacesStillInGroup = previousWorkspaces.filter {
@@ -493,18 +494,18 @@ public final class CodexModelContext {
         let refreshedWorkspaceIDs = Set(refreshedWorkspaces.map(\.id))
         let preservedWorkspaces = previousWorkspacesStillInGroup.filter {
             refreshedWorkspaceIDs.contains($0.id) == false
-                && containsPreservedMissingRefreshChat(in: $0, archivedScope: descriptor.predicate.archived)
+                && containsPreservedMissingRefreshChat(in: $0, archivedScope: archivedScope(for: descriptor))
         }
         group.replaceContextWorkspaces(sort(refreshedWorkspaces + preservedWorkspaces, using: descriptor.sortBy))
         let currentChatIDs = Set(group.workspaces.flatMap(\.chats).map(\.id))
         let removedChats = previousChats.filter {
             currentChatIDs.contains($0.id) == false
                 && fetchedChatIDs.contains($0.id) == false
-                && isInRefreshedScope($0, archivedScope: descriptor.predicate.archived)
+                && isInRefreshedScope($0, archivedScope: archivedScope(for: descriptor))
         }
         await refreshWorkspaceGroupInRegisteredResults(
             group,
-            archived: descriptor.predicate.archived == true,
+            archived: archivedScope(for: descriptor) == true,
             removedChats: removedChats
         )
     }
@@ -519,8 +520,8 @@ public final class CodexModelContext {
         let snapshots = try await fetchAllThreadSnapshots(matching: descriptor)
         let fetchedChats = await applyFetchedSnapshots(
             snapshots,
-            archived: descriptor.predicate.archived == true,
-            scopedWorkspaceURL: descriptor.predicate.singleWorkspace
+            archived: archivedScope(for: descriptor) == true,
+            scopedWorkspaceURL: singleWorkspaceScope(for: descriptor)
         )
         let chats = sort(
             fetchedChats,
@@ -529,7 +530,7 @@ public final class CodexModelContext {
         let refreshedIDs = Set(chats.map(\.id))
         let preservedChats = previousChats.filter {
             refreshedIDs.contains($0.id) == false
-                && shouldPreserveMissingRefreshChat($0, archivedScope: descriptor.predicate.archived)
+                && shouldPreserveMissingRefreshChat($0, archivedScope: archivedScope(for: descriptor))
         }
         let currentChats = chats + preservedChats
         workspace.replaceContextChats(currentChats)
@@ -538,11 +539,11 @@ public final class CodexModelContext {
             previousChats,
             from: workspace,
             keeping: currentChats,
-            archivedScope: descriptor.predicate.archived
+            archivedScope: archivedScope(for: descriptor)
         )
         await refreshWorkspaceInRegisteredResults(
             workspace,
-            archived: descriptor.predicate.archived == true,
+            archived: archivedScope(for: descriptor) == true,
             removedChats: removedChats
         )
     }
@@ -703,6 +704,7 @@ public final class CodexModelContext {
                     name: metadata.name,
                     preview: metadata.preview,
                     modelProvider: metadata.modelProvider,
+                    sourceKind: metadata.sourceKind,
                     createdAt: metadata.createdAt,
                     updatedAt: metadata.updatedAt,
                     recencyAt: metadata.recencyAt,
@@ -1067,6 +1069,7 @@ public final class CodexModelContext {
             id: thread.id,
             workspace: thread.workspace,
             modelProvider: input.options.modelProvider,
+            sourceKind: .appServer,
             createdAt: now,
             updatedAt: now,
             ephemeral: input.options.ephemeral
@@ -1124,6 +1127,7 @@ public final class CodexModelContext {
                 workspace: review.eventThread.workspace ?? workspaceURL,
                 preview: input.target.dataKitPreview,
                 modelProvider: input.options.modelProvider,
+                sourceKind: .subAgentReview,
                 createdAt: now,
                 updatedAt: now,
                 recencyAt: now,
@@ -1462,9 +1466,9 @@ public final class CodexModelContext {
         _ rhs: CodexChat,
         descriptor: CodexFetchDescriptor<CodexChat>
     ) -> Bool {
-        let descriptor = descriptor.sortBy.first
-        let order = descriptor?.order ?? .reverse
-        switch descriptor?.key ?? .recencyAt {
+        let sortPlan = descriptor.sortPlans.first
+        let order = sortPlan?.order ?? .reverse
+        switch sortPlan?.key ?? .recencyAt {
         case .name:
             return compare(lhs.title, rhs.title, order: order)
         case .createdAt:
@@ -1479,7 +1483,7 @@ public final class CodexModelContext {
     private func compare<Value: Comparable>(
         _ lhs: Value?,
         _ rhs: Value?,
-        order: CodexSortOrder
+        order: SortOrder
     ) -> Bool {
         switch (lhs, rhs) {
         case let (.some(lhs), .some(rhs)):
@@ -1507,12 +1511,16 @@ public final class CodexModelContext {
     ) async throws
         -> CodexFetchPage<CodexChat>
     {
+        let plan = CodexThreadQueryPlan(descriptor: descriptor)
         if canUseServerOrderedPages(for: descriptor, cursor: cursor) == false {
-            let fetchedChats = await applyFetchedSnapshots(
-                try await fetchAllThreadSnapshots(matching: descriptor),
-                archived: descriptor.predicate.archived == true,
-                scopedWorkspaceURL: descriptor.predicate.singleWorkspace,
-                excluding: excludedRegistration
+            let fetchedChats = filter(
+                await applyFetchedSnapshots(
+                    try await fetchAllThreadSnapshots(matching: descriptor),
+                    archived: plan.archived == true,
+                    scopedWorkspaceURL: plan.singleWorkspace,
+                    excluding: excludedRegistration
+                ),
+                using: plan
             )
             let chats = sort(
                 fetchedChats,
@@ -1528,12 +1536,15 @@ public final class CodexModelContext {
             )
         }
 
-        let page = try await appServer.listThreads(threadQuery(from: descriptor, cursor: cursor))
-        let fetchedChats = await applyFetchedSnapshots(
-            page.threads,
-            archived: descriptor.predicate.archived == true,
-            scopedWorkspaceURL: descriptor.predicate.singleWorkspace,
-            excluding: excludedRegistration
+        let page = try await appServer.listThreads(plan.threadQuery(cursor: cursor, includePaging: true))
+        let fetchedChats = filter(
+            await applyFetchedSnapshots(
+                page.threads,
+                archived: plan.archived == true,
+                scopedWorkspaceURL: plan.singleWorkspace,
+                excluding: excludedRegistration
+            ),
+            using: plan
         )
         let chats = sort(
             fetchedChats,
@@ -1553,8 +1564,8 @@ public final class CodexModelContext {
     ) async throws -> CodexFetchPage<CodexWorkspace> {
         let chats = await applyFetchedSnapshots(
             try await fetchAllThreadSnapshots(matching: descriptor),
-            archived: descriptor.predicate.archived == true,
-            scopedWorkspaceURL: descriptor.predicate.singleWorkspace,
+            archived: archivedScope(for: descriptor) == true,
+            scopedWorkspaceURL: singleWorkspaceScope(for: descriptor),
             excluding: excludedRegistration
         )
         let relationshipChats = chats + preservedLiveChatsForFetchedRelationships(
@@ -1568,8 +1579,8 @@ public final class CodexModelContext {
                 for: descriptor,
                 relationshipIsComplete: true
             ),
-            workspaceFilters: descriptor.predicate.workspaces,
-            archivedScope: descriptor.predicate.archived
+            workspaceFilters: workspaceFilters(for: descriptor),
+            archivedScope: archivedScope(for: descriptor)
         )
         await removeChatsFromRegisteredResults(removedChats, excluding: excludedRegistration)
         let workspaces = unique(relationshipChats.compactMap(\.workspace))
@@ -1591,8 +1602,8 @@ public final class CodexModelContext {
     ) async throws -> CodexFetchPage<CodexWorkspaceGroup> {
         let chats = await applyFetchedSnapshots(
             try await fetchAllThreadSnapshots(matching: descriptor),
-            archived: descriptor.predicate.archived == true,
-            scopedWorkspaceURL: descriptor.predicate.singleWorkspace,
+            archived: archivedScope(for: descriptor) == true,
+            scopedWorkspaceURL: singleWorkspaceScope(for: descriptor),
             excluding: excludedRegistration
         )
         let relationshipChats = chats + preservedLiveChatsForFetchedRelationships(
@@ -1600,7 +1611,7 @@ public final class CodexModelContext {
             descriptor: descriptor,
             requiresIncludePendingChanges: true
         )
-        let preservingGroupWorkspaces = descriptor.predicate.workspaces != nil
+        let preservingGroupWorkspaces = workspaceFilters(for: descriptor) != nil
             || shouldPreserveExistingWorkspaceChats(
                 for: descriptor,
                 relationshipIsComplete: true
@@ -1611,15 +1622,15 @@ public final class CodexModelContext {
                 for: descriptor,
                 relationshipIsComplete: true
             ),
-            workspaceFilters: descriptor.predicate.workspaces,
-            archivedScope: descriptor.predicate.archived
+            workspaceFilters: workspaceFilters(for: descriptor),
+            archivedScope: archivedScope(for: descriptor)
         )
         await removeChatsFromRegisteredResults(removedChats, excluding: excludedRegistration)
         let workspaces = unique(relationshipChats.compactMap(\.workspace))
         syncGroupWorkspaces(
             workspaces,
             preservingExisting: preservingGroupWorkspaces,
-            archivedScope: descriptor.predicate.archived
+            archivedScope: archivedScope(for: descriptor)
         )
         let groups = unique(workspaces.compactMap(\.workspaceGroup))
         let sortedGroups = sort(groups, using: descriptor.sortBy)
@@ -1676,6 +1687,7 @@ public final class CodexModelContext {
             name: snapshot.name,
             preview: snapshot.preview,
             modelProvider: snapshot.modelProvider,
+            sourceKind: snapshot.sourceKind,
             createdAt: snapshot.createdAt,
             updatedAt: snapshot.updatedAt,
             recencyAt: snapshot.recencyAt,
@@ -1692,6 +1704,7 @@ public final class CodexModelContext {
             name: chat.name,
             preview: chat.preview,
             modelProvider: chat.modelProvider,
+            sourceKind: chat.sourceKind,
             isArchived: chat.isArchived,
             createdAt: chat.createdAt,
             updatedAt: chat.updatedAt,
@@ -1771,7 +1784,7 @@ public final class CodexModelContext {
         if group.workspaces.contains(where: { $0 === workspace }) == false {
             group.replaceContextWorkspaces(sort(
                 group.workspaces + [workspace],
-                using: [CodexSortDescriptor(\.name)]
+                using: [SortDescriptor(\.name)]
             ))
         }
         return workspace
@@ -1826,7 +1839,7 @@ public final class CodexModelContext {
             }
         }
         let relationshipIsComplete = page.relationshipIsComplete
-            ?? (page.nextCursor == nil && descriptor.fetchOffset == 0)
+            ?? (page.nextCursor == nil && descriptor.normalizedFetchOffset == 0)
         await syncLoadedRelationships(
             relationshipItems,
             descriptor: descriptor,
@@ -1849,8 +1862,8 @@ public final class CodexModelContext {
             let removedChats = syncWorkspaceChats(
                 chats,
                 preservingExisting: preservingExisting,
-                workspaceFilters: descriptor.predicate.workspaces,
-                archivedScope: descriptor.predicate.archived
+                workspaceFilters: workspaceFilters(for: descriptor),
+                archivedScope: archivedScope(for: descriptor)
             )
             await removeChatsFromRegisteredResults(removedChats, excluding: excludedRegistration)
         }
@@ -1957,7 +1970,7 @@ public final class CodexModelContext {
                 }
                 group.replaceContextWorkspaces(sort(
                     fetchedWorkspaces + remainingWorkspaces,
-                    using: [CodexSortDescriptor(\.name)]
+                    using: [SortDescriptor(\.name)]
                 ))
             } else {
                 let fetchedIDs = Set(fetchedWorkspaces.map(\.id))
@@ -1967,7 +1980,7 @@ public final class CodexModelContext {
                 }
                 group.replaceContextWorkspaces(sort(
                     fetchedWorkspaces + preservedWorkspaces,
-                    using: [CodexSortDescriptor(\.name)]
+                    using: [SortDescriptor(\.name)]
                 ))
             }
         }
@@ -2007,12 +2020,10 @@ public final class CodexModelContext {
         for descriptor: CodexFetchDescriptor<Model>,
         relationshipIsComplete: Bool
     ) -> Bool {
-        (Model.self == CodexChat.self
+        let plan = chatQueryPlan(for: descriptor)
+        return (Model.self == CodexChat.self
             && relationshipIsComplete == false)
-            || descriptor.predicate.searchTerm?.isEmpty == false
-            || descriptor.predicate.modelProviders?.isEmpty == false
-            || descriptor.predicate.sourceKinds != nil
-            || descriptor.predicate.useStateDBOnly != nil
+            || plan?.membershipRequiresServerRefresh == true
     }
 
     package func preservedLiveChats<Model: CodexPersistentModel>(
@@ -2072,7 +2083,7 @@ public final class CodexModelContext {
         return chatsByID.values.filter { chat in
             loadedChatIDs.contains(chat.id) == false
                 && shouldPreserveLiveFetchedChat(chat)
-                && shouldIncludeLiveFetchedChat(chat, predicate: descriptor.predicate)
+                && shouldIncludeLiveFetchedChat(chat, descriptor: descriptor)
         }
     }
 
@@ -2096,42 +2107,20 @@ public final class CodexModelContext {
         for descriptor: CodexFetchDescriptor<Model>,
         requiresIncludePendingChanges: Bool
     ) -> Bool {
-        (requiresIncludePendingChanges == false || descriptor.includePendingChanges)
-            && descriptor.fetchOffset == 0
-            && descriptor.predicate.searchTerm?.isEmpty != false
-            && descriptor.predicate.modelProviders?.isEmpty != false
-            && descriptor.predicate.sourceKinds == nil
-            && descriptor.predicate.useStateDBOnly == nil
+        let plan = chatQueryPlan(for: descriptor)
+        return (requiresIncludePendingChanges == false || descriptor.includePendingChanges)
+            && descriptor.normalizedFetchOffset == 0
+            && plan?.membershipRequiresServerRefresh != true
     }
 
     private func shouldIncludeLiveFetchedChat<Model: CodexPersistentModel>(
         _ chat: CodexChat,
-        predicate: CodexFetchPredicate<Model>
+        descriptor: CodexFetchDescriptor<Model>
     ) -> Bool {
-        switch predicate.archived {
-        case .some(let expectedArchived):
-            guard expectedArchived == chat.isArchived else {
-                return false
-            }
-        case .none:
-            guard chat.isArchived == false else {
-                return false
-            }
+        guard let plan = chatQueryPlan(for: descriptor) else {
+            return chat.isArchived == false
         }
-
-        if let workspaces = predicate.workspaces {
-            guard let chatWorkspace = chat.workspace else {
-                return false
-            }
-            let chatPath = Self.standardizedDirectoryURL(chatWorkspace.url).path
-            guard workspaces.contains(where: {
-                Self.standardizedDirectoryURL($0).path == chatPath
-            }) else {
-                return false
-            }
-        }
-
-        return true
+        return plan.matches(chat)
     }
 
     private func workspaceIfLoaded(for url: URL) -> CodexWorkspace? {
@@ -2278,6 +2267,40 @@ public final class CodexModelContext {
         return threads
     }
 
+    private func chatQueryPlan<Model: CodexPersistentModel>(
+        for descriptor: CodexFetchDescriptor<Model>
+    ) -> CodexThreadQueryPlan? {
+        guard Model.self == CodexChat.self else {
+            if descriptor.predicate != nil {
+                preconditionFailure("CodexFetchDescriptor does not support predicates for \(Model.self).")
+            }
+            return nil
+        }
+        return CodexThreadQueryPlan(descriptor: descriptor as! CodexFetchDescriptor<CodexChat>)
+    }
+
+    private func archivedScope<Model: CodexPersistentModel>(
+        for descriptor: CodexFetchDescriptor<Model>
+    ) -> Bool? {
+        chatQueryPlan(for: descriptor)?.archived
+    }
+
+    private func workspaceFilters<Model: CodexPersistentModel>(
+        for descriptor: CodexFetchDescriptor<Model>
+    ) -> [URL]? {
+        chatQueryPlan(for: descriptor)?.workspaces
+    }
+
+    private func singleWorkspaceScope<Model: CodexPersistentModel>(
+        for descriptor: CodexFetchDescriptor<Model>
+    ) -> URL? {
+        chatQueryPlan(for: descriptor)?.singleWorkspace
+    }
+
+    private func filter(_ chats: [CodexChat], using plan: CodexThreadQueryPlan) -> [CodexChat] {
+        chats.filter { plan.matches($0) }
+    }
+
     private func localPage<Model: CodexPersistentModel>(
         _ items: [Model],
         for descriptor: CodexFetchDescriptor<Model>,
@@ -2285,7 +2308,7 @@ public final class CodexModelContext {
     ) -> CodexFetchPage<Model> {
         let offset =
             cursor == nil
-            ? descriptor.fetchOffset
+            ? descriptor.normalizedFetchOffset
             : localCursorOffset(from: cursor)
         let start = min(offset, items.count)
         guard let limit = descriptor.fetchLimit else {
@@ -2312,19 +2335,25 @@ public final class CodexModelContext {
         for descriptor: CodexFetchDescriptor<Model>,
         cursor: String?
     ) -> Bool {
-        if descriptor.fetchOffset > 0 {
+        if descriptor.normalizedFetchOffset > 0 {
             return false
         }
         if cursor?.hasPrefix(Self.localCursorPrefix) == true {
             return false
         }
-        guard let primarySort = descriptor.sortBy.first else {
+        guard let plan = chatQueryPlan(for: descriptor) else {
+            return true
+        }
+        guard plan.serverPredicateIsComplete else {
+            return false
+        }
+        guard let primarySort = plan.sortPlans.first else {
             return true
         }
         if primarySort.key == .recencyAt {
             return true
         }
-        return descriptor.sortBy.count == 1 && primarySort.threadSortKey != nil
+        return plan.sortPlans.count == 1 && primarySort.threadSortKey != nil
     }
 
     package func localCursor(for offset: Int) -> String {
@@ -2352,7 +2381,11 @@ public final class CodexModelContext {
     )
         -> CodexThreadQuery
     {
-        let serverSort = descriptor.sortBy.first { sortDescriptor in
+        if let plan = chatQueryPlan(for: descriptor) {
+            return plan.threadQuery(cursor: cursor, includePaging: includePaging)
+        }
+        let sortPlans = descriptor.sortPlans
+        let serverSort = sortPlans.first { sortDescriptor in
             switch sortDescriptor.key {
             case .createdAt, .updatedAt, .recencyAt:
                 return true
@@ -2361,16 +2394,10 @@ public final class CodexModelContext {
             }
         }
         return CodexThreadQuery(
-            archived: descriptor.predicate.archived,
             cursor: includePaging ? cursor : nil,
-            workspaces: descriptor.predicate.workspaces,
             limit: includePaging ? descriptor.fetchLimit : nil,
-            searchTerm: descriptor.predicate.searchTerm,
-            modelProviders: descriptor.predicate.modelProviders,
-            sortDirection: serverSort?.order.threadSortDirection,
-            sortKey: serverSort?.threadSortKey,
-            sourceKinds: descriptor.predicate.sourceKinds,
-            useStateDBOnly: descriptor.predicate.useStateDBOnly
+            sortDirection: serverSort?.threadSortDirection,
+            sortKey: serverSort?.threadSortKey
         )
     }
 
@@ -2394,50 +2421,51 @@ public final class CodexModelContext {
         return (.unknown("unknown"), "Unknown")
     }
 
-    private func sort(_ chats: [CodexChat], using descriptors: [CodexSortDescriptor<CodexChat>])
+    private func sort(_ chats: [CodexChat], using descriptors: [SortDescriptor<CodexChat>])
         -> [CodexChat]
     {
-        guard descriptors.first?.key != .recencyAt else {
+        let sortPlans = descriptors.map(CodexSortPlan<CodexChat>.init(descriptor:))
+        guard sortPlans.first?.key != .recencyAt else {
             return chats
         }
-        let localDescriptors = descriptors.filter { $0.key != .recencyAt }
-        guard localDescriptors.isEmpty == false else {
+        let localSortPlans = sortPlans.filter { $0.key != .recencyAt }
+        guard localSortPlans.isEmpty == false else {
             return chats
         }
-        return sortModels(chats, using: localDescriptors) { descriptor, lhs, rhs in
-            switch descriptor.key {
+        return sortModels(chats, using: localSortPlans) { sortPlan, lhs, rhs in
+            switch sortPlan.key {
             case .name:
-                compare(lhs.title, rhs.title, order: descriptor.order)
+                compare(lhs.title, rhs.title, order: sortPlan.order)
             case .createdAt:
-                compare(lhs.createdAt, rhs.createdAt, order: descriptor.order)
+                compare(lhs.createdAt, rhs.createdAt, order: sortPlan.order)
             case .updatedAt:
-                compare(lhs.updatedAt, rhs.updatedAt, order: descriptor.order)
+                compare(lhs.updatedAt, rhs.updatedAt, order: sortPlan.order)
             case .recencyAt:
-                compare(lhs.recencyAt, rhs.recencyAt, order: descriptor.order)
+                compare(lhs.recencyAt, rhs.recencyAt, order: sortPlan.order)
             }
         }
     }
 
     private func sort(
         _ workspaces: [CodexWorkspace],
-        using descriptors: [CodexSortDescriptor<CodexWorkspace>]
+        using descriptors: [SortDescriptor<CodexWorkspace>]
     ) -> [CodexWorkspace] {
-        sortModels(workspaces, using: descriptors) { descriptor, lhs, rhs in
-            switch descriptor.key {
+        sortModels(workspaces, using: descriptors.map(CodexSortPlan<CodexWorkspace>.init(descriptor:))) { sortPlan, lhs, rhs in
+            switch sortPlan.key {
             case .name, .createdAt, .updatedAt, .recencyAt:
-                compare(lhs.name, rhs.name, order: descriptor.order)
+                compare(lhs.name, rhs.name, order: sortPlan.order)
             }
         }
     }
 
     private func sort(
         _ groups: [CodexWorkspaceGroup],
-        using descriptors: [CodexSortDescriptor<CodexWorkspaceGroup>]
+        using descriptors: [SortDescriptor<CodexWorkspaceGroup>]
     ) -> [CodexWorkspaceGroup] {
-        sortModels(groups, using: descriptors) { descriptor, lhs, rhs in
-            switch descriptor.key {
+        sortModels(groups, using: descriptors.map(CodexSortPlan<CodexWorkspaceGroup>.init(descriptor:))) { sortPlan, lhs, rhs in
+            switch sortPlan.key {
             case .name, .createdAt, .updatedAt, .recencyAt:
-                compare(lhs.name, rhs.name, order: descriptor.order)
+                compare(lhs.name, rhs.name, order: sortPlan.order)
             }
         }
     }
@@ -2465,12 +2493,12 @@ public final class CodexModelContext {
         }
     }
 
-    private func compare(_ lhs: String, _ rhs: String, order: CodexSortOrder) -> ComparisonResult {
+    private func compare(_ lhs: String, _ rhs: String, order: SortOrder) -> ComparisonResult {
         let result = lhs.localizedStandardCompare(rhs)
         return order == .forward ? result : result.reversed
     }
 
-    private func compare(_ lhs: Date?, _ rhs: Date?, order: CodexSortOrder) -> ComparisonResult {
+    private func compare(_ lhs: Date?, _ rhs: Date?, order: SortOrder) -> ComparisonResult {
         switch (lhs, rhs) {
         case (.some(let lhs), .some(let rhs)):
             if lhs == rhs {
@@ -2522,30 +2550,6 @@ private extension CodexReviewTarget {
             let preview = instructions.trimmingCharacters(in: .whitespacesAndNewlines)
             return preview.isEmpty ? "Review code changes." : preview
         }
-    }
-}
-
-extension CodexSortDescriptor {
-    fileprivate var threadSortKey: CodexThreadSortKey? {
-        switch key {
-        case .createdAt:
-            return .createdAt
-        case .updatedAt:
-            return .updatedAt
-        case .recencyAt:
-            return .recencyAt
-        case .name:
-            return nil
-        }
-    }
-}
-
-extension CodexFetchPredicate {
-    fileprivate var singleWorkspace: URL? {
-        guard let workspaces, workspaces.count == 1 else {
-            return nil
-        }
-        return workspaces[0]
     }
 }
 

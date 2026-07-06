@@ -488,6 +488,7 @@ extension AppServerAPI.Thread {
             case name
             case preview
             case modelProvider
+            case sourceKind
             case createdAt
             case updatedAt
             case recencyAt
@@ -511,6 +512,7 @@ extension AppServerAPI.Thread {
         package var name: String?
         package var preview: String?
         package var modelProvider: String?
+        package var sourceKind: String?
         package var createdAt: Int?
         package var updatedAt: Int?
         package var recencyAt: Int?
@@ -525,6 +527,7 @@ extension AppServerAPI.Thread {
             case name
             case preview
             case modelProvider
+            case sourceKind
             case createdAt
             case updatedAt
             case recencyAt
@@ -539,6 +542,7 @@ extension AppServerAPI.Thread {
             name: String? = nil,
             preview: String? = nil,
             modelProvider: String? = nil,
+            sourceKind: String? = nil,
             createdAt: Int? = nil,
             updatedAt: Int? = nil,
             recencyAt: Int? = nil,
@@ -552,6 +556,7 @@ extension AppServerAPI.Thread {
             self.name = name
             self.preview = preview
             self.modelProvider = modelProvider
+            self.sourceKind = sourceKind
             self.createdAt = createdAt
             self.updatedAt = updatedAt
             self.recencyAt = recencyAt
@@ -563,6 +568,7 @@ extension AppServerAPI.Thread {
                 name: name,
                 preview: preview,
                 modelProvider: modelProvider,
+                sourceKind: sourceKind,
                 createdAt: createdAt,
                 updatedAt: updatedAt,
                 recencyAt: recencyAt,
@@ -579,6 +585,7 @@ extension AppServerAPI.Thread {
             name = try container.decodeIfPresent(String.self, forKey: .name)
             preview = try container.decodeIfPresent(String.self, forKey: .preview)
             modelProvider = try container.decodeIfPresent(String.self, forKey: .modelProvider)
+            sourceKind = try container.decodeIfPresent(String.self, forKey: .sourceKind)
             createdAt = try container.decodeIfPresent(Int.self, forKey: .createdAt)
             updatedAt = try container.decodeIfPresent(Int.self, forKey: .updatedAt)
             recencyAt = try container.decodeIfPresent(Int.self, forKey: .recencyAt)
@@ -595,6 +602,7 @@ extension AppServerAPI.Thread {
             try encode(name, forKey: .name, into: &container)
             try encode(preview, forKey: .preview, into: &container)
             try encode(modelProvider, forKey: .modelProvider, into: &container)
+            try encode(sourceKind, forKey: .sourceKind, into: &container)
             try encode(createdAt, forKey: .createdAt, into: &container)
             try encode(updatedAt, forKey: .updatedAt, into: &container)
             try encode(recencyAt, forKey: .recencyAt, into: &container)
@@ -623,6 +631,7 @@ extension AppServerAPI.Thread {
             name: String?,
             preview: String?,
             modelProvider: String?,
+            sourceKind: String?,
             createdAt: Int?,
             updatedAt: Int?,
             recencyAt: Int?,
@@ -642,6 +651,9 @@ extension AppServerAPI.Thread {
             }
             if modelProvider != nil {
                 fields.insert(.modelProvider)
+            }
+            if sourceKind != nil {
+                fields.insert(.sourceKind)
             }
             if createdAt != nil {
                 fields.insert(.createdAt)
@@ -691,6 +703,8 @@ private extension AppServerAPI.Thread.Snapshot.Field {
             self = .preview
         case .modelProvider:
             self = .modelProvider
+        case .sourceKind:
+            self = .sourceKind
         case .createdAt:
             self = .createdAt
         case .updatedAt:
