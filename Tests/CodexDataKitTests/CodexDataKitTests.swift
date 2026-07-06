@@ -39,6 +39,12 @@ private func nonNilModelProviderChatPredicate() -> Predicate<CodexChat> {
     }
 }
 
+private func archivedNilModelProviderChatPredicate() -> Predicate<CodexChat> {
+    #Predicate<CodexChat> { chat in
+        chat.isArchived && chat.modelProvider == nil
+    }
+}
+
 private func sourceKindChatPredicate(_ sourceKinds: [CodexThreadSourceKind]) -> Predicate<CodexChat> {
     #Predicate<CodexChat> { chat in
         chat.sourceKind != nil && sourceKinds.contains(chat.sourceKind!)
@@ -619,6 +625,28 @@ struct CodexModelContextTests {
             await runtime.transport.recordedRequests(method: "thread/list").first)
         let params = try recorded.decodeParams(ThreadListParams.self)
         #expect(params.archived == true)
+    }
+
+    @Test("nil equality predicates merge with archived thread list scope")
+    func nilEqualityPredicatesMergeWithArchivedThreadListScope() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-archived", name: "Archived")
+        ]))
+
+        let results = try await context.fetch(CodexFetchRequest<CodexChat>(
+            predicate: archivedNilModelProviderChatPredicate()
+        ))
+
+        #expect(results.map(\.id.rawValue) == ["thread-archived"])
+        #expect(results.first?.isArchived == true)
+        let recorded = try #require(
+            await runtime.transport.recordedRequests(method: "thread/list").first)
+        let params = try recorded.decodeParams(ThreadListParams.self)
+        #expect(params.archived == true)
+        #expect(params.limit == nil)
     }
 
     @Test("missing source kind matches app server source filters")

@@ -378,7 +378,7 @@ private struct CodexThreadServerFilter: Hashable, Sendable {
             filter.sourceKinds = [sourceKind]
             return filter
         default:
-            return nil
+            return nilCheckFilter(lhs, rhs)
         }
     }
 
@@ -392,14 +392,13 @@ private struct CodexThreadServerFilter: Hashable, Sendable {
             filter.archived = !value
             return filter
         default:
-            return nilCheckFilter(lhs, rhs, expectsNil: false)
+            return nilCheckFilter(lhs, rhs)
         }
     }
 
     private static func nilCheckFilter(
         _ lhs: CodexChatPredicateValue,
-        _ rhs: CodexChatPredicateValue,
-        expectsNil: Bool
+        _ rhs: CodexChatPredicateValue
     ) -> Self? {
         switch (lhs, rhs) {
         case (.key(.workspaceID), .nilLiteral),
@@ -408,7 +407,7 @@ private struct CodexThreadServerFilter: Hashable, Sendable {
             (.nilLiteral, .key(.modelProvider)),
             (.key(.sourceKind), .nilLiteral),
             (.nilLiteral, .key(.sourceKind)):
-            return expectsNil ? nil : Self(isComplete: false)
+            return Self(isComplete: false)
         default:
             return nil
         }
