@@ -27,7 +27,7 @@ package struct CodexChatRecord: Hashable, Sendable {
         workspaceID = chat.workspaceID
         workspaceURL = chat.workspace?.url
         workspaceGroupID = chat.workspaceGroupID
-        sourceKind = chat.sourceKind
+        sourceKind = chat.sourceKind ?? .appServer
         searchableText = chat.searchableText
         createdAt = chat.createdAt
         updatedAt = chat.updatedAt
@@ -53,9 +53,9 @@ package struct CodexThreadQueryPlan: Sendable {
             self.predicateSignature = lowered.signature
             self.serverFilter = CodexThreadServerFilter(signature: lowered.signature)
         } else {
-            self.predicate = nil
+            self.predicate = { $0.isArchived == false }
             self.predicateSignature = nil
-            self.serverFilter = .init()
+            self.serverFilter = .defaultChatFilter
         }
         self.sortPlans = descriptor.sortPlans
         self.fetchLimit = descriptor.fetchLimit
@@ -265,6 +265,12 @@ private struct CodexThreadServerFilter: Hashable, Sendable {
         self.isComplete = isComplete
     }
 
+    static var defaultChatFilter: Self {
+        var filter = Self()
+        filter.archived = false
+        return filter
+    }
+
     var requiresServerRefreshForMembership: Bool {
         searchTerm?.isEmpty == false
             || modelProviders?.isEmpty == false
@@ -289,7 +295,7 @@ private struct CodexThreadServerFilter: Hashable, Sendable {
         case .equal(let lhs, let rhs):
             return equalityFilter(lhs, rhs)
         case .notEqual(let lhs, let rhs):
-            return nilCheckFilter(lhs, rhs, expectsNil: false)
+            return inequalityFilter(lhs, rhs)
         case .localizedStandardContains(let lhs, let rhs):
             return localizedContainsFilter(lhs, rhs)
         case .contains(let lhs, let rhs):
@@ -357,6 +363,20 @@ private struct CodexThreadServerFilter: Hashable, Sendable {
             return filter
         default:
             return nil
+        }
+    }
+
+    private static func inequalityFilter(
+        _ lhs: CodexChatPredicateValue,
+        _ rhs: CodexChatPredicateValue
+    ) -> Self? {
+        switch (lhs, rhs) {
+        case (.key(.isArchived), .bool(let value)), (.bool(let value), .key(.isArchived)):
+            var filter = Self()
+            filter.archived = !value
+            return filter
+        default:
+            return nilCheckFilter(lhs, rhs, expectsNil: false)
         }
     }
 
