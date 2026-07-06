@@ -18,10 +18,10 @@ package actor CodexAppServerNotificationRouter {
     private let client: AppServerClient
     private var routerTask: Task<Void, Never>?
     private var threadIDByTurnID: [CodexTurnID: CodexThreadID] = [:]
-    private var reviewThreadIDs: Set<CodexThreadID> = []
     private var turnHistoryByTurnID: [CodexTurnID: [CodexTurnEvent]] = [:]
     private var threadHistoryByThreadID: [CodexThreadID: [CodexThreadEvent]] = [:]
     private var threadGenerationStartByThreadID: [CodexThreadID: ThreadGenerationStart] = [:]
+    private var unscopedDiagnosticRouting = UnscopedDiagnosticRoutingState()
     private var turnSubscribersByTurnID: [CodexTurnID: [UUID: TurnSubscriber]] = [:]
     private var threadSubscribersByThreadID: [CodexThreadID: [UUID: ThreadSubscriber]] = [:]
 
@@ -33,6 +33,47 @@ package actor CodexAppServerNotificationRouter {
     private enum ThreadGenerationStart {
         case cursor(Int)
         case includingTurn(CodexTurnID, fallbackCursor: Int)
+    }
+
+    private struct UnscopedDiagnosticRoutingState {
+        private var startupThreadIDs: Set<CodexThreadID> = []
+        private var turnIDByThreadID: [CodexThreadID: CodexTurnID] = [:]
+
+        mutating func beginStartup(in threadID: CodexThreadID) {
+            startupThreadIDs.insert(threadID)
+        }
+
+        mutating func activate(in threadID: CodexThreadID, until turnID: CodexTurnID) {
+            startupThreadIDs.remove(threadID)
+            turnIDByThreadID[threadID] = turnID
+        }
+
+        mutating func stop(in threadID: CodexThreadID) {
+            startupThreadIDs.remove(threadID)
+            turnIDByThreadID.removeValue(forKey: threadID)
+        }
+
+        mutating func stopActive(in threadID: CodexThreadID) {
+            turnIDByThreadID.removeValue(forKey: threadID)
+        }
+
+        func activeTurnID(in threadID: CodexThreadID) -> CodexTurnID? {
+            turnIDByThreadID[threadID]
+        }
+
+        mutating func activeThreadIDs(
+            isStillActive: (CodexThreadID, CodexTurnID) -> Bool
+        ) -> [CodexThreadID] {
+            turnIDByThreadID = turnIDByThreadID.filter {
+                isStillActive($0.key, $0.value)
+            }
+            return Array(Set(turnIDByThreadID.keys).union(startupThreadIDs))
+        }
+
+        mutating func reset() {
+            startupThreadIDs.removeAll()
+            turnIDByThreadID.removeAll()
+        }
     }
     private let decoder = JSONDecoder()
 
@@ -107,22 +148,7 @@ package actor CodexAppServerNotificationRouter {
     }
 
     package func seedTurn(_ turnID: CodexTurnID, threadID: CodexThreadID) {
-        seedTurn(turnID, threadID: threadID, isReviewThread: false)
-    }
-
-    package func seedReviewTurn(_ turnID: CodexTurnID, reviewThreadID: CodexThreadID) {
-        seedTurn(turnID, threadID: reviewThreadID, isReviewThread: true)
-    }
-
-    private func seedTurn(
-        _ turnID: CodexTurnID,
-        threadID: CodexThreadID,
-        isReviewThread: Bool
-    ) {
         threadIDByTurnID[turnID] = threadID
-        if isReviewThread {
-            reviewThreadIDs.insert(threadID)
-        }
         guard let turnHistory = turnHistoryByTurnID[turnID] else {
             return
         }
@@ -175,41 +201,104 @@ package actor CodexAppServerNotificationRouter {
         )
     }
 
-    package func beginReviewThreadEventGeneration(
-        _ reviewThreadID: CodexThreadID,
-        including turnID: CodexTurnID
+    package func beginUnscopedDiagnosticRouting(in threadID: CodexThreadID) {
+        unscopedDiagnosticRouting.beginStartup(in: threadID)
+    }
+
+    package func activateUnscopedDiagnosticRouting(
+        in threadID: CodexThreadID,
+        until turnID: CodexTurnID
     ) {
-        seedTurn(turnID, threadID: reviewThreadID, isReviewThread: true)
-        beginThreadEventGeneration(reviewThreadID, including: turnID)
+        unscopedDiagnosticRouting.activate(in: threadID, until: turnID)
+    }
+
+    package func stopUnscopedDiagnosticRouting(in threadID: CodexThreadID) {
+        unscopedDiagnosticRouting.stop(in: threadID)
+    }
+
+    package func beginDetachedThreadEventGeneration(
+        _ threadID: CodexThreadID,
+        including turnID: CodexTurnID,
+        replacingUnscopedDiagnosticsIn sourceThreadID: CodexThreadID
+    ) {
+        threadGenerationStartByThreadID[threadID] = .includingTurn(
+            turnID,
+            fallbackCursor: threadHistoryByThreadID[threadID]?.count ?? 0
+        )
+        unscopedDiagnosticRouting.activate(in: threadID, until: turnID)
+        moveUnscopedDiagnostics(from: sourceThreadID, to: threadID)
+        seedTurn(turnID, threadID: threadID)
+        if sourceThreadID != threadID {
+            unscopedDiagnosticRouting.stop(in: sourceThreadID)
+        }
+    }
+
+    private func moveUnscopedDiagnostics(
+        from sourceThreadID: CodexThreadID,
+        to destinationThreadID: CodexThreadID
+    ) {
+        guard sourceThreadID != destinationThreadID else {
+            return
+        }
+        let sourceHistory = threadHistoryByThreadID[sourceThreadID] ?? []
+        var movedEventIndices: [Array<CodexThreadEvent>.Index] = []
+        for eventIndex in currentGenerationEventIndices(in: sourceHistory, threadID: sourceThreadID) {
+            let event = sourceHistory[eventIndex]
+            guard case .unknown(var raw) = event,
+                raw.turnID == nil,
+                Self.isUnscopedDiagnosticNotification(raw.method)
+            else {
+                continue
+            }
+            raw.threadID = destinationThreadID
+            let replayedEvent = CodexThreadEvent.unknown(raw)
+            movedEventIndices.append(eventIndex)
+            appendThreadEvent(replayedEvent, threadID: destinationThreadID)
+        }
+        if movedEventIndices.isEmpty == false {
+            var updatedSourceHistory = threadHistoryByThreadID[sourceThreadID] ?? []
+            for eventIndex in movedEventIndices.sorted(by: >) {
+                updatedSourceHistory.remove(at: eventIndex)
+            }
+            threadHistoryByThreadID[sourceThreadID] = updatedSourceHistory
+        }
     }
 
     private func route(_ notification: JSONRPC.Notification) {
-        let reviewNotification = try? AppServerReviewNotification(
-            method: notification.method,
-            paramsData: notification.params
-        )
-        if let reviewNotification,
-           reviewNotification.method.isThreadlessReviewBroadcast,
-           reviewNotification.payload.threadID == nil,
-           reviewNotification.payload.resolvedTurnID == nil,
-           routeReviewBroadcast(reviewNotification) {
-            return
-        }
-
-        var context = Self.context(from: notification.params, reviewNotification: reviewNotification)
+        var context = Self.context(from: notification.params)
         if let threadID = context.threadID, let turnID = context.turnID {
             threadIDByTurnID[turnID] = threadID
         } else if let turnID = context.turnID, let threadID = threadIDByTurnID[turnID] {
             context.threadID = threadID
         }
+        if context.threadID == nil,
+            context.turnID == nil,
+            Self.isUnscopedDiagnosticNotification(notification.method)
+        {
+            for threadID in activeUnscopedDiagnosticThreadIDs() {
+                routeNotification(
+                    method: notification.method,
+                    params: notification.params,
+                    context: .init(threadID: threadID)
+                )
+            }
+            return
+        }
+        routeNotification(method: notification.method, params: notification.params, context: context)
+    }
 
+    private func routeNotification(
+        method: String,
+        params: Data,
+        context: NotificationContext
+    ) {
         if let threadID = context.threadID {
-            let event = decodeThreadEvent(notification: notification, context: context)
+            let event = decodeThreadEvent(method: method, params: params, context: context)
             appendThreadEvent(event, threadID: threadID)
         }
 
         if let turnID = context.turnID {
-            let event = decodeTurnEvent(notification: notification, context: context)
+            let event = decodeTurnEvent(method: method, params: params, context: context)
             turnHistoryByTurnID[turnID, default: []].append(event)
             if let subscribers = turnSubscribersByTurnID[turnID] {
                 for subscriber in subscribers.values {
@@ -220,21 +309,6 @@ package actor CodexAppServerNotificationRouter {
                 finishTurnSubscribers(turnID: turnID)
             }
         }
-    }
-
-    private func routeReviewBroadcast(_ notification: AppServerReviewNotification) -> Bool {
-        guard reviewThreadIDs.isEmpty == false else {
-            return false
-        }
-        for threadID in reviewThreadIDs {
-            guard isCurrentThreadEventGenerationFinished(threadID) == false else {
-                continue
-            }
-            var raw = notification.rawNotification
-            raw.threadID = threadID
-            appendThreadEvent(.unknown(raw), threadID: threadID)
-        }
-        return true
     }
 
     private func appendThreadEvent(_ event: CodexThreadEvent, threadID: CodexThreadID) {
@@ -257,7 +331,12 @@ package actor CodexAppServerNotificationRouter {
             }
         }
         if case .closed = event {
+            unscopedDiagnosticRouting.stop(in: threadID)
             finishThreadSubscribers(threadID: threadID)
+        } else if let trackedTurnID = unscopedDiagnosticRouting.activeTurnID(in: threadID),
+            Self.isTerminalThreadEvent(event, for: trackedTurnID)
+        {
+            unscopedDiagnosticRouting.stopActive(in: threadID)
         }
     }
 
@@ -316,17 +395,27 @@ package actor CodexAppServerNotificationRouter {
         in history: [CodexThreadEvent],
         threadID: CodexThreadID
     ) -> [CodexThreadEvent] {
+        currentGenerationEventIndices(in: history, threadID: threadID).map { history[$0] }
+    }
+
+    private func currentGenerationEventIndices(
+        in history: [CodexThreadEvent],
+        threadID: CodexThreadID
+    ) -> [Array<CodexThreadEvent>.Index] {
         guard let generationStart = threadGenerationStartByThreadID[threadID] else {
-            return history
+            return Array(history.indices)
         }
 
         let startIndex = currentGenerationStartIndex(generationStart, in: history)
-        let events = Array(history[startIndex...])
+        let eventIndices = Array(history.indices.filter { $0 >= startIndex })
         if case .includingTurn(let turnID, _) = generationStart,
-           events.contains(where: { Self.threadEvent($0, matches: turnID) }) == false {
-            return events.filter { Self.threadEventTurnID($0).map { $0 == turnID } ?? true }
+            eventIndices.contains(where: { Self.threadEvent(history[$0], matches: turnID) }) == false
+        {
+            return eventIndices.filter {
+                Self.threadEventTurnID(history[$0]).map { $0 == turnID } ?? true
+            }
         }
-        return events
+        return eventIndices
     }
 
     private func shouldYieldThreadEvent(
@@ -379,7 +468,8 @@ package actor CodexAppServerNotificationRouter {
             if let boundaryIndex = precedingHistory.lastIndex(where: isThreadEventGenerationBoundary) {
                 return history.index(after: boundaryIndex)
             }
-            return firstTurnEventIndex
+            let clampedFallback = min(fallbackCursor, history.count)
+            return min(clampedFallback, firstTurnEventIndex)
         }
 
         let clampedFallback = min(fallbackCursor, history.count)
@@ -423,7 +513,7 @@ package actor CodexAppServerNotificationRouter {
         switch event {
         case .completed, .failed:
             true
-        case .started, .itemStarted, .itemUpdated, .itemCompleted, .messageDelta,
+        case .started, .itemStarted, .itemUpdated, .itemCompleted, .message, .messageDelta,
             .reasoningSummaryPartAdded, .reasoningDelta, .tokenUsageUpdated, .unknown:
             false
         }
@@ -436,6 +526,24 @@ package actor CodexAppServerNotificationRouter {
         return false
     }
 
+    private func activeUnscopedDiagnosticThreadIDs() -> [CodexThreadID] {
+        unscopedDiagnosticRouting.activeThreadIDs { threadID, turnID in
+            isCurrentThreadEventGenerationFinished(threadID) == false
+                && hasTerminalTurnEvent(threadID: threadID, turnID: turnID) == false
+        }
+    }
+
+    private nonisolated static func isUnscopedDiagnosticNotification(
+        _ method: String
+    ) -> Bool {
+        switch method {
+        case "warning", "deprecationNotice", "configWarning", "error":
+            true
+        default:
+            false
+        }
+    }
+
     private nonisolated static func isThreadEventGenerationBoundary(_ event: CodexThreadEvent) -> Bool {
         switch event {
         case .closed, .turnCompleted, .turnFailed:
@@ -443,6 +551,31 @@ package actor CodexAppServerNotificationRouter {
         case .turnStarted, .statusChanged, .itemStarted, .itemUpdated, .itemCompleted,
             .message, .messageDelta, .reasoningSummaryPartAdded, .reasoningDelta,
             .tokenUsageUpdated, .unknown:
+            false
+        }
+    }
+
+    private func hasTerminalTurnEvent(threadID: CodexThreadID, turnID: CodexTurnID) -> Bool {
+        if turnHistoryByTurnID[turnID]?.contains(where: Self.isTerminalTurnEvent) == true {
+            return true
+        }
+        return threadHistoryByThreadID[threadID]?.contains {
+            Self.isTerminalThreadEvent($0, for: turnID)
+        } == true
+    }
+
+    private nonisolated static func isTerminalThreadEvent(
+        _ event: CodexThreadEvent,
+        for turnID: CodexTurnID
+    ) -> Bool {
+        switch event {
+        case .turnCompleted(let response):
+            response.turnID == turnID
+        case .turnFailed(let eventTurnID, _):
+            eventTurnID == turnID
+        case .turnStarted, .statusChanged, .closed, .itemStarted, .itemUpdated, .itemCompleted,
+             .message, .messageDelta, .reasoningSummaryPartAdded, .reasoningDelta,
+             .tokenUsageUpdated, .unknown:
             false
         }
     }
@@ -484,6 +617,11 @@ package actor CodexAppServerNotificationRouter {
             return .itemUpdated(item, turnID: turnID)
         case .itemCompleted(let item):
             return .itemCompleted(item, turnID: turnID)
+        case .message(let message):
+            return .message(
+                CodexAgentMessageFallbackID.scopedMessage(message, turnID: turnID),
+                turnID: turnID
+            )
         case .messageDelta(let delta):
             return .messageDelta(delta, turnID: turnID)
         case .reasoningSummaryPartAdded(let part):
@@ -505,74 +643,84 @@ package actor CodexAppServerNotificationRouter {
     }
 
     private func decodeTurnEvent(
-        notification: JSONRPC.Notification,
+        method: String,
+        params: Data,
         context: NotificationContext
     ) -> CodexTurnEvent {
         let raw = CodexRawNotification(
-            method: notification.method,
-            params: notification.params,
+            method: method,
+            params: params,
             threadID: context.threadID,
             turnID: context.turnID
         )
-        switch notification.method {
+        switch method {
         case "turn/started":
             return .started(context.turnID ?? .init(rawValue: ""))
         case "turn/completed":
-            return .completed(turnResult(from: notification.params, context: context))
+            return .completed(turnResult(from: params, context: context))
         case "turn/failed", "turn/cancelled":
-            return .failed(turnFailureMessage(from: notification.params) ?? notification.method)
+            return .failed(turnFailureMessage(from: params) ?? method)
         case "item/started":
-            if let item = item(from: notification.params) {
+            if let item = item(from: params) {
                 return .itemStarted(item)
             }
             return .unknown(raw)
         case "item/updated":
-            if let item = item(from: notification.params) {
+            if let item = item(from: params) {
                 return .itemUpdated(item)
             }
             return .unknown(raw)
         case "item/completed":
-            if let item = item(from: notification.params) {
+            if let item = item(from: params) {
                 return .itemCompleted(item)
             }
             return .unknown(raw)
         case "item/commandExecution/outputDelta":
-            if let item = itemUpdate(from: notification.params, kind: .commandExecution) {
+            if let item = itemUpdate(from: params, kind: .commandExecution) {
                 return .itemUpdated(item)
             }
             return .unknown(raw)
         case "item/fileChange/outputDelta", "item/fileChange/patchUpdated":
-            if let item = itemUpdate(from: notification.params, kind: .fileChange) {
+            if let item = itemUpdate(from: params, kind: .fileChange) {
                 return .itemUpdated(item)
             }
             return .unknown(raw)
         case "item/mcpToolCall/progress":
-            if let item = itemUpdate(from: notification.params, kind: .mcpToolCall) {
+            if let item = itemUpdate(from: params, kind: .mcpToolCall) {
                 return .itemUpdated(item)
             }
             return .unknown(raw)
         case "item/agentMessage/delta":
-            if let delta = messageDelta(from: notification.params) {
+            if let delta = messageDelta(from: params) {
                 return .messageDelta(delta)
             }
             return .unknown(raw)
+        case "agent/message":
+            if let message = agentMessage(
+                from: params,
+                context: context,
+                fallbackItemID: CodexAgentMessageFallbackID.unscoped
+            ) {
+                return .message(message)
+            }
+            return .unknown(raw)
         case "item/reasoning/summaryPartAdded":
-            if let part = reasoningSummaryPart(from: notification.params) {
+            if let part = reasoningSummaryPart(from: params) {
                 return .reasoningSummaryPartAdded(part)
             }
             return .unknown(raw)
         case "item/reasoning/summaryTextDelta":
-            if let delta = reasoningSummaryDelta(from: notification.params) {
+            if let delta = reasoningSummaryDelta(from: params) {
                 return .reasoningDelta(delta)
             }
             return .unknown(raw)
         case "item/reasoning/textDelta":
-            if let delta = reasoningTextDelta(from: notification.params) {
+            if let delta = reasoningTextDelta(from: params) {
                 return .reasoningDelta(delta)
             }
             return .unknown(raw)
         case "thread/tokenUsage/updated":
-            if let usage = tokenUsage(from: notification.params) {
+            if let usage = tokenUsage(from: params) {
                 return .tokenUsageUpdated(usage)
             }
             return .unknown(raw)
@@ -582,82 +730,92 @@ package actor CodexAppServerNotificationRouter {
     }
 
     private func decodeThreadEvent(
-        notification: JSONRPC.Notification,
+        method: String,
+        params: Data,
         context: NotificationContext
     ) -> CodexThreadEvent {
         let raw = CodexRawNotification(
-            method: notification.method,
-            params: notification.params,
+            method: method,
+            params: params,
             threadID: context.threadID,
             turnID: context.turnID
         )
-        switch notification.method {
+        switch method {
         case "turn/started":
             return .turnStarted(context.turnID ?? .init(rawValue: ""))
         case "turn/completed":
-            return .turnCompleted(turnResult(from: notification.params, context: context))
+            return .turnCompleted(turnResult(from: params, context: context))
         case "turn/failed", "turn/cancelled":
             return .turnFailed(
                 turnID: context.turnID,
-                message: turnFailureMessage(from: notification.params) ?? notification.method
+                message: turnFailureMessage(from: params) ?? method
             )
         case "item/started":
-            if let item = item(from: notification.params) {
+            if let item = item(from: params) {
                 return .itemStarted(item, turnID: context.turnID)
             }
             return .unknown(raw)
         case "item/updated":
-            if let item = item(from: notification.params) {
+            if let item = item(from: params) {
                 return .itemUpdated(item, turnID: context.turnID)
             }
             return .unknown(raw)
         case "item/completed":
-            if let item = item(from: notification.params) {
+            if let item = item(from: params) {
                 return .itemCompleted(item, turnID: context.turnID)
             }
             return .unknown(raw)
         case "item/commandExecution/outputDelta":
-            if let item = itemUpdate(from: notification.params, kind: .commandExecution) {
+            if let item = itemUpdate(from: params, kind: .commandExecution) {
                 return .itemUpdated(item, turnID: context.turnID)
             }
             return .unknown(raw)
         case "item/fileChange/outputDelta", "item/fileChange/patchUpdated":
-            if let item = itemUpdate(from: notification.params, kind: .fileChange) {
+            if let item = itemUpdate(from: params, kind: .fileChange) {
                 return .itemUpdated(item, turnID: context.turnID)
             }
             return .unknown(raw)
         case "item/mcpToolCall/progress":
-            if let item = itemUpdate(from: notification.params, kind: .mcpToolCall) {
+            if let item = itemUpdate(from: params, kind: .mcpToolCall) {
                 return .itemUpdated(item, turnID: context.turnID)
             }
             return .unknown(raw)
         case "item/agentMessage/delta":
-            if let delta = messageDelta(from: notification.params) {
+            if let delta = messageDelta(from: params) {
                 return .messageDelta(delta, turnID: context.turnID)
             }
             return .unknown(raw)
+        case "agent/message":
+            if let message = agentMessage(
+                from: params,
+                context: context,
+                fallbackItemID: CodexAgentMessageFallbackID.scoped(turnID: context.turnID)
+            ) {
+                return .message(message, turnID: context.turnID)
+            }
+            return .unknown(raw)
         case "item/reasoning/summaryPartAdded":
-            if let part = reasoningSummaryPart(from: notification.params) {
+            if let part = reasoningSummaryPart(from: params) {
                 return .reasoningSummaryPartAdded(part, turnID: context.turnID)
             }
             return .unknown(raw)
         case "item/reasoning/summaryTextDelta":
-            if let delta = reasoningSummaryDelta(from: notification.params) {
+            if let delta = reasoningSummaryDelta(from: params) {
                 return .reasoningDelta(delta, turnID: context.turnID)
             }
             return .unknown(raw)
         case "item/reasoning/textDelta":
-            if let delta = reasoningTextDelta(from: notification.params) {
+            if let delta = reasoningTextDelta(from: params) {
                 return .reasoningDelta(delta, turnID: context.turnID)
             }
             return .unknown(raw)
         case "thread/tokenUsage/updated":
-            if let usage = tokenUsage(from: notification.params) {
+            if let usage = tokenUsage(from: params) {
                 return .tokenUsageUpdated(usage, turnID: context.turnID)
             }
             return .unknown(raw)
         case "thread/status/changed":
-            if let status = threadStatus(from: notification.params) {
+            if let status = threadStatus(from: params) {
                 return .statusChanged(status)
             }
             return .unknown(raw)
@@ -705,6 +863,7 @@ package actor CodexAppServerNotificationRouter {
     private func finishAll(throwing error: Error) {
         let turnSubscribers = turnSubscribersByTurnID.values.flatMap(\.values)
         let threadSubscribers = threadSubscribersByThreadID.values.flatMap(\.values)
+        unscopedDiagnosticRouting.reset()
         turnSubscribersByTurnID.removeAll()
         threadSubscribersByThreadID.removeAll()
         for subscriber in turnSubscribers {
@@ -758,6 +917,38 @@ package actor CodexAppServerNotificationRouter {
             itemID: payload.itemID,
             phase: payload.phase.map(CodexMessagePhase.init(rawValue:))
         )
+    }
+
+    private func agentMessage(
+        from data: Data,
+        context: NotificationContext,
+        fallbackItemID: String
+    ) -> CodexMessage? {
+        guard let payload = try? decoder.decode(AgentMessagePayload.self, from: data),
+              let text = nonEmpty(payload.message ?? payload.text)
+        else {
+            return nil
+        }
+        return .init(
+            id: agentMessageID(payload.itemID, fallbackItemID: fallbackItemID),
+            role: .assistant,
+            phase: payload.phase.map(CodexMessagePhase.init(rawValue:)),
+            text: text
+        )
+    }
+
+    private func agentMessageID(_ itemID: String?, fallbackItemID: String) -> String {
+        if let itemID = nonEmpty(itemID) {
+            return itemID
+        }
+        return fallbackItemID
+    }
+
+    private func nonEmpty(_ value: String?) -> String? {
+        guard let value, value.isEmpty == false else {
+            return nil
+        }
+        return value
     }
 
     private func reasoningSummaryPart(from data: Data) -> CodexReasoningPart? {
@@ -848,19 +1039,7 @@ package actor CodexAppServerNotificationRouter {
         return nil
     }
 
-    private static func context(
-        from data: Data,
-        reviewNotification: AppServerReviewNotification? = nil
-    ) -> NotificationContext {
-        if let reviewNotification {
-            let payload = reviewNotification.payload
-            if payload.threadID != nil || payload.resolvedTurnID != nil {
-                return .init(
-                    threadID: payload.threadID.map(CodexThreadID.init(rawValue:)),
-                    turnID: payload.resolvedTurnID.map(CodexTurnID.init(rawValue:))
-                )
-            }
-        }
+    private static func context(from data: Data) -> NotificationContext {
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return .init()
         }
@@ -911,6 +1090,20 @@ private struct AgentMessageDeltaPayload: Decodable {
     enum CodingKeys: String, CodingKey {
         case itemID = "itemId"
         case delta
+        case text
+        case phase
+    }
+}
+
+private struct AgentMessagePayload: Decodable {
+    var itemID: String?
+    var message: String?
+    var text: String?
+    var phase: String?
+
+    enum CodingKeys: String, CodingKey {
+        case itemID = "itemId"
+        case message
         case text
         case phase
     }

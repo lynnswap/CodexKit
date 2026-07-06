@@ -703,7 +703,7 @@ public struct CodexReviewResumeOptions: Equatable, Sendable {
     }
 }
 
-/// Review-scoped events emitted for a `CodexReviewSession`.
+/// Thread events projected for a `CodexReviewSession`.
 public enum CodexReviewEvent: Equatable, Sendable {
     case turnStarted(CodexTurnID)
     case turnCompleted(CodexResponse)
@@ -754,7 +754,7 @@ public enum CodexReviewEvent: Equatable, Sendable {
     }
 }
 
-/// Incremental review progress derived from review-domain events.
+/// Incremental progress derived from the review turn's thread events.
 public struct CodexReviewProgress: Equatable, Sendable {
     public enum Phase: Equatable, Sendable {
         case running
@@ -869,7 +869,7 @@ public struct CodexReviewSession: Identifiable, Sendable {
         return [activeTurnThreadID, sourceThreadID]
     }
 
-    /// Review-scoped events emitted by the review thread.
+    /// Thread events filtered to the review turn.
     public var events: CodexReviewEventSequence {
         .init(events: eventThread.events, terminalTurnID: turnID)
     }
@@ -1335,6 +1335,9 @@ public struct CodexTranscript: Equatable, Sendable {
     public var finalAnswer: String? {
         var fallback: String?
         for message in messages.reversed() where message.role == .assistant {
+            guard message.text.isEmpty == false else {
+                continue
+            }
             if message.phase == .finalAnswer {
                 return message.text
             }
@@ -1345,8 +1348,19 @@ public struct CodexTranscript: Equatable, Sendable {
         return fallback
     }
 
+    public var reviewOutputText: String? {
+        for item in items.reversed() where item.kind == .exitedReviewMode {
+            if let text = item.text, text.isEmpty == false {
+                return text
+            }
+        }
+        return nil
+    }
+
     public var responseText: String? {
-        messages.reversed().first { $0.role == .assistant }?.text
+        messages.reversed().first {
+            $0.role == .assistant && $0.text.isEmpty == false
+        }?.text
     }
 }
 
@@ -2076,7 +2090,7 @@ public struct CodexResponseStream: AsyncSequence, Sendable {
                 }
             case .failed(let message):
                 throw CodexAppServerError.turnFailed(message)
-            case .started, .itemStarted, .itemUpdated, .itemCompleted, .messageDelta,
+            case .started, .itemStarted, .itemUpdated, .itemCompleted, .message, .messageDelta,
                 .reasoningSummaryPartAdded, .reasoningDelta, .tokenUsageUpdated, .unknown:
                 continue
             }
@@ -2204,6 +2218,23 @@ public struct CodexMessageDelta: Equatable, Sendable {
     }
 }
 
+package enum CodexAgentMessageFallbackID {
+    package static let unscoped = "agent-message-delta"
+
+    package static func scoped(turnID: CodexTurnID?) -> String {
+        turnID.map { "\(unscoped):\($0.rawValue)" } ?? unscoped
+    }
+
+    package static func scopedMessage(_ message: CodexMessage, turnID: CodexTurnID?) -> CodexMessage {
+        guard message.id == unscoped else {
+            return message
+        }
+        var message = message
+        message.id = scoped(turnID: turnID)
+        return message
+    }
+}
+
 /// A reasoning summary or raw reasoning text part emitted by app-server.
 public struct CodexReasoningPart: Identifiable, Equatable, Sendable {
     public enum Kind: Equatable, Sendable {
@@ -2251,6 +2282,7 @@ package enum CodexTurnEvent: Equatable, Sendable {
     case itemStarted(CodexThreadItem)
     case itemUpdated(CodexThreadItem)
     case itemCompleted(CodexThreadItem)
+    case message(CodexMessage)
     case messageDelta(CodexMessageDelta)
     case reasoningSummaryPartAdded(CodexReasoningPart)
     case reasoningDelta(CodexReasoningDelta)

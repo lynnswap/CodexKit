@@ -239,12 +239,12 @@ not yet model directly.
 
 `review/start` is part of the app-server surface, so CodexAppServerKit exposes
 it as a high-level `CodexAppServer` operation and as a lower-level thread
-operation for callers that already own a thread. A review session provides the
-review turn response and review-domain streams. If app-server detaches the
-review into a separate thread, `events`, `progress`, and `transcriptUpdates`
-are bound to that review thread automatically. Detached
-review notification routing is owned by CodexAppServerKit, so callers do not
-need to parse JSON-RPC notifications or track app-server thread event details.
+operation for callers that already own a thread. App-server does not expose a
+separate review transport stream; review sessions project the normal thread
+event stream for the review turn. If app-server detaches the review into a
+separate thread, `events`, `progress`, and `transcriptUpdates` are bound to that
+review thread automatically through the same thread/turn notification routing
+used by regular turns.
 
 ```swift
 let review = try await appServer.startReview(
@@ -272,7 +272,7 @@ for try await progress in review.progress {
 }
 
 let response = try await review.collect()
-print(response.finalAnswer ?? "")
+print(response.transcript.reviewOutputText ?? "")
 ```
 
 Use `CodexThread.startReview` when a thread owner is already explicit:
@@ -291,12 +291,12 @@ try await appServer.startReview(in: workspaceURL, target: .custom(instructions: 
 ```
 
 `CodexReviewSession.events` yields `CodexReviewEvent`, preserving unknown
-schema-new notifications as `CodexRawNotification`. The terminal
-`.turnCompleted` response is finalized with the same transcript fallback used
-by `progress` and `collect()`, so `finalAnswer` is available when the live
-transcript contains a final-answer message even if the terminal app-server
-payload is sparse. `progress` yields `CodexReviewProgress` snapshots until the
-review turn completes or fails.
+schema-new notifications as `CodexRawNotification`. Review output is exposed as
+`CodexTranscript.reviewOutputText` from the `exitedReviewMode` item. Normal
+assistant-message final answers remain available through `finalAnswer` for
+regular turns and compatibility with app-server payloads that include an
+assistant review message. `progress` yields `CodexReviewProgress` snapshots
+until the review turn completes or fails.
 `transcriptUpdates` remains the transcript sequence for the review thread
 itself, which is useful when a UI wants thread-bound transcript snapshots rather
 than review progress phases.

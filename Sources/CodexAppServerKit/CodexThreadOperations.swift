@@ -143,19 +143,27 @@ extension CodexThread {
         delivery: CodexReviewDelivery = .inline,
         transcriptErrorHandlingPolicy: CodexTranscriptErrorHandlingPolicy = .preserveTranscript
     ) async throws -> CodexReviewSession {
-        let response: AppServerAPI.Review.Start.Response = try await withThreadEventGeneration(
-            id,
-            router: router
-        ) {
-            try await client.send(AppServerAPI.Review.Start.Request(
-                params: .init(threadID: id.rawValue, target: target, delivery: delivery)
-            ))
+        await router.beginUnscopedDiagnosticRouting(in: id)
+        let response: AppServerAPI.Review.Start.Response
+        do {
+            response = try await withThreadEventGeneration(id, router: router) {
+                try await client.send(AppServerAPI.Review.Start.Request(
+                    params: .init(threadID: id.rawValue, target: target, delivery: delivery)
+                ))
+            }
+        } catch {
+            await router.stopUnscopedDiagnosticRouting(in: id)
+            throw error
         }
         let responseReviewThreadID = response.reviewThreadID.map(CodexThreadID.init(rawValue:))
         let detachedReviewThreadID = responseReviewThreadID == id ? nil : responseReviewThreadID
         let turnID = CodexTurnID(rawValue: response.turnID)
         if let detachedReviewThreadID {
-            await router.beginReviewThreadEventGeneration(detachedReviewThreadID, including: turnID)
+            await router.beginDetachedThreadEventGeneration(
+                detachedReviewThreadID,
+                including: turnID,
+                replacingUnscopedDiagnosticsIn: id
+            )
         }
         let initialTurn = CodexAppServer.turnSnapshots(from: [response.turn])[0]
         let identity = CodexReviewIdentity(
@@ -178,7 +186,8 @@ extension CodexThread {
         transcriptErrorHandlingPolicy: CodexTranscriptErrorHandlingPolicy = .preserveTranscript
     ) async -> CodexReviewSession {
         let reviewThreadID = identity.activeTurnThreadID
-        await router.seedReviewTurn(identity.turnID, reviewThreadID: reviewThreadID)
+        await router.seedTurn(identity.turnID, threadID: reviewThreadID)
+        await router.activateUnscopedDiagnosticRouting(in: reviewThreadID, until: identity.turnID)
         let model = model ?? identity.model
         let turn = CodexTurn(
             id: identity.turnID,

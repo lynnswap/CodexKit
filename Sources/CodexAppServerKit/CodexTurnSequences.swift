@@ -172,7 +172,7 @@ public struct CodexThreadLogSequence: AsyncSequence, Sendable {
     }
 }
 
-/// Review-scoped event stream for a `CodexReviewSession`.
+/// Projection over a thread event stream for a `CodexReviewSession`.
 public struct CodexReviewEventSequence: AsyncSequence, Sendable {
     public typealias Element = CodexReviewEvent
 
@@ -246,7 +246,7 @@ public struct CodexReviewEventSequence: AsyncSequence, Sendable {
     }
 }
 
-/// Incremental progress stream for a `CodexReviewSession`.
+/// Incremental review progress projected from the thread event stream.
 public struct CodexReviewProgressSequence: AsyncSequence, Sendable {
     public typealias Element = CodexReviewProgress
 
@@ -420,7 +420,7 @@ package struct CodexTurnProgressSequence: AsyncSequence, Sendable {
             switch event {
             case .started, .unknown:
                 return .init(phase: .running, transcript: accumulator.transcript, usage: accumulator.usage)
-            case .itemStarted, .itemUpdated, .itemCompleted, .messageDelta,
+            case .itemStarted, .itemUpdated, .itemCompleted, .message, .messageDelta,
                 .reasoningSummaryPartAdded, .reasoningDelta:
                 _ = accumulator.apply(event)
                 return .init(phase: .running, transcript: accumulator.transcript, usage: accumulator.usage)
@@ -469,7 +469,7 @@ package struct CodexResponseCollector {
             switch event {
             case .started, .unknown:
                 continue
-            case .itemStarted, .itemUpdated, .itemCompleted, .messageDelta,
+            case .itemStarted, .itemUpdated, .itemCompleted, .message, .messageDelta,
                 .reasoningSummaryPartAdded, .reasoningDelta:
                 _ = accumulator.apply(event)
             case .tokenUsageUpdated:
@@ -506,7 +506,7 @@ private struct CodexResponseAccumulator {
             return true
         case .started, .completed, .failed, .unknown:
             return false
-        case .itemStarted, .itemUpdated, .itemCompleted, .messageDelta,
+        case .itemStarted, .itemUpdated, .itemCompleted, .message, .messageDelta,
             .reasoningSummaryPartAdded, .reasoningDelta:
             return transcriptAccumulator.apply(event)
         }
@@ -527,16 +527,47 @@ private struct CodexResponseAccumulator {
 
     func finalized(_ response: CodexResponse) -> CodexResponse {
         var response = response
-        if response.finalAnswer == nil {
+        let finalizedTranscript = finalizedTranscript(for: response.transcript)
+        if response.finalAnswer?.isEmpty != false {
             response.finalAnswer = transcript.finalAnswer
+                ?? finalizedTranscript.finalAnswer
         }
-        if response.transcript.items.isEmpty {
-            response.transcript = transcript
-        }
+        response.transcript = finalizedTranscript
         if response.usage == nil {
             response.usage = usage
         }
         return response
+    }
+
+    private func finalizedTranscript(for terminalTranscript: CodexTranscript) -> CodexTranscript {
+        let liveTranscript = transcript
+        guard terminalTranscript.items.isEmpty == false else {
+            return liveTranscript
+        }
+        guard terminalTranscript.reviewOutputText == nil else {
+            return terminalTranscript
+        }
+
+        var mergedItems = terminalTranscript.items
+        var didMerge = false
+        for liveItem in liveTranscript.items where liveItem.kind == .exitedReviewMode {
+            guard liveItem.text?.isEmpty == false else {
+                continue
+            }
+            if let index = mergedItems.firstIndex(where: { $0.id == liveItem.id && $0.kind == liveItem.kind }) {
+                guard mergedItems[index].text?.isEmpty != false else {
+                    continue
+                }
+                mergedItems[index] = liveItem
+            } else {
+                mergedItems.append(liveItem)
+            }
+            didMerge = true
+        }
+        guard didMerge else {
+            return terminalTranscript
+        }
+        return CodexTranscript(items: mergedItems)
     }
 }
 
@@ -554,6 +585,18 @@ private struct CodexTranscriptAccumulator {
         switch event {
         case .itemStarted(let item), .itemUpdated(let item), .itemCompleted(let item):
             upsert(item)
+            return true
+        case .message(let message):
+            upsert(
+                .init(
+                    id: message.id,
+                    kind: message.role == .user ? .userMessage : .agentMessage,
+                    content: .message(message)
+                ),
+                replacingFallbackID: message.role == .assistant
+                    ? CodexAgentMessageFallbackID.unscoped
+                    : nil
+            )
             return true
         case .messageDelta(let delta):
             append(delta)
@@ -574,13 +617,17 @@ private struct CodexTranscriptAccumulator {
         case .itemStarted(let item, _), .itemUpdated(let item, _), .itemCompleted(let item, _):
             upsert(item)
             return true
-        case .message(let message, _):
+        case .message(let message, let turnID):
             upsert(
                 .init(
                     id: message.id,
                     kind: message.role == .user ? .userMessage : .agentMessage,
                     content: .message(message)
-                ))
+                ),
+                replacingFallbackID: message.role == .assistant
+                    ? scopedFallbackMessageID(turnID: turnID)
+                    : nil
+            )
             return true
         case .messageDelta(let delta, let turnID):
             append(delta, fallbackItemID: scopedFallbackMessageID(turnID: turnID))
@@ -597,11 +644,25 @@ private struct CodexTranscriptAccumulator {
         }
     }
 
-    private mutating func upsert(_ item: CodexThreadItem) {
+    private mutating func upsert(
+        _ item: CodexThreadItem,
+        replacingFallbackID fallbackID: String? = nil
+    ) {
         if item.kind == .reasoning && item.id.contains(":summary:") == false
             && item.id.contains(":content:") == false
         {
             removeReasoningParts(parentItemID: item.id)
+        }
+        if let fallbackID,
+           fallbackID != item.id,
+           item.kind == .agentMessage,
+           itemIndexesByID[item.id] == nil,
+           let fallbackIndex = itemIndexesByID.removeValue(forKey: fallbackID)
+        {
+            messageDeltaTextByItemID.removeValue(forKey: fallbackID)
+            itemIndexesByID[item.id] = fallbackIndex
+            items[fallbackIndex] = item
+            return
         }
         if let index = itemIndexesByID[item.id] {
             items[index] = item
@@ -613,7 +674,7 @@ private struct CodexTranscriptAccumulator {
 
     private mutating func append(
         _ delta: CodexMessageDelta,
-        fallbackItemID: String = "agent-message-delta"
+        fallbackItemID: String = CodexAgentMessageFallbackID.unscoped
     ) {
         let itemID = delta.itemID ?? fallbackItemID
         let text = (messageDeltaTextByItemID[itemID] ?? "") + delta.text
@@ -628,7 +689,7 @@ private struct CodexTranscriptAccumulator {
     }
 
     private func scopedFallbackMessageID(turnID: CodexTurnID?) -> String {
-        turnID.map { "agent-message-delta:\($0.rawValue)" } ?? "agent-message-delta"
+        CodexAgentMessageFallbackID.scoped(turnID: turnID)
     }
 
     private mutating func start(_ part: CodexReasoningPart) {

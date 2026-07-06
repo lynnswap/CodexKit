@@ -404,7 +404,14 @@ public actor CodexAppServer {
         if threadOptions.model == nil {
             threadOptions.model = identity.model
         }
-        let activeThread = try await resumeThread(identity.activeTurnThreadID, options: threadOptions)
+        await router.beginUnscopedDiagnosticRouting(in: identity.activeTurnThreadID)
+        let activeThread: CodexThread
+        do {
+            activeThread = try await resumeThread(identity.activeTurnThreadID, options: threadOptions)
+        } catch {
+            await router.stopUnscopedDiagnosticRouting(in: identity.activeTurnThreadID)
+            throw error
+        }
         return await activeThread.reviewSession(
             identity,
             model: activeThread.model ?? identity.model,
