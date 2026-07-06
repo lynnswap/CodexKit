@@ -45,6 +45,12 @@ private func archivedNilModelProviderChatPredicate() -> Predicate<CodexChat> {
     }
 }
 
+private func negatedActiveProviderChatPredicate(_ modelProvider: String) -> Predicate<CodexChat> {
+    #Predicate<CodexChat> { chat in
+        !(chat.isArchived == false && chat.modelProvider == modelProvider)
+    }
+}
+
 private func archivedDoubleSearchChatPredicate(
     archived: Bool,
     first: String,
@@ -564,8 +570,8 @@ struct CodexModelContextTests {
         #expect(params.archived == true)
         #expect(params.cursor == nil)
         #expect(params.cwd == .paths([workspace.path]))
-        #expect(params.limit == 25)
-        #expect(params.searchTerm == "needle")
+        #expect(params.limit == nil)
+        #expect(params.searchTerm == nil)
         #expect(params.modelProviders == ["gpt-5"])
         #expect(params.sortDirection == "desc")
         #expect(params.sortKey == "recency_at")
@@ -590,6 +596,30 @@ struct CodexModelContextTests {
             await runtime.transport.recordedRequests(method: "thread/list").first)
         let params = try recorded.decodeParams(ThreadListParams.self)
         #expect(params.cwd == .paths([app.path, tools.path]))
+    }
+
+    @Test("localized search predicates are evaluated without server search pushdown")
+    func localizedSearchPredicatesAreEvaluatedWithoutServerSearchPushdown() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-cafe", name: "Café"),
+            .init(id: "thread-tea", name: "Tea"),
+        ]))
+
+        let results = try await context.fetch(CodexFetchRequest<CodexChat>(
+            predicate: searchChatPredicate("cafe"),
+            fetchLimit: 1
+        ))
+
+        #expect(results.map(\.id.rawValue) == ["thread-cafe"])
+        let recorded = try #require(
+            await runtime.transport.recordedRequests(method: "thread/list").first)
+        let params = try recorded.decodeParams(ThreadListParams.self)
+        #expect(params.archived == false)
+        #expect(params.searchTerm == nil)
+        #expect(params.limit == nil)
     }
 
     @Test("non-optional captured values match optional chat fields")
@@ -837,6 +867,43 @@ struct CodexModelContextTests {
         #expect(params.archived == false)
         #expect(params.searchTerm == nil)
         #expect(params.limit == nil)
+    }
+
+    @Test("negated compound archive predicates fetch both archive scopes")
+    func negatedCompoundArchivePredicatesFetchBothArchiveScopes() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-active-openai", name: "Active OpenAI", modelProvider: "openai"),
+            .init(
+                id: "thread-active-anthropic",
+                name: "Active Anthropic",
+                modelProvider: "anthropic"
+            ),
+        ]))
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-archived-openai", name: "Archived OpenAI", modelProvider: "openai")
+        ]))
+
+        let results = try await context.fetch(CodexFetchRequest<CodexChat>(
+            predicate: negatedActiveProviderChatPredicate("openai"),
+            sortDescriptors: [SortDescriptor(\.title)]
+        ))
+
+        #expect(results.map(\.id.rawValue) == [
+            "thread-active-anthropic",
+            "thread-archived-openai",
+        ])
+        #expect(results.map(\.isArchived) == [false, true])
+        let recorded = await runtime.transport.recordedRequests(method: "thread/list")
+        #expect(recorded.count == 2)
+        let activeParams = try #require(recorded.first).decodeParams(ThreadListParams.self)
+        let archivedParams = try #require(recorded.last).decodeParams(ThreadListParams.self)
+        #expect(activeParams.archived == false)
+        #expect(archivedParams.archived == true)
+        #expect(activeParams.limit == nil)
+        #expect(archivedParams.limit == nil)
     }
 
     @Test("missing source kind matches app server source filters")
@@ -4542,6 +4609,30 @@ struct CodexModelContextTests {
         #expect(await runtime.transport.recordedRequests(method: "thread/list").count == requestCount)
     }
 
+    @Test("implicit active scope applies to locally matched filtered results")
+    func implicitActiveScopeAppliesToLocallyMatchedFilteredResults() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-archive", workspace: workspaceURL, name: "Archive")
+        ]))
+        let results = context.fetchedResults(for: CodexFetchRequest<CodexChat>(
+            predicate: workspaceChatPredicate(workspaceURL),
+            sortDescriptors: [SortDescriptor(\.name)]
+        ))
+        try await results.performFetch()
+        let chat = try #require(results.items.first)
+        let requestCount = await runtime.transport.recordedRequests(method: "thread/list").count
+
+        try await runtime.transport.enqueueEmpty(for: "thread/archive")
+        try await chat.archive()
+
+        #expect(results.items.isEmpty)
+        #expect(await runtime.transport.recordedRequests(method: "thread/list").count == requestCount)
+    }
+
     @Test("server-filtered archive removes active chat when refresh fails")
     func serverFilteredArchiveRemovesActiveChatWhenRefreshFails() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -4965,8 +5056,8 @@ struct CodexModelContextTests {
         #expect(await runtime.transport.recordedRequests(method: "thread/list").count == 2)
     }
 
-    @Test("thread list fetch coalesces server-filtered revalidations")
-    func threadListFetchCoalescesServerFilteredRevalidations() async throws {
+    @Test("thread list fetch coalesces locally filtered revalidations")
+    func threadListFetchCoalescesLocallyFilteredRevalidations() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         let context = CodexModelContainer(appServer: runtime.server).mainContext
 
@@ -5000,7 +5091,7 @@ struct CodexModelContextTests {
         let recordedRequests = await runtime.transport.recordedRequests(method: "thread/list")
         #expect(recordedRequests.count == 4)
         let refreshParams = try #require(recordedRequests.last).decodeParams(ThreadListParams.self)
-        #expect(refreshParams.searchTerm == "needle")
+        #expect(refreshParams.searchTerm == nil)
     }
 
     @Test("paged chat refresh reloads incomplete results after sort key changes")

@@ -1506,10 +1506,9 @@ public final class CodexModelContext {
         let plan = CodexThreadQueryPlan(descriptor: descriptor)
         if canUseServerOrderedPages(for: descriptor, cursor: cursor) == false {
             let fetchedChats = filter(
-                await applyFetchedSnapshots(
-                    try await fetchAllThreadSnapshots(matching: descriptor),
-                    archived: plan.archived == true,
-                    scopedWorkspaceURL: plan.singleWorkspace,
+                try await fetchAllChats(
+                    matching: descriptor,
+                    plan: plan,
                     excluding: excludedRegistration
                 ),
                 using: plan
@@ -1547,6 +1546,26 @@ public final class CodexModelContext {
             nextCursor: page.nextCursor,
             backwardsCursor: page.backwardsCursor
         )
+    }
+
+    private func fetchAllChats(
+        matching descriptor: CodexFetchDescriptor<CodexChat>,
+        plan: CodexThreadQueryPlan,
+        excluding excludedRegistration: (any CodexFetchedResultsRegistration)? = nil
+    ) async throws -> [CodexChat] {
+        var chats: [CodexChat] = []
+        for archived in plan.archiveScopes {
+            chats.append(contentsOf: await applyFetchedSnapshots(
+                try await fetchAllThreadSnapshots(
+                    matching: descriptor,
+                    archived: archived
+                ),
+                archived: archived,
+                scopedWorkspaceURL: plan.singleWorkspace,
+                excluding: excludedRegistration
+            ))
+        }
+        return unique(chats)
     }
 
     private func fetchWorkspacePage(
@@ -2243,9 +2262,10 @@ public final class CodexModelContext {
     }
 
     private func fetchAllThreadSnapshots<Model: CodexPersistentModel>(
-        matching descriptor: CodexFetchDescriptor<Model>
+        matching descriptor: CodexFetchDescriptor<Model>,
+        archived archiveScope: Bool? = nil
     ) async throws -> [CodexThreadSnapshot] {
-        var query = threadQuery(from: descriptor, includePaging: false)
+        var query = threadQuery(from: descriptor, includePaging: false, archived: archiveScope)
         var threads: [CodexThreadSnapshot] = []
         var cursor: String?
 
@@ -2366,12 +2386,17 @@ public final class CodexModelContext {
     private func threadQuery<Model: CodexPersistentModel>(
         from descriptor: CodexFetchDescriptor<Model>,
         cursor: String? = nil,
-        includePaging: Bool = true
+        includePaging: Bool = true,
+        archived archiveScope: Bool? = nil
     )
         -> CodexThreadQuery
     {
         if let plan = chatQueryPlan(for: descriptor) {
-            return plan.threadQuery(cursor: cursor, includePaging: includePaging)
+            return plan.threadQuery(
+                cursor: cursor,
+                includePaging: includePaging,
+                archived: archiveScope
+            )
         }
         let sortPlans = descriptor.sortPlans
         let serverSort = sortPlans.first { sortDescriptor in

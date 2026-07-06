@@ -1383,7 +1383,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
     }
 
     private func requestMatchesArchiveScope(_ archived: Bool) -> Bool {
-        (chatQueryPlan?.archived ?? false) == archived
+        chatQueryPlan?.matchesArchiveScope(archived) ?? (archived == false)
     }
 
     private func requestIsScoped(to workspace: CodexWorkspace) -> Bool {

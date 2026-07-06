@@ -78,6 +78,10 @@ package struct CodexThreadQueryPlan: Sendable {
         serverFilter.archived
     }
 
+    package var archiveScopes: [Bool] {
+        archived.map { [$0] } ?? [false, true]
+    }
+
     package var workspaces: [URL]? {
         serverFilter.workspaces
     }
@@ -118,10 +122,18 @@ package struct CodexThreadQueryPlan: Sendable {
     }
 
     package func matches(_ record: CodexChatRecord) -> Bool {
-        predicate?(record) ?? true
+        serverFilter.matchesArchiveScope(record) && (predicate?(record) ?? true)
     }
 
-    package func threadQuery(cursor: String?, includePaging: Bool) -> CodexThreadQuery {
+    package func matchesArchiveScope(_ archived: Bool) -> Bool {
+        serverFilter.matchesArchiveScope(archived)
+    }
+
+    package func threadQuery(
+        cursor: String?,
+        includePaging: Bool,
+        archived archiveScope: Bool? = nil
+    ) -> CodexThreadQuery {
         let serverSort = sortPlans.first { sortPlan in
             switch sortPlan.key {
             case .createdAt, .updatedAt, .recencyAt:
@@ -131,7 +143,7 @@ package struct CodexThreadQueryPlan: Sendable {
             }
         }
         return CodexThreadQuery(
-            archived: archived,
+            archived: archiveScope ?? archived,
             cursor: includePaging ? cursor : nil,
             workspaces: workspaces,
             limit: includePaging ? fetchLimit : nil,
@@ -281,9 +293,7 @@ private struct CodexThreadServerFilter: Hashable, Sendable {
                 self = Self.defaultChatFilter
                 self.isComplete = false
             case .ambiguous:
-                preconditionFailure(
-                    "CodexChat predicates with isArchived must lower to one archived scope."
-                )
+                self = Self(isComplete: false)
             }
             return
         }
@@ -300,9 +310,8 @@ private struct CodexThreadServerFilter: Hashable, Sendable {
                 filter.archived = false
             }
         case .ambiguous:
-            preconditionFailure(
-                "CodexChat predicates with isArchived must lower to one archived scope."
-            )
+            filter.archived = nil
+            filter.isComplete = false
         }
         self = filter
     }
@@ -322,6 +331,14 @@ private struct CodexThreadServerFilter: Hashable, Sendable {
             || modelProviders?.isEmpty == false
             || sourceKinds?.isEmpty == false
             || isComplete == false
+    }
+
+    func matchesArchiveScope(_ record: CodexChatRecord) -> Bool {
+        matchesArchiveScope(record.isArchived)
+    }
+
+    func matchesArchiveScope(_ archived: Bool) -> Bool {
+        self.archived.map { archived == $0 } ?? true
     }
 
     private static func archiveScope(from signature: CodexChatPredicateSignature) -> ArchiveScope {
@@ -390,7 +407,63 @@ private struct CodexThreadServerFilter: Hashable, Sendable {
     private static func negatedArchiveScope(
         from signature: CodexChatPredicateSignature
     ) -> ArchiveScope {
-        switch archiveScope(from: signature) {
+        switch signature {
+        case .bool(.key(.isArchived)):
+            return .scoped(false)
+        case .bool:
+            return .unscoped
+        case .equal(let lhs, let rhs):
+            return negatedEqualityArchiveScope(lhs, rhs)
+        case .notEqual(let lhs, let rhs):
+            return negatedInequalityArchiveScope(lhs, rhs)
+        case .localizedStandardContains, .contains:
+            return .unscoped
+        case .conjunction(let lhs, let rhs):
+            if lhs.boolConstant == true {
+                return negatedArchiveScope(from: rhs)
+            }
+            if rhs.boolConstant == true {
+                return negatedArchiveScope(from: lhs)
+            }
+            if lhs.boolConstant == false || rhs.boolConstant == false {
+                return .unscoped
+            }
+            return archiveScope(from: signature) == .unscoped ? .unscoped : .ambiguous
+        case .disjunction(let lhs, let rhs):
+            if lhs.boolConstant == false {
+                return negatedArchiveScope(from: rhs)
+            }
+            if rhs.boolConstant == false {
+                return negatedArchiveScope(from: lhs)
+            }
+            if lhs.boolConstant == true || rhs.boolConstant == true {
+                return .unscoped
+            }
+            return archiveScope(from: signature) == .unscoped ? .unscoped : .ambiguous
+        case .negation(let signature):
+            return archiveScope(from: signature)
+        }
+    }
+
+    private static func negatedEqualityArchiveScope(
+        _ lhs: CodexChatPredicateValue,
+        _ rhs: CodexChatPredicateValue
+    ) -> ArchiveScope {
+        switch equalityArchiveScope(lhs, rhs) {
+        case .scoped(let archived):
+            return .scoped(!archived)
+        case .unscoped:
+            return .unscoped
+        case .ambiguous:
+            return .ambiguous
+        }
+    }
+
+    private static func negatedInequalityArchiveScope(
+        _ lhs: CodexChatPredicateValue,
+        _ rhs: CodexChatPredicateValue
+    ) -> ArchiveScope {
+        switch inequalityArchiveScope(lhs, rhs) {
         case .scoped(let archived):
             return .scoped(!archived)
         case .unscoped:
@@ -586,9 +659,7 @@ private struct CodexThreadServerFilter: Hashable, Sendable {
         else {
             return nil
         }
-        var filter = Self()
-        filter.searchTerm = searchTerm.isEmpty ? nil : searchTerm
-        return filter
+        return searchTerm.isEmpty ? Self() : Self(isComplete: false)
     }
 
     private static func containsFilter(
