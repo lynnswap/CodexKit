@@ -700,7 +700,7 @@ private struct CodexThreadServerFilter: Hashable, Sendable {
         guard let lhs = filter(from: lhs), let rhs = filter(from: rhs) else {
             return nil
         }
-        var merged = Self()
+        var merged = Self(isComplete: lhs.isComplete && rhs.isComplete)
         if lhs.onlyHasSourceKinds, rhs.onlyHasSourceKinds {
             merged.sourceKinds = union(lhs.sourceKinds, rhs.sourceKinds)
             return merged

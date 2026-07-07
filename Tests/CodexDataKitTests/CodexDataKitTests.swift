@@ -33,6 +33,19 @@ private func modelProviderChatPredicate(_ modelProviders: [String]) -> Predicate
     }
 }
 
+private func providerSearchDisjunctionChatPredicate(
+    firstProvider: String,
+    secondProvider: String,
+    searchTerm: String
+) -> Predicate<CodexChat> {
+    let first: String? = firstProvider
+    let second: String? = secondProvider
+    return #Predicate<CodexChat> { chat in
+        (chat.modelProvider == first && chat.searchableText.localizedStandardContains(searchTerm))
+            || (chat.modelProvider == second && chat.searchableText.localizedStandardContains(searchTerm))
+    }
+}
+
 private func nonNilModelProviderChatPredicate() -> Predicate<CodexChat> {
     #Predicate<CodexChat> { chat in
         chat.modelProvider != nil
@@ -618,6 +631,37 @@ struct CodexModelContextTests {
             await runtime.transport.recordedRequests(method: "thread/list").first)
         let params = try recorded.decodeParams(ThreadListParams.self)
         #expect(params.archived == false)
+        #expect(params.searchTerm == nil)
+        #expect(params.limit == nil)
+    }
+
+    @Test("disjunction unions preserve incomplete local filters")
+    func disjunctionUnionsPreserveIncompleteLocalFilters() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [
+            .init(id: "thread-openai-match", name: "Café", modelProvider: "openai"),
+            .init(id: "thread-anthropic-match", name: "Café", modelProvider: "anthropic"),
+            .init(id: "thread-openai-miss", name: "Tea", modelProvider: "openai"),
+            .init(id: "thread-other-match", name: "Café", modelProvider: "other"),
+        ]))
+
+        let results = try await context.fetch(CodexFetchRequest<CodexChat>(
+            predicate: providerSearchDisjunctionChatPredicate(
+                firstProvider: "openai",
+                secondProvider: "anthropic",
+                searchTerm: "cafe"
+            ),
+            fetchLimit: 1
+        ))
+
+        #expect(results.map(\.id.rawValue) == ["thread-openai-match"])
+        let recorded = try #require(
+            await runtime.transport.recordedRequests(method: "thread/list").first)
+        let params = try recorded.decodeParams(ThreadListParams.self)
+        #expect(params.archived == false)
+        #expect(params.modelProviders == ["openai", "anthropic"])
         #expect(params.searchTerm == nil)
         #expect(params.limit == nil)
     }
