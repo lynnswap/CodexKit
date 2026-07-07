@@ -172,14 +172,14 @@ package struct CodexFetchDescriptorSignature: Hashable, Sendable {
 }
 
 package struct CodexSortPlanSignature: Hashable, Sendable {
-    package var key: CodexSortKey
+    package var path: CodexSortPath
     package var order: SortOrder
     package var comparison: String?
 }
 
 extension CodexSortPlan {
     package var signature: CodexSortPlanSignature {
-        .init(key: key, order: order, comparison: comparisonSignature)
+        .init(path: path, order: order, comparison: comparisonSignature)
     }
 }
 

@@ -720,6 +720,18 @@ struct CodexModelContextTests {
         #expect(localized.querySignature != lexical.querySignature)
     }
 
+    @Test("chat title and name sort descriptors affect query signatures")
+    func chatTitleAndNameSortDescriptorsAffectQuerySignatures() {
+        let title = CodexFetchDescriptor<CodexChat>(
+            sortBy: [SortDescriptor(\.title)]
+        )
+        let name = CodexFetchDescriptor<CodexChat>(
+            sortBy: [SortDescriptor(\.name)]
+        )
+
+        #expect(title.querySignature != name.querySignature)
+    }
+
     @Test("non-nil predicates are filtered before applying local fetch limits")
     func nonNilPredicatesFilterBeforeApplyingLocalFetchLimits() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()

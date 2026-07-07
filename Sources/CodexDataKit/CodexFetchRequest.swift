@@ -9,26 +9,46 @@ package enum CodexSortKey: Sendable, Hashable {
     case recencyAt
 }
 
+package enum CodexSortPath: Sendable, Hashable {
+    case workspaceGroupName
+    case workspaceName
+    case chatTitle
+    case chatName
+    case chatCreatedAt
+    case chatUpdatedAt
+    case chatRecencyAt
+
+    package var sortKey: CodexSortKey {
+        switch self {
+        case .workspaceGroupName, .workspaceName, .chatTitle, .chatName:
+            return .name
+        case .chatCreatedAt:
+            return .createdAt
+        case .chatUpdatedAt:
+            return .updatedAt
+        case .chatRecencyAt:
+            return .recencyAt
+        }
+    }
+}
+
 package struct CodexSortPlan<Model: CodexPersistentModel>: Sendable, Hashable {
-    package var key: CodexSortKey
+    package var path: CodexSortPath
+    package var key: CodexSortKey {
+        path.sortKey
+    }
     package var order: SortOrder
     package var comparisonSignature: String?
 
-    package init(key: CodexSortKey, order: SortOrder) {
-        self.key = key
-        self.order = order
-        self.comparisonSignature = nil
-    }
-
     package init(descriptor: SortDescriptor<Model>) {
         guard let keyPath = descriptor.keyPath,
-            let key = CodexKnownKeyPaths.sortKey(for: Model.self, keyPath: keyPath)
+            let path = CodexKnownKeyPaths.sortPath(for: Model.self, keyPath: keyPath)
         else {
             preconditionFailure(
                 "CodexFetchDescriptor does not support sorting \(Model.self) by descriptor \(descriptor)."
             )
         }
-        self.key = key
+        self.path = path
         self.order = descriptor.order
         self.comparisonSignature = Self.comparisonSignature(for: descriptor)
     }
@@ -179,20 +199,27 @@ public struct CodexFetchDescriptor<Model: CodexPersistentModel>: Sendable {
 }
 
 package enum CodexKnownKeyPaths {
+    static func sortPath<Model: CodexPersistentModel>(
+        for _: Model.Type,
+        keyPath: AnyKeyPath
+    ) -> CodexSortPath? {
+        if Model.self == CodexWorkspaceGroup.self {
+            return sortPathForWorkspaceGroup(keyPath)
+        }
+        if Model.self == CodexWorkspace.self {
+            return sortPathForWorkspace(keyPath)
+        }
+        if Model.self == CodexChat.self {
+            return sortPathForChat(keyPath)
+        }
+        return nil
+    }
+
     static func sortKey<Model: CodexPersistentModel>(
         for _: Model.Type,
         keyPath: AnyKeyPath
     ) -> CodexSortKey? {
-        if Model.self == CodexWorkspaceGroup.self {
-            return sortKeyForWorkspaceGroup(keyPath)
-        }
-        if Model.self == CodexWorkspace.self {
-            return sortKeyForWorkspace(keyPath)
-        }
-        if Model.self == CodexChat.self {
-            return sortKeyForChat(keyPath)
-        }
-        return nil
+        sortPath(for: Model.self, keyPath: keyPath)?.sortKey
     }
 
     static func sectionKey<Model: CodexPersistentModel>(
@@ -215,28 +242,29 @@ package enum CodexKnownKeyPaths {
         return nil
     }
 
-    private static func sortKeyForWorkspaceGroup(_ keyPath: AnyKeyPath) -> CodexSortKey? {
-        keyPath == (\CodexWorkspaceGroup.name as AnyKeyPath) ? .name : nil
+    private static func sortPathForWorkspaceGroup(_ keyPath: AnyKeyPath) -> CodexSortPath? {
+        keyPath == (\CodexWorkspaceGroup.name as AnyKeyPath) ? .workspaceGroupName : nil
     }
 
-    private static func sortKeyForWorkspace(_ keyPath: AnyKeyPath) -> CodexSortKey? {
-        keyPath == (\CodexWorkspace.name as AnyKeyPath) ? .name : nil
+    private static func sortPathForWorkspace(_ keyPath: AnyKeyPath) -> CodexSortPath? {
+        keyPath == (\CodexWorkspace.name as AnyKeyPath) ? .workspaceName : nil
     }
 
-    private static func sortKeyForChat(_ keyPath: AnyKeyPath) -> CodexSortKey? {
-        if keyPath == (\CodexChat.title as AnyKeyPath)
-            || keyPath == (\CodexChat.name as AnyKeyPath)
-        {
-            return .name
+    private static func sortPathForChat(_ keyPath: AnyKeyPath) -> CodexSortPath? {
+        if keyPath == (\CodexChat.title as AnyKeyPath) {
+            return .chatTitle
+        }
+        if keyPath == (\CodexChat.name as AnyKeyPath) {
+            return .chatName
         }
         if keyPath == (\CodexChat.createdAt as AnyKeyPath) {
-            return .createdAt
+            return .chatCreatedAt
         }
         if keyPath == (\CodexChat.updatedAt as AnyKeyPath) {
-            return .updatedAt
+            return .chatUpdatedAt
         }
         if keyPath == (\CodexChat.recencyAt as AnyKeyPath) {
-            return .recencyAt
+            return .chatRecencyAt
         }
         return nil
     }
