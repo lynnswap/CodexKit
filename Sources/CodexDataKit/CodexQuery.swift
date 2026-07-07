@@ -1,3 +1,4 @@
+import Foundation
 import SwiftUI
 
 extension EnvironmentValues {
@@ -78,43 +79,43 @@ public struct CodexQuery<Model: CodexPersistentModel>: @preconcurrency DynamicPr
     }
 
     public init(
-        filter: CodexFetchPredicate<Model>? = nil,
-        sort: [CodexSortDescriptor<Model>] = [],
+        filter: Predicate<Model>? = nil,
+        sort: [SortDescriptor<Model>] = [],
         animation _: Animation? = nil,
         sectionBy: CodexSectionDescriptor<Model>? = nil
     ) {
         self.fetchDescriptor = CodexFetchDescriptor(
-            predicate: filter ?? .init(),
+            predicate: filter,
             sortBy: sort
         )
         self.sectionBy = sectionBy
     }
 
     public init<Value: Comparable>(
-        filter: CodexFetchPredicate<Model>? = nil,
-        sort keyPath: KeyPath<Model, Value>,
-        order: CodexSortOrder = .forward,
+        filter: Predicate<Model>? = nil,
+        sort keyPath: KeyPath<Model, Value> & Sendable,
+        order: SortOrder = .forward,
         animation: Animation? = nil,
         sectionBy: CodexSectionDescriptor<Model>? = nil
     ) {
         self.init(
             filter: filter,
-            sort: [CodexSortDescriptor(keyPath, order: order)],
+            sort: [SortDescriptor(keyPath, order: order)],
             animation: animation,
             sectionBy: sectionBy
         )
     }
 
     public init<Value: Comparable>(
-        filter: CodexFetchPredicate<Model>? = nil,
-        sort keyPath: KeyPath<Model, Value?>,
-        order: CodexSortOrder = .forward,
+        filter: Predicate<Model>? = nil,
+        sort keyPath: KeyPath<Model, Value?> & Sendable,
+        order: SortOrder = .forward,
         animation: Animation? = nil,
         sectionBy: CodexSectionDescriptor<Model>? = nil
     ) {
         self.init(
             filter: filter,
-            sort: [CodexSortDescriptor(keyPath, order: order)],
+            sort: [SortDescriptor(keyPath, order: order)],
             animation: animation,
             sectionBy: sectionBy
         )
@@ -140,7 +141,7 @@ public struct CodexQuery<Model: CodexPersistentModel>: @preconcurrency DynamicPr
 
         if let fetchedResults,
            fetchedResults.modelContext === modelContext,
-           fetchedResults.fetchDescriptor == fetchDescriptor,
+           fetchedResults.querySignature == fetchDescriptor.querySignature,
            fetchedResults.sectionBy == sectionBy {
             return
         }

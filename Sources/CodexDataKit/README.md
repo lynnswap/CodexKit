@@ -39,13 +39,14 @@ for chat in chats.items {
 Use `CodexFetchDescriptor` when you want SwiftData-style value configuration:
 
 ```swift
+let workspaceID = CodexWorkspaceID(rawValue: workspaceURL.standardizedFileURL.resolvingSymlinksInPath().path)
 let descriptor = CodexFetchDescriptor<CodexChat>(
-    predicate: .init(
-        archived: false,
-        workspace: workspaceURL,
-        searchTerm: "review"
-    ),
-    sortBy: [CodexSortDescriptor(\.recencyAt, order: .reverse)],
+    predicate: #Predicate<CodexChat> { chat in
+        chat.isArchived == false
+            && chat.workspaceID == workspaceID
+            && chat.searchableText.localizedStandardContains("review")
+    },
+    sortBy: [SortDescriptor(\.recencyAt, order: .reverse)],
     fetchLimit: 50
 )
 
@@ -60,8 +61,11 @@ Use `CodexFetchRequest` when request construction reads better as a mutable Core
 
 ```swift
 let request = CodexFetchRequest<CodexChat>()
-request.predicate = .init(workspace: workspaceURL)
-request.sortDescriptors = [CodexSortDescriptor(\.updatedAt, order: .reverse)]
+let workspaceID = CodexWorkspaceID(rawValue: workspaceURL.standardizedFileURL.resolvingSymlinksInPath().path)
+request.predicate = #Predicate<CodexChat> { chat in
+    chat.workspaceID == workspaceID
+}
+request.sortDescriptors = [SortDescriptor(\.updatedAt, order: .reverse)]
 request.fetchLimit = 100
 
 let results = context.fetchedResults(for: request)
@@ -118,7 +122,7 @@ let workspaces = context.fetchedResults(
 
 let chats = context.fetchedResults(
     for: CodexFetchDescriptor<CodexChat>(
-        sortBy: [CodexSortDescriptor(\.updatedAt, order: .reverse)]
+        sortBy: [SortDescriptor(\.updatedAt, order: .reverse)]
     ),
     sectionedBy: .workspace
 )

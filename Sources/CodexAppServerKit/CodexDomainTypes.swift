@@ -964,6 +964,7 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
         case name
         case preview
         case modelProvider
+        case sourceKind
         case createdAt
         case updatedAt
         case recencyAt
@@ -977,6 +978,7 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
     public var name: String?
     public var preview: String?
     public var modelProvider: String?
+    public var sourceKind: CodexThreadSourceKind?
     public var createdAt: Date?
     public var updatedAt: Date?
     public var recencyAt: Date?
@@ -995,6 +997,7 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
             && lhs.name == rhs.name
             && lhs.preview == rhs.preview
             && lhs.modelProvider == rhs.modelProvider
+            && lhs.sourceKind == rhs.sourceKind
             && lhs.createdAt == rhs.createdAt
             && lhs.updatedAt == rhs.updatedAt
             && lhs.recencyAt == rhs.recencyAt
@@ -1009,6 +1012,7 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
         name: String? = nil,
         preview: String? = nil,
         modelProvider: String? = nil,
+        sourceKind: CodexThreadSourceKind? = nil,
         createdAt: Date? = nil,
         updatedAt: Date? = nil,
         recencyAt: Date? = nil,
@@ -1022,6 +1026,7 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
             name: name,
             preview: preview,
             modelProvider: modelProvider,
+            sourceKind: sourceKind,
             createdAt: createdAt,
             updatedAt: updatedAt,
             recencyAt: recencyAt,
@@ -1034,6 +1039,7 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
                 name: name,
                 preview: preview,
                 modelProvider: modelProvider,
+                sourceKind: sourceKind,
                 createdAt: createdAt,
                 updatedAt: updatedAt,
                 recencyAt: recencyAt,
@@ -1050,6 +1056,7 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
         name: String? = nil,
         preview: String? = nil,
         modelProvider: String? = nil,
+        sourceKind: CodexThreadSourceKind? = nil,
         createdAt: Date? = nil,
         updatedAt: Date? = nil,
         recencyAt: Date? = nil,
@@ -1064,6 +1071,7 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
         self.name = name
         self.preview = preview
         self.modelProvider = modelProvider
+        self.sourceKind = sourceKind
         self.createdAt = createdAt
         self.updatedAt = updatedAt
         self.recencyAt = recencyAt
@@ -1077,6 +1085,7 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
             name: name,
             preview: preview,
             modelProvider: modelProvider,
+            sourceKind: sourceKind,
             createdAt: createdAt,
             updatedAt: updatedAt,
             recencyAt: recencyAt,
@@ -1095,6 +1104,7 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
         name: String?,
         preview: String?,
         modelProvider: String?,
+        sourceKind: CodexThreadSourceKind?,
         createdAt: Date?,
         updatedAt: Date?,
         recencyAt: Date?,
@@ -1114,6 +1124,9 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
         }
         if modelProvider != nil {
             fields.insert(.modelProvider)
+        }
+        if sourceKind != nil {
+            fields.insert(.sourceKind)
         }
         if createdAt != nil {
             fields.insert(.createdAt)

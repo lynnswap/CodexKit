@@ -51,6 +51,7 @@ public actor CodexAppServerTestThreadStore {
             id: CodexThreadID(rawValue: threadID),
             workspace: request.cwd.map { URL(fileURLWithPath: $0, isDirectory: true) },
             modelProvider: request.modelProvider,
+            sourceKind: .appServer,
             createdAt: now,
             updatedAt: now,
             recencyAt: now,
@@ -692,6 +693,7 @@ public actor CodexAppServerTestTransport {
             name: snapshot.name,
             preview: snapshot.preview,
             modelProvider: snapshot.modelProvider,
+            sourceKind: snapshot.sourceKind?.rawValue,
             createdAt: snapshot.createdAt.map { Int($0.timeIntervalSince1970) },
             updatedAt: snapshot.updatedAt.map { Int($0.timeIntervalSince1970) },
             recencyAt: snapshot.recencyAt.map { Int($0.timeIntervalSince1970) },
@@ -724,6 +726,12 @@ public actor CodexAppServerTestTransport {
             if let modelProviders = request.modelProviders,
                 modelProviders.isEmpty == false,
                 modelProviders.contains(snapshot.modelProvider ?? "") == false
+            {
+                return false
+            }
+            if let sourceKinds = request.sourceKinds,
+                sourceKinds.isEmpty == false,
+                sourceKinds.contains((snapshot.sourceKind ?? .appServer).rawValue) == false
             {
                 return false
             }

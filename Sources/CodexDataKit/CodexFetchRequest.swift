@@ -2,20 +2,6 @@ import CodexAppServerKit
 import Foundation
 import Observation
 
-public enum CodexSortOrder: Sendable, Hashable, Codable {
-    case forward
-    case reverse
-
-    package var threadSortDirection: CodexSortDirection {
-        switch self {
-        case .forward:
-            .ascending
-        case .reverse:
-            .descending
-        }
-    }
-}
-
 package enum CodexSortKey: Sendable, Hashable {
     case name
     case createdAt
@@ -23,42 +9,78 @@ package enum CodexSortKey: Sendable, Hashable {
     case recencyAt
 }
 
-public struct CodexSortDescriptor<Model: CodexPersistentModel>: Sendable, Hashable {
-    package var key: CodexSortKey
-    public var order: CodexSortOrder
+package enum CodexSortPath: Sendable, Hashable {
+    case workspaceGroupName
+    case workspaceName
+    case chatTitle
+    case chatName
+    case chatCreatedAt
+    case chatUpdatedAt
+    case chatRecencyAt
 
-    package init(key: CodexSortKey, order: CodexSortOrder) {
-        self.key = key
-        self.order = order
+    package var sortKey: CodexSortKey {
+        switch self {
+        case .workspaceGroupName, .workspaceName, .chatTitle, .chatName:
+            return .name
+        case .chatCreatedAt:
+            return .createdAt
+        case .chatUpdatedAt:
+            return .updatedAt
+        case .chatRecencyAt:
+            return .recencyAt
+        }
     }
+}
 
-    public init<Value: Comparable>(
-        _ keyPath: KeyPath<Model, Value>,
-        order: CodexSortOrder = .forward
-    ) {
-        self.init(
-            key: Self.requireKnownSortKey(for: keyPath),
-            order: order
-        )
+package struct CodexSortPlan<Model: CodexPersistentModel>: Sendable, Hashable {
+    package var path: CodexSortPath
+    package var key: CodexSortKey {
+        path.sortKey
     }
+    package var order: SortOrder
+    package var comparisonSignature: String?
 
-    public init<Value: Comparable>(
-        _ keyPath: KeyPath<Model, Value?>,
-        order: CodexSortOrder = .forward
-    ) {
-        self.init(
-            key: Self.requireKnownSortKey(for: keyPath),
-            order: order
-        )
-    }
-
-    private static func requireKnownSortKey(for keyPath: AnyKeyPath) -> CodexSortKey {
-        guard let key = CodexKnownKeyPaths.sortKey(for: Model.self, keyPath: keyPath) else {
+    package init(descriptor: SortDescriptor<Model>) {
+        guard let keyPath = descriptor.keyPath,
+            let path = CodexKnownKeyPaths.sortPath(for: Model.self, keyPath: keyPath)
+        else {
             preconditionFailure(
-                "CodexSortDescriptor does not support sorting \(Model.self) by key path \(keyPath)."
+                "CodexFetchDescriptor does not support sorting \(Model.self) by descriptor \(descriptor)."
             )
         }
-        return key
+        self.path = path
+        self.order = descriptor.order
+        self.comparisonSignature = Self.comparisonSignature(for: descriptor)
+    }
+
+    package var threadSortDirection: CodexSortDirection {
+        switch order {
+        case .forward:
+            .ascending
+        case .reverse:
+            .descending
+        }
+    }
+
+    package var threadSortKey: CodexThreadSortKey? {
+        switch key {
+        case .createdAt:
+            return .createdAt
+        case .updatedAt:
+            return .updatedAt
+        case .recencyAt:
+            return .recencyAt
+        case .name:
+            return nil
+        }
+    }
+
+    private static func comparisonSignature(for descriptor: SortDescriptor<Model>) -> String? {
+        Mirror(reflecting: descriptor).children.first { child in
+            child.label == "comparison"
+        }.map { child in
+            String(describing: child.value)
+        }
     }
 }
 
@@ -112,107 +134,92 @@ extension CodexSectionDescriptor where Model == CodexChat {
     }
 }
 
-public struct CodexFetchPredicate<Model: CodexPersistentModel>: Sendable, Hashable {
-    public var archived: Bool?
-    public var workspaces: [URL]? {
+public struct CodexFetchDescriptor<Model: CodexPersistentModel>: Sendable {
+    public var predicate: Predicate<Model>? {
         didSet {
-            if workspaces?.isEmpty == true {
-                workspaces = nil
-            }
+            Self.validate(predicate: predicate)
         }
     }
-    public var workspace: URL? {
-        get {
-            workspaces?.first
-        }
-        set {
-            workspaces = newValue.map { [$0] }
-        }
-    }
-    public var searchTerm: String? {
+    public var sortBy: [SortDescriptor<Model>]
+    public var fetchLimit: Int? {
         didSet {
-            if searchTerm?.isEmpty == true {
-                searchTerm = nil
-            }
+            Self.validate(fetchLimit: fetchLimit)
         }
     }
-    public var modelProviders: [String]? {
+    public var fetchOffset: Int? {
         didSet {
-            if modelProviders?.isEmpty == true {
-                modelProviders = nil
-            }
-        }
-    }
-    public var sourceKinds: [CodexThreadSourceKind]? {
-        didSet {
-            if sourceKinds?.isEmpty == true {
-                sourceKinds = nil
-            }
-        }
-    }
-    public var useStateDBOnly: Bool?
-
-    public init(
-        archived: Bool? = nil,
-        workspace: URL? = nil,
-        workspaces: [URL]? = nil,
-        searchTerm: String? = nil,
-        modelProviders: [String]? = nil,
-        sourceKinds: [CodexThreadSourceKind]? = nil,
-        useStateDBOnly: Bool? = nil
-    ) {
-        self.archived = archived
-        let workspaceList = workspaces ?? workspace.map { [$0] }
-        self.workspaces = workspaceList?.isEmpty == true ? nil : workspaceList
-        self.searchTerm = searchTerm?.isEmpty == true ? nil : searchTerm
-        self.modelProviders = modelProviders?.isEmpty == true ? nil : modelProviders
-        self.sourceKinds = sourceKinds?.isEmpty == true ? nil : sourceKinds
-        self.useStateDBOnly = useStateDBOnly
-    }
-}
-
-public struct CodexFetchDescriptor<Model: CodexPersistentModel>: Sendable, Hashable {
-    public var predicate: CodexFetchPredicate<Model>
-    public var sortBy: [CodexSortDescriptor<Model>]
-    public var fetchLimit: Int?
-    public var fetchOffset: Int {
-        didSet {
-            fetchOffset = max(0, fetchOffset)
+            Self.validate(fetchOffset: fetchOffset)
         }
     }
     public var includePendingChanges: Bool
 
     public init(
-        predicate: CodexFetchPredicate<Model> = .init(),
-        sortBy: [CodexSortDescriptor<Model>] = [],
+        predicate: Predicate<Model>? = nil,
+        sortBy: [SortDescriptor<Model>] = [],
         fetchLimit: Int? = nil,
-        fetchOffset: Int = 0,
+        fetchOffset: Int? = nil,
         includePendingChanges: Bool = true
     ) {
+        Self.validate(predicate: predicate)
+        Self.validate(fetchLimit: fetchLimit)
+        Self.validate(fetchOffset: fetchOffset)
         self.predicate = predicate
         self.sortBy = sortBy
         self.fetchLimit = fetchLimit
-        self.fetchOffset = max(0, fetchOffset)
+        self.fetchOffset = fetchOffset
         self.includePendingChanges = includePendingChanges
     }
 
+    package var normalizedFetchOffset: Int {
+        fetchOffset ?? 0
+    }
+
+    package var sortPlans: [CodexSortPlan<Model>] {
+        sortBy.map(CodexSortPlan.init(descriptor:))
+    }
+
+    private static func validate(fetchLimit: Int?) {
+        if let fetchLimit {
+            precondition(fetchLimit >= 0, "CodexFetchDescriptor fetchLimit must be non-negative.")
+        }
+    }
+
+    private static func validate(fetchOffset: Int?) {
+        if let fetchOffset {
+            precondition(fetchOffset >= 0, "CodexFetchDescriptor fetchOffset must be non-negative.")
+        }
+    }
+
+    private static func validate(predicate: Predicate<Model>?) {
+        guard predicate != nil, Model.self != CodexChat.self else {
+            return
+        }
+        preconditionFailure("CodexFetchDescriptor does not support predicates for \(Model.self).")
+    }
 }
 
-private enum CodexKnownKeyPaths {
+package enum CodexKnownKeyPaths {
+    static func sortPath<Model: CodexPersistentModel>(
+        for _: Model.Type,
+        keyPath: AnyKeyPath
+    ) -> CodexSortPath? {
+        if Model.self == CodexWorkspaceGroup.self {
+            return sortPathForWorkspaceGroup(keyPath)
+        }
+        if Model.self == CodexWorkspace.self {
+            return sortPathForWorkspace(keyPath)
+        }
+        if Model.self == CodexChat.self {
+            return sortPathForChat(keyPath)
+        }
+        return nil
+    }
+
     static func sortKey<Model: CodexPersistentModel>(
         for _: Model.Type,
         keyPath: AnyKeyPath
     ) -> CodexSortKey? {
-        if Model.self == CodexWorkspaceGroup.self {
-            return sortKeyForWorkspaceGroup(keyPath)
-        }
-        if Model.self == CodexWorkspace.self {
-            return sortKeyForWorkspace(keyPath)
-        }
-        if Model.self == CodexChat.self {
-            return sortKeyForChat(keyPath)
-        }
-        return nil
+        sortPath(for: Model.self, keyPath: keyPath)?.sortKey
     }
 
     static func sectionKey<Model: CodexPersistentModel>(
@@ -235,40 +242,49 @@ private enum CodexKnownKeyPaths {
         return nil
     }
 
-    private static func sortKeyForWorkspaceGroup(_ keyPath: AnyKeyPath) -> CodexSortKey? {
-        keyPath == (\CodexWorkspaceGroup.name as AnyKeyPath) ? .name : nil
+    private static func sortPathForWorkspaceGroup(_ keyPath: AnyKeyPath) -> CodexSortPath? {
+        keyPath == (\CodexWorkspaceGroup.name as AnyKeyPath) ? .workspaceGroupName : nil
     }
 
-    private static func sortKeyForWorkspace(_ keyPath: AnyKeyPath) -> CodexSortKey? {
-        keyPath == (\CodexWorkspace.name as AnyKeyPath) ? .name : nil
+    private static func sortPathForWorkspace(_ keyPath: AnyKeyPath) -> CodexSortPath? {
+        keyPath == (\CodexWorkspace.name as AnyKeyPath) ? .workspaceName : nil
     }
 
-    private static func sortKeyForChat(_ keyPath: AnyKeyPath) -> CodexSortKey? {
-        if keyPath == (\CodexChat.title as AnyKeyPath)
-            || keyPath == (\CodexChat.name as AnyKeyPath)
-        {
-            return .name
+    private static func sortPathForChat(_ keyPath: AnyKeyPath) -> CodexSortPath? {
+        if keyPath == (\CodexChat.title as AnyKeyPath) {
+            return .chatTitle
+        }
+        if keyPath == (\CodexChat.name as AnyKeyPath) {
+            return .chatName
         }
         if keyPath == (\CodexChat.createdAt as AnyKeyPath) {
-            return .createdAt
+            return .chatCreatedAt
         }
         if keyPath == (\CodexChat.updatedAt as AnyKeyPath) {
-            return .updatedAt
+            return .chatUpdatedAt
         }
         if keyPath == (\CodexChat.recencyAt as AnyKeyPath) {
-            return .recencyAt
+            return .chatRecencyAt
         }
         return nil
     }
 }
 
 public final class CodexFetchRequest<Model: CodexPersistentModel> {
-    public var predicate: CodexFetchPredicate<Model>
-    public var sortDescriptors: [CodexSortDescriptor<Model>]
-    public var fetchLimit: Int?
-    public var fetchOffset: Int {
+    public var predicate: Predicate<Model>? {
         didSet {
-            fetchOffset = max(0, fetchOffset)
+            Self.validate(predicate: predicate)
+        }
+    }
+    public var sortDescriptors: [SortDescriptor<Model>]
+    public var fetchLimit: Int? {
+        didSet {
+            Self.validate(fetchLimit: fetchLimit)
+        }
+    }
+    public var fetchOffset: Int? {
+        didSet {
+            Self.validate(fetchOffset: fetchOffset)
         }
     }
     public var includePendingChanges: Bool
@@ -293,16 +309,19 @@ public final class CodexFetchRequest<Model: CodexPersistentModel> {
     }
 
     public init(
-        predicate: CodexFetchPredicate<Model> = .init(),
-        sortDescriptors: [CodexSortDescriptor<Model>] = [],
+        predicate: Predicate<Model>? = nil,
+        sortDescriptors: [SortDescriptor<Model>] = [],
         fetchLimit: Int? = nil,
-        fetchOffset: Int = 0,
+        fetchOffset: Int? = nil,
         includePendingChanges: Bool = true
     ) {
+        Self.validate(predicate: predicate)
+        Self.validate(fetchLimit: fetchLimit)
+        Self.validate(fetchOffset: fetchOffset)
         self.predicate = predicate
         self.sortDescriptors = sortDescriptors
         self.fetchLimit = fetchLimit
-        self.fetchOffset = max(0, fetchOffset)
+        self.fetchOffset = fetchOffset
         self.includePendingChanges = includePendingChanges
     }
 
@@ -319,6 +338,25 @@ public final class CodexFetchRequest<Model: CodexPersistentModel> {
     package func copy() -> CodexFetchRequest<Model> {
         CodexFetchRequest(fetchDescriptor)
     }
+
+    private static func validate(fetchLimit: Int?) {
+        if let fetchLimit {
+            precondition(fetchLimit >= 0, "CodexFetchRequest fetchLimit must be non-negative.")
+        }
+    }
+
+    private static func validate(fetchOffset: Int?) {
+        if let fetchOffset {
+            precondition(fetchOffset >= 0, "CodexFetchRequest fetchOffset must be non-negative.")
+        }
+    }
+
+    private static func validate(predicate: Predicate<Model>?) {
+        guard predicate != nil, Model.self != CodexChat.self else {
+            return
+        }
+        preconditionFailure("CodexFetchRequest does not support predicates for \(Model.self).")
+    }
 }
 
 extension CodexFetchDescriptor where Model == CodexWorkspaceGroup {
@@ -333,7 +371,7 @@ extension CodexFetchDescriptor where Model == CodexWorkspace {
     }
 
     public static func workspaces(
-        sortBy: [CodexSortDescriptor<CodexWorkspace>] = codexDefaultWorkspaceSortDescriptors()
+        sortBy: [SortDescriptor<CodexWorkspace>] = codexDefaultWorkspaceSortDescriptors()
     ) -> Self {
         .init(sortBy: sortBy)
     }
@@ -341,7 +379,10 @@ extension CodexFetchDescriptor where Model == CodexWorkspace {
 
 extension CodexFetchDescriptor where Model == CodexChat {
     public static var recentChats: Self {
-        .init(sortBy: codexDefaultChatSortDescriptors())
+        .init(
+            predicate: #Predicate<CodexChat> { $0.isArchived == false },
+            sortBy: codexDefaultChatSortDescriptors()
+        )
     }
 
     public static func chats(
@@ -353,11 +394,14 @@ extension CodexFetchDescriptor where Model == CodexChat {
 
     public static func chats(
         in workspace: CodexWorkspace,
-        sortBy: [CodexSortDescriptor<CodexChat>],
+        sortBy: [SortDescriptor<CodexChat>],
         fetchLimit: Int? = nil
     ) -> Self {
-        .init(
-            predicate: .init(workspace: workspace.url),
+        let scopedWorkspaceID: CodexWorkspaceID? = workspace.id
+        return .init(
+            predicate: #Predicate<CodexChat> { chat in
+                chat.workspaceID == scopedWorkspaceID && chat.isArchived == false
+            },
             sortBy: sortBy,
             fetchLimit: fetchLimit
         )
@@ -376,7 +420,7 @@ extension CodexFetchRequest where Model == CodexWorkspace {
     }
 
     public static func workspaces(
-        sortDescriptors: [CodexSortDescriptor<CodexWorkspace>] =
+        sortDescriptors: [SortDescriptor<CodexWorkspace>] =
             codexDefaultWorkspaceSortDescriptors()
     ) -> Self {
         Self(.workspaces(sortBy: sortDescriptors))
@@ -401,7 +445,7 @@ extension CodexFetchRequest where Model == CodexChat {
 
     public static func chats(
         in workspace: CodexWorkspace,
-        sortDescriptors: [CodexSortDescriptor<CodexChat>],
+        sortDescriptors: [SortDescriptor<CodexChat>],
         fetchLimit: Int? = nil
     ) -> Self {
         Self(.chats(
@@ -414,19 +458,19 @@ extension CodexFetchRequest where Model == CodexChat {
 
 @usableFromInline
 func codexDefaultWorkspaceGroupSortDescriptors()
-    -> [CodexSortDescriptor<CodexWorkspaceGroup>]
+    -> [SortDescriptor<CodexWorkspaceGroup>]
 {
-    [CodexSortDescriptor(key: .name, order: .forward)]
+    [SortDescriptor(\.name)]
 }
 
 @usableFromInline
-func codexDefaultWorkspaceSortDescriptors() -> [CodexSortDescriptor<CodexWorkspace>] {
-    [CodexSortDescriptor(key: .name, order: .forward)]
+func codexDefaultWorkspaceSortDescriptors() -> [SortDescriptor<CodexWorkspace>] {
+    [SortDescriptor(\.name)]
 }
 
 @usableFromInline
-func codexDefaultChatSortDescriptors() -> [CodexSortDescriptor<CodexChat>] {
-    [CodexSortDescriptor(key: .updatedAt, order: .reverse)]
+func codexDefaultChatSortDescriptors() -> [SortDescriptor<CodexChat>] {
+    [SortDescriptor(\.updatedAt, order: .reverse)]
 }
 
 public enum CodexFetchSectionID: Sendable, Hashable, CustomStringConvertible {
@@ -578,6 +622,7 @@ package protocol CodexFetchedResultsRegistration: AnyObject {
 public final class CodexFetchedResults<Model: CodexPersistentModel> {
     public let modelContext: CodexModelContext
     public private(set) var fetchDescriptor: CodexFetchDescriptor<Model>
+    package let querySignature: CodexFetchDescriptorSignature
     public private(set) var sectionBy: CodexSectionDescriptor<Model>?
     public private(set) var items: [Model] = []
     public private(set) var sections: [CodexFetchSection<Model>] = []
@@ -599,6 +644,7 @@ public final class CodexFetchedResults<Model: CodexPersistentModel> {
     ) {
         self.modelContext = modelContext
         self.fetchDescriptor = fetchDescriptor
+        self.querySignature = fetchDescriptor.querySignature
         self.sectionBy = sectionBy
     }
 
@@ -684,7 +730,7 @@ public final class CodexFetchedResults<Model: CodexPersistentModel> {
         }
         if page.relationshipIsComplete == true, let authoritativeItems = page.relationshipItems {
             let start = min(
-                fetchDescriptor.fetchOffset,
+                fetchDescriptor.normalizedFetchOffset,
                 authoritativeItems.count
             )
             let end = min(start + items.count + page.items.count, authoritativeItems.count)
@@ -850,7 +896,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             group: group,
             reason: reason
         )
-        if fetchDescriptor.fetchOffset > 0 {
+        if fetchDescriptor.normalizedFetchOffset > 0 {
             await refreshAfterMutation(reason: reason)
             return
         }
@@ -976,7 +1022,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             nextCursor == nil,
             sortedItems.count > windowItems.count
         {
-            let cursorOffset = fetchDescriptor.fetchOffset + windowItems.count
+            let cursorOffset = fetchDescriptor.normalizedFetchOffset + windowItems.count
             nextCursor = modelContext.localCursor(for: cursorOffset)
         }
         updateItemsAndSections(
@@ -991,7 +1037,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
     private var canInsertLiveModel: Bool {
         canEvaluateFilterLocally
             && fetchDescriptor.includePendingChanges
-            && fetchDescriptor.fetchOffset == 0
+            && fetchDescriptor.normalizedFetchOffset == 0
             && (nextCursor == nil || fetchDescriptor.fetchLimit == nil)
     }
 
@@ -1022,15 +1068,18 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
     }
 
     private var membershipRequiresServerRefresh: Bool {
-        fetchDescriptor.predicate.searchTerm?.isEmpty == false
-            || fetchDescriptor.predicate.modelProviders?.isEmpty == false
-            || fetchDescriptor.predicate.sourceKinds != nil
-            || fetchDescriptor.predicate.useStateDBOnly != nil
+        chatQueryPlan?.membershipRequiresServerRefresh ?? false
     }
 
     private var usesServerOwnedOrdering: Bool {
-        fetchDescriptor.sortBy.first?.key == .recencyAt
-            || (Model.self == CodexChat.self && fetchDescriptor.sortBy.isEmpty)
+        chatQueryPlan?.usesServerOwnedOrdering ?? false
+    }
+
+    private var chatQueryPlan: CodexThreadQueryPlan? {
+        guard Model.self == CodexChat.self else {
+            return nil
+        }
+        return CodexThreadQueryPlan(descriptor: fetchDescriptor as! CodexFetchDescriptor<CodexChat>)
     }
 
     private func backfillAfterLocalRemovalIfNeeded(
@@ -1041,7 +1090,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         guard missingCount > 0, shouldRefreshAfterLocalRemoval else {
             return
         }
-        let backfillOffset = fetchDescriptor.fetchOffset + items.count
+        let backfillOffset = fetchDescriptor.normalizedFetchOffset + items.count
         var descriptor = fetchDescriptor
         descriptor.fetchLimit = missingCount
         do {
@@ -1068,7 +1117,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         _ changes: [CodexFetchedChatRevalidation]
     ) async -> Bool {
         guard Model.self == CodexChat.self,
-            (nextCursor != nil || fetchDescriptor.fetchOffset > 0),
+            (nextCursor != nil || fetchDescriptor.normalizedFetchOffset > 0),
             changes.contains(where: { shouldInclude($0.chat, archived: $0.archived) })
         else {
             return false
@@ -1083,54 +1132,12 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
     }
 
     private func shouldInclude(_ chat: CodexChat, archived: Bool) -> Bool {
-        switch fetchDescriptor.predicate.archived {
-        case .some(let expectedArchived):
-            guard expectedArchived == archived else {
-                return false
-            }
-        case .none:
-            guard archived == false else {
-                return false
-            }
+        guard let chatQueryPlan else {
+            return archived == false
         }
-
-        if let workspaces = fetchDescriptor.predicate.workspaces {
-            guard let chatWorkspace = chat.workspace,
-                workspaces.contains(where: {
-                    Self.standardizedPath(chatWorkspace.url) == Self.standardizedPath($0)
-                })
-            else {
-                return false
-            }
-        }
-
-        if let searchTerm = fetchDescriptor.predicate.searchTerm, searchTerm.isEmpty == false {
-            let searchableText = [
-                chat.name,
-                chat.preview,
-                chat.workspace?.name,
-                chat.title,
-            ]
-            guard
-                searchableText.contains(where: { text in
-                    text?.localizedCaseInsensitiveContains(searchTerm) == true
-                })
-            else {
-                return false
-            }
-        }
-
-        if let modelProviders = fetchDescriptor.predicate.modelProviders,
-            modelProviders.isEmpty == false
-        {
-            guard let modelProvider = chat.modelProvider,
-                modelProviders.contains(modelProvider)
-            else {
-                return false
-            }
-        }
-
-        return true
+        var record = CodexChatRecord(chat: chat)
+        record.isArchived = archived
+        return chatQueryPlan.matches(record)
     }
 
     private func shouldKeep(
@@ -1404,11 +1411,11 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
     }
 
     private func requestMatchesArchiveScope(_ archived: Bool) -> Bool {
-        (fetchDescriptor.predicate.archived ?? false) == archived
+        chatQueryPlan?.matchesArchiveScope(archived) ?? (archived == false)
     }
 
     private func requestIsScoped(to workspace: CodexWorkspace) -> Bool {
-        guard let filterWorkspaces = fetchDescriptor.predicate.workspaces else {
+        guard let filterWorkspaces = chatQueryPlan?.workspaces else {
             return false
         }
         return filterWorkspaces.contains {
