@@ -1605,6 +1605,9 @@ extension AppServerAPI.Turn.Interrupt {
 
         package static let method = "turn/interrupt"
         package var params: AppServerAPI.Turn.Interrupt.Params
+        package var scope: AppServerAPI.RequestScope? {
+            .thread(params.threadID)
+        }
 
         package init(params: AppServerAPI.Turn.Interrupt.Params) {
             self.params = params
@@ -2411,6 +2414,17 @@ extension AppServerAPI.Account.Login {
             case .chatgptAuthTokens:
                 try container.encode("chatgptAuthTokens", forKey: .type)
             }
+        }
+    }
+}
+
+extension AppServerAPI.Account.Login.Response {
+    package var pendingLoginID: String? {
+        switch self {
+        case .chatgpt(let loginID, _, _), .chatgptDeviceCode(let loginID, _, _):
+            loginID
+        case .apiKey, .chatgptAuthTokens:
+            nil
         }
     }
 }

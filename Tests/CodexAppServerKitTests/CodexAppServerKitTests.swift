@@ -659,6 +659,7 @@ struct CodexAppServerKitTests {
             turnID: "turn-review",
             reviewThreadID: "thread-review"
         )
+        try await runtime.transport.enqueueEmpty(for: "turn/interrupt")
         try await runtime.transport.enqueueEmpty(for: "thread/delete")
         try await runtime.transport.enqueueEmpty(for: "thread/delete")
         await runtime.transport.holdNextIgnoringCancellation(
@@ -677,6 +678,11 @@ struct CodexAppServerKitTests {
         await runtime.transport.waitForRequest(method: "review/start")
         task.cancel()
         await reviewStartGate.open()
+        await runtime.transport.waitForRequest(method: "turn/interrupt")
+        try await runtime.transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(id: "turn-review", status: "interrupted"))
+        )
 
         do {
             _ = try await withTimeout {
@@ -689,6 +695,7 @@ struct CodexAppServerKitTests {
                 "initialize",
                 "thread/start",
                 "review/start",
+                "turn/interrupt",
                 "thread/delete",
                 "thread/delete",
             ])
@@ -699,6 +706,107 @@ struct CodexAppServerKitTests {
         } catch {
             Issue.record("Expected CancellationError, got \(error).")
         }
+    }
+
+    @Test func standaloneStartThreadDeletesLateIdentityBeforeCancellationReturns() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let startGate = CodexAppServerTestGate()
+        try await runtime.transport.enqueueThreadStart(threadID: "thread-late", model: "gpt-5")
+        try await runtime.transport.enqueueEmpty(for: "thread/delete")
+        await runtime.transport.holdNextIgnoringCancellation(method: "thread/start", gate: startGate)
+
+        let task = Task {
+            try await runtime.server.startThread(
+                in: URL(fileURLWithPath: "/tmp/project", isDirectory: true)
+            )
+        }
+        await runtime.transport.waitForRequest(method: "thread/start")
+        task.cancel()
+        await startGate.open()
+
+        await #expect(throws: CancellationError.self) {
+            try await task.value
+        }
+        #expect(await runtime.transport.recordedRequests().map(\.method) == [
+            "initialize",
+            "thread/start",
+            "thread/delete",
+        ])
+        let delete = try #require(await runtime.transport.recordedRequests().last)
+        #expect(
+            try delete.decodeParams(AppServerAPI.Thread.Delete.Params.self).threadID
+                == "thread-late"
+        )
+    }
+
+    @Test func forkThreadDeletesLateForkBeforeCancellationReturns() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let forkGate = CodexAppServerTestGate()
+        try await runtime.transport.enqueue(
+            AppServerAPI.Thread.Fork.Response(thread: .init(id: "thread-fork")),
+            for: "thread/fork"
+        )
+        try await runtime.transport.enqueueEmpty(for: "thread/delete")
+        await runtime.transport.holdNextIgnoringCancellation(method: "thread/fork", gate: forkGate)
+
+        let task = Task {
+            try await runtime.server.forkThread("thread-source")
+        }
+        await runtime.transport.waitForRequest(method: "thread/fork")
+        task.cancel()
+        await forkGate.open()
+
+        await #expect(throws: CancellationError.self) {
+            try await task.value
+        }
+        #expect(await runtime.transport.recordedRequests().map(\.method) == [
+            "initialize",
+            "thread/fork",
+            "thread/delete",
+        ])
+        let delete = try #require(await runtime.transport.recordedRequests().last)
+        #expect(
+            try delete.decodeParams(AppServerAPI.Thread.Delete.Params.self).threadID
+                == "thread-fork"
+        )
+    }
+
+    @Test func loginChatGPTCancelsLateLoginBeforeCancellationReturns() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let loginGate = CodexAppServerTestGate()
+        try await runtime.transport.enqueueChatGPTLogin(
+            loginID: "login-late",
+            authenticationURL: URL(string: "https://example.test/auth")!
+        )
+        try await runtime.transport.enqueue(
+            AppServerAPI.Account.Login.Cancel.Response(),
+            for: "account/login/cancel"
+        )
+        await runtime.transport.holdNextIgnoringCancellation(
+            method: "account/login/start",
+            gate: loginGate
+        )
+
+        let task = Task {
+            try await runtime.server.loginChatGPT()
+        }
+        await runtime.transport.waitForRequest(method: "account/login/start")
+        task.cancel()
+        await loginGate.open()
+
+        await #expect(throws: CancellationError.self) {
+            try await task.value
+        }
+        #expect(await runtime.transport.recordedRequests().map(\.method) == [
+            "initialize",
+            "account/login/start",
+            "account/login/cancel",
+        ])
+        let cancel = try #require(await runtime.transport.recordedRequests().last)
+        #expect(
+            try cancel.decodeParams(AppServerAPI.Account.Login.Cancel.Params.self).loginID
+                == "login-late"
+        )
     }
 
     @Test func appServerListThreadsSerializesQueryOptions() async throws {
@@ -2100,6 +2208,7 @@ struct CodexAppServerKitTests {
             turnID: "turn-restarted",
             reviewThreadID: "thread-review-restarted"
         )
+        try await runtime.transport.enqueueEmpty(for: "turn/interrupt")
         let identity = CodexReviewIdentity(
             threadID: "thread-source",
             turnID: "turn-review",
@@ -2444,6 +2553,11 @@ struct CodexAppServerKitTests {
         await runtime.transport.waitForRequest(method: "review/start")
         restart.cancel()
         await reviewStartGate.open()
+        await runtime.transport.waitForRequest(method: "turn/interrupt", count: 2)
+        try await runtime.transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(id: "turn-restarted", status: "interrupted"))
+        )
 
         do {
             _ = try await withTimeout {
@@ -2460,6 +2574,7 @@ struct CodexAppServerKitTests {
                 "thread/rollback",
                 "thread/resume",
                 "review/start",
+                "turn/interrupt",
                 "thread/delete",
                 "thread/delete",
                 "thread/delete",
@@ -2936,6 +3051,31 @@ struct CodexAppServerKitTests {
         }
     }
 
+    @Test func cancellationBeforeTransportAcceptsWriteHasNoWireEffect() async throws {
+        let transport = TestPreWriteSuspendingTransport(
+            response: try JSONEncoder().encode(EmptyResponse())
+        )
+        let client = AppServerClient(transport: transport)
+        let scope = AppServerAPI.RequestScope.thread("thread-1")
+        let task = Task {
+            let _: EmptyResponse = try await client.send(
+                method: "ping",
+                params: EmptyResponse(),
+                responseType: EmptyResponse.self,
+                scope: scope
+            )
+        }
+        await transport.waitUntilSendEntered()
+        task.cancel()
+        await transport.allowWriteAcceptance()
+
+        await #expect(throws: CancellationError.self) {
+            try await task.value
+        }
+        #expect(transport.wireRequestCount() == 0)
+        #expect(await client.requestLaneCountForTesting() == 0)
+    }
+
     @Test func transportClosureIsConnectionTerminationNotRequestFailure() async throws {
         let transport = CodexAppServerTestTransport()
         await transport.enqueueFailure(.closed, for: "ping")
@@ -3075,6 +3215,39 @@ struct CodexAppServerKitTests {
         }
     }
 
+    @Test func callerCancellationStopsShieldedOverloadBackoff() async throws {
+        let transport = CodexAppServerTestTransport()
+        await transport.enqueueFailure(code: -32_001, message: "busy", for: "ping")
+        let backoffStarted = TestSignal()
+        let backoffCancelled = TestSignal()
+        let backoffWaiter = TestCancellationWaiter {
+            backoffCancelled.signal()
+        }
+        let client = AppServerClient(
+            transport: transport,
+            overloadRetryDelay: { _ in .seconds(30) },
+            retrySleep: { _ in
+                backoffStarted.signal()
+                try await backoffWaiter.wait()
+            }
+        )
+        let task = Task {
+            let _: EmptyResponse = try await client.send(
+                method: "ping",
+                params: EmptyResponse(),
+                responseType: EmptyResponse.self
+            )
+        }
+        await backoffStarted.wait()
+        task.cancel()
+        await backoffCancelled.wait()
+
+        await #expect(throws: CancellationError.self) {
+            try await task.value
+        }
+        #expect(await transport.recordedRequests(method: "ping").count == 1)
+    }
+
     @Test func handshakeDeadlineTakesPrecedenceOverGenericRequestDeadline() async throws {
         let transport = TestSuspendingTransport(response: try JSONEncoder().encode(
             AppServerAPI.Initialize.Response(codexHome: "/tmp/codex")
@@ -3205,22 +3378,236 @@ struct CodexAppServerKitTests {
                 params: .init(threadID: "thread-1", input: [.text("second")])
             ))
         }
-        try await Task.sleep(for: .milliseconds(20))
+        try await client.waitForQueuedRequestCountForTesting(
+            scope: .thread("thread-1"),
+            atLeast: 1
+        )
         second.cancel()
 
-        await gate.open()
-        _ = try await first.value
         do {
-            _ = try await withTimeout {
-                try await second.value
-            }
+            _ = try await second.value
             Issue.record("Expected the queued scoped request to throw CancellationError.")
         } catch is CancellationError {
         } catch {
             Issue.record("Expected CancellationError, got \(error).")
         }
+        #expect(await client.queuedRequestCountForTesting(scope: .thread("thread-1")) == 0)
+        #expect(await client.requestLaneCountForTesting() == 1)
 
+        await gate.open()
+        _ = try await first.value
         #expect(await transport.recordedRequests(method: "turn/start").count == 1)
+        #expect(await client.requestLaneCountForTesting() == 0)
+    }
+
+    @Test func postWriteCancellationKeepsLaneUntilCorrelatedResponse() async throws {
+        let transport = CodexAppServerTestTransport()
+        let responseGate = CodexAppServerTestGate()
+        await transport.holdNextIgnoringCancellation(method: "ping", gate: responseGate)
+        try await transport.enqueueEmpty(for: "ping")
+        try await transport.enqueueEmpty(for: "ping")
+        let client = AppServerClient(transport: transport)
+        let scope = AppServerAPI.RequestScope.thread("thread-1")
+
+        let first = Task {
+            let _: EmptyResponse = try await client.send(
+                method: "ping",
+                params: EmptyResponse(),
+                responseType: EmptyResponse.self,
+                scope: scope
+            )
+        }
+        await transport.waitForRequest(method: "ping")
+        first.cancel()
+
+        let second = Task {
+            let _: EmptyResponse = try await client.send(
+                method: "ping",
+                params: EmptyResponse(),
+                responseType: EmptyResponse.self,
+                scope: scope
+            )
+        }
+        try await client.waitForQueuedRequestCountForTesting(scope: scope, atLeast: 1)
+
+        #expect(await transport.recordedRequests(method: "ping").count == 1)
+        await responseGate.open()
+
+        await #expect(throws: CancellationError.self) {
+            try await first.value
+        }
+        try await second.value
+        #expect(await transport.recordedRequests(method: "ping").count == 2)
+        #expect(await client.requestLaneCountForTesting() == 0)
+    }
+
+    @Test func postWriteCancellationKeepsLaneThroughRequiredCleanup() async throws {
+        let transport = CodexAppServerTestTransport()
+        let responseGate = CodexAppServerTestGate()
+        let cleanupStarted = TestSignal()
+        let cleanupGate = CodexAppServerTestGate()
+        await transport.holdNextIgnoringCancellation(method: "ping", gate: responseGate)
+        try await transport.enqueueEmpty(for: "ping")
+        try await transport.enqueueEmpty(for: "ping")
+        let client = AppServerClient(transport: transport)
+        let scope = AppServerAPI.RequestScope.thread("thread-1")
+
+        let first = Task {
+            let _: EmptyResponse = try await client.send(
+                method: "ping",
+                params: EmptyResponse(),
+                responseType: EmptyResponse.self,
+                scope: scope,
+                onPostWriteCancellation: { _ in
+                    cleanupStarted.signal()
+                    await cleanupGate.waitIgnoringCancellation()
+                }
+            )
+        }
+        await transport.waitForRequest(method: "ping")
+        first.cancel()
+        await responseGate.open()
+        await cleanupStarted.wait()
+
+        let second = Task {
+            let _: EmptyResponse = try await client.send(
+                method: "ping",
+                params: EmptyResponse(),
+                responseType: EmptyResponse.self,
+                scope: scope
+            )
+        }
+        try await client.waitForQueuedRequestCountForTesting(scope: scope, atLeast: 1)
+
+        #expect(await transport.recordedRequests(method: "ping").count == 1)
+        await cleanupGate.open()
+        await #expect(throws: CancellationError.self) {
+            try await first.value
+        }
+        try await second.value
+        #expect(await transport.recordedRequests(method: "ping").count == 2)
+        #expect(await client.requestLaneCountForTesting() == 0)
+    }
+
+    @Test func cleanupChildWithStaleLaneTokenQueuesBehindCurrentOwner() async throws {
+        let transport = CodexAppServerTestTransport()
+        let firstResponseGate = CodexAppServerTestGate()
+        let blockerResponseGate = CodexAppServerTestGate()
+        let staleChildGate = CodexAppServerTestGate()
+        let staleChildTask = Mutex<Task<Void, Error>?>(nil)
+        await transport.holdNextIgnoringCancellation(method: "ping", gate: firstResponseGate)
+        await transport.holdNextIgnoringCancellation(method: "ping", gate: blockerResponseGate)
+        try await transport.enqueueEmpty(for: "ping")
+        try await transport.enqueueEmpty(for: "ping")
+        try await transport.enqueueEmpty(for: "ping")
+        let client = AppServerClient(transport: transport)
+        let scope = AppServerAPI.RequestScope.thread("thread-1")
+
+        let first = Task {
+            let _: EmptyResponse = try await client.send(
+                method: "ping",
+                params: EmptyResponse(),
+                responseType: EmptyResponse.self,
+                scope: scope,
+                onPostWriteCancellation: { _ in
+                    let task = Task {
+                        await staleChildGate.waitIgnoringCancellation()
+                        let _: EmptyResponse = try await client.send(
+                            method: "ping",
+                            params: EmptyResponse(),
+                            responseType: EmptyResponse.self,
+                            scope: scope
+                        )
+                    }
+                    staleChildTask.withLock { $0 = task }
+                }
+            )
+        }
+        await transport.waitForRequest(method: "ping")
+        first.cancel()
+        await firstResponseGate.open()
+        await #expect(throws: CancellationError.self) {
+            try await first.value
+        }
+
+        let blocker = Task {
+            let _: EmptyResponse = try await client.send(
+                method: "ping",
+                params: EmptyResponse(),
+                responseType: EmptyResponse.self,
+                scope: scope
+            )
+        }
+        await transport.waitForRequest(method: "ping", count: 2)
+        let child = try #require(staleChildTask.withLock { $0 })
+        await staleChildGate.open()
+        try await withTimeout {
+            try await client.waitForQueuedRequestCountForTesting(scope: scope, atLeast: 1)
+        }
+
+        #expect(await transport.recordedRequests(method: "ping").count == 2)
+        await blockerResponseGate.open()
+        try await blocker.value
+        try await child.value
+        #expect(await transport.recordedRequests(method: "ping").count == 3)
+        #expect(await client.requestLaneCountForTesting() == 0)
+    }
+
+    @Test func postWriteDeadlineClosesConnectionBeforeReleasingLane() async throws {
+        let transport = CodexAppServerTestTransport()
+        let responseGate = CodexAppServerTestGate()
+        let deadlineGate = CodexAppServerTestGate()
+        await transport.holdNextIgnoringCancellation(method: "ping", gate: responseGate)
+        try await transport.enqueueEmpty(for: "ping")
+        let client = AppServerClient(
+            transport: transport,
+            deadlineClock: .init { duration in
+                #expect(duration == .seconds(5))
+                await deadlineGate.waitIgnoringCancellation()
+            }
+        )
+        let scope = AppServerAPI.RequestScope.thread("thread-1")
+
+        let first = Task {
+            let _: EmptyResponse = try await client.send(
+                method: "ping",
+                params: EmptyResponse(),
+                responseType: EmptyResponse.self,
+                scope: scope,
+                deadline: .seconds(5)
+            )
+        }
+        await transport.waitForRequest(method: "ping")
+
+        let second = Task {
+            let _: EmptyResponse = try await client.send(
+                method: "ping",
+                params: EmptyResponse(),
+                responseType: EmptyResponse.self,
+                scope: scope
+            )
+        }
+        try await client.waitForQueuedRequestCountForTesting(scope: scope, atLeast: 1)
+
+        await deadlineGate.open()
+        do {
+            try await first.value
+            Issue.record("Expected request deadline.")
+        } catch let error as CodexAppServerError {
+            #expect(error == .request(.init(
+                requestID: 1,
+                method: "ping",
+                purpose: .operation("ping"),
+                kind: .deadlineExceeded(.seconds(5))
+            )))
+        }
+        await #expect(throws: CodexAppServerError.self) {
+            try await second.value
+        }
+
+        #expect(await transport.recordedRequests(method: "ping").count == 1)
+        #expect(await transport.isClosedForTesting())
+        #expect(await client.requestLaneCountForTesting() == 0)
     }
 
     @Test func turnResultReplaysEarlyNotificationsAndKeepsUnknownEvents() async throws {
@@ -6018,6 +6405,52 @@ private actor ServerRequestRecorder {
     }
 }
 
+private final class TestPreWriteSuspendingTransport: JSONRPC.Transport, Sendable {
+    private let response: Data
+    private let sendEntered = TestSignal()
+    private let writeAcceptanceGate = CodexAppServerTestGate()
+    private let requestCount = Mutex(0)
+
+    init(response: Data) {
+        self.response = response
+    }
+
+    func send(
+        _ request: JSONRPC.Request,
+        acceptWrite: @Sendable () throws -> Void
+    ) async throws -> Data {
+        sendEntered.signal()
+        await writeAcceptanceGate.waitIgnoringCancellation()
+        try acceptWrite()
+        requestCount.withLock { $0 += 1 }
+        return response
+    }
+
+    func waitUntilSendEntered() async {
+        await sendEntered.wait()
+    }
+
+    func allowWriteAcceptance() async {
+        await writeAcceptanceGate.open()
+    }
+
+    func wireRequestCount() -> Int {
+        requestCount.withLock { $0 }
+    }
+
+    func notify(_ notification: JSONRPC.Notification) async throws {}
+
+    func notificationStream() async -> AsyncThrowingStream<JSONRPC.Notification, Error> {
+        .init { continuation in
+            continuation.finish()
+        }
+    }
+
+    func close() async {
+        await writeAcceptanceGate.open()
+    }
+}
+
 private final class TestSuspendingTransport: JSONRPC.Transport, Sendable {
     let response: Data
     private let started = TestSignal()
@@ -6033,7 +6466,11 @@ private final class TestSuspendingTransport: JSONRPC.Transport, Sendable {
         }
     }
 
-    func send(_ request: JSONRPC.Request) async throws -> Data {
+    func send(
+        _ request: JSONRPC.Request,
+        acceptWrite: @Sendable () throws -> Void
+    ) async throws -> Data {
+        try acceptWrite()
         started.signal()
         try await suspension.wait()
         return response
@@ -6055,7 +6492,9 @@ private final class TestSuspendingTransport: JSONRPC.Transport, Sendable {
         }
     }
 
-    func close() async {}
+    func close() async {
+        suspension.cancel()
+    }
 }
 
 private final class TestSignal: Sendable {
@@ -6132,16 +6571,20 @@ private final class TestCancellationWaiter: Sendable {
                 }
             }
         } onCancel: {
-            onCancel()
-            let continuation = state.withLock { state in
-                state.isCancelled = true
-                let continuation = state.continuation
-                state.continuation = nil
-                return continuation
-            }
-            continuation?.resume()
+            cancel()
         }
         try Task.checkCancellation()
+    }
+
+    func cancel() {
+        onCancel()
+        let continuation = state.withLock { state in
+            state.isCancelled = true
+            let continuation = state.continuation
+            state.continuation = nil
+            return continuation
+        }
+        continuation?.resume()
     }
 }
 

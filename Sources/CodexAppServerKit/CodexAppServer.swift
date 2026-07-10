@@ -334,7 +334,15 @@ public actor CodexAppServer {
                     sessionStartSource: options.sessionStartSource?.appServerSource,
                     threadSource: options.threadSource?.appServerSource
                 )
-            ))
+            ),
+            onPostWriteCancellation: { [client] response in
+                let _: EmptyResponse = try await client.send(
+                    AppServerAPI.Thread.Delete.Request(
+                        params: .init(threadID: response.threadID)
+                    )
+                )
+            }
+        )
         return CodexThread(
             id: .init(rawValue: response.threadID),
             workspace: workspace,
@@ -366,7 +374,7 @@ public actor CodexAppServer {
         delivery: CodexReviewDelivery = .inline
     ) async throws -> CodexReviewSession {
         try Task.checkCancellation()
-        let thread = try await startThreadIgnoringCallerCancellation(
+        let thread = try await startThread(
             in: workspace,
             instructions: instructions,
             options: options
@@ -380,8 +388,7 @@ public actor CodexAppServer {
 
         let review: CodexReviewSession
         do {
-            review = try await startReviewIgnoringCallerCancellation(
-                thread: thread,
+            review = try await thread.startReview(
                 target: target,
                 delivery: delivery
             )
@@ -558,10 +565,12 @@ public actor CodexAppServer {
             )
             try Task.checkCancellation()
 
-            let review = try await startReviewIgnoringCallerCancellation(
-                thread: sourceThread,
+            let review = try await sourceThread.startReview(
                 target: target,
-                delivery: delivery
+                delivery: delivery,
+                onPostWriteCancellation: { [self] review in
+                    try await cleanupCancelledRestart(review, tokenID: token.id)
+                }
             )
             do {
                 try Task.checkCancellation()
@@ -579,6 +588,15 @@ public actor CodexAppServer {
             }
             throw error
         }
+    }
+
+    private func cleanupCancelledRestart(
+        _ review: CodexReviewSession,
+        tokenID: CodexReviewRestartToken.ID
+    ) async throws {
+        try await interruptAndAwaitTerminal(review.response)
+        await cleanupReview(review.identity)
+        reviewRestartContextsByTokenID.removeValue(forKey: tokenID)
     }
 
     /// Deletes all app-server threads owned by a review lifecycle.
@@ -628,7 +646,15 @@ public actor CodexAppServer {
             AppServerAPI.Thread.Fork.Request(
                 threadID: id.rawValue,
                 params: threadStartParams(options: options)
-            ))
+            ),
+            onPostWriteCancellation: { [client] response in
+                let _: EmptyResponse = try await client.send(
+                    AppServerAPI.Thread.Delete.Request(
+                        params: .init(threadID: response.thread.id)
+                    )
+                )
+            }
+        )
         return await thread(from: response.thread)
     }
 
@@ -813,7 +839,9 @@ public actor CodexAppServer {
         let response = try await client.send(
             AppServerAPI.Account.Login.Start.Request(
                 params: .init(type: "apiKey", apiKey: apiKey)
-            ))
+            ),
+            onPostWriteCancellation: cancelLoginAfterPostWriteCancellation
+        )
         return try Self.loginHandle(from: response)
     }
 
@@ -825,7 +853,9 @@ public actor CodexAppServer {
         let response = try await client.send(
             AppServerAPI.Account.Login.Start.Request(
                 params: .init(type: "chatgpt")
-            ))
+            ),
+            onPostWriteCancellation: cancelLoginAfterPostWriteCancellation
+        )
         return try Self.loginHandle(from: response)
     }
 
@@ -846,7 +876,9 @@ public actor CodexAppServer {
                         callbackURLScheme: nativeWebAuthentication.callbackURLScheme
                     )
                 )
-            ))
+            ),
+            onPostWriteCancellation: cancelLoginAfterPostWriteCancellation
+        )
         return try Self.chatGPTLogin(from: response)
     }
 
@@ -858,7 +890,9 @@ public actor CodexAppServer {
         let response = try await client.send(
             AppServerAPI.Account.Login.Start.Request(
                 params: .init(type: "chatgptDeviceCode")
-            ))
+            ),
+            onPostWriteCancellation: cancelLoginAfterPostWriteCancellation
+        )
         return try Self.loginHandle(from: response)
     }
 
@@ -882,6 +916,19 @@ public actor CodexAppServer {
     public func cancelLogin(id: CodexLoginHandle.ID) async throws {
         let _: AppServerAPI.Account.Login.Cancel.Response = try await client.send(
             AppServerAPI.Account.Login.Cancel.Request(params: .init(loginID: id.rawValue))
+        )
+    }
+
+    private func cancelLoginAfterPostWriteCancellation(
+        _ response: AppServerAPI.Account.Login.Response
+    ) async throws {
+        guard let loginID = response.pendingLoginID else {
+            return
+        }
+        let _: AppServerAPI.Account.Login.Cancel.Response = try await client.send(
+            AppServerAPI.Account.Login.Cancel.Request(
+                params: .init(loginID: loginID)
+            )
         )
     }
 
@@ -970,41 +1017,14 @@ public actor CodexAppServer {
         }
     }
 
-    private func startThreadIgnoringCallerCancellation(
-        in workspace: URL,
-        instructions: CodexInstructions?,
-        options: CodexThread.Options
-    ) async throws -> CodexThread {
-        try await Task.detached { [self] in
-            try await startThread(
-                in: workspace,
-                instructions: instructions,
-                options: options
-            )
-        }.value
-    }
-
-    private func startReviewIgnoringCallerCancellation(
-        thread: CodexThread,
-        target: CodexReviewTarget,
-        delivery: CodexReviewDelivery
-    ) async throws -> CodexReviewSession {
-        try await Task.detached {
-            try await thread.startReview(
-                target: target,
-                delivery: delivery
-            )
-        }.value
-    }
-
     private func deleteThreadIgnoringCallerCancellation(_ id: CodexThreadID) async {
-        await Task.detached { [self] in
+        await Task { [self] in
             try? await deleteThread(id)
         }.value
     }
 
     private func cleanupReviewIgnoringCallerCancellation(_ identity: CodexReviewIdentity) async {
-        await Task.detached { [self] in
+        await Task { [self] in
             await cleanupReview(identity)
         }.value
     }

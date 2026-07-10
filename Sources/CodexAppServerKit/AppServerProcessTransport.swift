@@ -130,9 +130,13 @@ package actor AppServerProcessTransport: JSONRPC.Transport {
         stderrEvents.start()
     }
 
-    package func send(_ request: JSONRPC.Request) async throws -> Data {
+    package func send(
+        _ request: JSONRPC.Request,
+        acceptWrite: @Sendable () throws -> Void
+    ) async throws -> Data {
         try throwIfClosed()
         let payload = try makeRequestPayload(request)
+        try acceptWrite()
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 pending[request.id] = .init(continuation: continuation)

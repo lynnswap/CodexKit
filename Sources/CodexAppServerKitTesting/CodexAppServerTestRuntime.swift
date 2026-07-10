@@ -430,6 +430,7 @@ public actor CodexAppServerTestTransport {
     private var maxActiveByMethod: [String: Int] = [:]
     private var gatesByMethod: [String: RequestGate] = [:]
     private var oneShotGatesByMethod: [String: [RequestGate]] = [:]
+    private var activeRequestGatesByRequestID: [Int: RequestGate] = [:]
     private var requestCountWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
     private var requestMethodWaiters: [(String, Int, CheckedContinuation<Void, Never>)] = []
     private var notificationStreamCountWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
@@ -1136,10 +1137,14 @@ public actor CodexAppServerTestTransport {
 }
 
 extension CodexAppServerTestTransport: JSONRPC.Transport {
-    package func send(_ request: JSONRPC.Request) async throws -> Data {
+    package func send(
+        _ request: JSONRPC.Request,
+        acceptWrite: @Sendable () throws -> Void
+    ) async throws -> Data {
         guard closed == false else {
             throw JSONRPC.Error.closed
         }
+        try acceptWrite()
         requests.append(request)
         resumeRequestCountWaiters()
         resumeRequestMethodWaiters()
@@ -1150,9 +1155,14 @@ extension CodexAppServerTestTransport: JSONRPC.Transport {
         )
         let queuedResponse = dequeueResponse(for: request.method)
         if let gate = dequeueOneShotGate(for: request.method) ?? gatesByMethod[request.method] {
+            activeRequestGatesByRequestID[request.id] = gate
             await gate.wait()
+            activeRequestGatesByRequestID.removeValue(forKey: request.id)
         }
         activeByMethod[request.method, default: 1] -= 1
+        guard closed == false else {
+            throw JSONRPC.Error.closed
+        }
         if let queuedResponse {
             switch queuedResponse {
             case .success(let data):
@@ -1179,7 +1189,19 @@ extension CodexAppServerTestTransport: JSONRPC.Transport {
     }
 
     package func close() async {
+        guard closed == false else {
+            return
+        }
         closed = true
+        let requestGates = Array(activeRequestGatesByRequestID.values)
+            + Array(gatesByMethod.values)
+            + oneShotGatesByMethod.values.flatMap { $0 }
+        activeRequestGatesByRequestID.removeAll(keepingCapacity: false)
+        gatesByMethod.removeAll(keepingCapacity: false)
+        oneShotGatesByMethod.removeAll(keepingCapacity: false)
+        for requestGate in requestGates {
+            await requestGate.gate.open()
+        }
         for continuation in serverNotificationContinuations {
             continuation.finish()
         }

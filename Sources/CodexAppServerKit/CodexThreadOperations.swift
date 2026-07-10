@@ -154,18 +154,44 @@ extension CodexThread {
         target: CodexReviewTarget,
         delivery: CodexReviewDelivery = .inline
     ) async throws -> CodexReviewSession {
+        try await startReview(
+            target: target,
+            delivery: delivery,
+            onPostWriteCancellation: { review in
+                try await cleanupCancelledReviewSession(review)
+            }
+        )
+    }
+
+    package func startReview(
+        target: CodexReviewTarget,
+        delivery: CodexReviewDelivery = .inline,
+        onPostWriteCancellation: @escaping @Sendable (CodexReviewSession) async throws -> Void
+    ) async throws -> CodexReviewSession {
         await router.beginUnscopedDiagnosticRouting(in: id)
         let response: AppServerAPI.Review.Start.Response
         do {
             response = try await withThreadEventGeneration(id, router: router) {
-                try await client.send(AppServerAPI.Review.Start.Request(
-                    params: .init(threadID: id.rawValue, target: target, delivery: delivery)
-                ))
+                try await client.send(
+                    AppServerAPI.Review.Start.Request(
+                        params: .init(threadID: id.rawValue, target: target, delivery: delivery)
+                    ),
+                    onPostWriteCancellation: { response in
+                        let review = await reviewSession(from: response)
+                        try await onPostWriteCancellation(review)
+                    }
+                )
             }
         } catch {
             await router.stopUnscopedDiagnosticRouting(in: id)
             throw error
         }
+        return await reviewSession(from: response)
+    }
+
+    private func reviewSession(
+        from response: AppServerAPI.Review.Start.Response
+    ) async -> CodexReviewSession {
         let responseReviewThreadID = response.reviewThreadID.map(CodexThreadID.init(rawValue:))
         let detachedReviewThreadID = responseReviewThreadID == id ? nil : responseReviewThreadID
         let turnID = CodexTurnID(rawValue: response.turnID)
@@ -186,6 +212,20 @@ extension CodexThread {
         return await reviewSession(
             identity,
             initialTurn: initialTurn
+        )
+    }
+
+    private func cleanupCancelledReviewSession(
+        _ review: CodexReviewSession
+    ) async throws {
+        try await interruptAndAwaitTerminal(review.response)
+        guard review.reviewThreadID != id else {
+            return
+        }
+        let _: EmptyResponse = try await client.send(
+            AppServerAPI.Thread.Delete.Request(
+                params: .init(threadID: review.reviewThreadID.rawValue)
+            )
         )
     }
 
@@ -369,7 +409,7 @@ extension CodexThread {
     }
 }
 
-private func interruptAndAwaitTerminal(_ stream: CodexResponseStream) async throws {
+package func interruptAndAwaitTerminal(_ stream: CodexResponseStream) async throws {
     let cleanup = Task {
         let cancellation = try await stream.cancel()
         try await stream.waitForCancelledResponse(cancellation)

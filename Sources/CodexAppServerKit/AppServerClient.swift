@@ -87,16 +87,18 @@ package actor AppServerClient {
         return response
     }
 
-    package func send<Request: AppServerAPI.Request>(_ request: Request) async throws
-        -> Request.Response
-    {
+    package func send<Request: AppServerAPI.Request>(
+        _ request: Request,
+        onPostWriteCancellation: @escaping @Sendable (Request.Response) async throws -> Void = { _ in }
+    ) async throws -> Request.Response {
         try await send(
             method: Request.method,
             params: request.params,
             responseType: Request.Response.self,
             scope: request.scope,
             purpose: .operation(Request.method),
-            deadline: deadlines.request
+            deadline: deadlines.request,
+            onPostWriteCancellation: onPostWriteCancellation
         )
     }
 
@@ -124,9 +126,10 @@ package actor AppServerClient {
         scope: AppServerAPI.RequestScope? = nil,
         purpose: CodexRequestPurpose? = nil,
         deadline: Duration? = nil,
-        afterResponse: @escaping @Sendable (Response) async throws -> Void = { _ in }
+        afterResponse: @escaping @Sendable (Response) async throws -> Void = { _ in },
+        onPostWriteCancellation: @escaping @Sendable (Response) async throws -> Void = { _ in }
     ) async throws -> Response {
-        try await serializer.run(scope: scope) { [encoder, self] in
+        try await serializer.run(scope: scope) { [encoder, self] laneToken in
             let requestID = await self.allocateRequestID()
             let requestPurpose = purpose ?? .operation(method)
             let encodedParams: Data
@@ -143,28 +146,63 @@ package actor AppServerClient {
                 ))
             }
             let initialRequestID = requestID
+            let state = RequestOperationState()
             let operation = { @Sendable [self] in
-                try await performRequestWithRetries(
+                let response = try await performRequestWithRetries(
                     initialRequestID: initialRequestID,
                     method: method,
                     encodedParams: encodedParams,
                     responseType: responseType,
                     purpose: requestPurpose,
-                    afterResponse: afterResponse
+                    afterResponse: afterResponse,
+                    operationState: state
                 )
+                state.markResponseBound()
+                switch state.resolveResponse() {
+                case .returnResponse:
+                    return response
+                case .performCleanup(let abandonment):
+                    try await serializer.runCleanup(using: laneToken) {
+                        try await onPostWriteCancellation(response)
+                    }
+                    state.markCleanupComplete()
+                    throw abandonment
+                }
             }
-            guard let deadline else {
-                return try await operation()
-            }
-            do {
-                return try await self.runWithDeadline(deadline, operation: operation)
-            } catch is RequestDeadlineExpired {
-                throw CodexAppServerError.request(.init(
-                    requestID: initialRequestID,
-                    method: method,
-                    purpose: requestPurpose,
-                    kind: .deadlineExceeded(deadline)
-                ))
+            return try await withTaskCancellationHandler {
+                let operationTask = Task {
+                    do {
+                        guard let deadline else {
+                            return try await operation()
+                        }
+                        do {
+                            return try await self.runRequestWithDeadline(
+                                deadline,
+                                operationState: state,
+                                operation: operation
+                            )
+                        } catch is RequestDeadlineExpired {
+                            throw CodexAppServerError.request(.init(
+                                requestID: initialRequestID,
+                                method: method,
+                                purpose: requestPurpose,
+                                kind: .deadlineExceeded(deadline)
+                            ))
+                        }
+                    } catch RequestOperationAbandonment.callerCancellation {
+                        throw CancellationError()
+                    } catch RequestOperationAbandonment.deadline {
+                        throw RequestDeadlineExpired()
+                    } catch {
+                        if state.preWriteCancellationShouldWin() {
+                            throw CancellationError()
+                        }
+                        throw error
+                    }
+                }
+                return try await operationTask.value
+            } onCancel: {
+                state.requestCancellation()
             }
         }
     }
@@ -175,7 +213,8 @@ package actor AppServerClient {
         encodedParams: Data,
         responseType: Response.Type,
         purpose: CodexRequestPurpose,
-        afterResponse: @escaping @Sendable (Response) async throws -> Void
+        afterResponse: @escaping @Sendable (Response) async throws -> Void,
+        operationState: RequestOperationState
     ) async throws -> Response {
         var requestID = initialRequestID
         var retryAttempt = 0
@@ -187,11 +226,18 @@ package actor AppServerClient {
             do {
                 let rawResponse: Data
                 do {
-                    rawResponse = try await transport.send(.init(
-                        id: attemptRequestID,
-                        method: method,
-                        params: encodedParams
-                    ))
+                    rawResponse = try await transport.send(
+                        .init(
+                            id: attemptRequestID,
+                            method: method,
+                            params: encodedParams
+                        ),
+                        acceptWrite: {
+                            try operationState.acceptWrite()
+                        }
+                    )
+                } catch let abandonment as RequestOperationAbandonment {
+                    throw abandonment
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch let error as JSONRPC.Error {
@@ -239,6 +285,8 @@ package actor AppServerClient {
                 return response
             } catch is CancellationError {
                 throw CancellationError()
+            } catch let abandonment as RequestOperationAbandonment {
+                throw abandonment
             } catch let error as JSONRPC.Error {
                 if case .responseError(let serverError) = error,
                    serverError.code == Self.appServerOverloadedErrorCode {
@@ -257,7 +305,10 @@ package actor AppServerClient {
                     logger.warning(
                         "JSON-RPC request \(attemptRequestID, privacy: .public) overloaded for \(method, privacy: .public); retrying in \(String(describing: delay), privacy: .public)"
                     )
-                    try await retrySleep(delay)
+                    try await waitForRetryDelay(
+                        delay,
+                        operationState: operationState
+                    )
                     requestID = allocateRequestID()
                     continue
                 }
@@ -295,6 +346,26 @@ package actor AppServerClient {
 
     package func close() async {
         await transport.close()
+    }
+
+    package func requestLaneCountForTesting() async -> Int {
+        await serializer.laneCountForTesting()
+    }
+
+    package func queuedRequestCountForTesting(
+        scope: AppServerAPI.RequestScope
+    ) async -> Int {
+        await serializer.queuedWaiterCountForTesting(scope: scope)
+    }
+
+    package func waitForQueuedRequestCountForTesting(
+        scope: AppServerAPI.RequestScope,
+        atLeast minimumCount: Int
+    ) async throws {
+        try await serializer.waitForQueuedWaiterCountForTesting(
+            scope: scope,
+            atLeast: minimumCount
+        )
     }
 
     package func runTurnWithDeadline<Output: Sendable>(
@@ -340,6 +411,84 @@ package actor AppServerClient {
         }
     }
 
+    private func runRequestWithDeadline<Output: Sendable>(
+        _ deadline: Duration,
+        operationState: RequestOperationState,
+        operation: @escaping @Sendable () async throws -> Output
+    ) async throws -> Output {
+        try await withThrowingTaskGroup(of: DeadlineRace<Output>.self) { group in
+            group.addTask { .value(try await operation()) }
+            group.addTask { [deadlineClock] in
+                try await deadlineClock.sleep(deadline)
+                return .expired
+            }
+            var deadlineWon = false
+            while true {
+                let result: DeadlineRace<Output>
+                do {
+                    guard let next = try await group.next() else {
+                        preconditionFailure("Deadline race must have a winner.")
+                    }
+                    result = next
+                } catch {
+                    if deadlineWon {
+                        throw RequestDeadlineExpired()
+                    }
+                    throw error
+                }
+                switch result {
+                case .value(let value):
+                    group.cancelAll()
+                    return value
+                case .expired:
+                    switch operationState.requestDeadline() {
+                    case .ignored:
+                        continue
+                    case .awaitPreWriteExit:
+                        deadlineWon = true
+                    case .closeConnection:
+                        deadlineWon = true
+                        await transport.close()
+                    }
+                }
+            }
+        }
+    }
+
+    private func waitForRetryDelay(
+        _ delay: Duration,
+        operationState: RequestOperationState
+    ) async throws {
+        try operationState.beginRetryWait()
+        let retrySleep = self.retrySleep
+        try await withThrowingTaskGroup(of: RetryDelayRace.self) { group in
+            group.addTask {
+                try await retrySleep(delay)
+                return .delayElapsed
+            }
+            group.addTask {
+                if let abandonment = await operationState.waitForAbandonment() {
+                    return .abandoned(abandonment)
+                }
+                return .waiterCancelled
+            }
+            defer { group.cancelAll() }
+            guard let result = try await group.next() else {
+                preconditionFailure("A retry delay race must have a winner.")
+            }
+            switch result {
+            case .delayElapsed:
+                break
+            case .abandoned(let abandonment):
+                throw abandonment
+            case .waiterCancelled:
+                try Task.checkCancellation()
+                preconditionFailure("An active retry abandonment waiter cannot end without a signal.")
+            }
+        }
+        try operationState.finishRetryWait()
+    }
+
     private nonisolated static func transportFailure(from error: Error) -> CodexTransportFailure {
         if let failure = error as? CodexTransportFailure {
             return failure
@@ -365,98 +514,10 @@ private enum DeadlineRace<Value: Sendable>: Sendable {
     case expired
 }
 
+private enum RetryDelayRace: Sendable {
+    case delayElapsed
+    case abandoned(RequestOperationAbandonment)
+    case waiterCancelled
+}
+
 private struct RequestDeadlineExpired: Error, Sendable {}
-
-package actor RequestSerializer {
-    private var lanes: [AppServerAPI.RequestScope: SerialLane] = [:]
-
-    package init() {}
-
-    package func run<Output: Sendable>(
-        scope: AppServerAPI.RequestScope?,
-        operation: @Sendable () async throws -> Output
-    ) async throws -> Output {
-        guard let scope else {
-            try Task.checkCancellation()
-            return try await operation()
-        }
-        let lane = lane(for: scope)
-        try await lane.enter()
-        do {
-            try Task.checkCancellation()
-            let output = try await operation()
-            await lane.leave()
-            return output
-        } catch {
-            await lane.leave()
-            throw error
-        }
-    }
-
-    private func lane(for scope: AppServerAPI.RequestScope) -> SerialLane {
-        if let lane = lanes[scope] {
-            return lane
-        }
-        let lane = SerialLane()
-        lanes[scope] = lane
-        return lane
-    }
-}
-
-private actor SerialLane {
-    private struct Waiter {
-        var id: UUID
-        var continuation: CheckedContinuation<Bool, Never>
-    }
-
-    private var isOccupied = false
-    private var waiters: [Waiter] = []
-
-    func enter() async throws {
-        try Task.checkCancellation()
-        if isOccupied == false {
-            isOccupied = true
-            return
-        }
-        let waiterID = UUID()
-        let acquired = await withTaskCancellationHandler {
-            await withCheckedContinuation { continuation in
-                if Task.isCancelled {
-                    continuation.resume(returning: false)
-                } else {
-                    waiters.append(.init(id: waiterID, continuation: continuation))
-                }
-            }
-        } onCancel: {
-            Task {
-                await self.cancelWaiter(id: waiterID)
-            }
-        }
-        if Task.isCancelled {
-            if acquired {
-                leave()
-            }
-            throw CancellationError()
-        }
-        guard acquired else {
-            throw CancellationError()
-        }
-    }
-
-    func leave() {
-        if waiters.isEmpty {
-            isOccupied = false
-        } else {
-            let next = waiters.removeFirst()
-            next.continuation.resume(returning: true)
-        }
-    }
-
-    private func cancelWaiter(id: UUID) {
-        guard let index = waiters.firstIndex(where: { $0.id == id }) else {
-            return
-        }
-        let waiter = waiters.remove(at: index)
-        waiter.continuation.resume(returning: false)
-    }
-}

@@ -24,7 +24,10 @@ package enum JSONRPC {
     }
 
     package protocol Transport: Sendable {
-        func send(_ request: Request) async throws -> Data
+        func send(
+            _ request: Request,
+            acceptWrite: @Sendable () throws -> Void
+        ) async throws -> Data
         func notify(_ notification: Notification) async throws
         func notificationStream() async -> AsyncThrowingStream<Notification, Swift.Error>
         func close() async
