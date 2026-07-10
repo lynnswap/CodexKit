@@ -7,7 +7,6 @@ CodexKit is a Swift package for building macOS apps and tools that talk to a loc
 - `CodexAppServerKit`: Swift domain APIs for app-server connections, threads, responses, streaming, reviews, models, accounts, and login flows.
 - `CodexDataKit`: SwiftData-style `@Observable` app-server backed model objects and fetch APIs, built on top of `CodexAppServerKit`.
 - `CodexAppServerKitTesting`: An in-memory app-server test runtime for deterministic tests without launching a real process.
-- `CodexKit`: A small shared package target for package-level symbols.
 
 ## Requirements
 
