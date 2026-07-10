@@ -2213,11 +2213,31 @@ public struct CodexMessageDelta: Equatable, Sendable {
     public var text: String
     public var itemID: String?
     public var phase: CodexMessagePhase?
+    package var currentItem: CodexThreadItem?
 
     public init(text: String, itemID: String? = nil, phase: CodexMessagePhase? = nil) {
         self.text = text
         self.itemID = itemID
         self.phase = phase
+        currentItem = nil
+    }
+
+    package init(
+        text: String,
+        itemID: String,
+        phase: CodexMessagePhase?,
+        currentItem: CodexThreadItem
+    ) {
+        self.text = text
+        self.itemID = itemID
+        self.phase = phase
+        self.currentItem = currentItem
+    }
+
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.text == rhs.text
+            && lhs.itemID == rhs.itemID
+            && lhs.phase == rhs.phase
     }
 }
 
@@ -2248,6 +2268,7 @@ public struct CodexReasoningPart: Identifiable, Equatable, Sendable {
     public var itemID: String
     public var kind: Kind
     public var index: Int
+    package var currentItem: CodexThreadItem?
 
     public var id: String {
         switch kind {
@@ -2262,6 +2283,25 @@ public struct CodexReasoningPart: Identifiable, Equatable, Sendable {
         self.itemID = itemID
         self.kind = kind
         self.index = index
+        currentItem = nil
+    }
+
+    package init(
+        itemID: String,
+        kind: Kind,
+        index: Int,
+        currentItem: CodexThreadItem
+    ) {
+        self.itemID = itemID
+        self.kind = kind
+        self.index = index
+        self.currentItem = currentItem
+    }
+
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.itemID == rhs.itemID
+            && lhs.kind == rhs.kind
+            && lhs.index == rhs.index
     }
 }
 
@@ -2269,6 +2309,7 @@ public struct CodexReasoningPart: Identifiable, Equatable, Sendable {
 public struct CodexReasoningDelta: Identifiable, Equatable, Sendable {
     public var part: CodexReasoningPart
     public var delta: String
+    package var currentItem: CodexThreadItem?
 
     public var id: String {
         part.id
@@ -2277,6 +2318,21 @@ public struct CodexReasoningDelta: Identifiable, Equatable, Sendable {
     public init(part: CodexReasoningPart, delta: String) {
         self.part = part
         self.delta = delta
+        currentItem = nil
+    }
+
+    package init(
+        part: CodexReasoningPart,
+        delta: String,
+        currentItem: CodexThreadItem
+    ) {
+        self.part = part
+        self.delta = delta
+        self.currentItem = currentItem
+    }
+
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.part == rhs.part && lhs.delta == rhs.delta
     }
 }
 

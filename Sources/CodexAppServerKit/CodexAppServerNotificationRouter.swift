@@ -37,6 +37,8 @@ package actor CodexAppServerNotificationRouter {
     private var unscopedDiagnosticRouting = UnscopedDiagnosticRoutingState()
     private var turnSubscribersByTurnID: [CodexTurnID: [UUID: TurnSubscriber]] = [:]
     private var threadSubscribersByThreadID: [CodexThreadID: [UUID: ThreadSubscriber]] = [:]
+    private var itemReducer = CodexItemReducer()
+    private var routingFailure: CodexAppServerError?
 
     private enum ThreadEventReplayPolicy {
         case currentGeneration
@@ -95,7 +97,7 @@ package actor CodexAppServerNotificationRouter {
     }
 
     package func start() async {
-        guard routerTask == nil else {
+        guard routerTask == nil, routingFailure == nil else {
             return
         }
         let notifications = await client.notificationStream()
@@ -183,6 +185,7 @@ package actor CodexAppServerNotificationRouter {
         _ turns: [CodexTurnSnapshot]?,
         threadID: CodexThreadID
     ) {
+        itemReducer.seed(turns)
         for turn in turns ?? [] {
             seedTurn(turn.id, threadID: threadID)
         }
@@ -200,6 +203,13 @@ package actor CodexAppServerNotificationRouter {
 
     package func threadSubscriberCountForTesting(for threadID: CodexThreadID) -> Int {
         threadSubscribersByThreadID[threadID]?.count ?? 0
+    }
+
+    package func itemSnapshotForTesting(
+        turnID: CodexTurnID,
+        itemID: String
+    ) -> CodexThreadItem? {
+        itemReducer.item(turnID: turnID, itemID: itemID)
     }
 
     package func beginThreadEventGeneration(_ threadID: CodexThreadID) {
@@ -292,6 +302,9 @@ package actor CodexAppServerNotificationRouter {
     }
 
     private func route(_ notification: JSONRPC.Notification) {
+        guard routingFailure == nil else {
+            return
+        }
         var context = Self.context(from: notification.params)
         if let threadID = context.threadID, let turnID = context.turnID {
             threadIDByTurnID[turnID] = threadID
@@ -320,9 +333,16 @@ package actor CodexAppServerNotificationRouter {
         context: NotificationContext
     ) {
         if method == "turn/completed" {
+            var releasedTurnID = context.turnID
+            defer {
+                if let releasedTurnID {
+                    itemReducer.release(turnID: releasedTurnID)
+                }
+            }
             do {
                 let outcome = try terminalOutcome(from: params, context: context)
                 let turnID = context.turnID ?? outcome.response.turnID
+                releasedTurnID = turnID
                 guard recordTerminalDecision(.outcome(outcome), turnID: turnID) else {
                     return
                 }
@@ -352,6 +372,35 @@ package actor CodexAppServerNotificationRouter {
             }
             return
         }
+        if Self.isCurrentItemNotification(method) {
+            do {
+                let turnID = try requiredTurnID(context, method: method, rawData: params)
+                let event = try reduceItemEvent(
+                    method: method,
+                    params: params,
+                    turnID: turnID
+                )
+                if let threadID = context.threadID ?? threadIDByTurnID[turnID] {
+                    appendThreadEvent(
+                        Self.threadEvent(from: event, turnID: turnID, threadID: threadID),
+                        threadID: threadID
+                    )
+                }
+                turnHistoryByTurnID[turnID, default: []].append(event)
+                if let subscribers = turnSubscribersByTurnID[turnID] {
+                    for subscriber in subscribers.values {
+                        subscriber.continuation.yield(event)
+                    }
+                }
+            } catch {
+                recordNotificationFailure(
+                    error,
+                    method: method,
+                    rawData: params
+                )
+            }
+            return
+        }
         if let threadID = context.threadID {
             let event = decodeThreadEvent(method: method, params: params, context: context)
             appendThreadEvent(event, threadID: threadID)
@@ -369,6 +418,17 @@ package actor CodexAppServerNotificationRouter {
                 finishTurnSubscribers(turnID: turnID)
             }
         }
+    }
+
+    private func recordNotificationFailure(
+        _ error: Error,
+        method: String,
+        rawData: Data
+    ) {
+        let failure = Self.notificationError(from: error, method: method, rawData: rawData)
+        routerTask?.cancel()
+        routerTask = nil
+        finishAll(throwing: failure)
     }
 
     private func appendThreadEvent(_ event: CodexThreadEvent, threadID: CodexThreadID) {
@@ -392,6 +452,11 @@ package actor CodexAppServerNotificationRouter {
         }
         if case .closed = event {
             unscopedDiagnosticRouting.stop(in: threadID)
+            for turnID in threadIDByTurnID.compactMap({ entry in
+                entry.value == threadID ? entry.key : nil
+            }) {
+                itemReducer.release(turnID: turnID)
+            }
             finishThreadSubscribers(threadID: threadID)
         } else if let trackedTurnID = unscopedDiagnosticRouting.activeTurnID(in: threadID),
             Self.isTerminalThreadEvent(event, for: trackedTurnID)
@@ -405,6 +470,10 @@ package actor CodexAppServerNotificationRouter {
         turnID: CodexTurnID,
         continuation: AsyncThrowingStream<CodexTurnEvent, Error>.Continuation
     ) {
+        if let routingFailure {
+            continuation.finish(throwing: routingFailure)
+            return
+        }
         let history = turnHistoryByTurnID[turnID] ?? []
         for event in history {
             continuation.yield(event)
@@ -429,6 +498,10 @@ package actor CodexAppServerNotificationRouter {
         continuation: AsyncThrowingStream<CodexThreadEvent, Error>.Continuation,
         replayPolicy: ThreadEventReplayPolicy = .currentGeneration
     ) {
+        if let routingFailure {
+            continuation.finish(throwing: routingFailure)
+            return
+        }
         let history = threadHistoryByThreadID[threadID] ?? []
         let replayedHistory: [CodexThreadEvent]
         switch replayPolicy {
@@ -717,6 +790,128 @@ package actor CodexAppServerNotificationRouter {
         }
     }
 
+    private nonisolated static func isCurrentItemNotification(_ method: String) -> Bool {
+        switch method {
+        case "item/started", "item/completed", "item/agentMessage/delta", "item/plan/delta",
+             "item/reasoning/summaryTextDelta", "item/reasoning/summaryPartAdded",
+             "item/reasoning/textDelta", "item/commandExecution/outputDelta",
+             "item/fileChange/patchUpdated", "item/mcpToolCall/progress":
+            true
+        default:
+            false
+        }
+    }
+
+    private func requiredTurnID(
+        _ context: NotificationContext,
+        method: String,
+        rawData: Data
+    ) throws -> CodexTurnID {
+        guard let turnID = context.turnID, turnID.rawValue.isEmpty == false else {
+            throw CodexAppServerError.malformedNotification(.init(
+                method: method,
+                message: "Current-v2 item notification is missing required turnId.",
+                rawData: rawData
+            ))
+        }
+        return turnID
+    }
+
+    private func reduceItemEvent(
+        method: String,
+        params: Data,
+        turnID: CodexTurnID
+    ) throws -> CodexTurnEvent {
+        let mutation: CodexItemReducer.Mutation
+        switch method {
+        case "item/started":
+            mutation = .started(try itemSnapshot(from: params))
+        case "item/completed":
+            mutation = .completed(try itemSnapshot(from: params))
+        case "item/agentMessage/delta":
+            let payload = try decoder.decode(ItemTextDeltaPayload.self, from: params)
+            mutation = .agentMessageDelta(itemID: payload.itemID, delta: payload.delta)
+        case "item/plan/delta":
+            let payload = try decoder.decode(ItemTextDeltaPayload.self, from: params)
+            mutation = .planDelta(itemID: payload.itemID, delta: payload.delta)
+        case "item/reasoning/summaryPartAdded":
+            let payload = try decoder.decode(ReasoningSummaryPartPayload.self, from: params)
+            mutation = .reasoningSummaryPartAdded(
+                itemID: payload.itemID,
+                index: payload.summaryIndex
+            )
+        case "item/reasoning/summaryTextDelta":
+            let payload = try decoder.decode(ReasoningSummaryTextDeltaPayload.self, from: params)
+            mutation = .reasoningSummaryDelta(
+                itemID: payload.itemID,
+                index: payload.summaryIndex,
+                delta: payload.delta
+            )
+        case "item/reasoning/textDelta":
+            let payload = try decoder.decode(ReasoningTextDeltaPayload.self, from: params)
+            mutation = .reasoningTextDelta(
+                itemID: payload.itemID,
+                index: payload.contentIndex,
+                delta: payload.delta
+            )
+        case "item/commandExecution/outputDelta":
+            let payload = try decoder.decode(ItemTextDeltaPayload.self, from: params)
+            mutation = .commandOutputDelta(itemID: payload.itemID, delta: payload.delta)
+        case "item/fileChange/patchUpdated":
+            let payload = try decoder.decode(ItemPatchSnapshotPayload.self, from: params)
+            mutation = .filePatchSnapshot(
+                itemID: payload.itemID,
+                output: payload.changes.displayText
+            )
+        case "item/mcpToolCall/progress":
+            let payload = try decoder.decode(ItemProgressMessagePayload.self, from: params)
+            mutation = .mcpProgress(itemID: payload.itemID, message: payload.message)
+        default:
+            preconditionFailure("Non-item method reached CodexItemReducer: \(method)")
+        }
+
+        let item = try itemReducer.apply(mutation, turnID: turnID)
+        switch mutation {
+        case .started:
+            return .itemStarted(item)
+        case .completed:
+            return .itemCompleted(item)
+        case .agentMessageDelta(let itemID, let delta):
+            return .messageDelta(.init(
+                text: delta,
+                itemID: itemID,
+                phase: item.message?.phase,
+                currentItem: item
+            ))
+        case .reasoningSummaryPartAdded(let itemID, let index):
+            return .reasoningSummaryPartAdded(.init(
+                itemID: itemID,
+                kind: .summary,
+                index: index,
+                currentItem: item
+            ))
+        case .reasoningSummaryDelta(let itemID, let index, let delta):
+            let part = CodexReasoningPart(itemID: itemID, kind: .summary, index: index)
+            return .reasoningDelta(.init(part: part, delta: delta, currentItem: item))
+        case .reasoningTextDelta(let itemID, let index, let delta):
+            let part = CodexReasoningPart(itemID: itemID, kind: .text, index: index)
+            return .reasoningDelta(.init(part: part, delta: delta, currentItem: item))
+        case .planDelta, .commandOutputDelta, .filePatchSnapshot, .mcpProgress:
+            return .itemUpdated(item)
+        }
+    }
+
+    private func itemSnapshot(from data: Data) throws -> CodexThreadItem {
+        let payload = try decoder.decode(ItemPayload.self, from: data)
+        guard let item = payload.item.makeThreadItem(
+            startedAt: payload.startedAtMS.map(Self.date(millisecondsSince1970:)),
+            completedAt: payload.completedAtMS.map(Self.date(millisecondsSince1970:))
+        ) else {
+            throw ItemNotificationDecodingError.missingItemID
+        }
+        return item
+    }
+
     private func decodeTurnEvent(
         method: String,
         params: Data,
@@ -731,41 +926,6 @@ package actor CodexAppServerNotificationRouter {
         switch method {
         case "turn/started":
             return .started(context.turnID ?? .init(rawValue: ""))
-        case "item/started":
-            if let item = item(from: params) {
-                return .itemStarted(item)
-            }
-            return .unknown(raw)
-        case "item/updated":
-            if let item = item(from: params) {
-                return .itemUpdated(item)
-            }
-            return .unknown(raw)
-        case "item/completed":
-            if let item = item(from: params) {
-                return .itemCompleted(item)
-            }
-            return .unknown(raw)
-        case "item/commandExecution/outputDelta":
-            if let item = itemUpdate(from: params, kind: .commandExecution) {
-                return .itemUpdated(item)
-            }
-            return .unknown(raw)
-        case "item/fileChange/outputDelta", "item/fileChange/patchUpdated":
-            if let item = itemUpdate(from: params, kind: .fileChange) {
-                return .itemUpdated(item)
-            }
-            return .unknown(raw)
-        case "item/mcpToolCall/progress":
-            if let item = itemUpdate(from: params, kind: .mcpToolCall) {
-                return .itemUpdated(item)
-            }
-            return .unknown(raw)
-        case "item/agentMessage/delta":
-            if let delta = messageDelta(from: params) {
-                return .messageDelta(delta)
-            }
-            return .unknown(raw)
         case "agent/message":
             if let message = agentMessage(
                 from: params,
@@ -773,21 +933,6 @@ package actor CodexAppServerNotificationRouter {
                 fallbackItemID: CodexAgentMessageFallbackID.unscoped
             ) {
                 return .message(message)
-            }
-            return .unknown(raw)
-        case "item/reasoning/summaryPartAdded":
-            if let part = reasoningSummaryPart(from: params) {
-                return .reasoningSummaryPartAdded(part)
-            }
-            return .unknown(raw)
-        case "item/reasoning/summaryTextDelta":
-            if let delta = reasoningSummaryDelta(from: params) {
-                return .reasoningDelta(delta)
-            }
-            return .unknown(raw)
-        case "item/reasoning/textDelta":
-            if let delta = reasoningTextDelta(from: params) {
-                return .reasoningDelta(delta)
             }
             return .unknown(raw)
         case "thread/tokenUsage/updated":
@@ -814,41 +959,6 @@ package actor CodexAppServerNotificationRouter {
         switch method {
         case "turn/started":
             return .turnStarted(context.turnID ?? .init(rawValue: ""))
-        case "item/started":
-            if let item = item(from: params) {
-                return .itemStarted(item, turnID: context.turnID)
-            }
-            return .unknown(raw)
-        case "item/updated":
-            if let item = item(from: params) {
-                return .itemUpdated(item, turnID: context.turnID)
-            }
-            return .unknown(raw)
-        case "item/completed":
-            if let item = item(from: params) {
-                return .itemCompleted(item, turnID: context.turnID)
-            }
-            return .unknown(raw)
-        case "item/commandExecution/outputDelta":
-            if let item = itemUpdate(from: params, kind: .commandExecution) {
-                return .itemUpdated(item, turnID: context.turnID)
-            }
-            return .unknown(raw)
-        case "item/fileChange/outputDelta", "item/fileChange/patchUpdated":
-            if let item = itemUpdate(from: params, kind: .fileChange) {
-                return .itemUpdated(item, turnID: context.turnID)
-            }
-            return .unknown(raw)
-        case "item/mcpToolCall/progress":
-            if let item = itemUpdate(from: params, kind: .mcpToolCall) {
-                return .itemUpdated(item, turnID: context.turnID)
-            }
-            return .unknown(raw)
-        case "item/agentMessage/delta":
-            if let delta = messageDelta(from: params) {
-                return .messageDelta(delta, turnID: context.turnID)
-            }
-            return .unknown(raw)
         case "agent/message":
             if let message = agentMessage(
                 from: params,
@@ -856,21 +966,6 @@ package actor CodexAppServerNotificationRouter {
                 fallbackItemID: CodexAgentMessageFallbackID.scoped(turnID: context.turnID)
             ) {
                 return .message(message, turnID: context.turnID)
-            }
-            return .unknown(raw)
-        case "item/reasoning/summaryPartAdded":
-            if let part = reasoningSummaryPart(from: params) {
-                return .reasoningSummaryPartAdded(part, turnID: context.turnID)
-            }
-            return .unknown(raw)
-        case "item/reasoning/summaryTextDelta":
-            if let delta = reasoningSummaryDelta(from: params) {
-                return .reasoningDelta(delta, turnID: context.turnID)
-            }
-            return .unknown(raw)
-        case "item/reasoning/textDelta":
-            if let delta = reasoningTextDelta(from: params) {
-                return .reasoningDelta(delta, turnID: context.turnID)
             }
             return .unknown(raw)
         case "thread/tokenUsage/updated":
@@ -942,9 +1037,11 @@ package actor CodexAppServerNotificationRouter {
         }
     }
 
-    private func finishAll(throwing error: Error) {
+    private func finishAll(throwing error: CodexAppServerError) {
         let turnSubscribers = turnSubscribersByTurnID.values.flatMap(\.values)
         let threadSubscribers = threadSubscribersByThreadID.values.flatMap(\.values)
+        routingFailure = routingFailure ?? error
+        itemReducer.releaseAll()
         unscopedDiagnosticRouting.reset()
         turnSubscribersByTurnID.removeAll()
         threadSubscribersByThreadID.removeAll()
@@ -1014,51 +1111,6 @@ package actor CodexAppServerNotificationRouter {
         ))
     }
 
-    private func item(from data: Data) -> CodexThreadItem? {
-        guard let payload = try? decoder.decode(ItemPayload.self, from: data) else {
-            return nil
-        }
-        return payload.item.makeThreadItem(
-            startedAt: payload.startedAtMS.map(Self.date(millisecondsSince1970:)),
-            completedAt: payload.completedAtMS.map(Self.date(millisecondsSince1970:))
-        )
-    }
-
-    private func itemUpdate(from data: Data, kind: CodexThreadItem.Kind) -> CodexThreadItem? {
-        guard let payload = try? decoder.decode(ItemProgressPayload.self, from: data) else {
-            return nil
-        }
-        let output = payload.delta ?? payload.message ?? payload.changes?.displayText
-        let itemID = payload.itemID ?? UUID().uuidString
-        let content: CodexThreadItem.Content
-        switch kind {
-        case .commandExecution:
-            content = .command(.init(command: "", output: output))
-        case .fileChange:
-            content = .fileChange(.init(output: output))
-        case .mcpToolCall:
-            content = .toolCall(.init(result: output))
-        case let kind:
-            content = .unknown(.init(rawType: kind.rawValue, text: output, payload: data))
-        }
-        return .init(id: itemID, kind: kind, content: content, rawPayload: data)
-    }
-
-    private func messageDelta(from data: Data) -> CodexMessageDelta? {
-        guard let payload = try? decoder.decode(AgentMessageDeltaPayload.self, from: data) else {
-            return nil
-        }
-        let text = payload.delta ?? payload.text ?? ""
-        guard text.isEmpty == false else {
-            return nil
-        }
-        return .init(
-            text: text,
-            itemID: payload.itemID,
-            phase: payload.phase.map(CodexMessagePhase.init(rawValue:))
-        )
-    }
-
     private func agentMessage(
         from data: Data,
         context: NotificationContext,
@@ -1089,46 +1141,6 @@ package actor CodexAppServerNotificationRouter {
             return nil
         }
         return value
-    }
-
-    private func reasoningSummaryPart(from data: Data) -> CodexReasoningPart? {
-        guard let payload = try? decoder.decode(
-            ReasoningSummaryPartPayload.self,
-            from: data
-        ) else {
-            return nil
-        }
-        return .init(itemID: payload.itemID, kind: .summary, index: payload.summaryIndex)
-    }
-
-    private func reasoningSummaryDelta(from data: Data) -> CodexReasoningDelta? {
-        guard let payload = try? decoder.decode(
-            ReasoningSummaryTextDeltaPayload.self,
-            from: data
-        ) else {
-            return nil
-        }
-        let part = CodexReasoningPart(
-            itemID: payload.itemID,
-            kind: .summary,
-            index: payload.summaryIndex
-        )
-        return .init(part: part, delta: payload.delta)
-    }
-
-    private func reasoningTextDelta(from data: Data) -> CodexReasoningDelta? {
-        guard let payload = try? decoder.decode(
-            ReasoningTextDeltaPayload.self,
-            from: data
-        ) else {
-            return nil
-        }
-        let part = CodexReasoningPart(
-            itemID: payload.itemID,
-            kind: .text,
-            index: payload.contentIndex
-        )
-        return .init(part: part, delta: payload.delta)
     }
 
     private func tokenUsage(from data: Data) -> CodexTokenUsage? {
@@ -1237,17 +1249,24 @@ private struct TurnCompletedPayload: Decodable {
     var turn: AppServerAPI.Turn.Payload
 }
 
-private struct AgentMessageDeltaPayload: Decodable {
-    var itemID: String?
-    var delta: String?
-    var text: String?
-    var phase: String?
+private enum ItemNotificationDecodingError: LocalizedError {
+    case missingItemID
+
+    var errorDescription: String? {
+        switch self {
+        case .missingItemID:
+            "Current-v2 item notification is missing required item.id."
+        }
+    }
+}
+
+private struct ItemTextDeltaPayload: Decodable {
+    var itemID: String
+    var delta: String
 
     enum CodingKeys: String, CodingKey {
         case itemID = "itemId"
         case delta
-        case text
-        case phase
     }
 }
 
@@ -1311,17 +1330,23 @@ private struct ItemPayload: Decodable {
     }
 }
 
-private struct ItemProgressPayload: Decodable {
-    var itemID: String?
-    var delta: String?
-    var message: String?
-    var changes: AppServerJSONValue?
+private struct ItemPatchSnapshotPayload: Decodable {
+    var itemID: String
+    var changes: AppServerJSONValue
 
     enum CodingKeys: String, CodingKey {
         case itemID = "itemId"
-        case delta
-        case message
         case changes
+    }
+}
+
+private struct ItemProgressMessagePayload: Decodable {
+    var itemID: String
+    var message: String
+
+    enum CodingKeys: String, CodingKey {
+        case itemID = "itemId"
+        case message
     }
 }
 

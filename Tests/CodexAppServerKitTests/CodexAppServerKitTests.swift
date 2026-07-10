@@ -1882,7 +1882,21 @@ struct CodexAppServerKitTests {
     @Test func reviewEventSequenceFinalizesCompletedResponseFromMessageDelta() async throws {
         let events = [
             CodexThreadEvent.messageDelta(
-                .init(text: "Final", itemID: "message-1", phase: .finalAnswer),
+                .init(
+                    text: "Final",
+                    itemID: "message-1",
+                    phase: .finalAnswer,
+                    currentItem: .init(
+                        id: "message-1",
+                        kind: .agentMessage,
+                        content: .message(.init(
+                            id: "message-1",
+                            role: .assistant,
+                            phase: .finalAnswer,
+                            text: "Final"
+                        ))
+                    )
+                ),
                 turnID: "turn-review"
             ),
             .terminal(.completed(.init(turnID: "turn-review"))),
@@ -3216,6 +3230,12 @@ struct CodexAppServerKitTests {
             method: "future/notification",
             params: TurnIDParams(turnID: "turn-1")
         )
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-1",
+            turnID: "turn-1",
+            item: .init(id: "message-1", type: "agentMessage", text: "")
+        )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(turnID: "turn-1", delta: "Done")
@@ -3348,6 +3368,12 @@ struct CodexAppServerKitTests {
         })
 
         await router.beginThreadEventGeneration("thread-1")
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-1",
+            turnID: "turn-2",
+            item: .init(id: "message-1", type: "agentMessage", text: "")
+        )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(
@@ -3364,7 +3390,7 @@ struct CodexAppServerKitTests {
         let currentGeneration = try await withTimeout {
             try await collect(await router.observationEvents(for: "thread-1"))
         }
-        #expect(currentGeneration.count == 2)
+        #expect(currentGeneration.count == 3)
         #expect(currentGeneration.contains { event in
             if case .messageDelta(let delta, let turnID) = event {
                 return delta.text == "Current" && turnID == "turn-2"
@@ -3384,6 +3410,12 @@ struct CodexAppServerKitTests {
             method: "turn/started",
             params: TurnStartedParams(threadID: "thread-review", turnID: "turn-old")
         )
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-review",
+            turnID: "turn-old",
+            item: .init(id: "message-1", type: "agentMessage", text: "")
+        )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(
@@ -3399,6 +3431,12 @@ struct CodexAppServerKitTests {
         try await transport.emitServerNotification(
             method: "turn/started",
             params: TurnStartedParams(threadID: "thread-review", turnID: "turn-current")
+        )
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-review",
+            turnID: "turn-current",
+            item: .init(id: "message-1", type: "agentMessage", text: "")
         )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
@@ -3449,6 +3487,12 @@ struct CodexAppServerKitTests {
             try await runtime.server.resumeThread("thread-resume-events")
         }
         await runtime.transport.waitForRequest(method: "thread/resume")
+        try await emitItemStarted(
+            on: runtime.transport,
+            threadID: "thread-resume-events",
+            turnID: "turn-resume-events",
+            item: .init(id: "message-1", type: "agentMessage", text: "")
+        )
         try await runtime.transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(
@@ -3518,6 +3562,12 @@ struct CodexAppServerKitTests {
         await transport.waitForNotificationStreamCount(1)
         let thread = CodexThread(id: "thread-1", client: client, router: router)
 
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-1",
+            turnID: "turn-1",
+            item: .init(id: "message-1", type: "agentMessage", text: "")
+        )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(
@@ -3539,6 +3589,12 @@ struct CodexAppServerKitTests {
             try await thread.streamResponse(to: "Next turn.")
         }
         await transport.waitForRequest(method: "turn/start")
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-1",
+            turnID: "turn-2",
+            item: .init(id: "message-1", type: "agentMessage", text: "")
+        )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(
@@ -3556,7 +3612,7 @@ struct CodexAppServerKitTests {
         let events = try await withTimeout {
             try await collect(thread.events)
         }
-        #expect(events.count == 2)
+        #expect(events.count == 3)
         #expect(events.contains { event in
             if case .messageDelta(let delta, let turnID) = event {
                 return delta.text == "During start" && turnID == "turn-2"
@@ -3584,6 +3640,12 @@ struct CodexAppServerKitTests {
         await transport.waitForNotificationStreamCount(1)
         let thread = CodexThread(id: "thread-1", client: client, router: router)
 
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-1",
+            turnID: "turn-previous",
+            item: .init(id: "message-1", type: "agentMessage", text: "")
+        )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(
@@ -3605,6 +3667,12 @@ struct CodexAppServerKitTests {
             try await thread.startReview(target: .baseBranch("main"))
         }
         await transport.waitForRequest(method: "review/start")
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-1",
+            turnID: "turn-review",
+            item: .init(id: "message-1", type: "agentMessage", text: "")
+        )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(
@@ -3701,6 +3769,12 @@ struct CodexAppServerKitTests {
             return false
         })
 
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-review",
+            turnID: "turn-previous",
+            item: .init(id: "message-1", type: "agentMessage", text: "")
+        )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(
@@ -3725,6 +3799,12 @@ struct CodexAppServerKitTests {
         await transport.emitServerNotificationJSON(
             method: "thread/status/changed",
             json: #"{"threadId":"thread-review","status":{"type":"active","activeFlags":[]}}"#
+        )
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-review",
+            turnID: "turn-review",
+            item: .init(id: "message-1", type: "agentMessage", text: "")
         )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
@@ -3813,6 +3893,12 @@ struct CodexAppServerKitTests {
         await transport.waitForNotificationStreamCount(1)
         let thread = CodexThread(id: "thread-1", client: client, router: router)
 
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-1",
+            turnID: "turn-previous",
+            item: .init(id: "message-1", type: "agentMessage", text: "")
+        )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(
@@ -3838,6 +3924,12 @@ struct CodexAppServerKitTests {
             await router.threadSubscriberCountForTesting(for: "thread-1") == 1
         })
 
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-1",
+            turnID: "turn-compact",
+            item: .init(id: "message-1", type: "agentMessage", text: "")
+        )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(
@@ -3884,6 +3976,12 @@ struct CodexAppServerKitTests {
         await transport.waitForNotificationStreamCount(1)
         let thread = CodexThread(id: "thread-1", client: client, router: router)
 
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-1",
+            turnID: "turn-previous",
+            item: .init(id: "message-1", type: "agentMessage", text: "")
+        )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(
@@ -3905,13 +4003,6 @@ struct CodexAppServerKitTests {
             try await thread.startReview(target: .baseBranch("main"))
         }
         await transport.waitForRequest(method: "review/start")
-        try await transport.emitServerNotification(
-            method: "item/agentMessage/delta",
-            params: TurnDeltaParams(
-                turnID: "turn-failed-review",
-                delta: "Failed review start"
-            )
-        )
         await gate.open()
         do {
             _ = try await reviewTask.value
@@ -3942,6 +4033,12 @@ struct CodexAppServerKitTests {
         let runtime = try await CodexAppServerTestRuntime.start()
         try await runtime.transport.enqueueThreadResume(.init(id: "thread-resume-failure"))
         let thread = try await runtime.server.resumeThread("thread-resume-failure")
+        try await emitItemStarted(
+            on: runtime.transport,
+            threadID: "thread-resume-failure",
+            turnID: "turn-resume-failure",
+            item: .init(id: "message-1", type: "agentMessage", text: "")
+        )
         try await runtime.transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(
@@ -4163,6 +4260,12 @@ struct CodexAppServerKitTests {
             method: "turn/started",
             params: TurnStartedParams(threadID: "thread-1", turnID: "turn-1")
         )
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-1",
+            turnID: "turn-1",
+            item: .init(id: "message-1", type: "agentMessage", text: "")
+        )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(turnID: "turn-1", itemID: "message-1", delta: "First")
@@ -4174,6 +4277,12 @@ struct CodexAppServerKitTests {
         try await transport.emitServerNotification(
             method: "turn/started",
             params: TurnStartedParams(threadID: "thread-1", turnID: "turn-2")
+        )
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-1",
+            turnID: "turn-2",
+            item: .init(id: "message-2", type: "agentMessage", text: "")
         )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
@@ -4192,75 +4301,6 @@ struct CodexAppServerKitTests {
         let transcripts = try await collect(thread.transcriptUpdates)
 
         #expect(transcripts.last?.items.compactMap(\.text) == ["First", "Second"])
-    }
-
-    @Test func threadTranscriptReconcilesCompleteAgentMessageWithoutItemIDWithPriorDelta() async throws {
-        let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
-        await transport.waitForNotificationStreamCount(1)
-        try await transport.emitServerNotification(
-            method: "item/agentMessage/delta",
-            params: MessageDeltaWithoutItemIDParams(
-                threadID: "thread-1",
-                turnID: "turn-1",
-                delta: "Final"
-            )
-        )
-        try await transport.emitServerNotification(
-            method: "agent/message",
-            params: AgentMessageParams(
-                threadID: "thread-1",
-                turnID: "turn-1",
-                itemID: nil,
-                message: "Final"
-            )
-        )
-        try await transport.emitServerNotification(
-            method: "thread/closed",
-            params: ThreadIDParams(threadID: "thread-1")
-        )
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
-
-        let transcripts = try await collect(thread.transcriptUpdates)
-
-        #expect(transcripts.last?.items.compactMap(\.text) == ["Final"])
-    }
-
-    @Test func threadTranscriptReconcilesCompleteAgentMessageRealItemIDWithFallbackDelta() async throws {
-        let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
-        await transport.waitForNotificationStreamCount(1)
-        try await transport.emitServerNotification(
-            method: "item/agentMessage/delta",
-            params: MessageDeltaWithoutItemIDParams(
-                threadID: "thread-1",
-                turnID: "turn-1",
-                delta: "Final"
-            )
-        )
-        try await transport.emitServerNotification(
-            method: "agent/message",
-            params: AgentMessageParams(
-                threadID: "thread-1",
-                turnID: "turn-1",
-                itemID: "message-1",
-                message: "Final"
-            )
-        )
-        try await transport.emitServerNotification(
-            method: "thread/closed",
-            params: ThreadIDParams(threadID: "thread-1")
-        )
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
-
-        let transcripts = try await collect(thread.transcriptUpdates)
-
-        #expect(transcripts.last?.items.map(\.id) == ["message-1"])
-        #expect(transcripts.last?.items.compactMap(\.text) == ["Final"])
     }
 
     @Test func responseStreamYieldsSnapshotsAndCollectsFinalResponse() async throws {
@@ -4284,6 +4324,12 @@ struct CodexAppServerKitTests {
             CodexPrompt.Part.mention(name: "repo", path: URL(fileURLWithPath: "/tmp/repo"))
         }
 
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-1",
+            turnID: "turn-1",
+            item: .init(id: "message-1", type: "agentMessage", text: "", phase: "final_answer")
+        )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(turnID: "turn-1", delta: "Final")
@@ -4294,9 +4340,12 @@ struct CodexAppServerKitTests {
         )
 
         var iterator = stream.makeAsyncIterator()
-        let first = try await iterator.next()
-        #expect(first?.turnID == "turn-1")
-        #expect(first?.content == "Final")
+        let started = try await iterator.next()
+        #expect(started?.turnID == "turn-1")
+        #expect(started?.content == nil)
+        let updated = try await iterator.next()
+        #expect(updated?.turnID == "turn-1")
+        #expect(updated?.content == "Final")
 
         let response = try await stream.collect()
         #expect(response.response.turnID == "turn-1")
@@ -4325,6 +4374,12 @@ struct CodexAppServerKitTests {
         let thread = CodexThread(id: "thread-1", client: client, router: router)
 
         let stream = try await thread.streamResponse(to: "Summarize this.")
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-1",
+            turnID: "turn-1",
+            item: .init(id: "message-1", type: "agentMessage", text: "", phase: "final_answer")
+        )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(turnID: "turn-1", itemID: "message-1", delta: "Final")
@@ -4342,71 +4397,6 @@ struct CodexAppServerKitTests {
 
         #expect(response.response.transcript.finalAnswer == "Final")
         #expect(response.response.transcript.items.first?.text == "Final")
-    }
-
-    @Test func responseStreamReconcilesCompleteAgentMessageWithoutItemIDWithPriorDelta() async throws {
-        let transport = CodexAppServerTestTransport()
-        try await transport.enqueue(
-            AppServerAPI.Turn.Start.Response(turn: .init(id: "turn-1", status: "running")),
-            for: "turn/start"
-        )
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
-        await transport.waitForNotificationStreamCount(1)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
-
-        let stream = try await thread.streamResponse(to: "Summarize this.")
-        try await transport.emitServerNotification(
-            method: "item/agentMessage/delta",
-            params: MessageDeltaWithoutItemIDParams(turnID: "turn-1", delta: "Final")
-        )
-        try await transport.emitServerNotification(
-            method: "agent/message",
-            params: AgentMessageParams(turnID: "turn-1", itemID: nil, message: "Final")
-        )
-        try await transport.emitServerNotification(
-            method: "turn/completed",
-            params: TurnCompletedParams(turn: .init(id: "turn-1", status: "completed"))
-        )
-
-        let response = try await stream.collect()
-
-        #expect(response.response.transcript.finalAnswer == "Final")
-        #expect(response.response.transcript.items.compactMap(\.text) == ["Final"])
-    }
-
-    @Test func responseStreamReconcilesCompleteAgentMessageRealItemIDWithFallbackDelta() async throws {
-        let transport = CodexAppServerTestTransport()
-        try await transport.enqueue(
-            AppServerAPI.Turn.Start.Response(turn: .init(id: "turn-1", status: "running")),
-            for: "turn/start"
-        )
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
-        await transport.waitForNotificationStreamCount(1)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
-
-        let stream = try await thread.streamResponse(to: "Summarize this.")
-        try await transport.emitServerNotification(
-            method: "item/agentMessage/delta",
-            params: MessageDeltaWithoutItemIDParams(turnID: "turn-1", delta: "Final")
-        )
-        try await transport.emitServerNotification(
-            method: "agent/message",
-            params: AgentMessageParams(turnID: "turn-1", itemID: "message-1", message: "Final")
-        )
-        try await transport.emitServerNotification(
-            method: "turn/completed",
-            params: TurnCompletedParams(turn: .init(id: "turn-1", status: "completed"))
-        )
-
-        let response = try await stream.collect()
-
-        #expect(response.response.transcript.finalAnswer == "Final")
-        #expect(response.response.transcript.items.map(\.id) == ["message-1"])
-        #expect(response.response.transcript.items.compactMap(\.text) == ["Final"])
     }
 
     @Test func responseStreamCollectsTranscriptFromCompletedTurnItems() async throws {
@@ -4491,6 +4481,12 @@ struct CodexAppServerKitTests {
         let thread = CodexThread(id: "thread-1", client: client, router: router)
 
         let stream = try await thread.streamResponse(to: "Try this.")
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-1",
+            turnID: "turn-1",
+            item: .init(id: "message-1", type: "agentMessage", text: "", phase: "final_answer")
+        )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(turnID: "turn-1", delta: "Partial")
@@ -4508,8 +4504,10 @@ struct CodexAppServerKitTests {
         )
 
         var iterator = stream.makeAsyncIterator()
-        let first = try await iterator.next()
-        #expect(first?.content == "Partial")
+        let started = try await iterator.next()
+        #expect(started?.content == nil)
+        let partial = try await iterator.next()
+        #expect(partial?.content == "Partial")
         let terminal = try await iterator.next()
         #expect(terminal?.response?.transcript.responseText == "Partial")
         #expect(terminal?.response?.startedAt == Date(timeIntervalSince1970: 1_700_000_000))
@@ -4622,6 +4620,12 @@ struct CodexAppServerKitTests {
         let router = CodexAppServerNotificationRouter(client: client)
         await router.start()
         await transport.waitForNotificationStreamCount(1)
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-1",
+            turnID: "turn-1",
+            item: .init(id: "message-1", type: "agentMessage", text: "")
+        )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(threadID: "thread-1", turnID: "turn-1", delta: "First")
@@ -4637,8 +4641,9 @@ struct CodexAppServerKitTests {
 
         let thread = CodexThread(id: "thread-1", client: client, router: router)
         let logs = try await collect(thread.logEntries)
-        #expect(logs.map(\.id) == ["message-1:0", "message-1:1"])
-        #expect(logs.compactMap(\.messageDelta).map(\.text) == ["First", "Second"])
+        let deltas = logs.filter { $0.phase == .delta }
+        #expect(deltas.map(\.id) == ["message-1:0", "message-1:1"])
+        #expect(deltas.compactMap(\.messageDelta).map(\.text) == ["First", "Second"])
     }
 
     @Test func threadLogEntriesContinueAfterTurnCompletionUntilThreadClosed() async throws {
@@ -4647,6 +4652,12 @@ struct CodexAppServerKitTests {
         let router = CodexAppServerNotificationRouter(client: client)
         await router.start()
         await transport.waitForNotificationStreamCount(1)
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-1",
+            turnID: "turn-1",
+            item: .init(id: "message-1", type: "agentMessage", text: "")
+        )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(threadID: "thread-1", turnID: "turn-1", delta: "First")
@@ -4654,6 +4665,12 @@ struct CodexAppServerKitTests {
         try await transport.emitServerNotification(
             method: "turn/completed",
             params: TurnCompletedParams(turn: .init(id: "turn-1", status: "completed"))
+        )
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-1",
+            turnID: "turn-2",
+            item: .init(id: "message-1", type: "agentMessage", text: "")
         )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
@@ -4666,16 +4683,18 @@ struct CodexAppServerKitTests {
 
         let thread = CodexThread(id: "thread-1", client: client, router: router)
         let logs = try await collect(thread.logEntries)
-        #expect(logs.map(\.id) == ["message-1:0", "message-1:1"])
-        #expect(logs.compactMap(\.messageDelta).map(\.text) == ["First", "Second"])
+        let deltas = logs.filter { $0.phase == .delta }
+        #expect(deltas.map(\.id) == ["message-1:0", "message-1:1"])
+        #expect(deltas.compactMap(\.messageDelta).map(\.text) == ["First", "Second"])
     }
 
-    @Test func messageDeltaWithoutItemIDDecodesWithFallbackIdentity() async throws {
+    @Test func messageDeltaWithoutItemIDFailsAsMalformedNotification() async throws {
         let transport = CodexAppServerTestTransport()
         let client = AppServerClient(transport: transport)
         let router = CodexAppServerNotificationRouter(client: client)
         await router.start()
         await transport.waitForNotificationStreamCount(1)
+        let events = await router.events(for: CodexTurnID(rawValue: "turn-1"))
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: MessageDeltaWithoutItemIDParams(
@@ -4684,40 +4703,22 @@ struct CodexAppServerKitTests {
                 delta: "Missing item identity"
             )
         )
-        try await transport.emitServerNotification(
-            method: "thread/closed",
-            params: ThreadIDParams(threadID: "thread-1")
-        )
 
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
-        let events = try await collect(thread.events)
-        let deltaEvent = try #require(events.first { event in
-            if case .messageDelta = event {
-                return true
-            }
-            return false
-        })
-        guard case .messageDelta(let delta, let turnID) = deltaEvent else {
-            Issue.record("Expected message delta event")
+        let failure = try #require(await terminalStreamFailure(events))
+        guard case .malformedNotification(let malformed) = failure else {
+            Issue.record("Expected malformed notification, got \(failure).")
             return
         }
-        #expect(delta.text == "Missing item identity")
-        #expect(delta.itemID == nil)
-        #expect(turnID == "turn-1")
-        #expect(events.contains { event in
-            if case .unknown(let raw) = event {
-                return raw.method == "item/agentMessage/delta"
-            }
-            return false
-        } == false)
+        #expect(malformed.method == "item/agentMessage/delta")
     }
 
-    @Test func threadItemWithoutIDDecodesAsUnknown() async throws {
+    @Test func threadItemWithoutIDFailsAsMalformedNotification() async throws {
         let transport = CodexAppServerTestTransport()
         let client = AppServerClient(transport: transport)
         let router = CodexAppServerNotificationRouter(client: client)
         await router.start()
         await transport.waitForNotificationStreamCount(1)
+        let events = await router.events(for: CodexTurnID(rawValue: "turn-1"))
         try await transport.emitServerNotification(
             method: "item/completed",
             params: ThreadItemWithoutIDParams(
@@ -4726,25 +4727,13 @@ struct CodexAppServerKitTests {
                 item: .init(type: "agentMessage", text: "Missing item identity")
             )
         )
-        try await transport.emitServerNotification(
-            method: "thread/closed",
-            params: ThreadIDParams(threadID: "thread-1")
-        )
 
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
-        let events = try await collect(thread.events)
-        #expect(events.contains { event in
-            if case .itemCompleted = event {
-                return true
-            }
-            return false
-        } == false)
-        #expect(events.contains { event in
-            if case .unknown(let raw) = event {
-                return raw.method == "item/completed"
-            }
-            return false
-        })
+        let failure = try #require(await terminalStreamFailure(events))
+        guard case .malformedNotification(let malformed) = failure else {
+            Issue.record("Expected malformed notification, got \(failure).")
+            return
+        }
+        #expect(malformed.method == "item/completed")
     }
 
     @Test func threadLogEntriesIncludeProgressDeltaNotifications() async throws {
@@ -4754,6 +4743,18 @@ struct CodexAppServerKitTests {
         await router.start()
         await transport.waitForNotificationStreamCount(1)
 
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-1",
+            turnID: "turn-1",
+            item: .init(
+                id: "command-1",
+                type: "commandExecution",
+                command: "swift test",
+                aggregatedOutput: "",
+                status: "inProgress"
+            )
+        )
         try await transport.emitServerNotification(
             method: "item/commandExecution/outputDelta",
             params: ItemOutputDeltaParams(
@@ -4763,13 +4764,15 @@ struct CodexAppServerKitTests {
                 delta: "Compiling"
             )
         )
-        try await transport.emitServerNotification(
-            method: "item/fileChange/outputDelta",
-            params: ItemOutputDeltaParams(
-                threadID: "thread-1",
-                turnID: "turn-1",
-                itemID: "file-1",
-                delta: "diff --git"
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-1",
+            turnID: "turn-1",
+            item: .init(
+                id: "patch-1",
+                type: "fileChange",
+                status: "inProgress",
+                changes: .array([])
             )
         )
         try await transport.emitServerNotification(
@@ -4784,6 +4787,17 @@ struct CodexAppServerKitTests {
                         "path": .string("Sources/File.swift"),
                     ]),
                 ])
+            )
+        )
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-1",
+            turnID: "turn-1",
+            item: .init(
+                id: "tool-1",
+                type: "mcpToolCall",
+                status: "inProgress",
+                tool: "review"
             )
         )
         try await transport.emitServerNotification(
@@ -4802,13 +4816,18 @@ struct CodexAppServerKitTests {
 
         let thread = CodexThread(id: "thread-1", client: client, router: router)
         let logs = try await collect(thread.logEntries)
+        let updates = logs.filter { $0.phase == .updated }
 
-        #expect(logs.count == 4)
-        #expect(logs.allSatisfy { $0.phase == .updated && $0.turnID == "turn-1" })
-        #expect(logs.contains { $0.item?.kind == .commandExecution && $0.item?.text == "Compiling" })
-        #expect(logs.contains { $0.item?.kind == .fileChange && $0.item?.text == "diff --git" })
+        #expect(updates.count == 3)
+        #expect(updates.allSatisfy { $0.turnID == "turn-1" })
+        #expect(updates.contains {
+            guard case .command(let command) = $0.item?.content else {
+                return false
+            }
+            return command.command == "swift test" && command.output == "Compiling"
+        })
         #expect(
-            logs.contains {
+            updates.contains {
                 if case .fileChange(let fileChange) = $0.item?.content {
                     fileChange.output?.contains("File.swift") == true
                 } else {
@@ -4816,7 +4835,7 @@ struct CodexAppServerKitTests {
                 }
             })
         #expect(
-            logs.contains {
+            updates.contains {
                 if case .toolCall(let toolCall) = $0.item?.content {
                     toolCall.result == "Reviewing"
                 } else {
@@ -4825,12 +4844,13 @@ struct CodexAppServerKitTests {
             })
     }
 
-    @Test func progressDeltaNotificationsWithoutItemIDRemainItemUpdates() async throws {
+    @Test func progressDeltaWithoutItemIDFailsAsMalformedNotification() async throws {
         let transport = CodexAppServerTestTransport()
         let client = AppServerClient(transport: transport)
         let router = CodexAppServerNotificationRouter(client: client)
         await router.start()
         await transport.waitForNotificationStreamCount(1)
+        let events = await router.events(for: CodexTurnID(rawValue: "turn-1"))
 
         try await transport.emitServerNotification(
             method: "item/commandExecution/outputDelta",
@@ -4840,53 +4860,13 @@ struct CodexAppServerKitTests {
                 delta: "Compiling"
             )
         )
-        try await transport.emitServerNotification(
-            method: "item/fileChange/patchUpdated",
-            params: ItemPatchUpdatedWithoutItemIDParams(
-                threadID: "thread-1",
-                turnID: "turn-1",
-                changes: .array([
-                    .object([
-                        "kind": .string("update"),
-                        "path": .string("Sources/File.swift"),
-                    ]),
-                ])
-            )
-        )
-        try await transport.emitServerNotification(
-            method: "item/mcpToolCall/progress",
-            params: ItemProgressWithoutItemIDParams(
-                threadID: "thread-1",
-                turnID: "turn-1",
-                message: "Reviewing"
-            )
-        )
-        try await transport.emitServerNotification(
-            method: "thread/closed",
-            params: ThreadIDParams(threadID: "thread-1")
-        )
 
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
-        let events = try await collect(thread.events)
-        let updates = events.compactMap { event -> CodexThreadItem? in
-            if case .itemUpdated(let item, let turnID) = event {
-                #expect(turnID == "turn-1")
-                return item
-            }
-            return nil
+        let failure = try #require(await terminalStreamFailure(events))
+        guard case .malformedNotification(let malformed) = failure else {
+            Issue.record("Expected malformed notification, got \(failure).")
+            return
         }
-
-        #expect(updates.count == 3)
-        #expect(updates.allSatisfy { $0.id.isEmpty == false })
-        #expect(updates.contains { $0.kind == .commandExecution && $0.text == "Compiling" })
-        #expect(updates.contains { $0.kind == .fileChange && $0.text?.contains("File.swift") == true })
-        #expect(updates.contains { $0.kind == .mcpToolCall && $0.text == "Reviewing" })
-        #expect(events.contains { event in
-            if case .unknown(let raw) = event {
-                return raw.method.hasPrefix("item/")
-            }
-            return false
-        } == false)
+        #expect(malformed.method == "item/commandExecution/outputDelta")
     }
 
     @Test func completedFileChangeItemsPreserveChangesOutput() async throws {
@@ -4931,6 +4911,17 @@ struct CodexAppServerKitTests {
         await router.start()
         await transport.waitForNotificationStreamCount(1)
 
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-1",
+            turnID: "turn-1",
+            item: .init(
+                id: "reasoning-1",
+                type: "reasoning",
+                summary: [],
+                content: []
+            )
+        )
         try await transport.emitServerNotification(
             method: "item/reasoning/summaryPartAdded",
             params: ReasoningSummaryPartParams(
@@ -5796,18 +5787,6 @@ private struct ItemPatchUpdatedParams: Encodable, Sendable {
     }
 }
 
-private struct ItemPatchUpdatedWithoutItemIDParams: Encodable, Sendable {
-    var threadID: String
-    var turnID: String
-    var changes: AppServerJSONValue
-
-    enum CodingKeys: String, CodingKey {
-        case threadID = "threadId"
-        case turnID = "turnId"
-        case changes
-    }
-}
-
 private struct ItemProgressParams: Encodable, Sendable {
     var threadID: String
     var turnID: String
@@ -5818,18 +5797,6 @@ private struct ItemProgressParams: Encodable, Sendable {
         case threadID = "threadId"
         case turnID = "turnId"
         case itemID = "itemId"
-        case message
-    }
-}
-
-private struct ItemProgressWithoutItemIDParams: Encodable, Sendable {
-    var threadID: String
-    var turnID: String
-    var message: String
-
-    enum CodingKeys: String, CodingKey {
-        case threadID = "threadId"
-        case turnID = "turnId"
         case message
     }
 }
@@ -6188,6 +6155,18 @@ private func terminalStreamFailure(
         Issue.record("Expected CodexAppServerError, got \(error).")
         return nil
     }
+}
+
+private func emitItemStarted(
+    on transport: CodexAppServerTestTransport,
+    threadID: String,
+    turnID: String,
+    item: ThreadItemParams.Item
+) async throws {
+    try await transport.emitServerNotification(
+        method: "item/started",
+        params: ThreadItemParams(threadID: threadID, turnID: turnID, item: item)
+    )
 }
 
 private func eventually(

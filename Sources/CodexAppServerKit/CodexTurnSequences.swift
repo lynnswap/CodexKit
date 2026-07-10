@@ -525,8 +525,6 @@ private struct CodexResponseAccumulator {
 private struct CodexTranscriptAccumulator {
     private var items: [CodexThreadItem] = []
     private var itemIndexesByID: [String: Int] = [:]
-    private var messageDeltaTextByItemID: [String: String] = [:]
-    private var reasoningDeltaTextByPartID: [String: String] = [:]
 
     var transcript: CodexTranscript {
         .init(items: items)
@@ -550,13 +548,13 @@ private struct CodexTranscriptAccumulator {
             )
             return true
         case .messageDelta(let delta):
-            append(delta)
+            upsert(Self.currentItem(from: delta))
             return true
         case .reasoningSummaryPartAdded(let part):
-            start(part)
+            upsert(Self.currentItem(from: part))
             return true
         case .reasoningDelta(let delta):
-            append(delta)
+            upsert(Self.currentItem(from: delta))
             return true
         case .started, .snapshot, .tokenUsageUpdated, .terminal, .unknown:
             return false
@@ -580,14 +578,14 @@ private struct CodexTranscriptAccumulator {
                     : nil
             )
             return true
-        case .messageDelta(let delta, let turnID):
-            append(delta, fallbackItemID: scopedFallbackMessageID(turnID: turnID))
+        case .messageDelta(let delta, _):
+            upsert(Self.currentItem(from: delta))
             return true
         case .reasoningSummaryPartAdded(let part, _):
-            start(part)
+            upsert(Self.currentItem(from: part))
             return true
         case .reasoningDelta(let delta, _):
-            append(delta)
+            upsert(Self.currentItem(from: delta))
             return true
         case .turnStarted, .snapshot, .terminal, .tokenUsageUpdated, .statusChanged,
             .closed, .unknown:
@@ -599,18 +597,12 @@ private struct CodexTranscriptAccumulator {
         _ item: CodexThreadItem,
         replacingFallbackID fallbackID: String? = nil
     ) {
-        if item.kind == .reasoning && item.id.contains(":summary:") == false
-            && item.id.contains(":content:") == false
-        {
-            removeReasoningParts(parentItemID: item.id)
-        }
         if let fallbackID,
            fallbackID != item.id,
            item.kind == .agentMessage,
            itemIndexesByID[item.id] == nil,
            let fallbackIndex = itemIndexesByID.removeValue(forKey: fallbackID)
         {
-            messageDeltaTextByItemID.removeValue(forKey: fallbackID)
             itemIndexesByID[item.id] = fallbackIndex
             items[fallbackIndex] = item
             return
@@ -623,57 +615,28 @@ private struct CodexTranscriptAccumulator {
         }
     }
 
-    private mutating func append(
-        _ delta: CodexMessageDelta,
-        fallbackItemID: String = CodexAgentMessageFallbackID.unscoped
-    ) {
-        let itemID = delta.itemID ?? fallbackItemID
-        let text = (messageDeltaTextByItemID[itemID] ?? "") + delta.text
-        messageDeltaTextByItemID[itemID] = text
-        let message = CodexMessage(
-            id: itemID,
-            role: .assistant,
-            phase: delta.phase,
-            text: text
-        )
-        upsert(.init(id: itemID, kind: .agentMessage, content: .message(message)))
-    }
-
     private func scopedFallbackMessageID(turnID: CodexTurnID?) -> String {
         CodexAgentMessageFallbackID.scoped(turnID: turnID)
     }
 
-    private mutating func start(_ part: CodexReasoningPart) {
-        upsert(.init(
-            id: part.id,
-            kind: .reasoning,
-            content: .reasoning(.empty)
-        ))
+    private static func currentItem(from delta: CodexMessageDelta) -> CodexThreadItem {
+        guard let currentItem = delta.currentItem else {
+            preconditionFailure("CodexMessageDelta must be emitted through CodexItemReducer.")
+        }
+        return currentItem
     }
 
-    private mutating func append(_ delta: CodexReasoningDelta) {
-        let text = (reasoningDeltaTextByPartID[delta.id] ?? "") + delta.delta
-        reasoningDeltaTextByPartID[delta.id] = text
-        let reasoning: CodexReasoning
-        switch delta.part.kind {
-        case .summary:
-            reasoning = .init(summary: text)
-        case .text:
-            reasoning = .init(content: text)
+    private static func currentItem(from part: CodexReasoningPart) -> CodexThreadItem {
+        guard let currentItem = part.currentItem else {
+            preconditionFailure("CodexReasoningPart must be emitted through CodexItemReducer.")
         }
-        upsert(.init(id: delta.id, kind: .reasoning, content: .reasoning(reasoning)))
+        return currentItem
     }
 
-    private mutating func removeReasoningParts(parentItemID: String) {
-        let prefixes = ["\(parentItemID):summary:", "\(parentItemID):content:"]
-        items.removeAll { item in
-            prefixes.contains { item.id.hasPrefix($0) }
+    private static func currentItem(from delta: CodexReasoningDelta) -> CodexThreadItem {
+        guard let currentItem = delta.currentItem else {
+            preconditionFailure("CodexReasoningDelta must be emitted through CodexItemReducer.")
         }
-        reasoningDeltaTextByPartID = reasoningDeltaTextByPartID.filter { id, _ in
-            prefixes.contains { id.hasPrefix($0) } == false
-        }
-        itemIndexesByID = Dictionary(
-            uniqueKeysWithValues: items.enumerated().map { index, item in (item.id, index) }
-        )
+        return currentItem
     }
 }

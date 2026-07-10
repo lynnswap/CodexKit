@@ -5871,16 +5871,12 @@ struct CodexModelContextTests {
         #expect(startedCommand.startedAt != nil)
 
         try await runtime.transport.emitServerNotification(
-            method: "item/updated",
-            params: ThreadItemParams(
+            method: "item/commandExecution/outputDelta",
+            params: OutputDeltaParams(
                 threadID: "thread-command-lifecycle",
                 turnID: "turn-command-lifecycle",
-                item: .init(
-                    id: "command-1",
-                    type: "commandExecution",
-                    command: "/bin/zsh -lc",
-                    output: "done"
-                )
+                itemID: "command-1",
+                delta: "done"
             )
         )
         #expect(await changes.itemUpdated(id: "command-1") != nil)
@@ -6005,6 +6001,12 @@ struct CodexModelContextTests {
                 turnID: "turn-command-existing-progress"
             )
         )
+        try await emitAgentMessageStarted(
+            on: runtime.transport,
+            threadID: "thread-command-existing-progress",
+            turnID: "turn-command-existing-progress",
+            itemID: "message-around-command"
+        )
         try await runtime.transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(
@@ -6112,6 +6114,12 @@ struct CodexModelContextTests {
         }
         #expect(startedCommand.status == .inProgress)
 
+        try await emitAgentMessageStarted(
+            on: runtime.transport,
+            threadID: "thread-command-progress",
+            turnID: "turn-command-progress",
+            itemID: "message-after-command"
+        )
         try await runtime.transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(
@@ -6201,17 +6209,12 @@ struct CodexModelContextTests {
         })
 
         try await runtime.transport.emitServerNotification(
-            method: "item/updated",
-            params: ThreadItemParams(
+            method: "item/commandExecution/outputDelta",
+            params: OutputDeltaParams(
                 threadID: "thread-command-late-update",
                 turnID: "turn-command-late-update",
-                item: .init(
-                    id: "command-first",
-                    type: "commandExecution",
-                    command: "git status",
-                    output: "late output",
-                    status: "inProgress"
-                )
+                itemID: "command-first",
+                delta: "late output"
             )
         )
 
@@ -6270,7 +6273,7 @@ struct CodexModelContextTests {
         #expect(snapshotItem.text == "Snapshot")
 
         try await runtime.transport.emitServerNotification(
-            method: "item/updated",
+            method: "item/completed",
             params: ThreadItemParams(
                 threadID: "thread-live",
                 turnID: "turn-existing",
@@ -6288,6 +6291,13 @@ struct CodexModelContextTests {
         try await runtime.transport.emitServerNotification(
             method: "turn/started",
             params: TurnStartedParams(threadID: "thread-live", turnID: "turn-live")
+        )
+        try await emitAgentMessageStarted(
+            on: runtime.transport,
+            threadID: "thread-live",
+            turnID: "turn-live",
+            itemID: "message-live",
+            phase: "final_answer"
         )
         try await runtime.transport.emitServerNotification(
             method: "item/agentMessage/delta",
@@ -6486,6 +6496,13 @@ struct CodexModelContextTests {
         #expect(chat.turn(id: "turn-restarted") != nil)
         #expect(await runtime.transport.recordedRequests(method: "thread/resume").count == 2)
 
+        try await emitAgentMessageStarted(
+            on: runtime.transport,
+            threadID: "thread-finished",
+            turnID: "turn-restarted",
+            itemID: "message-restarted",
+            phase: "final_answer"
+        )
         try await runtime.transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(
@@ -6542,6 +6559,19 @@ struct CodexModelContextTests {
         let runtime = try await CodexAppServerTestRuntime.start()
         let context = CodexModelContainer(appServer: runtime.server).mainContext
 
+        try await runtime.transport.emitServerNotification(
+            method: "item/started",
+            params: ThreadItemParams(
+                threadID: "thread-replay",
+                turnID: "turn-replay",
+                item: .init(
+                    id: "command-replay",
+                    type: "commandExecution",
+                    command: "echo hello",
+                    output: ""
+                )
+            )
+        )
         try await runtime.transport.emitServerNotification(
             method: "item/commandExecution/outputDelta",
             params: OutputDeltaParams(
@@ -6627,6 +6657,13 @@ struct CodexModelContextTests {
         }
         await runtime.transport.waitForRequest(method: "thread/read")
 
+        try await emitAgentMessageStarted(
+            on: runtime.transport,
+            threadID: "thread-message-replay",
+            turnID: "turn-message-replay",
+            itemID: "message-replay",
+            phase: "final_answer"
+        )
         try await runtime.transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(
@@ -7200,6 +7237,13 @@ struct CodexModelContextTests {
         #expect(observation.chat === chat)
         #expect(chat.items.map(\.text) == ["Snapshot"])
 
+        try await emitAgentMessageStarted(
+            on: runtime.transport,
+            threadID: "thread-changes",
+            turnID: "turn-live",
+            itemID: "message-live",
+            phase: "final_answer"
+        )
         try await runtime.transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(
@@ -7238,7 +7282,7 @@ struct CodexModelContextTests {
         #expect(chat.items.first { $0.itemID == "message-live" }?.text == "Hello")
 
         try await runtime.transport.emitServerNotification(
-            method: "item/updated",
+            method: "item/completed",
             params: ThreadItemParams(
                 threadID: "thread-changes",
                 turnID: "turn-live",
@@ -7254,55 +7298,6 @@ struct CodexModelContextTests {
         let updatedChange = await changes.itemUpdated(id: "message-live")
         #expect(updatedChange != nil)
         #expect(chat.items.first { $0.itemID == "message-live" }?.text == "Rewritten")
-    }
-
-    @Test("turnless item identities are scoped per chat")
-    func turnlessItemIdentitiesAreScopedPerChat() async throws {
-        let runtime = try await CodexAppServerTestRuntime.start(threads: [
-            .init(id: "thread-turnless-alpha", status: .active(activeFlags: []), turns: []),
-            .init(id: "thread-turnless-beta", status: .active(activeFlags: []), turns: []),
-        ])
-        let context = CodexModelContainer(appServer: runtime.server).mainContext
-
-        let alpha = context.model(for: CodexThreadID(rawValue: "thread-turnless-alpha"))
-        let beta = context.model(for: CodexThreadID(rawValue: "thread-turnless-beta"))
-        let alphaObservation = try await alpha.observe()
-        let betaObservation = try await beta.observe()
-        defer {
-            alphaObservation.cancel()
-            betaObservation.cancel()
-        }
-        let alphaChanges = ChatUpdateRecorder(stream: alphaObservation.updates)
-        let betaChanges = ChatUpdateRecorder(stream: betaObservation.updates)
-
-        try await runtime.transport.emitServerNotification(
-            method: "item/agentMessage/delta",
-            params: ThreadScopedDeltaParams(
-                threadID: "thread-turnless-alpha",
-                itemID: "shared-message",
-                delta: "Alpha",
-                phase: "final_answer"
-            )
-        )
-        try await runtime.transport.emitServerNotification(
-            method: "item/agentMessage/delta",
-            params: ThreadScopedDeltaParams(
-                threadID: "thread-turnless-beta",
-                itemID: "shared-message",
-                delta: "Beta",
-                phase: "final_answer"
-            )
-        )
-
-        #expect(await alphaChanges.itemInserted(id: "shared-message") != nil)
-        #expect(await betaChanges.itemInserted(id: "shared-message") != nil)
-        let alphaItem = try #require(alpha.items.first { $0.itemID == "shared-message" })
-        let betaItem = try #require(beta.items.first { $0.itemID == "shared-message" })
-        #expect(alphaItem !== betaItem)
-        #expect(alphaItem.chat === alpha)
-        #expect(betaItem.chat === beta)
-        #expect(alphaItem.text == "Alpha")
-        #expect(betaItem.text == "Beta")
     }
 
     @Test("chat item identity preserves kind changes from baseline to live updates")
@@ -7476,6 +7471,13 @@ struct CodexModelContextTests {
         }
         let changes = ChatUpdateRecorder(stream: observation.updates)
 
+        try await emitAgentMessageStarted(
+            on: runtime.transport,
+            threadID: "thread-refresh-live",
+            turnID: "turn-live",
+            itemID: "message-live",
+            phase: "final_answer"
+        )
         try await runtime.transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(
@@ -7595,6 +7597,13 @@ struct CodexModelContextTests {
         }
         let changes = ChatUpdateRecorder(stream: observation.updates)
 
+        try await emitAgentMessageStarted(
+            on: runtime.transport,
+            threadID: "thread-refresh-terminal",
+            turnID: "turn-live",
+            itemID: "message-live",
+            phase: "final_answer"
+        )
         try await runtime.transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(
@@ -7656,6 +7665,13 @@ struct CodexModelContextTests {
         }
         let changes = ChatUpdateRecorder(stream: observation.updates)
 
+        try await emitAgentMessageStarted(
+            on: runtime.transport,
+            threadID: "thread-refresh-not-loaded",
+            turnID: "turn-live",
+            itemID: "message-live",
+            phase: "final_answer"
+        )
         try await runtime.transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(
@@ -7872,6 +7888,13 @@ struct CodexModelContextTests {
         let observation = try await chat.observe()
         let changes = ChatUpdateRecorder(stream: observation.updates)
 
+        try await emitAgentMessageStarted(
+            on: runtime.transport,
+            threadID: "thread-reobserve-live",
+            turnID: "turn-live",
+            itemID: "message-live",
+            phase: "final_answer"
+        )
         try await runtime.transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(
@@ -7951,6 +7974,13 @@ struct CodexModelContextTests {
         }
 
         await runtime.transport.waitForRequest(method: "thread/read", count: 2)
+        try await emitAgentMessageStarted(
+            on: runtime.transport,
+            threadID: "thread-refresh-failure",
+            turnID: "turn-buffered",
+            itemID: "message-buffered",
+            phase: "final_answer"
+        )
         try await runtime.transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(
@@ -8121,6 +8151,19 @@ struct CodexModelContextTests {
         }
         let changes = ChatUpdateRecorder(stream: observation.updates)
 
+        try await runtime.transport.emitServerNotification(
+            method: "item/started",
+            params: ThreadItemParams(
+                threadID: "thread-output",
+                turnID: "turn-output",
+                item: .init(
+                    id: "command-output",
+                    type: "commandExecution",
+                    command: "echo Hello",
+                    output: ""
+                )
+            )
+        )
         try await runtime.transport.emitServerNotification(
             method: "item/commandExecution/outputDelta",
             params: OutputDeltaParams(
@@ -8894,6 +8937,13 @@ struct CodexModelContextTests {
                 target: .uncommittedChanges,
                 options: .init(model: "gpt-5", ephemeral: false)
             )
+        )
+        try await emitAgentMessageStarted(
+            on: runtime.transport,
+            threadID: "thread-review",
+            turnID: "turn-review",
+            itemID: "message-before-observe",
+            phase: "final_answer"
         )
         try await runtime.transport.emitServerNotification(
             method: "item/agentMessage/delta",
@@ -10268,34 +10318,6 @@ private struct TurnDeltaParams: Encodable, Sendable {
     }
 }
 
-private struct ThreadScopedDeltaParams: Encodable, Sendable {
-    var threadID: String
-    var itemID: String?
-    var delta: String
-    var phase: String?
-
-    enum CodingKeys: String, CodingKey {
-        case threadID = "threadId"
-        case itemID = "itemId"
-        case delta
-        case phase
-    }
-}
-
-private struct TurnOnlyDeltaParams: Encodable, Sendable {
-    var turnID: String
-    var itemID: String?
-    var delta: String
-    var phase: String?
-
-    enum CodingKeys: String, CodingKey {
-        case turnID = "turnId"
-        case itemID = "itemId"
-        case delta
-        case phase
-    }
-}
-
 private struct OutputDeltaParams: Encodable, Sendable {
     var threadID: String
     var turnID: String
@@ -10430,6 +10452,29 @@ private struct TokenUsageParams: Encodable, Sendable {
         var reasoningOutputTokens: Int = 0
         var totalTokens: Int
     }
+}
+
+private func emitAgentMessageStarted(
+    on transport: CodexAppServerTestTransport,
+    threadID: String,
+    turnID: String,
+    itemID: String,
+    text: String = "",
+    phase: String? = nil
+) async throws {
+    try await transport.emitServerNotification(
+        method: "item/started",
+        params: ThreadItemParams(
+            threadID: threadID,
+            turnID: turnID,
+            item: .init(
+                id: itemID,
+                type: "agentMessage",
+                text: text,
+                phase: phase
+            )
+        )
+    )
 }
 
 @MainActor
