@@ -3,6 +3,7 @@ import CodexAppServerKit
 package struct CodexAppServerTestConnectionHarness: Sendable {
     package let client: AppServerClient
     package let router: CodexAppServerNotificationRouter
+    package let turnReplayStore: TurnReplayStore
     package let connection: AppServerConnection
     package let supervisor: ConnectionSupervisor
     package let lease: AppServerConnectionLease
@@ -74,11 +75,16 @@ package struct CodexAppServerTestConnectionHarness: Sendable {
         client: AppServerClient,
         connectionCloseAction: ConnectionCloseAction
     ) async -> Self {
-        let router = CodexAppServerNotificationRouter(client: client)
+        let turnReplayStore = TurnReplayStore()
+        let router = CodexAppServerNotificationRouter(
+            client: client,
+            turnReplayStore: turnReplayStore
+        )
         let connection = AppServerConnection(
             transport: transport,
             client: client,
             router: router,
+            turnReplayStore: turnReplayStore,
             serverRequestHandler: handler
                 ?? CodexAppServer.Configuration.defaultServerRequestHandler(clock: clock),
             serverRequestDiagnosticHandler: diagnosticHandler
@@ -93,6 +99,7 @@ package struct CodexAppServerTestConnectionHarness: Sendable {
         return .init(
             client: client,
             router: router,
+            turnReplayStore: turnReplayStore,
             connection: connection,
             supervisor: supervisor,
             lease: lease

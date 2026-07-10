@@ -130,26 +130,9 @@ try await stream.cancel()
 Cancelling a task that awaits `stream.collect()` only stops that local
 consumer. Explicit `stream.cancel()` owns the server-side interrupt.
 
-When a UI needs to accept another prompt while a response is in flight, submit
-it with an explicit follow-up mode:
-
-```swift
-let next = try await stream.submit(
-    "Now update the tests.",
-    mode: .queueAfterCurrentResponse
-)
-
-let urgent = try await stream.submit(
-    "Stop and try the shorter path.",
-    mode: .cancelCurrentResponse
-)
-```
-
-Use `steer(with:)` when the new input should modify the current turn.
-`.queueAfterCurrentResponse` waits for the current response to finish before
-starting the next turn. `.cancelCurrentResponse` sends `turn/interrupt`,
-waits for app-server's terminal event, and then starts the next turn in the
-same thread.
+Use `steer(with:)` when new input should modify the current turn. Start a
+follow-up from the reusable `CodexThread` handle; terminal response handles
+release their connection lease and do not start another generation.
 
 It also exposes reasoning controls with domain values instead of raw strings:
 

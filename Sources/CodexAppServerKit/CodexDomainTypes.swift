@@ -502,6 +502,7 @@ public struct CodexThread: Identifiable, Sendable {
 
     package let client: AppServerClient
     package let router: CodexAppServerNotificationRouter
+    package let turnReplayStore: TurnReplayStore
     package let connectionLease: AppServerConnectionLease
 
     package init(
@@ -517,6 +518,7 @@ public struct CodexThread: Identifiable, Sendable {
         self.model = model
         self.client = client
         self.router = router
+        self.turnReplayStore = router.turnReplayStore
         self.connectionLease = connectionLease
     }
 }
@@ -720,6 +722,35 @@ package enum CodexReviewEvent: Equatable, Sendable {
             self = .unknown(raw)
         }
     }
+
+    package init(_ event: CodexTurnEvent, turnID: CodexTurnID) {
+        switch event {
+        case .started(let eventTurnID):
+            self = .turnStarted(eventTurnID)
+        case .snapshot(let snapshot):
+            self = .snapshot(snapshot)
+        case .terminal(let outcome):
+            self = .terminal(outcome)
+        case .itemStarted(let item):
+            self = .itemStarted(item, turnID: turnID)
+        case .itemUpdated(let item):
+            self = .itemUpdated(item, turnID: turnID)
+        case .itemCompleted(let item):
+            self = .itemCompleted(item, turnID: turnID)
+        case .message(let message):
+            self = .message(message, turnID: turnID)
+        case .messageDelta(let delta):
+            self = .messageDelta(delta, turnID: turnID)
+        case .reasoningSummaryPartAdded(let part):
+            self = .reasoningSummaryPartAdded(part, turnID: turnID)
+        case .reasoningDelta(let delta):
+            self = .reasoningDelta(delta, turnID: turnID)
+        case .tokenUsageUpdated(let usage):
+            self = .tokenUsageUpdated(usage, turnID: turnID)
+        case .unknown(let raw):
+            self = .unknown(raw)
+        }
+    }
 }
 
 /// Incremental progress derived from the review turn's thread events.
@@ -760,16 +791,13 @@ public struct CodexReviewSession: Identifiable, Sendable {
     /// The live response stream for the review turn.
     package let response: CodexResponseStream
 
-    package let eventThread: CodexThread
-
     package init(
         threadID: CodexThreadID,
         turnID: CodexTurnID,
         reviewThreadID: CodexThreadID,
         model: String?,
         initialTurn: CodexTurnSnapshot,
-        response: CodexResponseStream,
-        eventThread: CodexThread
+        response: CodexResponseStream
     ) {
         self.threadID = threadID
         self.turnID = turnID
@@ -777,7 +805,6 @@ public struct CodexReviewSession: Identifiable, Sendable {
         self.model = model
         self.initialTurn = initialTurn
         self.response = response
-        self.eventThread = eventThread
     }
 
     /// Persistable identity for this review run.
@@ -819,27 +846,31 @@ public struct CodexReviewSession: Identifiable, Sendable {
 
     /// Thread events filtered to the review turn.
     package var events: CodexReviewEventSequence {
-        .init(events: eventThread.events, terminalTurnID: turnID)
+        .init(events: response.turn.events, turnID: turnID)
     }
 
     /// Agent messages emitted by the review thread.
-    package var messages: CodexThreadMessageSequence {
-        eventThread.messages
+    package var messages: CodexTurnMessageSequence {
+        .init(events: response.turn.events)
     }
 
     /// Incremental transcript snapshots for the review thread.
-    package var transcriptUpdates: CodexThreadTranscriptSequence {
-        eventThread.transcriptUpdates
+    package var transcriptUpdates: CodexTurnTranscriptSequence {
+        .init(events: response.turn.events)
     }
 
     /// Log-oriented item events emitted by the review thread.
-    package var logEntries: CodexThreadLogSequence {
-        .init(events: eventThread.events, terminalTurnID: turnID)
+    package var logEntries: CodexTurnLogSequence {
+        .init(events: response.turn.events, turnID: turnID)
     }
 
     /// Incremental progress snapshots for the review thread.
     package var progress: CodexReviewProgressSequence {
-        .init(events: eventThread.events, terminalTurnID: turnID)
+        .init(
+            turnID: turnID,
+            store: response.turn.turnReplayStore,
+            state: response.turn.state
+        )
     }
 
     /// Collects the review response until the turn finishes.
@@ -897,20 +928,27 @@ package struct CodexTurn: Identifiable, Sendable {
 
     package let client: AppServerClient
     package let router: CodexAppServerNotificationRouter
-    package let connectionLease: AppServerConnectionLease
+    package let turnReplayStore: TurnReplayStore
+    package let state: TurnGenerationHandleState
 
     package init(
         id: CodexTurnID,
         threadID: CodexThreadID,
         client: AppServerClient,
         router: CodexAppServerNotificationRouter,
-        connectionLease: AppServerConnectionLease
+        turnReplayStore: TurnReplayStore,
+        state: TurnGenerationHandleState
     ) {
+        precondition(
+            router.turnReplayStore === turnReplayStore,
+            "A turn and its router must share one replay store identity."
+        )
         self.id = id
         self.threadID = threadID
         self.client = client
         self.router = router
-        self.connectionLease = connectionLease
+        self.turnReplayStore = turnReplayStore
+        self.state = state
     }
 }
 
@@ -1987,11 +2025,6 @@ public struct CodexTurnCancellation: Equatable, Sendable {
 }
 
 package struct CodexResponseStream: AsyncSequence, Sendable {
-    package enum SubmissionMode: Equatable, Sendable {
-        case queueAfterCurrentResponse
-        case cancelCurrentResponse
-    }
-
     package struct Snapshot: Equatable, Sendable {
         package var turnID: CodexTurnID
         package var content: String?
@@ -2014,7 +2047,7 @@ package struct CodexResponseStream: AsyncSequence, Sendable {
         }
     }
 
-    private let turn: CodexTurn
+    package let turn: CodexTurn
 
     package init(turn: CodexTurn) {
         self.turn = turn
@@ -2068,55 +2101,14 @@ package struct CodexResponseStream: AsyncSequence, Sendable {
         try await steer(with: try prompt())
     }
 
-    package func submit(
-        _ prompt: CodexPrompt,
-        mode: SubmissionMode,
-        options: CodexGenerationOptions = .init()
-    ) async throws -> CodexResponseStream {
-        switch mode {
-        case .queueAfterCurrentResponse:
-            _ = try await collect(timeout: nil)
-            return try await startFollowUp(to: prompt, options: options)
-        case .cancelCurrentResponse:
-            let cancellation = try await cancel()
-            try await waitForCancelledResponse(cancellation)
-            return try await startFollowUp(to: prompt, options: options)
-        }
-    }
-
-    package func submit(
-        _ prompt: String,
-        mode: SubmissionMode,
-        options: CodexGenerationOptions = .init()
-    ) async throws -> CodexResponseStream {
-        try await submit(CodexPrompt(prompt), mode: mode, options: options)
-    }
-
-    package func submit(
-        mode: SubmissionMode,
-        options: CodexGenerationOptions = .init(),
-        @CodexPromptBuilder prompt: () throws -> CodexPrompt
-    ) async throws -> CodexResponseStream {
-        try await submit(try prompt(), mode: mode, options: options)
-    }
-
-    private func startFollowUp(
-        to prompt: CodexPrompt,
-        options: CodexGenerationOptions
-    ) async throws -> CodexResponseStream {
-        let turn = try await startCodexTurn(
-            threadID: turn.threadID,
-            prompt: prompt,
-            options: options,
-            client: turn.client,
-            router: turn.router,
-            connectionLease: turn.connectionLease
+    package func waitForCancelledResponse(
+        _ cancellation: CodexTurnCancellation,
+        preparedState: TurnGenerationHandleState? = nil
+    ) async throws {
+        let cancelledTurn = try await cancelledTurn(
+            for: cancellation,
+            preparedState: preparedState
         )
-        return .init(turn: turn)
-    }
-
-    package func waitForCancelledResponse(_ cancellation: CodexTurnCancellation) async throws {
-        let cancelledTurn = cancelledTurn(for: cancellation)
         for try await event in cancelledTurn.events {
             switch event {
             case .terminal(let outcome):
@@ -2135,20 +2127,41 @@ package struct CodexResponseStream: AsyncSequence, Sendable {
     }
 
     package func closeConnection() async {
-        await turn.connectionLease.closeConnection()
+        await turn.state.closeConnection()
     }
 
-    private func cancelledTurn(for cancellation: CodexTurnCancellation) -> CodexTurn {
+    private func cancelledTurn(
+        for cancellation: CodexTurnCancellation,
+        preparedState: TurnGenerationHandleState?
+    ) async throws -> CodexTurn {
         let cancelledTurnID = cancellation.turnID ?? turn.id
         if cancelledTurnID == turn.id {
+            if let preparedState {
+                precondition(
+                    preparedState === turn.state,
+                    "The original cancellation generation must preserve its state identity."
+                )
+            }
             return turn
+        }
+        let state: TurnGenerationHandleState
+        if let preparedState {
+            state = preparedState
+        } else {
+            let connectionLease = try await turn.state.connectionLeaseForSiblingGeneration()
+            state = await turn.turnReplayStore.restoreGeneration(
+                turnID: cancelledTurnID,
+                initialSnapshot: .init(id: cancelledTurnID, state: .inProgress),
+                connectionLease: connectionLease
+            )
         }
         return CodexTurn(
             id: cancelledTurnID,
             threadID: cancellation.threadID,
             client: turn.client,
             router: turn.router,
-            connectionLease: turn.connectionLease
+            turnReplayStore: turn.turnReplayStore,
+            state: state
         )
     }
 

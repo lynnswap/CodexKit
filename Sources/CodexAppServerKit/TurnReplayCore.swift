@@ -8,9 +8,59 @@ package enum TurnReplayPendingOperationKind: Equatable, Sendable {
 
 package struct TurnReplayPendingToken: Hashable, Sendable {
     fileprivate let rawValue: UUID
+    private let writePhase: TurnReplayPendingWritePhase
 
     package init() {
         self.rawValue = UUID()
+        self.writePhase = TurnReplayPendingWritePhase()
+    }
+
+    package static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.rawValue == rhs.rawValue
+    }
+
+    package func hash(into hasher: inout Hasher) {
+        hasher.combine(rawValue)
+    }
+
+    package func acceptWrite() {
+        writePhase.acceptWrite()
+    }
+
+    package func rejectAcceptedWrite() {
+        writePhase.rejectAcceptedWrite()
+    }
+
+    package var isWriteAccepted: Bool {
+        writePhase.isWriteAccepted
+    }
+}
+
+private final class TurnReplayPendingWritePhase: Sendable {
+    private let accepted = Mutex(false)
+
+    var isWriteAccepted: Bool {
+        accepted.withLock { $0 }
+    }
+
+    func acceptWrite() {
+        accepted.withLock { accepted in
+            precondition(
+                accepted == false,
+                "A turn operation attempt may accept its write exactly once."
+            )
+            accepted = true
+        }
+    }
+
+    func rejectAcceptedWrite() {
+        accepted.withLock { accepted in
+            precondition(
+                accepted,
+                "Only a write-accepted turn operation attempt can be rejected."
+            )
+            accepted = false
+        }
     }
 }
 

@@ -113,13 +113,43 @@ package actor TurnGenerationHandleState {
         }
         await connectionLease.closeConnection()
     }
+
+    package func connectionLeaseForSiblingGeneration() throws -> AppServerConnectionLease {
+        switch phase {
+        case .live(let connectionLease):
+            return connectionLease
+        case .terminal:
+            throw CodexTransportFailure.contractViolation(
+                message: "A terminal turn handle no longer retains the connection lease needed to observe a different generation."
+            )
+        case .terminated(let termination):
+            throw CodexAppServerError.connectionTerminated(termination)
+        }
+    }
 }
 
 package actor TurnReplayStore {
+    package enum RoutingDisposition: Equatable, Sendable {
+        case routed(overflowCount: Int)
+        case untracked
+    }
+
+    package enum TerminalRoutingDisposition: Equatable, Sendable {
+        case routed
+        case duplicate
+        case untracked
+    }
+
     package enum PendingCancellationDisposition: Equatable, Sendable {
         case removedBeforeWrite
         case retainedAfterWrite
         case notRegistered
+    }
+
+    package struct RestoredGenerationReservation: Sendable {
+        fileprivate let turnID: CodexTurnID
+        package let state: TurnGenerationHandleState
+        fileprivate let token: UUID
     }
 
     package struct Snapshot: Equatable, Sendable {
@@ -138,14 +168,9 @@ package actor TurnReplayStore {
         case terminated(CodexConnectionTermination)
     }
 
-    private enum PendingPhase {
-        case beforeWrite
-        case afterWrite
-    }
-
     private struct PendingOperation {
         var kind: TurnReplayPendingOperationKind
-        var phase: PendingPhase
+        var token: TurnReplayPendingToken
         var state: WeakTurnGenerationHandleState
     }
 
@@ -163,6 +188,8 @@ package actor TurnReplayStore {
         var accumulator: TurnReplayAccumulator
         let relay = TurnReplayRelay()
         var state: WeakTurnGenerationHandleState?
+        var provisionalRestorationTokens: Set<UUID> = []
+        var isPublished = true
 
         init(turnID: CodexTurnID) {
             self.turnID = turnID
@@ -201,26 +228,10 @@ package actor TurnReplayStore {
         let token = TurnReplayPendingToken()
         pendingOperations[token] = .init(
             kind: kind,
-            phase: .beforeWrite,
+            token: token,
             state: .init(state)
         )
         return token
-    }
-
-    package func markWriteAccepted(_ token: TurnReplayPendingToken) {
-        requireOpen()
-        guard var operation = pendingOperations[token] else {
-            preconditionFailure("A write-accepted turn operation must still be registered.")
-        }
-        guard case .beforeWrite = operation.phase else {
-            preconditionFailure("A turn operation write may be accepted exactly once.")
-        }
-        precondition(
-            operation.state.value != nil,
-            "The structured request scope must retain generation state after write acceptance."
-        )
-        operation.phase = .afterWrite
-        pendingOperations[token] = operation
     }
 
     @discardableResult
@@ -231,12 +242,28 @@ package actor TurnReplayStore {
         guard let operation = pendingOperations[token] else {
             return .notRegistered
         }
-        switch operation.phase {
-        case .beforeWrite:
+        if operation.token.isWriteAccepted == false {
             pendingOperations.removeValue(forKey: token)
             return .removedBeforeWrite
-        case .afterWrite:
-            return .retainedAfterWrite
+        }
+        precondition(
+            operation.state.value != nil,
+            "Post-write generation state must remain alive until binding or termination."
+        )
+        return .retainedAfterWrite
+    }
+
+    package func waitForTermination(
+        retaining state: TurnGenerationHandleState
+    ) async {
+        switch phase {
+        case .terminated:
+            return
+        case .open, .terminating:
+            await withCheckedContinuation { continuation in
+                terminationWaiters.append(continuation)
+            }
+            withExtendedLifetime(state) {}
         }
     }
 
@@ -253,7 +280,7 @@ package actor TurnReplayStore {
         guard let operation = pendingOperations[token] else {
             preconditionFailure("A turn generation may bind only from a pending operation.")
         }
-        guard case .afterWrite = operation.phase else {
+        guard operation.token.isWriteAccepted else {
             preconditionFailure("A turn generation cannot bind before its request write.")
         }
         guard let state = operation.state.value else {
@@ -292,7 +319,7 @@ package actor TurnReplayStore {
 
         let remainingPostWriteCount = pendingOperations.values.reduce(into: 0) {
             count, pending in
-            if case .afterWrite = pending.phase {
+            if pending.token.isWriteAccepted {
                 count += 1
             }
         }
@@ -320,6 +347,133 @@ package actor TurnReplayStore {
             preconditionFailure("A finalizing generation cannot accept a live handle.")
         }
         generation.register(state)
+    }
+
+    package func restoreGeneration(
+        turnID: CodexTurnID,
+        initialSnapshot: CodexTurnSnapshot,
+        connectionLease: AppServerConnectionLease
+    ) -> TurnGenerationHandleState {
+        requireOpen()
+        precondition(
+            initialSnapshot.id == turnID,
+            "A restored generation snapshot must identify its turn."
+        )
+        precondition(
+            orphanGenerations[turnID] == nil,
+            "A restored generation cannot replace an unbound request generation."
+        )
+        if let generation = generations[turnID] {
+            guard case .active = generation.phase else {
+                preconditionFailure("A finalized generation must be restored from its handle state.")
+            }
+            generation.accumulator.seed(initialSnapshot)
+            generation.isPublished = true
+            if let existing = generation.liveState() {
+                return existing
+            }
+            let state = TurnGenerationHandleState(connectionLease: connectionLease)
+            generation.register(state)
+            return state
+        }
+
+        let state = TurnGenerationHandleState(connectionLease: connectionLease)
+        let generation = Generation(turnID: turnID)
+        generation.accumulator.seed(initialSnapshot)
+        generation.register(state)
+        generations[turnID] = generation
+        return state
+    }
+
+    package func reserveRestoredGeneration(
+        turnID: CodexTurnID,
+        initialSnapshot: CodexTurnSnapshot,
+        connectionLease: AppServerConnectionLease
+    ) -> RestoredGenerationReservation {
+        requireOpen()
+        precondition(
+            initialSnapshot.id == turnID,
+            "A reserved restored-generation snapshot must identify its turn."
+        )
+        precondition(
+            orphanGenerations[turnID] == nil,
+            "A restored generation reservation cannot replace an unbound request generation."
+        )
+        let token = UUID()
+        if let generation = generations[turnID] {
+            guard case .active = generation.phase else {
+                preconditionFailure("A finalized generation cannot accept a restore reservation.")
+            }
+            generation.accumulator.seed(initialSnapshot)
+            let state: TurnGenerationHandleState
+            if let existing = generation.liveState() {
+                state = existing
+            } else {
+                state = TurnGenerationHandleState(connectionLease: connectionLease)
+                generation.register(state)
+            }
+            precondition(generation.provisionalRestorationTokens.insert(token).inserted)
+            return .init(turnID: turnID, state: state, token: token)
+        }
+
+        let state = TurnGenerationHandleState(connectionLease: connectionLease)
+        let generation = Generation(turnID: turnID)
+        generation.isPublished = false
+        generation.accumulator.seed(initialSnapshot)
+        generation.register(state)
+        precondition(generation.provisionalRestorationTokens.insert(token).inserted)
+        generations[turnID] = generation
+        return .init(turnID: turnID, state: state, token: token)
+    }
+
+    package func commitRestoredGeneration(
+        _ reservation: RestoredGenerationReservation
+    ) async {
+        guard let generation = generations[reservation.turnID] else {
+            await requireFinalizedReservationState(reservation.state)
+            return
+        }
+        requireReservation(reservation, in: generation)
+        precondition(
+            generation.provisionalRestorationTokens.remove(reservation.token) != nil,
+            "A restored generation reservation may be committed or discarded exactly once."
+        )
+        generation.isPublished = true
+        switch generation.phase {
+        case .active:
+            return
+        case .finalizing(let compactSnapshot):
+            _ = await reservation.state.transitionToTerminal(compactSnapshot)
+        case .terminating(let termination):
+            _ = await reservation.state.transitionToTerminated(termination)
+        case .terminalPendingBind:
+            preconditionFailure("A restored generation cannot be pending its initial bind.")
+        }
+    }
+
+    @discardableResult
+    package func discardRestoredGeneration(
+        _ reservation: RestoredGenerationReservation
+    ) async -> Bool {
+        guard let generation = generations[reservation.turnID] else {
+            await requireFinalizedReservationState(reservation.state)
+            return false
+        }
+        requireReservation(reservation, in: generation)
+        precondition(
+            generation.provisionalRestorationTokens.remove(reservation.token) != nil,
+            "A restored generation reservation may be committed or discarded exactly once."
+        )
+        guard case .active = generation.phase,
+              generation.isPublished == false,
+              generation.provisionalRestorationTokens.isEmpty else {
+            return false
+        }
+        precondition(
+            generations.removeValue(forKey: reservation.turnID) === generation,
+            "A discarded provisional generation changed identity."
+        )
+        return true
     }
 
     package func events(
@@ -374,11 +528,25 @@ package actor TurnReplayStore {
         _ event: CodexTurnEvent,
         for turnID: CodexTurnID
     ) -> Int {
+        switch routeIfTracked(event, for: turnID) {
+        case .routed(let overflowCount):
+            return overflowCount
+        case .untracked:
+            preconditionFailure("A strict turn replay yield requires a tracked generation.")
+        }
+    }
+
+    package func routeIfTracked(
+        _ event: CodexTurnEvent,
+        for turnID: CodexTurnID
+    ) -> RoutingDisposition {
         requireOpen()
         if case .terminal = event {
             preconditionFailure("Turn replay terminal delivery must use finish(_:).")
         }
-        let generation = generationForRouting(turnID)
+        guard let generation = generationForRoutingIfTracked(turnID) else {
+            return .untracked
+        }
         guard case .active = generation.phase else {
             preconditionFailure("A terminal generation cannot accept another event.")
         }
@@ -388,20 +556,30 @@ package actor TurnReplayStore {
             accumulatedSnapshot: generation.accumulator.snapshot
         )
         generation.relay.yieldProgress(generation.accumulator.progress)
-        return overflowCount
+        return .routed(overflowCount: overflowCount)
     }
 
     package func finish(_ outcome: CodexTurnOutcome) async {
+        guard await finishIfTracked(outcome) != .untracked else {
+            preconditionFailure("A strict turn replay finish requires a tracked generation.")
+        }
+    }
+
+    package func finishIfTracked(
+        _ outcome: CodexTurnOutcome
+    ) async -> TerminalRoutingDisposition {
         requireOpen()
         let turnID = outcome.response.turnID
-        let generation = generationForRouting(turnID)
+        guard let generation = generationForRoutingIfTracked(turnID) else {
+            return .untracked
+        }
         switch generation.phase {
         case .active:
             break
         case .terminalPendingBind(let existing), .finalizing(let existing):
             let duplicate = generation.accumulator.compact(outcome)
             precondition(existing == duplicate, "A turn generation terminal cannot be replaced.")
-            return
+            return .duplicate
         case .terminating:
             preconditionFailure("A terminating generation cannot accept a terminal outcome.")
         }
@@ -410,7 +588,7 @@ package actor TurnReplayStore {
         if orphanGenerations[turnID] === generation {
             generation.phase = .terminalPendingBind(compactSnapshot)
             generation.relay.finish(with: compactSnapshot)
-            return
+            return .routed
         }
 
         generation.phase = .finalizing(compactSnapshot)
@@ -423,6 +601,7 @@ package actor TurnReplayStore {
         } else if case .open = phase {
             preconditionFailure("A finalizing turn generation changed identity.")
         }
+        return .routed
     }
 
     package func terminateAll(with termination: CodexConnectionTermination) async {
@@ -506,7 +685,7 @@ package actor TurnReplayStore {
 
     package func snapshotForTesting() -> Snapshot {
         let postWriteCount = pendingOperations.values.reduce(into: 0) { count, operation in
-            if case .afterWrite = operation.phase {
+            if operation.token.isWriteAccepted {
                 count += 1
             }
         }
@@ -539,13 +718,18 @@ package actor TurnReplayStore {
         )
     }
 
-    private func generationForRouting(_ turnID: CodexTurnID) -> Generation {
+    package func subscriberCountForTesting(turnID: CodexTurnID) -> Int {
+        (generations[turnID] ?? orphanGenerations[turnID])?
+            .relay.snapshotForTesting().subscriberCount ?? 0
+    }
+
+    private func generationForRoutingIfTracked(_ turnID: CodexTurnID) -> Generation? {
         if let generation = generations[turnID] ?? orphanGenerations[turnID] {
             return generation
         }
         let unboundPostWriteCount = pendingOperations.values.reduce(into: 0) {
             count, operation in
-            guard case .afterWrite = operation.phase else {
+            guard operation.token.isWriteAccepted else {
                 return
             }
             precondition(
@@ -553,6 +737,9 @@ package actor TurnReplayStore {
                 "Post-write generation state must remain alive until binding or termination."
             )
             count += 1
+        }
+        guard unboundPostWriteCount > 0 else {
+            return nil
         }
         precondition(
             orphanGenerations.count < unboundPostWriteCount,
@@ -599,6 +786,33 @@ package actor TurnReplayStore {
             )
         }
         preconditionFailure("A live handle has no active turn replay generation.")
+    }
+
+    private func requireReservation(
+        _ reservation: RestoredGenerationReservation,
+        in generation: Generation
+    ) {
+        guard let registeredState = generation.liveState() else {
+            preconditionFailure("A reserved restored generation must retain its structured scope.")
+        }
+        precondition(
+            registeredState === reservation.state,
+            "A restore reservation must resolve against its canonical generation state."
+        )
+        precondition(
+            generation.provisionalRestorationTokens.contains(reservation.token),
+            "A restored generation reservation may be committed or discarded exactly once."
+        )
+    }
+
+    private func requireFinalizedReservationState(
+        _ state: TurnGenerationHandleState
+    ) async {
+        guard await state.snapshot() != .live else {
+            preconditionFailure(
+                "A live restore reservation cannot outlive its replay generation."
+            )
+        }
     }
 
     private func requireOpen() {

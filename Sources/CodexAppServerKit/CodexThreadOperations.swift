@@ -168,36 +168,63 @@ extension CodexThread {
         delivery: CodexReviewDelivery = .inline,
         onPostWriteCancellation: @escaping @Sendable (CodexReviewSession) async throws -> Void
     ) async throws -> CodexReviewSession {
-        let response: AppServerAPI.Review.Start.Response = try await withThreadEventGeneration(
-            id,
-            router: router
-        ) {
-            try await client.send(
-                AppServerAPI.Review.Start.Request(
-                    params: .init(threadID: id.rawValue, target: target, delivery: delivery)
-                ),
-                onPostWriteCancellation: { response in
-                    let review = await reviewSession(from: response)
-                    try await onPostWriteCancellation(review)
-                }
+        let state = TurnGenerationHandleState(connectionLease: connectionLease)
+        let pending = await turnReplayStore.registerPendingOperation(
+            kind: .review(sourceThreadID: id, delivery: delivery),
+            state: state
+        )
+        do {
+            let response: AppServerAPI.Review.Start.Response = try await withThreadEventGeneration(
+                id,
+                router: router
+            ) {
+                try await client.send(
+                    AppServerAPI.Review.Start.Request(
+                        params: .init(threadID: id.rawValue, target: target, delivery: delivery)
+                    ),
+                    onWriteAccepted: pending.acceptWrite,
+                    onResponseRejected: pending.rejectAcceptedWrite,
+                    onPostWriteCancellation: { response in
+                        let review = await reviewSession(
+                            from: response,
+                            pending: pending,
+                            state: state
+                        )
+                        try await onPostWriteCancellation(review)
+                    }
+                )
+            }
+            return await reviewSession(from: response, pending: pending, state: state)
+        } catch {
+            await finishPendingTurnOperation(
+                pending,
+                state: state,
+                store: turnReplayStore
             )
+            throw error
         }
-        return await reviewSession(from: response)
     }
 
     private func reviewSession(
-        from response: AppServerAPI.Review.Start.Response
+        from response: AppServerAPI.Review.Start.Response,
+        pending: TurnReplayPendingToken,
+        state: TurnGenerationHandleState
     ) async -> CodexReviewSession {
         let responseReviewThreadID = response.reviewThreadID.map(CodexThreadID.init(rawValue:))
         let detachedReviewThreadID = responseReviewThreadID == id ? nil : responseReviewThreadID
         let turnID = CodexTurnID(rawValue: response.turnID)
+        let initialTurn = CodexAppServer.turnSnapshots(from: [response.turn])[0]
+        await turnReplayStore.bind(
+            pending,
+            to: turnID,
+            initialSnapshot: initialTurn
+        )
         if let detachedReviewThreadID {
             await router.beginDetachedThreadEventGeneration(
                 detachedReviewThreadID,
                 including: turnID
             )
         }
-        let initialTurn = CodexAppServer.turnSnapshots(from: [response.turn])[0]
         let identity = CodexReviewIdentity(
             threadID: id,
             turnID: turnID,
@@ -206,7 +233,8 @@ extension CodexThread {
         )
         return await reviewSession(
             identity,
-            initialTurn: initialTurn
+            initialTurn: initialTurn,
+            state: state
         )
     }
 
@@ -227,34 +255,43 @@ extension CodexThread {
     package func reviewSession(
         _ identity: CodexReviewIdentity,
         model: String? = nil,
-        initialTurn: CodexTurnSnapshot? = nil
+        initialTurn: CodexTurnSnapshot? = nil,
+        state proposedState: TurnGenerationHandleState? = nil
     ) async -> CodexReviewSession {
         let reviewThreadID = identity.activeTurnThreadID
-        await router.seedTurn(identity.turnID, threadID: reviewThreadID)
+        let initialTurn = initialTurn ?? CodexTurnSnapshot(
+            id: identity.turnID,
+            state: .inProgress
+        )
+        let state: TurnGenerationHandleState
+        if let proposedState {
+            state = proposedState
+        } else {
+            state = await turnReplayStore.restoreGeneration(
+                turnID: identity.turnID,
+                initialSnapshot: initialTurn,
+                connectionLease: connectionLease
+            )
+        }
+        if await state.snapshot() == .live {
+            await router.seedTurn(identity.turnID, threadID: reviewThreadID)
+        }
         let model = model ?? identity.model
         let turn = CodexTurn(
             id: identity.turnID,
             threadID: reviewThreadID,
             client: client,
             router: router,
-            connectionLease: connectionLease
-        )
-        let eventThread = CodexThread(
-            id: reviewThreadID,
-            workspace: workspace,
-            model: model,
-            client: client,
-            router: router,
-            connectionLease: connectionLease
+            turnReplayStore: turnReplayStore,
+            state: state
         )
         return .init(
             threadID: identity.sourceThreadID,
             turnID: turn.id,
             reviewThreadID: reviewThreadID,
             model: model,
-            initialTurn: initialTurn ?? CodexTurnSnapshot(id: turn.id, state: .inProgress),
-            response: .init(turn: turn),
-            eventThread: eventThread
+            initialTurn: initialTurn,
+            response: .init(turn: turn)
         )
     }
 
@@ -407,10 +444,9 @@ extension CodexThread {
 
 package func interruptAndAwaitTerminal(_ stream: CodexResponseStream) async throws {
     let cleanup = Task {
-        let cancellation = try await stream.cancel()
-        try await stream.waitForCancelledResponse(cancellation)
+        try await stream.turn.interruptAndAwaitTerminal()
     }
-    try await cleanup.value
+    _ = try await cleanup.value
 }
 
 package func startCodexTurn(
@@ -421,38 +457,106 @@ package func startCodexTurn(
     router: CodexAppServerNotificationRouter,
     connectionLease: AppServerConnectionLease
 ) async throws -> CodexTurn {
-    let response: AppServerAPI.Turn.Start.Response = try await withThreadEventGeneration(
-        threadID,
-        router: router
-    ) {
-        try await client.send(
-            AppServerAPI.Turn.Start.Request(
-                params: .init(
-                    threadID: threadID.rawValue,
-                    input: prompt.appServerInput,
-                    approvalPolicy: options.approvalMode?.approvalPolicy,
-                    approvalsReviewer: options.approvalMode?.approvalsReviewer,
-                    clientUserMessageID: options.clientUserMessageID,
-                    cwd: options.cwd?.path,
-                    effort: options.effort?.rawValue,
-                    model: options.model,
-                    outputSchema: options.outputSchema?.appServerJSONValue,
-                    personality: options.personality?.rawValue,
-                    sandboxPolicy: options.sandbox?.turnSandboxPolicy,
-                    serviceTier: options.serviceTier,
-                    summary: options.summary?.rawValue
-                )
-            ))
+    let store = router.turnReplayStore
+    let state = TurnGenerationHandleState(connectionLease: connectionLease)
+    let pending = await store.registerPendingOperation(
+        kind: .turn(threadID: threadID),
+        state: state
+    )
+    do {
+        let response: AppServerAPI.Turn.Start.Response = try await withThreadEventGeneration(
+            threadID,
+            router: router
+        ) {
+            try await client.send(
+                AppServerAPI.Turn.Start.Request(
+                    params: .init(
+                        threadID: threadID.rawValue,
+                        input: prompt.appServerInput,
+                        approvalPolicy: options.approvalMode?.approvalPolicy,
+                        approvalsReviewer: options.approvalMode?.approvalsReviewer,
+                        clientUserMessageID: options.clientUserMessageID,
+                        cwd: options.cwd?.path,
+                        effort: options.effort?.rawValue,
+                        model: options.model,
+                        outputSchema: options.outputSchema?.appServerJSONValue,
+                        personality: options.personality?.rawValue,
+                        sandboxPolicy: options.sandbox?.turnSandboxPolicy,
+                        serviceTier: options.serviceTier,
+                        summary: options.summary?.rawValue
+                    )
+                ),
+                onWriteAccepted: pending.acceptWrite,
+                onResponseRejected: pending.rejectAcceptedWrite,
+                onPostWriteCancellation: { response in
+                    let turn = await bindTurn(
+                        response,
+                        threadID: threadID,
+                        client: client,
+                        router: router,
+                        store: store,
+                        pending: pending,
+                        state: state
+                    )
+                    _ = try await turn.interruptAndAwaitTerminal()
+                }
+            )
+        }
+        return await bindTurn(
+            response,
+            threadID: threadID,
+            client: client,
+            router: router,
+            store: store,
+            pending: pending,
+            state: state
+        )
+    } catch {
+        await finishPendingTurnOperation(pending, state: state, store: store)
+        throw error
     }
-    let turnID = CodexTurnID(rawValue: response.turn.id)
+}
+
+private func bindTurn(
+    _ response: AppServerAPI.Turn.Start.Response,
+    threadID: CodexThreadID,
+    client: AppServerClient,
+    router: CodexAppServerNotificationRouter,
+    store: TurnReplayStore,
+    pending: TurnReplayPendingToken,
+    state: TurnGenerationHandleState
+) async -> CodexTurn {
+    let snapshot = CodexAppServer.turnSnapshots(from: [response.turn])[0]
+    let turnID = snapshot.id
+    await store.bind(pending, to: turnID, initialSnapshot: snapshot)
     await router.seedTurn(turnID, threadID: threadID)
     return CodexTurn(
         id: turnID,
         threadID: threadID,
         client: client,
         router: router,
-        connectionLease: connectionLease
+        turnReplayStore: store,
+        state: state
     )
+}
+
+private func finishPendingTurnOperation(
+    _ pending: TurnReplayPendingToken,
+    state: TurnGenerationHandleState,
+    store: TurnReplayStore
+) async {
+    switch await store.cancelPendingOperation(pending) {
+    case .removedBeforeWrite:
+        return
+    case .retainedAfterWrite:
+        await store.waitForTermination(retaining: state)
+    case .notRegistered:
+        guard await state.snapshot() == .live else {
+            return
+        }
+        await state.closeConnection()
+        await store.waitForTermination(retaining: state)
+    }
 }
 
 package func withThreadEventGeneration<Response: Sendable>(
@@ -468,28 +572,11 @@ package func withThreadEventGeneration<Response: Sendable>(
 
 extension CodexTurn {
     package var events: CodexTurnEventSequence {
-        .init {
-            AsyncThrowingStream { continuation in
-                let task = Task {
-                    let stream = await router.events(for: id)
-                    do {
-                        for try await event in stream {
-                            continuation.yield(event)
-                        }
-                        continuation.finish()
-                    } catch {
-                        continuation.finish(throwing: error)
-                    }
-                }
-                continuation.onTermination = { _ in
-                    task.cancel()
-                }
-            }
-        }
+        .init(turnID: id, store: turnReplayStore, state: state)
     }
 
     package var progress: CodexTurnProgressSequence {
-        .init(events: events)
+        .init(turnID: id, store: turnReplayStore, state: state)
     }
 
     package func result() async throws -> CodexTurnOutcome {
@@ -513,20 +600,99 @@ extension CodexTurn {
 
     @discardableResult
     package func interrupt() async throws -> CodexTurnCancellation {
-        try await interruptCodexTurn(threadID: threadID, turnID: id, client: client)
+        if try await state.cachedOutcome() != nil {
+            return .init(threadID: threadID, turnID: id)
+        }
+        return try await interruptCodexTurn(threadID: threadID, turnID: id, client: client)
     }
 
     @discardableResult
     package func interrupt(
         willCancelActiveTurn: (@Sendable (CodexTurnCancellation) async -> Void)?
     ) async throws -> CodexTurnCancellation {
-        try await interruptCodexTurn(
+        if try await state.cachedOutcome() != nil {
+            return .init(threadID: threadID, turnID: id)
+        }
+        return try await interruptCodexTurn(
             threadID: threadID,
             turnID: id,
             client: client,
             willCancelActiveTurn: willCancelActiveTurn
         )
     }
+
+    @discardableResult
+    package func interruptAndAwaitTerminal(
+        willCancelActiveTurn: (@Sendable (CodexTurnCancellation) async -> Void)? = nil
+    ) async throws -> CodexTurnCancellation {
+        if try await state.cachedOutcome() != nil {
+            return .init(threadID: threadID, turnID: id)
+        }
+        let connectionLease = try await state.connectionLeaseForSiblingGeneration()
+        let prepared = try await interruptCodexTurnPreparingTarget(
+            threadID: threadID,
+            turnID: id,
+            client: client,
+            originalState: state,
+            store: turnReplayStore,
+            connectionLease: connectionLease,
+            willCancelActiveTurn: willCancelActiveTurn
+        )
+        try await CodexResponseStream(turn: self).waitForCancelledResponse(
+            prepared.cancellation,
+            preparedState: prepared.state
+        )
+        return prepared.cancellation
+    }
+}
+
+private struct PreparedTurnInterruption: Sendable {
+    var cancellation: CodexTurnCancellation
+    var state: TurnGenerationHandleState
+}
+
+private func interruptCodexTurnPreparingTarget(
+    threadID: CodexThreadID,
+    turnID: CodexTurnID,
+    client: AppServerClient,
+    originalState: TurnGenerationHandleState,
+    store: TurnReplayStore,
+    connectionLease: AppServerConnectionLease,
+    willCancelActiveTurn: (@Sendable (CodexTurnCancellation) async -> Void)?
+) async throws -> PreparedTurnInterruption {
+    for attempt in 0...interruptActivationRetryLimit {
+        do {
+            try await sendInterrupt(threadID: threadID, turnID: turnID, client: client)
+            return .init(
+                cancellation: .init(threadID: threadID, turnID: turnID),
+                state: originalState
+            )
+        } catch {
+            if attempt < interruptActivationRetryLimit,
+               isExpectedTurnNotActive(error, turnID: turnID) {
+                try await Task.sleep(nanoseconds: interruptActivationRetryDelayNanoseconds)
+                continue
+            }
+            guard let activeTurnID = activeTurnID(from: error),
+                  activeTurnID != turnID.rawValue
+            else {
+                throw error
+            }
+            let activeTurn = CodexTurnID(rawValue: activeTurnID)
+            let cancellation = CodexTurnCancellation(threadID: threadID, turnID: activeTurn)
+            let state = await store.restoreGeneration(
+                turnID: activeTurn,
+                initialSnapshot: .init(id: activeTurn, state: .inProgress),
+                connectionLease: connectionLease
+            )
+            if let willCancelActiveTurn {
+                await willCancelActiveTurn(cancellation)
+            }
+            try await sendInterrupt(threadID: threadID, turnID: activeTurn, client: client)
+            return .init(cancellation: cancellation, state: state)
+        }
+    }
+    throw CancellationError()
 }
 
 @discardableResult

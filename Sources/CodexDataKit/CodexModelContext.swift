@@ -1119,12 +1119,16 @@ public final class CodexModelContext {
         workspaceURL: URL,
         input: CodexReviewInput
     ) async -> CodexStartedReview {
+        let eventThread = await appServer.reviewEventThread(
+            for: review,
+            workspace: workspaceURL
+        )
         let isExistingChat = chatsByID[review.activeTurnThreadID] != nil
         let now = Date()
         let change = CodexStartedReviewContextChange(
             snapshot: CodexThreadSnapshot(
                 id: review.activeTurnThreadID,
-                workspace: review.eventThread.workspace ?? workspaceURL,
+                workspace: eventThread.workspace ?? workspaceURL,
                 preview: input.target.dataKitPreview,
                 modelProvider: input.options.modelProvider,
                 sourceKind: .subAgentReview,
@@ -1136,7 +1140,7 @@ public final class CodexModelContext {
                 turns: [review.initialTurn],
                 turnItemsAreAuthoritative: false
             ),
-            eventThread: review.eventThread,
+            eventThread: eventThread,
             archived: false,
             provisionalSeedTurnID: review.initialTurn.id
         )

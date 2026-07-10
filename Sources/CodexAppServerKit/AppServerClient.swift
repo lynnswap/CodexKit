@@ -146,6 +146,8 @@ package actor AppServerClient {
 
     package func send<Request: AppServerAPI.Request>(
         _ request: Request,
+        onWriteAccepted: @escaping @Sendable () -> Void = {},
+        onResponseRejected: @escaping @Sendable () -> Void = {},
         onPostWriteCancellation: @escaping @Sendable (Request.Response) async throws -> Void = { _ in }
     ) async throws -> Request.Response {
         try await send(
@@ -155,6 +157,8 @@ package actor AppServerClient {
             scope: request.scope,
             purpose: .operation(Request.method),
             deadline: deadlines.request,
+            onWriteAccepted: onWriteAccepted,
+            onResponseRejected: onResponseRejected,
             onPostWriteCancellation: onPostWriteCancellation
         )
     }
@@ -184,6 +188,8 @@ package actor AppServerClient {
         purpose: CodexRequestPurpose? = nil,
         deadline: Duration? = nil,
         afterResponse: @escaping @Sendable (Response) async throws -> Void = { _ in },
+        onWriteAccepted: @escaping @Sendable () -> Void = {},
+        onResponseRejected: @escaping @Sendable () -> Void = {},
         onPostWriteCancellation: @escaping @Sendable (Response) async throws -> Void = { _ in }
     ) async throws -> Response {
         try await serializer.run(scope: scope) { [encoder, self] laneToken in
@@ -212,6 +218,8 @@ package actor AppServerClient {
                     responseType: responseType,
                     purpose: requestPurpose,
                     afterResponse: afterResponse,
+                    onWriteAccepted: onWriteAccepted,
+                    onResponseRejected: onResponseRejected,
                     operationState: state
                 )
                 state.markResponseBound()
@@ -271,6 +279,8 @@ package actor AppServerClient {
         responseType: Response.Type,
         purpose: CodexRequestPurpose,
         afterResponse: @escaping @Sendable (Response) async throws -> Void,
+        onWriteAccepted: @escaping @Sendable () -> Void,
+        onResponseRejected: @escaping @Sendable () -> Void,
         operationState: RequestOperationState
     ) async throws -> Response {
         var requestID = initialRequestID
@@ -291,6 +301,7 @@ package actor AppServerClient {
                         ),
                         acceptWrite: {
                             try operationState.acceptWrite()
+                            onWriteAccepted()
                         }
                     )
                 } catch let abandonment as RequestOperationAbandonment {
@@ -320,6 +331,7 @@ package actor AppServerClient {
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch {
+                    onResponseRejected()
                     throw CodexAppServerError.request(.init(
                         requestID: attemptRequestID,
                         method: method,
@@ -336,6 +348,7 @@ package actor AppServerClient {
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch {
+                    onResponseRejected()
                     throw CodexAppServerError.request(.init(
                         requestID: attemptRequestID,
                         method: method,
@@ -352,6 +365,9 @@ package actor AppServerClient {
             } catch let abandonment as RequestOperationAbandonment {
                 throw abandonment
             } catch let error as JSONRPC.Error {
+                if case .responseError = error {
+                    onResponseRejected()
+                }
                 if case .responseError(let serverError) = error,
                    serverError.code == Self.appServerOverloadedErrorCode {
                     guard let delay = overloadRetryDelay(retryAttempt) else {

@@ -166,6 +166,7 @@ public actor CodexAppServer {
 
     private let client: AppServerClient
     private let router: CodexAppServerNotificationRouter
+    private let turnReplayStore: TurnReplayStore
     private let connectionEventHub: ConnectionEventHub
     private let connectionLease: AppServerConnectionLease
     private var retainedReviewCleanupIdentitiesBySourceThreadID: [CodexThreadID: [CodexReviewIdentity]] = [:]
@@ -214,11 +215,16 @@ public actor CodexAppServer {
             deadlineClock: configuration.deadlineClock,
             connectionCloseAction: connectionCloseAction
         )
-        let router = CodexAppServerNotificationRouter(client: client)
+        let turnReplayStore = TurnReplayStore()
+        let router = CodexAppServerNotificationRouter(
+            client: client,
+            turnReplayStore: turnReplayStore
+        )
         let connection = AppServerConnection(
             transport: transport,
             client: client,
             router: router,
+            turnReplayStore: turnReplayStore,
             serverRequestHandler: configuration.serverRequestHandler
                 ?? Configuration.defaultServerRequestHandler(clock: configuration.clock)
         )
@@ -240,6 +246,7 @@ public actor CodexAppServer {
         }
         self.client = client
         self.router = router
+        self.turnReplayStore = turnReplayStore
         self.connectionEventHub = client.connectionEventHub
         self.connectionLease = connectionLease
     }
@@ -253,11 +260,16 @@ public actor CodexAppServer {
             connectionCloseAction: connectionCloseAction
         )
         let configuration = Configuration()
-        let router = CodexAppServerNotificationRouter(client: client)
+        let turnReplayStore = TurnReplayStore()
+        let router = CodexAppServerNotificationRouter(
+            client: client,
+            turnReplayStore: turnReplayStore
+        )
         let connection = AppServerConnection(
             transport: transport,
             client: client,
             router: router,
+            turnReplayStore: turnReplayStore,
             serverRequestHandler: Configuration.defaultServerRequestHandler(
                 clock: configuration.clock
             )
@@ -280,6 +292,7 @@ public actor CodexAppServer {
         }
         self.client = client
         self.router = router
+        self.turnReplayStore = turnReplayStore
         self.connectionEventHub = client.connectionEventHub
         self.connectionLease = connectionLease
     }
@@ -291,6 +304,7 @@ public actor CodexAppServer {
     ) {
         self.client = client
         self.router = router
+        self.turnReplayStore = router.turnReplayStore
         self.connectionEventHub = client.connectionEventHub
         self.connectionLease = connectionLease
     }
@@ -435,6 +449,20 @@ public actor CodexAppServer {
         }
     }
 
+    package func reviewEventThread(
+        for review: CodexReviewSession,
+        workspace: URL
+    ) -> CodexThread {
+        CodexThread(
+            id: review.activeTurnThreadID,
+            workspace: workspace,
+            model: review.model,
+            client: client,
+            router: router,
+            connectionLease: connectionLease
+        )
+    }
+
     /// Resumes an existing Codex thread.
     ///
     /// - Parameters:
@@ -479,14 +507,43 @@ public actor CodexAppServer {
         if threadOptions.model == nil {
             threadOptions.model = identity.model
         }
-        let activeThread = try await resumeThread(
-            identity.activeTurnThreadID,
-            options: threadOptions
+        let activeTurnThreadID = identity.activeTurnThreadID
+        let initialTurn = CodexTurnSnapshot(id: identity.turnID, state: .inProgress)
+        let reservation = await turnReplayStore.reserveRestoredGeneration(
+            turnID: identity.turnID,
+            initialSnapshot: initialTurn,
+            connectionLease: connectionLease
         )
-        return await activeThread.reviewSession(
-            identity,
-            model: activeThread.model ?? identity.model
-        )
+        let state = reservation.state
+        await router.seedTurn(identity.turnID, threadID: activeTurnThreadID)
+        do {
+            let activeThread = try await resumeThread(
+                activeTurnThreadID,
+                options: threadOptions
+            )
+            await turnReplayStore.commitRestoredGeneration(reservation)
+            if await state.snapshot() != .live {
+                await router.discardTurnAssociation(
+                    identity.turnID,
+                    threadID: activeTurnThreadID
+                )
+            }
+            return await activeThread.reviewSession(
+                identity,
+                model: activeThread.model ?? identity.model,
+                initialTurn: initialTurn,
+                state: state
+            )
+        } catch {
+            let removedGeneration = await turnReplayStore.discardRestoredGeneration(reservation)
+            if removedGeneration {
+                await router.discardTurnAssociation(
+                    identity.turnID,
+                    threadID: activeTurnThreadID
+                )
+            }
+            throw error
+        }
     }
 
     /// Cancels a running review and prepares it for a later restart.
@@ -507,7 +564,8 @@ public actor CodexAppServer {
         threadOptions: CodexThread.ResumeOptions = .init()
     ) async throws -> CodexReviewRestartToken {
         let review = try await resumeReview(identity, threadOptions: threadOptions)
-        let cancellation = try await review.cancel { retryCancellation in
+        let cancellation = try await review.response.turn.interruptAndAwaitTerminal {
+            retryCancellation in
             if retryCancellation.turnID != Optional(identity.turnID) {
                 await self.rememberReviewCleanupIdentity(
                     for: retryCancellation,
@@ -516,7 +574,6 @@ public actor CodexAppServer {
                 )
             }
         }
-        try await review.response.waitForCancelledResponse(cancellation)
         rememberReviewCleanupIdentity(identity)
         rememberReviewCleanupIdentity(
             for: cancellation,

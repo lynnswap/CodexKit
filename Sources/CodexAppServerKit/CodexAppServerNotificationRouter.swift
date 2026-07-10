@@ -7,10 +7,6 @@ private let notificationRouterLogger = Logger(
 )
 
 package actor CodexAppServerNotificationRouter {
-    private struct TurnSubscriber {
-        var continuation: AsyncThrowingStream<CodexTurnEvent, Error>.Continuation
-    }
-
     private struct ThreadSubscriber {
         var continuation: AsyncThrowingStream<CodexThreadEvent, Error>.Continuation
         var replayPolicy: ThreadEventReplayPolicy
@@ -18,22 +14,17 @@ package actor CodexAppServerNotificationRouter {
 
     private typealias NotificationContext = AppServerNotificationDecoder.Context
 
-    private enum TurnTerminalDecision: Equatable {
-        case outcome(CodexTurnOutcome)
-        case failure(CodexAppServerError)
-    }
-
     private var threadIDByTurnID: [CodexTurnID: CodexThreadID] = [:]
-    private var turnHistoryByTurnID: [CodexTurnID: [CodexTurnEvent]] = [:]
-    private var terminalDecisionByTurnID: [CodexTurnID: TurnTerminalDecision] = [:]
     private var threadHistoryByThreadID: [CodexThreadID: [CodexThreadEvent]] = [:]
     private var threadFailureByThreadID: [CodexThreadID: CodexAppServerError] = [:]
     private var threadGenerationStartByThreadID: [CodexThreadID: ThreadGenerationStart] = [:]
-    private var turnSubscribersByTurnID: [CodexTurnID: [UUID: TurnSubscriber]] = [:]
     private var threadSubscribersByThreadID: [CodexThreadID: [UUID: ThreadSubscriber]] = [:]
     private var itemReducer = CodexItemReducer()
-    private var routingFailure: CodexAppServerError?
+    // Removed with the general thread-history bridge when thread observation moves
+    // to its dedicated bounded owner. Per-turn replay never reads this state.
+    private var threadRoutingTermination: CodexAppServerError?
     private let accountEventHub: AccountEventHub
+    package nonisolated let turnReplayStore: TurnReplayStore
 
     private enum ThreadEventReplayPolicy {
         case currentGeneration
@@ -47,22 +38,12 @@ package actor CodexAppServerNotificationRouter {
 
     package init(
         client: AppServerClient,
+        turnReplayStore: TurnReplayStore,
         accountEventHub: AccountEventHub = .init()
     ) {
         _ = client
+        self.turnReplayStore = turnReplayStore
         self.accountEventHub = accountEventHub
-    }
-
-    package func events(for turnID: CodexTurnID) -> AsyncThrowingStream<CodexTurnEvent, Error> {
-        let (stream, continuation) = AsyncThrowingStream<CodexTurnEvent, Error>.makeStream(
-            bufferingPolicy: .unbounded
-        )
-        let subscriptionID = UUID()
-        continuation.onTermination = { _ in
-            Task { await self.removeTurnSubscriber(subscriptionID, turnID: turnID) }
-        }
-        addTurnSubscriber(subscriptionID, turnID: turnID, continuation: continuation)
-        return stream
     }
 
     package func events(for threadID: CodexThreadID) -> AsyncThrowingStream<
@@ -104,22 +85,27 @@ package actor CodexAppServerNotificationRouter {
     }
 
     package func seedTurn(_ turnID: CodexTurnID, threadID: CodexThreadID) {
-        threadIDByTurnID[turnID] = threadID
-        for turnEvent in turnHistoryByTurnID[turnID] ?? [] {
-            let threadEvent = Self.threadEvent(
-                from: turnEvent,
-                turnID: turnID,
-                threadID: threadID
+        if let existingThreadID = threadIDByTurnID[turnID] {
+            precondition(
+                existingThreadID == threadID,
+                "A turn cannot move between thread associations."
             )
-            if (threadHistoryByThreadID[threadID] ?? []).contains(threadEvent) {
-                continue
-            }
-            appendThreadEvent(threadEvent, threadID: threadID)
         }
-        if case .failure(let failure) = terminalDecisionByTurnID[turnID] {
-            threadFailureByThreadID[threadID] = failure
-            finishThreadSubscribers(threadID: threadID, throwing: failure)
+        threadIDByTurnID[turnID] = threadID
+    }
+
+    package func discardTurnAssociation(
+        _ turnID: CodexTurnID,
+        threadID: CodexThreadID
+    ) {
+        guard let registeredThreadID = threadIDByTurnID[turnID] else {
+            return
         }
+        precondition(
+            registeredThreadID == threadID,
+            "Only the thread that owns a turn association may discard it."
+        )
+        threadIDByTurnID.removeValue(forKey: turnID)
     }
 
     package func seedTurns(
@@ -141,10 +127,6 @@ package actor CodexAppServerNotificationRouter {
     ) async {
         await accountEventHub.replaceRateLimits(with: response)
     }
-    package func turnSubscriberCountForTesting(for turnID: CodexTurnID) -> Int {
-        turnSubscribersByTurnID[turnID]?.count ?? 0
-    }
-
     package func threadSubscriberCountForTesting(for threadID: CodexThreadID) -> Int {
         threadSubscribersByThreadID[threadID]?.count ?? 0
     }
@@ -196,7 +178,7 @@ package actor CodexAppServerNotificationRouter {
     package func route(
         _ decoded: AppServerNotificationDecoder.DecodedNotification
     ) async throws {
-        guard routingFailure == nil else {
+        guard threadRoutingTermination == nil else {
             return
         }
         guard decoded.disposition != .explicitIgnore else {
@@ -229,20 +211,17 @@ package actor CodexAppServerNotificationRouter {
             let outcome = try terminalOutcome(from: turn, context: context)
             let turnID = context.turnID ?? outcome.response.turnID
             releasedTurnID = turnID
-            guard recordTerminalDecision(.outcome(outcome), turnID: turnID) else {
-                return
-            }
-            if let threadID = context.threadID ?? threadIDByTurnID[turnID] {
+            let disposition = await turnReplayStore.finishIfTracked(outcome)
+            if let threadID = context.threadID ?? threadIDByTurnID[turnID],
+               shouldPublishThreadTerminal(
+                   disposition,
+                   outcome: outcome,
+                   threadID: threadID
+               )
+            {
                 appendThreadEvent(.terminal(outcome), threadID: threadID)
             }
-            let event = CodexTurnEvent.terminal(outcome)
-            turnHistoryByTurnID[turnID, default: []].append(event)
-            if let subscribers = turnSubscribersByTurnID[turnID] {
-                for subscriber in subscribers.values {
-                    subscriber.continuation.yield(event)
-                }
-            }
-            finishTurnSubscribers(turnID: turnID)
+            threadIDByTurnID.removeValue(forKey: turnID)
 
         case .item(let mutation):
             guard let turnID = context.turnID else {
@@ -255,12 +234,10 @@ package actor CodexAppServerNotificationRouter {
                     threadID: threadID
                 )
             }
-            turnHistoryByTurnID[turnID, default: []].append(event)
-            if let subscribers = turnSubscribersByTurnID[turnID] {
-                for subscriber in subscribers.values {
-                    subscriber.continuation.yield(event)
-                }
-            }
+            recordReplayDisposition(
+                await turnReplayStore.routeIfTracked(event, for: turnID),
+                turnID: turnID
+            )
 
         case .turnStarted(let payloadTurnID):
             let turnID = context.turnID ?? payloadTurnID
@@ -268,12 +245,10 @@ package actor CodexAppServerNotificationRouter {
                 appendThreadEvent(.turnStarted(turnID), threadID: threadID)
             }
             let event = CodexTurnEvent.started(turnID)
-            turnHistoryByTurnID[turnID, default: []].append(event)
-            if let subscribers = turnSubscribersByTurnID[turnID] {
-                for subscriber in subscribers.values {
-                    subscriber.continuation.yield(event)
-                }
-            }
+            recordReplayDisposition(
+                await turnReplayStore.routeIfTracked(event, for: turnID),
+                turnID: turnID
+            )
 
         case .threadStatus(let status):
             if let threadID = context.threadID {
@@ -289,12 +264,10 @@ package actor CodexAppServerNotificationRouter {
             }
             if let turnID = context.turnID {
                 let event = CodexTurnEvent.tokenUsageUpdated(usage)
-                turnHistoryByTurnID[turnID, default: []].append(event)
-                if let subscribers = turnSubscribersByTurnID[turnID] {
-                    for subscriber in subscribers.values {
-                        subscriber.continuation.yield(event)
-                    }
-                }
+                recordReplayDisposition(
+                    await turnReplayStore.routeIfTracked(event, for: turnID),
+                    turnID: turnID
+                )
             }
 
         case .threadClosed:
@@ -327,12 +300,10 @@ package actor CodexAppServerNotificationRouter {
             }
             if let turnID = context.turnID {
                 let event = CodexTurnEvent.unknown(raw)
-                turnHistoryByTurnID[turnID, default: []].append(event)
-                if let subscribers = turnSubscribersByTurnID[turnID] {
-                    for subscriber in subscribers.values {
-                        subscriber.continuation.yield(event)
-                    }
-                }
+                recordReplayDisposition(
+                    await turnReplayStore.routeIfTracked(event, for: turnID),
+                    turnID: turnID
+                )
             }
 
         case .ignored:
@@ -360,40 +331,15 @@ package actor CodexAppServerNotificationRouter {
             }
         }
         if case .closed = event {
-            for turnID in threadIDByTurnID.compactMap({ entry in
+            let turnIDs = threadIDByTurnID.compactMap { entry in
                 entry.value == threadID ? entry.key : nil
-            }) {
+            }
+            for turnID in turnIDs {
                 itemReducer.release(turnID: turnID)
+                threadIDByTurnID.removeValue(forKey: turnID)
             }
             finishThreadSubscribers(threadID: threadID)
         }
-    }
-
-    private func addTurnSubscriber(
-        _ subscriptionID: UUID,
-        turnID: CodexTurnID,
-        continuation: AsyncThrowingStream<CodexTurnEvent, Error>.Continuation
-    ) {
-        if let routingFailure {
-            continuation.finish(throwing: routingFailure)
-            return
-        }
-        let history = turnHistoryByTurnID[turnID] ?? []
-        for event in history {
-            continuation.yield(event)
-        }
-        if let decision = terminalDecisionByTurnID[turnID] {
-            switch decision {
-            case .outcome:
-                continuation.finish()
-            case .failure(let failure):
-                continuation.finish(throwing: failure)
-            }
-            return
-        }
-        turnSubscribersByTurnID[turnID, default: [:]][subscriptionID] = .init(
-            continuation: continuation
-        )
     }
 
     private func addThreadSubscriber(
@@ -402,8 +348,8 @@ package actor CodexAppServerNotificationRouter {
         continuation: AsyncThrowingStream<CodexThreadEvent, Error>.Continuation,
         replayPolicy: ThreadEventReplayPolicy = .currentGeneration
     ) {
-        if let routingFailure {
-            continuation.finish(throwing: routingFailure)
+        if let threadRoutingTermination {
+            continuation.finish(throwing: threadRoutingTermination)
             return
         }
         let history = threadHistoryByThreadID[threadID] ?? []
@@ -579,15 +525,6 @@ package actor CodexAppServerNotificationRouter {
         }
     }
 
-    private func hasTerminalTurnEvent(threadID: CodexThreadID, turnID: CodexTurnID) -> Bool {
-        if terminalDecisionByTurnID[turnID] != nil {
-            return true
-        }
-        return threadHistoryByThreadID[threadID]?.contains {
-            Self.isTerminalThreadEvent($0, for: turnID)
-        } == true
-    }
-
     private nonisolated static func isTerminalThreadEvent(
         _ event: CodexThreadEvent,
         for turnID: CodexTurnID
@@ -600,6 +537,34 @@ package actor CodexAppServerNotificationRouter {
              .tokenUsageUpdated, .unknown:
             false
         }
+    }
+
+    private func shouldPublishThreadTerminal(
+        _ disposition: TurnReplayStore.TerminalRoutingDisposition,
+        outcome: CodexTurnOutcome,
+        threadID: CodexThreadID
+    ) -> Bool {
+        guard disposition != .duplicate else {
+            return false
+        }
+        guard let existing = threadHistoryByThreadID[threadID]?.first(where: {
+            Self.isTerminalThreadEvent($0, for: outcome.response.turnID)
+        }) else {
+            return true
+        }
+        guard case .terminal(let existingOutcome) = existing else {
+            preconditionFailure("A matching terminal thread event must carry a turn outcome.")
+        }
+        if existingOutcome != outcome {
+            notificationRouterLogger.error(
+                "Ignoring conflicting terminal outcome for turn \(outcome.response.turnID.rawValue, privacy: .public)"
+            )
+        } else {
+            notificationRouterLogger.debug(
+                "Ignoring duplicate terminal outcome for turn \(outcome.response.turnID.rawValue, privacy: .public)"
+            )
+        }
+        return false
     }
 
     private nonisolated static func threadEvent(
@@ -701,36 +666,10 @@ package actor CodexAppServerNotificationRouter {
         }
     }
 
-    private func removeTurnSubscriber(_ subscriptionID: UUID, turnID: CodexTurnID) {
-        turnSubscribersByTurnID[turnID]?.removeValue(forKey: subscriptionID)
-        if turnSubscribersByTurnID[turnID]?.isEmpty == true {
-            turnSubscribersByTurnID.removeValue(forKey: turnID)
-        }
-    }
-
     private func removeThreadSubscriber(_ subscriptionID: UUID, threadID: CodexThreadID) {
         threadSubscribersByThreadID[threadID]?.removeValue(forKey: subscriptionID)
         if threadSubscribersByThreadID[threadID]?.isEmpty == true {
             threadSubscribersByThreadID.removeValue(forKey: threadID)
-        }
-    }
-
-    private func finishTurnSubscribers(turnID: CodexTurnID) {
-        let subscribers =
-            turnSubscribersByTurnID.removeValue(forKey: turnID).map {
-                Array($0.values)
-            } ?? []
-        for subscriber in subscribers {
-            subscriber.continuation.finish()
-        }
-    }
-
-    private func finishTurnSubscribers(turnID: CodexTurnID, throwing error: Error) {
-        let subscribers = turnSubscribersByTurnID.removeValue(forKey: turnID).map {
-            Array($0.values)
-        } ?? []
-        for subscriber in subscribers {
-            subscriber.continuation.finish(throwing: error)
         }
     }
 
@@ -754,39 +693,29 @@ package actor CodexAppServerNotificationRouter {
     }
 
     package func finishAll(throwing error: CodexAppServerError) async {
-        let turnSubscribers = turnSubscribersByTurnID.values.flatMap(\.values)
         let threadSubscribers = threadSubscribersByThreadID.values.flatMap(\.values)
-        routingFailure = routingFailure ?? error
+        threadRoutingTermination = threadRoutingTermination ?? error
         itemReducer.releaseAll()
-        turnSubscribersByTurnID.removeAll()
         threadSubscribersByThreadID.removeAll()
-        for subscriber in turnSubscribers {
-            subscriber.continuation.finish(throwing: error)
-        }
         for subscriber in threadSubscribers {
             subscriber.continuation.finish(throwing: error)
         }
         await accountEventHub.finish(throwing: error)
     }
 
-    private func recordTerminalDecision(
-        _ decision: TurnTerminalDecision,
+    private nonisolated func recordReplayDisposition(
+        _ disposition: TurnReplayStore.RoutingDisposition,
         turnID: CodexTurnID
-    ) -> Bool {
-        guard let existing = terminalDecisionByTurnID[turnID] else {
-            terminalDecisionByTurnID[turnID] = decision
-            return true
+    ) {
+        guard case .routed(let count) = disposition else {
+            return
         }
-        if existing != decision {
-            notificationRouterLogger.error(
-                "Ignoring conflicting terminal decision for turn \(turnID.rawValue, privacy: .public)"
-            )
-        } else {
-            notificationRouterLogger.debug(
-                "Ignoring duplicate terminal decision for turn \(turnID.rawValue, privacy: .public)"
-            )
+        guard count > 0 else {
+            return
         }
-        return false
+        notificationRouterLogger.warning(
+            "Compacted \(count, privacy: .public) slow turn replay subscriber(s) for \(turnID.rawValue, privacy: .public)"
+        )
     }
 
     private func terminalOutcome(

@@ -317,8 +317,20 @@ struct CodexItemReducerTests {
         let router = harness.router
         await transport.waitForNotificationStreamCount(1)
 
-        let firstTurnEvents = await router.events(for: CodexTurnID(rawValue: "turn-1"))
+        let firstState = await harness.turnReplayStore.restoreGeneration(
+            turnID: "turn-1",
+            initialSnapshot: .init(id: "turn-1", state: .inProgress),
+            connectionLease: harness.lease
+        )
+        let firstTurnEvents = try await harness.turnReplayStore.events(
+            for: "turn-1",
+            state: firstState
+        )
         var firstTurnIterator = firstTurnEvents.makeAsyncIterator()
+        guard case .snapshot? = try await firstTurnIterator.next() else {
+            Issue.record("Expected the initial snapshot for turn-1.")
+            return
+        }
         try await transport.emitServerNotification(
             method: "item/started",
             params: ItemLifecycleParams(
@@ -366,7 +378,14 @@ struct CodexItemReducerTests {
             method: "turn/completed",
             params: TurnTerminalParams(turn: .init(id: "turn-1", status: "completed"))
         )
-        guard case .terminal? = try await firstTurnIterator.next() else {
+        var receivedTerminal = false
+        while let event = try await firstTurnIterator.next() {
+            if case .terminal = event {
+                receivedTerminal = true
+                break
+            }
+        }
+        guard receivedTerminal else {
             Issue.record("Expected the terminal event for turn-1.")
             return
         }
@@ -376,8 +395,20 @@ struct CodexItemReducerTests {
             itemID: "command-1"
         ) == nil)
 
-        let secondTurnEvents = await router.events(for: CodexTurnID(rawValue: "turn-2"))
+        let secondState = await harness.turnReplayStore.restoreGeneration(
+            turnID: "turn-2",
+            initialSnapshot: .init(id: "turn-2", state: .inProgress),
+            connectionLease: harness.lease
+        )
+        let secondTurnEvents = try await harness.turnReplayStore.events(
+            for: "turn-2",
+            state: secondState
+        )
         var secondTurnIterator = secondTurnEvents.makeAsyncIterator()
+        guard case .snapshot? = try await secondTurnIterator.next() else {
+            Issue.record("Expected the initial snapshot for turn-2.")
+            return
+        }
         try await transport.emitServerNotification(
             method: "item/started",
             params: ItemLifecycleParams(

@@ -27,6 +27,7 @@ package actor AppServerConnection {
     package let client: AppServerClient
     package let router: CodexAppServerNotificationRouter
     package nonisolated let connectionEventHub: ConnectionEventHub
+    package nonisolated let turnReplayStore: TurnReplayStore
 
     private let transport: any JSONRPC.Transport
     private let serverRequestRegistry: ServerRequestRegistry
@@ -36,6 +37,7 @@ package actor AppServerConnection {
         transport: any JSONRPC.Transport,
         client: AppServerClient,
         router: CodexAppServerNotificationRouter,
+        turnReplayStore: TurnReplayStore,
         serverRequestHandler: @escaping CodexAppServerRequestHandler,
         serverRequestDiagnosticHandler: @escaping ServerRequestRegistry.DiagnosticHandler = {
             diagnostic in
@@ -48,9 +50,14 @@ package actor AppServerConnection {
             client.connectionEventHub === transport.connectionEventHub,
             "A connection must preserve its transport's event hub identity."
         )
+        precondition(
+            router.turnReplayStore === turnReplayStore,
+            "A connection and its router must share one turn replay store identity."
+        )
         self.transport = transport
         self.client = client
         self.router = router
+        self.turnReplayStore = turnReplayStore
         self.connectionEventHub = client.connectionEventHub
         self.serverRequestRegistry = ServerRequestRegistry(
             connectionEventHub: client.connectionEventHub,
@@ -137,6 +144,7 @@ package actor AppServerConnection {
 
     package func finishDomains(with termination: CodexConnectionTermination) async {
         let error = CodexAppServerError.connectionTerminated(termination)
+        await turnReplayStore.terminateAll(with: termination)
         await router.finishAll(throwing: error)
         connectionEventHub.finish(with: termination)
     }
