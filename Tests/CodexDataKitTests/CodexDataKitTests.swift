@@ -308,6 +308,7 @@ struct CodexModelContextTests {
         try await runtime.transport.emitServerNotification(
             method: "item/completed",
             params: ThreadItemParams(
+                lifecycle: .completed,
                 threadID: "thread-actor-live",
                 turnID: "turn-actor-live",
                 item: .init(
@@ -5714,6 +5715,7 @@ struct CodexModelContextTests {
         try await runtime.transport.emitServerNotification(
             method: "item/completed",
             params: ThreadItemParams(
+                lifecycle: .completed,
                 threadID: "thread-send",
                 turnID: "turn-send",
                 item: .init(
@@ -5726,7 +5728,10 @@ struct CodexModelContextTests {
         )
         try await runtime.transport.emitServerNotification(
             method: "turn/completed",
-            params: TurnCompletedParams(turn: .init(id: "turn-send", status: "completed"))
+            params: TurnCompletedParams(
+                threadID: "thread-send",
+                turn: .init(id: "turn-send", status: "completed")
+            )
         )
 
         let response = try await sendTask.value
@@ -5767,7 +5772,10 @@ struct CodexModelContextTests {
         await runtime.transport.waitForRequest(method: "turn/start")
         try await runtime.transport.emitServerNotification(
             method: "turn/completed",
-            params: TurnCompletedParams(turn: .init(id: "turn-send-phase", status: "completed"))
+            params: TurnCompletedParams(
+                threadID: "thread-send-phase",
+                turn: .init(id: "turn-send-phase", status: "completed")
+            )
         )
 
         _ = try await sendTask.value
@@ -5813,7 +5821,10 @@ struct CodexModelContextTests {
 
         try await runtime.transport.emitServerNotification(
             method: "turn/completed",
-            params: TurnCompletedParams(turn: .init(id: "turn-status-lifecycle", status: "completed"))
+            params: TurnCompletedParams(
+                threadID: "thread-status-lifecycle",
+                turn: .init(id: "turn-status-lifecycle", status: "completed")
+            )
         )
 
         #expect(await updateRecorder.statusChanged(.idle) != nil)
@@ -5850,6 +5861,7 @@ struct CodexModelContextTests {
         try await runtime.transport.emitServerNotification(
             method: "item/started",
             params: ThreadItemParams(
+                lifecycle: .started,
                 threadID: "thread-command-lifecycle",
                 turnID: "turn-command-lifecycle",
                 startedAtMs: 1_782_900_000_000,
@@ -5889,6 +5901,7 @@ struct CodexModelContextTests {
         try await runtime.transport.emitServerNotification(
             method: "item/completed",
             params: ThreadItemParams(
+                lifecycle: .completed,
                 threadID: "thread-command-lifecycle",
                 turnID: "turn-command-lifecycle",
                 completedAtMs: 1_782_900_001_000,
@@ -5941,6 +5954,7 @@ struct CodexModelContextTests {
         try await runtime.transport.emitServerNotification(
             method: "item/started",
             params: ThreadItemParams(
+                lifecycle: .started,
                 threadID: "thread-command-status-terminal",
                 turnID: "turn-command-status-terminal",
                 startedAtMs: Int64((startedAt.timeIntervalSince1970 * 1_000).rounded()),
@@ -6020,6 +6034,7 @@ struct CodexModelContextTests {
         try await runtime.transport.emitServerNotification(
             method: "item/started",
             params: ThreadItemParams(
+                lifecycle: .started,
                 threadID: "thread-command-existing-progress",
                 turnID: "turn-command-existing-progress",
                 startedAtMs: Int64((startedAt.timeIntervalSince1970 * 1_000).rounded()),
@@ -6094,6 +6109,7 @@ struct CodexModelContextTests {
         try await runtime.transport.emitServerNotification(
             method: "item/started",
             params: ThreadItemParams(
+                lifecycle: .started,
                 threadID: "thread-command-progress",
                 turnID: "turn-command-progress",
                 startedAtMs: Int64((startedAt.timeIntervalSince1970 * 1_000).rounded()),
@@ -6171,6 +6187,7 @@ struct CodexModelContextTests {
         try await runtime.transport.emitServerNotification(
             method: "item/started",
             params: ThreadItemParams(
+                lifecycle: .started,
                 threadID: "thread-command-late-update",
                 turnID: "turn-command-late-update",
                 item: .init(
@@ -6183,6 +6200,7 @@ struct CodexModelContextTests {
         try await runtime.transport.emitServerNotification(
             method: "item/started",
             params: ThreadItemParams(
+                lifecycle: .started,
                 threadID: "thread-command-late-update",
                 turnID: "turn-command-late-update",
                 item: .init(
@@ -6275,6 +6293,7 @@ struct CodexModelContextTests {
         try await runtime.transport.emitServerNotification(
             method: "item/completed",
             params: ThreadItemParams(
+                lifecycle: .completed,
                 threadID: "thread-live",
                 turnID: "turn-existing",
                 item: .init(
@@ -6337,7 +6356,7 @@ struct CodexModelContextTests {
         )
         try await runtime.transport.emitServerNotification(
             method: "turn/completed",
-            params: TurnCompletedParams(turn: .init(
+            params: TurnCompletedParams(threadID: "thread-live", turn: .init(
                 id: "turn-live",
                 status: "completed",
                 completedAt: Int(completedAt.timeIntervalSince1970)
@@ -6562,6 +6581,7 @@ struct CodexModelContextTests {
         try await runtime.transport.emitServerNotification(
             method: "item/started",
             params: ThreadItemParams(
+                lifecycle: .started,
                 threadID: "thread-replay",
                 turnID: "turn-replay",
                 item: .init(
@@ -6991,6 +7011,7 @@ struct CodexModelContextTests {
             try await runtime.transport.emitServerNotification(
                 method: "item/started",
                 params: ThreadItemParams(
+                    lifecycle: .started,
                     threadID: "thread-replay-live",
                     turnID: turnID,
                     item: .init(
@@ -7003,11 +7024,12 @@ struct CodexModelContextTests {
             try await runtime.transport.emitServerNotification(
                 method: "item/started",
                 params: ThreadItemParams(
+                    lifecycle: .started,
                     threadID: "thread-replay-live",
                     turnID: turnID,
                     item: .init(
                         id: "diagnostic-\(turnID)",
-                        type: "diagnostic",
+                        type: "agentMessage",
                         text: "Review was interrupted."
                     )
                 )
@@ -7044,6 +7066,7 @@ struct CodexModelContextTests {
             try await runtime.transport.emitServerNotification(
                 method: "item/started",
                 params: ThreadItemParams(
+                    lifecycle: .started,
                     threadID: "thread-reasoning-parts",
                     turnID: turnID,
                     item: .init(
@@ -7057,6 +7080,7 @@ struct CodexModelContextTests {
         try await runtime.transport.emitServerNotification(
             method: "item/started",
             params: ThreadItemParams(
+                lifecycle: .started,
                 threadID: "thread-reasoning-parts",
                 turnID: "turn-b",
                 item: .init(
@@ -7101,6 +7125,7 @@ struct CodexModelContextTests {
         try await runtime.transport.emitServerNotification(
             method: "item/started",
             params: ThreadItemParams(
+                lifecycle: .started,
                 threadID: "thread-duplicate-live",
                 turnID: "turn-duplicate-live",
                 item: .init(
@@ -7113,11 +7138,12 @@ struct CodexModelContextTests {
         try await runtime.transport.emitServerNotification(
             method: "item/started",
             params: ThreadItemParams(
+                lifecycle: .started,
                 threadID: "thread-duplicate-live",
                 turnID: "turn-duplicate-live",
                 item: .init(
                     id: "diagnostic-a",
-                    type: "diagnostic",
+                    type: "agentMessage",
                     text: "Repeated diagnostic"
                 )
             )
@@ -7125,6 +7151,7 @@ struct CodexModelContextTests {
         try await runtime.transport.emitServerNotification(
             method: "item/started",
             params: ThreadItemParams(
+                lifecycle: .started,
                 threadID: "thread-duplicate-live",
                 turnID: "turn-duplicate-live",
                 item: .init(
@@ -7137,11 +7164,12 @@ struct CodexModelContextTests {
         try await runtime.transport.emitServerNotification(
             method: "item/started",
             params: ThreadItemParams(
+                lifecycle: .started,
                 threadID: "thread-duplicate-live",
                 turnID: "turn-duplicate-live",
                 item: .init(
                     id: "diagnostic-b",
-                    type: "diagnostic",
+                    type: "agentMessage",
                     text: "Repeated diagnostic"
                 )
             )
@@ -7149,6 +7177,7 @@ struct CodexModelContextTests {
         try await runtime.transport.emitServerNotification(
             method: "item/started",
             params: ThreadItemParams(
+                lifecycle: .started,
                 threadID: "thread-duplicate-live",
                 turnID: "turn-duplicate-live",
                 item: .init(
@@ -7161,6 +7190,7 @@ struct CodexModelContextTests {
         try await runtime.transport.emitServerNotification(
             method: "item/started",
             params: ThreadItemParams(
+                lifecycle: .started,
                 threadID: "thread-duplicate-live",
                 turnID: "turn-duplicate-live",
                 item: .init(
@@ -7173,6 +7203,7 @@ struct CodexModelContextTests {
         try await runtime.transport.emitServerNotification(
             method: "item/started",
             params: ThreadItemParams(
+                lifecycle: .started,
                 threadID: "thread-duplicate-live",
                 turnID: "turn-duplicate-live",
                 item: .init(
@@ -7284,6 +7315,7 @@ struct CodexModelContextTests {
         try await runtime.transport.emitServerNotification(
             method: "item/completed",
             params: ThreadItemParams(
+                lifecycle: .completed,
                 threadID: "thread-changes",
                 turnID: "turn-live",
                 item: .init(
@@ -7542,6 +7574,7 @@ struct CodexModelContextTests {
         try await runtime.transport.emitServerNotification(
             method: "item/started",
             params: ThreadItemParams(
+                lifecycle: .started,
                 threadID: "thread-refresh-replay",
                 turnID: "turn-live",
                 item: .init(
@@ -7812,6 +7845,7 @@ struct CodexModelContextTests {
         try await runtime.transport.emitServerNotification(
             method: "item/started",
             params: ThreadItemParams(
+                lifecycle: .started,
                 threadID: "thread-refresh-not-loaded-fallback",
                 turnID: "turn-live",
                 item: .init(
@@ -8090,7 +8124,7 @@ struct CodexModelContextTests {
 
         try await runtime.transport.emitServerNotification(
             method: "thread/status/changed",
-            params: ThreadStatusParams(threadID: "thread-failed", status: .init(type: "closed"))
+            params: ThreadStatusParams(threadID: "thread-failed", status: .init(type: "idle"))
         )
         try await runtime.transport.emitServerNotification(
             method: "thread/closed",
@@ -8154,6 +8188,7 @@ struct CodexModelContextTests {
         try await runtime.transport.emitServerNotification(
             method: "item/started",
             params: ThreadItemParams(
+                lifecycle: .started,
                 threadID: "thread-output",
                 turnID: "turn-output",
                 item: .init(
@@ -8190,6 +8225,7 @@ struct CodexModelContextTests {
         try await runtime.transport.emitServerNotification(
             method: "item/completed",
             params: ThreadItemParams(
+                lifecycle: .completed,
                 threadID: "thread-output",
                 turnID: "turn-output",
                 item: .init(
@@ -8233,6 +8269,7 @@ struct CodexModelContextTests {
         try await runtime.transport.emitServerNotification(
             method: "item/started",
             params: ThreadItemParams(
+                lifecycle: .started,
                 threadID: "thread-patch-replacement",
                 turnID: "turn-patch-replacement",
                 item: .init(
@@ -8299,7 +8336,7 @@ struct CodexModelContextTests {
         await runtime.transport.waitForRequest(method: "turn/start")
         try await runtime.transport.emitServerNotification(
             method: "turn/completed",
-            params: TurnCompletedParams(turn: .init(
+            params: TurnCompletedParams(threadID: "thread-alpha", turn: .init(
                 id: "turn-alpha",
                 status: "completed",
                 completedAt: Int(completedAt.timeIntervalSince1970)
@@ -8340,7 +8377,7 @@ struct CodexModelContextTests {
         await runtime.transport.waitForRequest(method: "turn/start")
         try await runtime.transport.emitServerNotification(
             method: "turn/completed",
-            params: TurnCompletedParams(turn: .init(
+            params: TurnCompletedParams(threadID: "thread-alpha", turn: .init(
                 id: "turn-alpha",
                 status: "completed",
                 completedAt: Int(completedAt.timeIntervalSince1970)
@@ -8383,7 +8420,7 @@ struct CodexModelContextTests {
         ]))
         try await runtime.transport.emitServerNotification(
             method: "turn/completed",
-            params: TurnCompletedParams(turn: .init(
+            params: TurnCompletedParams(threadID: "thread-alpha", turn: .init(
                 id: "turn-alpha",
                 status: "completed",
                 completedAt: Int(completedAt.timeIntervalSince1970)
@@ -8435,7 +8472,7 @@ struct CodexModelContextTests {
         await runtime.transport.waitForRequest(method: "turn/start")
         try await runtime.transport.emitServerNotification(
             method: "turn/completed",
-            params: TurnCompletedParams(turn: .init(
+            params: TurnCompletedParams(threadID: "thread-alpha", turn: .init(
                 id: "turn-alpha",
                 status: "completed",
                 completedAt: Int(completedAt.timeIntervalSince1970)
@@ -9114,6 +9151,7 @@ struct CodexModelContextTests {
         try await runtime.transport.emitServerNotification(
             method: "item/started",
             params: ThreadItemParams(
+                lifecycle: .started,
                 threadID: "thread-review",
                 turnID: "turn-live",
                 item: .init(
@@ -10263,6 +10301,12 @@ private struct ThreadStartParams: Decodable, Sendable {
 }
 
 private struct ThreadItemParams: Encodable, Sendable {
+    enum Lifecycle: Sendable {
+        case started
+        case completed
+    }
+
+    var lifecycle: Lifecycle
     var threadID: String
     var turnID: String
     var startedAtMs: Int64? = nil
@@ -10277,6 +10321,57 @@ private struct ThreadItemParams: Encodable, Sendable {
         case item
     }
 
+    init(
+        lifecycle: Lifecycle,
+        threadID: String,
+        turnID: String,
+        startedAtMs: Int64? = nil,
+        completedAtMs: Int64? = nil,
+        item: Item
+    ) {
+        self.lifecycle = lifecycle
+        self.threadID = threadID
+        self.turnID = turnID
+        self.startedAtMs = startedAtMs
+        self.completedAtMs = completedAtMs
+        self.item = item
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(threadID, forKey: .threadID)
+        try container.encode(turnID, forKey: .turnID)
+        switch lifecycle {
+        case .started:
+            try container.encode(startedAtMs ?? 0, forKey: .startedAtMs)
+        case .completed:
+            try container.encode(completedAtMs ?? 0, forKey: .completedAtMs)
+        }
+        var item = item
+        switch item.type {
+        case "commandExecution":
+            item.command = item.command ?? item.text ?? ""
+            item.cwd = item.cwd ?? "/workspace"
+            item.commandActions = []
+            item.aggregatedOutput = item.output ?? item.text
+            item.status = lifecycle == .started ? "inProgress" : "completed"
+        case "fileChange":
+            item.status = lifecycle == .started ? "inProgress" : "completed"
+            item.changes = [
+                .init(
+                    diff: item.text ?? item.output ?? "",
+                    kind: .init(type: "update"),
+                    path: item.path ?? "/workspace/File.swift"
+                )
+            ]
+        case "enteredReviewMode", "exitedReviewMode":
+            item.review = item.text ?? ""
+        default:
+            break
+        }
+        try container.encode(item, forKey: .item)
+    }
+
     struct Item: Encodable, Sendable {
         var id: String
         var type: String
@@ -10289,16 +10384,41 @@ private struct ThreadItemParams: Encodable, Sendable {
         var exitCode: Int? = nil
         var status: String? = nil
         var durationMs: Int? = nil
+        var aggregatedOutput: String? = nil
+        var commandActions: [String]? = nil
+        var review: String? = nil
+        var changes: [FileChange]? = nil
+
+        struct FileChange: Encodable, Sendable {
+            var diff: String
+            var kind: Kind
+            var path: String
+
+            struct Kind: Encodable, Sendable {
+                var type: String
+            }
+        }
     }
 }
 
 private struct TurnStartedParams: Encodable, Sendable {
     var threadID: String
-    var turnID: String
+    var turn: Turn
 
     enum CodingKeys: String, CodingKey {
         case threadID = "threadId"
-        case turnID = "turnId"
+        case turn
+    }
+
+    init(threadID: String, turnID: String) {
+        self.threadID = threadID
+        self.turn = .init(id: turnID)
+    }
+
+    struct Turn: Encodable, Sendable {
+        var id: String
+        var status = "inProgress"
+        var items: [String] = []
     }
 }
 
@@ -10336,13 +10456,19 @@ private struct FileChangePatchUpdatedParams: Encodable, Sendable {
     var threadID: String
     var turnID: String
     var itemID: String
-    var changes: Changes
+    var changes: [Change]
 
     init(threadID: String, turnID: String, itemID: String, displayText: String) {
         self.threadID = threadID
         self.turnID = turnID
         self.itemID = itemID
-        self.changes = .init(displayText: displayText)
+        self.changes = [
+            .init(
+                diff: displayText,
+                kind: .init(type: "update"),
+                path: "Sources/File.swift"
+            )
+        ]
     }
 
     enum CodingKeys: String, CodingKey {
@@ -10352,8 +10478,14 @@ private struct FileChangePatchUpdatedParams: Encodable, Sendable {
         case changes
     }
 
-    struct Changes: Encodable, Sendable {
-        var displayText: String
+    struct Change: Encodable, Sendable {
+        var diff: String
+        var kind: Kind
+        var path: String
+
+        struct Kind: Encodable, Sendable {
+            var type: String
+        }
     }
 }
 
@@ -10368,6 +10500,7 @@ private struct ThreadStatusParams: Encodable, Sendable {
 
     struct Status: Encodable, Sendable {
         var type: String
+        var activeFlags: [String] = []
     }
 }
 
@@ -10380,10 +10513,10 @@ private struct ThreadClosedParams: Encodable, Sendable {
 }
 
 private struct TurnCompletedParams: Encodable, Sendable {
-    var threadID: String?
+    var threadID: String
     var turn: Turn
 
-    init(threadID: String? = nil, turn: Turn) {
+    init(threadID: String, turn: Turn) {
         self.threadID = threadID
         self.turn = turn
     }
@@ -10396,6 +10529,7 @@ private struct TurnCompletedParams: Encodable, Sendable {
     struct Turn: Encodable, Sendable {
         var id: String
         var status: String
+        var items: [String]
         var completedAt: Int?
         var error: Error?
 
@@ -10403,12 +10537,14 @@ private struct TurnCompletedParams: Encodable, Sendable {
             id: String,
             status: String,
             completedAt: Int? = nil,
-            error: Error? = nil
+            error: Error? = nil,
+            items: [String] = []
         ) {
             self.id = id
             self.status = status
             self.completedAt = completedAt
             self.error = error
+            self.items = items
         }
     }
 
@@ -10441,8 +10577,15 @@ private struct TokenUsageParams: Encodable, Sendable {
     }
 
     struct TokenUsage: Encodable, Sendable {
+        var last: Breakdown
         var total: Breakdown
         var modelContextWindow: Int?
+
+        init(total: Breakdown, modelContextWindow: Int? = nil) {
+            self.last = total
+            self.total = total
+            self.modelContextWindow = modelContextWindow
+        }
     }
 
     struct Breakdown: Encodable, Sendable {
@@ -10465,6 +10608,7 @@ private func emitAgentMessageStarted(
     try await transport.emitServerNotification(
         method: "item/started",
         params: ThreadItemParams(
+            lifecycle: .started,
             threadID: threadID,
             turnID: turnID,
             item: .init(

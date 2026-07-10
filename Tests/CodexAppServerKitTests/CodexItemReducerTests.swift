@@ -383,6 +383,8 @@ private struct ItemLifecycleParams: Encodable, Sendable {
         var command: String?
         var aggregatedOutput: String?
         var status: String?
+        var cwd: String
+        var commandActions: [String]
 
         init(
             id: String,
@@ -398,6 +400,8 @@ private struct ItemLifecycleParams: Encodable, Sendable {
             self.command = command
             self.aggregatedOutput = aggregatedOutput
             self.status = status
+            self.cwd = "/workspace"
+            self.commandActions = []
         }
     }
 
@@ -429,7 +433,19 @@ private struct ThreadStatusParams: Encodable, Sendable {
 }
 
 private struct TurnTerminalParams: Encodable, Sendable {
+    var threadID: String = "thread-1"
     var turn: AppServerAPI.Turn.Payload
+
+    enum CodingKeys: String, CodingKey {
+        case threadID = "threadId"
+        case turn
+    }
+
+    init(turn: AppServerAPI.Turn.Payload) {
+        var turn = turn
+        turn.items = turn.items ?? []
+        self.turn = turn
+    }
 }
 
 private func eventuallyItem(

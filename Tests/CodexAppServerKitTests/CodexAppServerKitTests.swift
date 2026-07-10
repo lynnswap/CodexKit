@@ -1204,10 +1204,6 @@ struct CodexAppServerKitTests {
             params: TurnCompletedParams(turn: .init(id: "turn-terminal-replay", status: "completed"))
         )
         let firstTerminalEvents = try await collect(firstTerminalStream)
-        await transport.emitServerNotificationJSON(
-            method: "turn/completed",
-            json: #"{"turn":{"id":"turn-terminal-replay"}}"#
-        )
         try await transport.emitServerNotification(
             method: "turn/completed",
             params: TurnCompletedParams(turn: .init(id: "turn-terminal-replay", status: "completed"))
@@ -1223,10 +1219,6 @@ struct CodexAppServerKitTests {
             json: #"{"turn":{"id":"turn-failure-replay"}}"#
         )
         let firstFailure = await terminalStreamFailure(firstFailureStream)
-        try await transport.emitServerNotification(
-            method: "turn/completed",
-            params: TurnCompletedParams(turn: .init(id: "turn-failure-replay", status: "completed"))
-        )
         let lateFailure = await terminalStreamFailure(
             await router.events(for: failureTurnID)
         )
@@ -1794,7 +1786,7 @@ struct CodexAppServerKitTests {
         let cancellation = try await review.cancel()
         try await runtime.transport.emitServerNotification(
             method: "turn/completed",
-            params: TurnCompletedParams(turn: .init(id: "turn-review", status: "completed"))
+            params: TurnCompletedParams(threadID: "thread-review", turn: .init(id: "turn-review", status: "completed"))
         )
 
         #expect(review.identity == identity)
@@ -1854,7 +1846,7 @@ struct CodexAppServerKitTests {
         let review = try await reviewTask.value
         try await runtime.transport.emitServerNotification(
             method: "turn/completed",
-            params: TurnCompletedParams(turn: .init(id: "turn-review", status: "completed"))
+            params: TurnCompletedParams(threadID: "thread-review", turn: .init(id: "turn-review", status: "completed"))
         )
 
         let events = try await collect(review.events)
@@ -2225,7 +2217,7 @@ struct CodexAppServerKitTests {
         await runtime.transport.waitForRequest(method: "turn/interrupt")
         try await runtime.transport.emitServerNotification(
             method: "turn/completed",
-            params: TurnCompletedParams(turn: .init(id: "turn-review", status: "interrupted"))
+            params: TurnCompletedParams(threadID: "thread-review", turn: .init(id: "turn-review", status: "interrupted"))
         )
         let token = try await withTimeout {
             try await prepareTask.value
@@ -2306,7 +2298,7 @@ struct CodexAppServerKitTests {
         await runtime.transport.waitForRequest(method: "turn/interrupt", count: 2)
         try await runtime.transport.emitServerNotification(
             method: "turn/completed",
-            params: TurnCompletedParams(turn: .init(id: "turn-new", status: "interrupted"))
+            params: TurnCompletedParams(threadID: "thread-review", turn: .init(id: "turn-new", status: "interrupted"))
         )
         _ = try await withTimeout {
             try await prepareTask.value
@@ -2391,7 +2383,7 @@ struct CodexAppServerKitTests {
         await runtime.transport.waitForRequest(method: "turn/interrupt")
         try await runtime.transport.emitServerNotification(
             method: "turn/completed",
-            params: TurnCompletedParams(turn: .init(id: "turn-review", status: "interrupted"))
+            params: TurnCompletedParams(threadID: "thread-review", turn: .init(id: "turn-review", status: "interrupted"))
         )
         let token = try await withTimeout {
             try await prepareTask.value
@@ -2620,7 +2612,7 @@ struct CodexAppServerKitTests {
         await runtime.transport.waitForRequest(method: "turn/interrupt")
         try await runtime.transport.emitServerNotification(
             method: "turn/completed",
-            params: TurnCompletedParams(turn: .init(id: "turn-review", status: "interrupted"))
+            params: TurnCompletedParams(threadID: "thread-review", turn: .init(id: "turn-review", status: "interrupted"))
         )
         let token = try await withTimeout {
             try await prepareTask.value
@@ -2685,7 +2677,7 @@ struct CodexAppServerKitTests {
         )
         try await transport.emitServerNotification(
             method: "turn/completed",
-            params: TurnCompletedParams(turn: .init(id: "turn-review", status: "completed"))
+            params: TurnCompletedParams(threadID: "thread-review", turn: .init(id: "turn-review", status: "completed"))
         )
 
         var eventIterator = review.events.makeAsyncIterator()
@@ -2801,7 +2793,12 @@ struct CodexAppServerKitTests {
         )
         try await transport.emitServerNotification(
             method: "error",
-            params: ReviewErrorParams(turnID: "turn-review", message: "recoverable")
+            params: ReviewErrorParams(
+                threadID: "thread-review",
+                turnID: "turn-review",
+                error: .init(message: "recoverable"),
+                willRetry: true
+            )
         )
         try await transport.emitServerNotification(
             method: "thread/closed",
@@ -2845,7 +2842,7 @@ struct CodexAppServerKitTests {
         )
         try await transport.emitServerNotification(
             method: "turn/completed",
-            params: TurnCompletedParams(turn: .init(id: "turn-review", status: "completed"))
+            params: TurnCompletedParams(threadID: "thread-review", turn: .init(id: "turn-review", status: "completed"))
         )
         try await transport.emitServerNotification(
             method: "deprecationNotice",
@@ -2893,7 +2890,7 @@ struct CodexAppServerKitTests {
         )
         try await transport.emitServerNotification(
             method: "turn/completed",
-            params: TurnCompletedParams(turn: .init(id: "turn-review", status: "completed"))
+            params: TurnCompletedParams(threadID: "thread-review", turn: .init(id: "turn-review", status: "completed"))
         )
         try await transport.emitServerNotification(
             method: "configWarning",
@@ -3816,7 +3813,7 @@ struct CodexAppServerKitTests {
         )
         try await transport.emitServerNotification(
             method: "turn/completed",
-            params: TurnCompletedParams(turn: .init(id: "turn-old", status: "completed"))
+            params: TurnCompletedParams(threadID: "thread-review", turn: .init(id: "turn-old", status: "completed"))
         )
         try await transport.emitServerNotification(
             method: "turn/started",
@@ -5173,7 +5170,8 @@ struct CodexAppServerKitTests {
                 itemID: "patch-1",
                 changes: .array([
                     .object([
-                        "kind": .string("update"),
+                        "diff": .string("@@ -1 +1 @@"),
+                        "kind": .object(["type": .string("update")]),
                         "path": .string("Sources/File.swift"),
                     ]),
                 ])
@@ -5219,7 +5217,7 @@ struct CodexAppServerKitTests {
         #expect(
             updates.contains {
                 if case .fileChange(let fileChange) = $0.item?.content {
-                    fileChange.output?.contains("File.swift") == true
+                    fileChange.output == "@@ -1 +1 @@"
                 } else {
                     false
                 }
@@ -5273,9 +5271,11 @@ struct CodexAppServerKitTests {
                 item: .init(
                     id: "file-1",
                     type: "fileChange",
+                    status: "completed",
                     changes: .array([
                         .object([
-                            "kind": .string("update"),
+                            "diff": .string("@@ -1 +1 @@"),
+                            "kind": .object(["type": .string("update")]),
                             "path": .string("Sources/File.swift"),
                         ]),
                     ])
@@ -5592,7 +5592,7 @@ struct CodexAppServerKitTests {
         #expect(account.planType == "plus")
     }
 
-    @Test func loginFlowUsesSupportedRequestsAndCompletionNotification() async throws {
+    @Test func loginFlowUsesSupportedRequests() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueueChatGPTLogin(
             loginID: "login-1",
@@ -5607,9 +5607,6 @@ struct CodexAppServerKitTests {
             client: client,
             router: CodexAppServerNotificationRouter(client: client)
         )
-        let accountEvents = await server.accountEvents()
-        await transport.waitForNotificationStreamCount(1)
-
         let handle = try await server.loginChatGPT()
 
         #expect(handle == .chatGPT(
@@ -5631,15 +5628,6 @@ struct CodexAppServerKitTests {
         )
         #expect(cancelParams.loginID == "login-1")
 
-        try await transport.emitServerNotification(
-            method: "account/login/completed",
-            params: LoginCompletedParams(loginID: "login-1", success: true)
-        )
-        var iterator = accountEvents.makeAsyncIterator()
-        #expect(try await iterator.next() == .loginCompleted(.init(
-            loginID: "login-1",
-            success: true
-        )))
         #expect(await transport.recordedRequests().map(\.method) == [
             "account/login/start",
             "account/login/cancel",
@@ -5981,7 +5969,7 @@ struct CodexAppServerKitTests {
         ])
         try await transport.emitServerNotification(
             method: "turn/completed",
-            params: TurnCompletedParams(turn: .init(id: "turn-new", status: "interrupted"))
+            params: TurnCompletedParams(threadID: "thread-review", turn: .init(id: "turn-new", status: "interrupted"))
         )
         _ = try await withTimeout {
             try await followUpTask.value
@@ -6068,12 +6056,20 @@ private struct LoginCompletedParams: Encodable, Sendable {
 }
 
 private struct ReviewErrorParams: Encodable, Sendable {
+    var threadID: String
     var turnID: String
-    var message: String
+    var error: ErrorPayload
+    var willRetry: Bool
 
     enum CodingKeys: String, CodingKey {
+        case threadID = "threadId"
         case turnID = "turnId"
-        case message
+        case error
+        case willRetry
+    }
+
+    struct ErrorPayload: Encodable, Sendable {
+        var message: String
     }
 }
 
@@ -6088,7 +6084,7 @@ private struct ThreadlessDiagnosticParams: Encodable, Sendable {
 }
 
 private struct TurnDeltaParams: Encodable, Sendable {
-    var threadID: String? = nil
+    var threadID: String = "thread-1"
     var turnID: String
     var itemID: String = "message-1"
     var delta: String
@@ -6102,7 +6098,7 @@ private struct TurnDeltaParams: Encodable, Sendable {
 }
 
 private struct AgentMessageParams: Encodable, Sendable {
-    var threadID: String? = nil
+    var threadID: String = "thread-1"
     var turnID: String
     var itemID: String? = "message-1"
     var message: String
@@ -6116,7 +6112,7 @@ private struct AgentMessageParams: Encodable, Sendable {
 }
 
 private struct MessageDeltaWithoutItemIDParams: Encodable, Sendable {
-    var threadID: String? = nil
+    var threadID: String = "thread-1"
     var turnID: String
     var delta: String
 
@@ -6129,11 +6125,16 @@ private struct MessageDeltaWithoutItemIDParams: Encodable, Sendable {
 
 private struct TurnStartedParams: Encodable, Sendable {
     var threadID: String
-    var turnID: String
+    var turn: AppServerAPI.Turn.Payload
 
     enum CodingKeys: String, CodingKey {
         case threadID = "threadId"
-        case turnID = "turnId"
+        case turn
+    }
+
+    init(threadID: String, turnID: String) {
+        self.threadID = threadID
+        self.turn = .init(id: turnID, status: "inProgress", items: [])
     }
 }
 
@@ -6192,18 +6193,35 @@ private struct ItemProgressParams: Encodable, Sendable {
 }
 
 private struct TurnCompletedParams: Encodable, Sendable {
+    var threadID: String
     var turn: AppServerAPI.Turn.Payload
+
+    enum CodingKeys: String, CodingKey {
+        case threadID = "threadId"
+        case turn
+    }
+
+    init(threadID: String = "thread-1", turn: AppServerAPI.Turn.Payload) {
+        self.threadID = threadID
+        var turn = turn
+        turn.items = turn.items ?? []
+        self.turn = turn
+    }
 }
 
 private struct ThreadItemParams: Encodable, Sendable {
     var threadID: String
     var turnID: String
     var item: Item
+    var startedAtMS: Int64 = 0
+    var completedAtMS: Int64 = 0
 
     enum CodingKeys: String, CodingKey {
         case threadID = "threadId"
         case turnID = "turnId"
         case item
+        case startedAtMS = "startedAtMs"
+        case completedAtMS = "completedAtMs"
     }
 
     struct Item: Encodable, Sendable {
@@ -6264,6 +6282,10 @@ private struct ThreadItemParams: Encodable, Sendable {
             case summary
             case content
             case changes
+            case cwd
+            case commandActions
+            case server
+            case arguments
         }
 
         func encode(to encoder: Encoder) throws {
@@ -6279,6 +6301,17 @@ private struct ThreadItemParams: Encodable, Sendable {
             try container.encodeIfPresent(tool, forKey: .tool)
             try container.encodeIfPresent(summary, forKey: .summary)
             try container.encodeIfPresent(changes, forKey: .changes)
+            if type == "commandExecution" {
+                try container.encode("/workspace", forKey: .cwd)
+                try container.encode([String](), forKey: .commandActions)
+            }
+            if type == "mcpToolCall" {
+                try container.encode("server", forKey: .server)
+                try container.encode(AppServerJSONValue.object([:]), forKey: .arguments)
+            }
+            if type == "fileChange", changes == nil {
+                try container.encode(AppServerJSONValue.array([]), forKey: .changes)
+            }
             if let contentItems {
                 try container.encode(contentItems, forKey: .content)
             } else {
@@ -6368,8 +6401,15 @@ private struct TokenUsageParams: Encodable, Sendable {
     }
 
     struct TokenUsage: Encodable, Sendable {
+        var last: Breakdown
         var total: Breakdown
         var modelContextWindow: Int?
+
+        init(total: Breakdown, modelContextWindow: Int? = nil) {
+            self.last = total
+            self.total = total
+            self.modelContextWindow = modelContextWindow
+        }
     }
 
     struct Breakdown: Encodable, Sendable {

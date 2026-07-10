@@ -272,32 +272,12 @@ public actor CodexAppServer {
 
     /// Returns account-related app-server notifications as typed domain events.
     ///
-    /// The stream includes login completion, account update, and Codex
-    /// rate-limit update notifications. Notifications with newer account
-    /// methods are preserved as `.unknown`; malformed known notifications are
-    /// reported as `.malformed` without terminating the stream.
-    ///
-    /// - Returns: A stream of account domain events.
-    public func accountEvents() async -> AsyncThrowingStream<CodexAccountEvent, Error> {
-        let notifications = await client.notificationStream()
-        return AsyncThrowingStream(bufferingPolicy: .unbounded) { continuation in
-            let task = Task {
-                do {
-                    for try await notification in notifications {
-                        guard let event = Self.accountEvent(from: notification) else {
-                            continue
-                        }
-                        continuation.yield(event)
-                    }
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
-                }
-            }
-            continuation.onTermination = { _ in
-                task.cancel()
-            }
-        }
+    /// A malformed known current-v2 notification terminates connection-wide routing, including
+    /// this sequence and active thread or turn sequences, with
+    /// ``CodexAppServerError/malformedNotification(_:)``. Call ``CodexAccountEvents/cancel()``
+    /// to release only this subscription without closing other routing.
+    public func accountEvents() async -> CodexAccountEvents {
+        await router.accountEvents()
     }
 
     /// Creates a new Codex thread in a workspace.
@@ -826,6 +806,7 @@ public actor CodexAppServer {
     /// - Throws: A transport, JSON-RPC, or app-server request error.
     public func rateLimits() async throws -> CodexRateLimits {
         let response = try await client.send(AppServerAPI.Account.RateLimits.Read.Request())
+        await router.replaceRateLimits(with: response)
         return .init(appServer: response)
     }
 
@@ -1279,50 +1260,6 @@ public actor CodexAppServer {
         )
     }
 
-    private nonisolated static func accountEvent(
-        from notification: JSONRPC.Notification
-    ) -> CodexAccountEvent? {
-        switch notification.method {
-        case "account/login/completed":
-            do {
-                let payload = try JSONDecoder().decode(
-                    AppServerAccountLoginCompletedNotification.self,
-                    from: notification.params
-                )
-                return .loginCompleted(.init(
-                    loginID: payload.loginID.map(CodexLoginHandle.ID.init(rawValue:)),
-                    success: payload.success,
-                    error: payload.error
-                ))
-            } catch {
-                return .malformed(method: notification.method, message: error.localizedDescription)
-            }
-        case "account/updated":
-            return .accountUpdated
-        case "account/rateLimits/updated":
-            do {
-                let payload = try JSONDecoder().decode(
-                    AppServerAccountRateLimitsUpdatedNotification.self,
-                    from: notification.params
-                )
-                guard AppServerAPI.Account.RateLimits.Response
-                    .isCodexRateLimit(payload.rateLimits.limitID)
-                else {
-                    return nil
-                }
-                return .rateLimitsUpdated(.init(
-                    appServer: .init(rateLimits: payload.rateLimits)
-                ))
-            } catch {
-                return .malformed(method: notification.method, message: error.localizedDescription)
-            }
-        case let method where method.hasPrefix("account/"):
-            return .unknown(.init(method: notification.method, params: notification.params))
-        default:
-            return nil
-        }
-    }
-
 }
 
 private struct CodexReviewRestartContext: Sendable {
@@ -1331,20 +1268,4 @@ private struct CodexReviewRestartContext: Sendable {
     var rollbackModel: String?
     var rollbackCompleted: Bool = false
     var isRestarting: Bool = false
-}
-
-private struct AppServerAccountLoginCompletedNotification: Decodable, Equatable, Sendable {
-    var error: String?
-    var loginID: String?
-    var success: Bool
-
-    enum CodingKeys: String, CodingKey {
-        case error
-        case loginID = "loginId"
-        case success
-    }
-}
-
-private struct AppServerAccountRateLimitsUpdatedNotification: Decodable, Equatable, Sendable {
-    var rateLimits: AppServerAPI.Account.RateLimits.Snapshot
 }

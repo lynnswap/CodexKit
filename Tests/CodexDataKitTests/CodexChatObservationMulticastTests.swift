@@ -157,11 +157,13 @@ struct CodexChatObservationMulticastTests {
 private struct ObservationTestThreadItemParams: Encodable, Sendable {
     var threadID: String
     var turnID: String
+    var startedAtMs: Int64 = 0
     var item: Item
 
     enum CodingKeys: String, CodingKey {
         case threadID = "threadId"
         case turnID = "turnId"
+        case startedAtMs
         case item
     }
 
