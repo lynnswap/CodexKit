@@ -313,11 +313,12 @@ struct CodexItemReducerTests {
 
     @Test func routerDoesNotMutateItemForThreadStatusAndReleasesOnTerminalAndStop() async throws {
         let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
 
+        let firstTurnEvents = await router.events(for: CodexTurnID(rawValue: "turn-1"))
+        var firstTurnIterator = firstTurnEvents.makeAsyncIterator()
         try await transport.emitServerNotification(
             method: "item/started",
             params: ItemLifecycleParams(
@@ -333,18 +334,29 @@ struct CodexItemReducerTests {
                 startedAtMS: 1_000
             )
         )
-        #expect(await eventuallyItem {
-            await router.itemSnapshotForTesting(turnID: "turn-1", itemID: "command-1") != nil
-        })
+        guard case .itemStarted? = try await firstTurnIterator.next() else {
+            Issue.record("Expected the item/started event for turn-1.")
+            return
+        }
+        #expect(await router.itemSnapshotForTesting(
+            turnID: "turn-1",
+            itemID: "command-1"
+        ) != nil)
         let beforeStatus = await router.itemSnapshotForTesting(
             turnID: "turn-1",
             itemID: "command-1"
         )
 
+        let statusEvents = await router.liveEvents(for: CodexThreadID(rawValue: "thread-1"))
+        var statusIterator = statusEvents.makeAsyncIterator()
         try await transport.emitServerNotification(
             method: "thread/status/changed",
             params: ThreadStatusParams(threadID: "thread-1", status: .init(type: "idle"))
         )
+        guard case .statusChanged? = try await statusIterator.next() else {
+            Issue.record("Expected the thread/status/changed event.")
+            return
+        }
         #expect(await router.itemSnapshotForTesting(
             turnID: "turn-1",
             itemID: "command-1"
@@ -354,10 +366,18 @@ struct CodexItemReducerTests {
             method: "turn/completed",
             params: TurnTerminalParams(turn: .init(id: "turn-1", status: "completed"))
         )
-        #expect(await eventuallyItem {
-            await router.itemSnapshotForTesting(turnID: "turn-1", itemID: "command-1") == nil
-        })
+        guard case .terminal? = try await firstTurnIterator.next() else {
+            Issue.record("Expected the terminal event for turn-1.")
+            return
+        }
+        #expect(try await firstTurnIterator.next() == nil)
+        #expect(await router.itemSnapshotForTesting(
+            turnID: "turn-1",
+            itemID: "command-1"
+        ) == nil)
 
+        let secondTurnEvents = await router.events(for: CodexTurnID(rawValue: "turn-2"))
+        var secondTurnIterator = secondTurnEvents.makeAsyncIterator()
         try await transport.emitServerNotification(
             method: "item/started",
             params: ItemLifecycleParams(
@@ -367,10 +387,15 @@ struct CodexItemReducerTests {
                 startedAtMS: 2_000
             )
         )
-        #expect(await eventuallyItem {
-            await router.itemSnapshotForTesting(turnID: "turn-2", itemID: "message-2") != nil
-        })
-        await router.stop()
+        guard case .itemStarted? = try await secondTurnIterator.next() else {
+            Issue.record("Expected the item/started event for turn-2.")
+            return
+        }
+        #expect(await router.itemSnapshotForTesting(
+            turnID: "turn-2",
+            itemID: "message-2"
+        ) != nil)
+        await harness.close()
         #expect(await router.itemSnapshotForTesting(turnID: "turn-2", itemID: "message-2") == nil)
     }
 }
@@ -446,17 +471,4 @@ private struct TurnTerminalParams: Encodable, Sendable {
         turn.items = turn.items ?? []
         self.turn = turn
     }
-}
-
-private func eventuallyItem(
-    attempts: Int = 50,
-    _ condition: () async -> Bool
-) async -> Bool {
-    for _ in 0..<attempts {
-        if await condition() {
-            return true
-        }
-        await Task.yield()
-    }
-    return await condition()
 }

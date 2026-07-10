@@ -166,6 +166,7 @@ public actor CodexAppServer {
 
     private let client: AppServerClient
     private let router: CodexAppServerNotificationRouter
+    private let connectionLease: AppServerConnectionLease
     private var retainedReviewCleanupIdentitiesBySourceThreadID: [CodexThreadID: [CodexReviewIdentity]] = [:]
     private var reviewRestartContextsByTokenID: [CodexReviewRestartToken.ID: CodexReviewRestartContext] = [:]
 
@@ -185,9 +186,7 @@ public actor CodexAppServer {
             executable: configuration.localProcess.executable,
             arguments: configuration.localProcess.arguments,
             environment: configuration.localProcess.environment,
-            codexHomeURL: configuration.localProcess.codexHomeURL,
-            clock: configuration.clock,
-            serverRequestHandler: configuration.serverRequestHandler
+            codexHomeURL: configuration.localProcess.codexHomeURL
         )
         let transport: AppServerProcessTransport
         do {
@@ -203,52 +202,89 @@ public actor CodexAppServer {
                 message: error.localizedDescription
             ))
         }
+        let connectionCloseAction = ConnectionCloseAction()
         let client = AppServerClient(
             transport: transport,
             deadlines: configuration.deadlines,
-            deadlineClock: configuration.deadlineClock
+            deadlineClock: configuration.deadlineClock,
+            connectionCloseAction: connectionCloseAction
         )
+        let router = CodexAppServerNotificationRouter(client: client)
+        let connection = AppServerConnection(
+            transport: transport,
+            client: client,
+            router: router,
+            serverRequestHandler: configuration.serverRequestHandler
+                ?? Configuration.defaultServerRequestHandler(clock: configuration.clock)
+        )
+        let supervisor = ConnectionSupervisor(connection: connection)
+        connectionCloseAction.bind(to: supervisor)
+        let connectionLease = AppServerConnectionLease(
+            supervisor: supervisor,
+            processTerminationToken: transport.processTerminationToken
+        )
+        await supervisor.start()
         do {
             _ = try await client.initialize(
                 clientName: configuration.clientName,
                 clientVersion: configuration.clientVersion
             )
         } catch {
-            await client.close()
+            await supervisor.closeConnection()
             throw error
         }
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
         self.client = client
         self.router = router
-    }
-
-    package init(
-        client: AppServerClient,
-        router: CodexAppServerNotificationRouter
-    ) {
-        self.client = client
-        self.router = router
+        self.connectionLease = connectionLease
     }
 
     package init(
         transport: any JSONRPC.Transport
     ) async throws {
-        let client = AppServerClient(transport: transport)
+        let connectionCloseAction = ConnectionCloseAction()
+        let client = AppServerClient(
+            transport: transport,
+            connectionCloseAction: connectionCloseAction
+        )
         let configuration = Configuration()
+        let router = CodexAppServerNotificationRouter(client: client)
+        let connection = AppServerConnection(
+            transport: transport,
+            client: client,
+            router: router,
+            serverRequestHandler: Configuration.defaultServerRequestHandler(
+                clock: configuration.clock
+            )
+        )
+        let supervisor = ConnectionSupervisor(connection: connection)
+        connectionCloseAction.bind(to: supervisor)
+        let connectionLease = AppServerConnectionLease(
+            supervisor: supervisor,
+            processTerminationToken: ProcessTerminationToken()
+        )
+        await supervisor.start()
         do {
             _ = try await client.initialize(
                 clientName: configuration.clientName,
                 clientVersion: configuration.clientVersion
             )
         } catch {
-            await client.close()
+            await supervisor.closeConnection()
             throw error
         }
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
         self.client = client
         self.router = router
+        self.connectionLease = connectionLease
+    }
+
+    package init(
+        client: AppServerClient,
+        router: CodexAppServerNotificationRouter,
+        connectionLease: AppServerConnectionLease
+    ) {
+        self.client = client
+        self.router = router
+        self.connectionLease = connectionLease
     }
 
     package static func testing(
@@ -262,19 +298,15 @@ public actor CodexAppServer {
     /// Call this when the container is no longer needed. Closing is idempotent
     /// from the perspective of public callers.
     public func close() async {
-        await router.stop()
-        await client.close()
-    }
-
-    package func notificationStream() async -> AsyncThrowingStream<JSONRPC.Notification, Error> {
-        await client.notificationStream()
+        await connectionLease.closeConnection()
     }
 
     /// Returns account-related app-server notifications as typed domain events.
     ///
     /// A malformed known current-v2 notification terminates connection-wide routing, including
-    /// this sequence and active thread or turn sequences, with
-    /// ``CodexAppServerError/malformedNotification(_:)``. Call ``CodexAccountEvents/cancel()``
+    /// this sequence and active thread or turn sequences, with a typed
+    /// ``CodexAppServerError/connectionTerminated(_:)`` protocol violation. Call
+    /// ``CodexAccountEvents/cancel()``
     /// to release only this subscription without closing other routing.
     public func accountEvents() async -> CodexAccountEvents {
         await router.accountEvents()
@@ -328,7 +360,8 @@ public actor CodexAppServer {
             workspace: workspace,
             model: response.model ?? options.model,
             client: client,
-            router: router
+            router: router,
+            connectionLease: connectionLease
         )
     }
 
@@ -967,7 +1000,8 @@ public actor CodexAppServer {
             workspace: snapshot.cwd.map { URL(fileURLWithPath: $0, isDirectory: true) },
             model: model,
             client: client,
-            router: router
+            router: router,
+            connectionLease: connectionLease
         )
     }
 

@@ -242,14 +242,16 @@ extension CodexThread {
             id: identity.turnID,
             threadID: reviewThreadID,
             client: client,
-            router: router
+            router: router,
+            connectionLease: connectionLease
         )
         let eventThread = CodexThread(
             id: reviewThreadID,
             workspace: workspace,
             model: model,
             client: client,
-            router: router
+            router: router,
+            connectionLease: connectionLease
         )
         return .init(
             threadID: identity.sourceThreadID,
@@ -297,7 +299,8 @@ extension CodexThread {
             prompt: prompt,
             options: options,
             client: client,
-            router: router
+            router: router,
+            connectionLease: connectionLease
         )
     }
 
@@ -404,8 +407,7 @@ extension CodexThread {
 
     /// Closes the app-server connection shared by this thread.
     public func closeConnection() async {
-        await router.stop()
-        await client.close()
+        await connectionLease.closeConnection()
     }
 }
 
@@ -422,7 +424,8 @@ package func startCodexTurn(
     prompt: CodexPrompt,
     options: CodexGenerationOptions = .init(),
     client: AppServerClient,
-    router: CodexAppServerNotificationRouter
+    router: CodexAppServerNotificationRouter,
+    connectionLease: AppServerConnectionLease
 ) async throws -> CodexTurn {
     let response: AppServerAPI.Turn.Start.Response = try await withThreadEventGeneration(
         threadID,
@@ -453,7 +456,8 @@ package func startCodexTurn(
         id: turnID,
         threadID: threadID,
         client: client,
-        router: router
+        router: router,
+        connectionLease: connectionLease
     )
 }
 

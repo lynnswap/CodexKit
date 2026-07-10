@@ -23,8 +23,6 @@ package actor CodexAppServerNotificationRouter {
         case failure(CodexAppServerError)
     }
 
-    private let client: AppServerClient
-    private var routerTask: Task<Void, Never>?
     private var threadIDByTurnID: [CodexTurnID: CodexThreadID] = [:]
     private var turnHistoryByTurnID: [CodexTurnID: [CodexTurnEvent]] = [:]
     private var terminalDecisionByTurnID: [CodexTurnID: TurnTerminalDecision] = [:]
@@ -37,7 +35,6 @@ package actor CodexAppServerNotificationRouter {
     private var itemReducer = CodexItemReducer()
     private var routingFailure: CodexAppServerError?
     private let accountEventHub: AccountEventHub
-    private let notificationDecoder = AppServerNotificationDecoder()
 
     private enum ThreadEventReplayPolicy {
         case currentGeneration
@@ -93,24 +90,8 @@ package actor CodexAppServerNotificationRouter {
         client: AppServerClient,
         accountEventHub: AccountEventHub = .init()
     ) {
-        self.client = client
+        _ = client
         self.accountEventHub = accountEventHub
-    }
-
-    package func start() async {
-        guard routerTask == nil, routingFailure == nil else {
-            return
-        }
-        let notifications = await client.notificationStream()
-        routerTask = Task {
-            do {
-                for try await notification in notifications {
-                    await self.route(notification)
-                }
-            } catch {
-                await self.finishAll(throwing: Self.connectionError(from: error))
-            }
-        }
     }
 
     package func events(for turnID: CodexTurnID) -> AsyncThrowingStream<CodexTurnEvent, Error> {
@@ -192,14 +173,7 @@ package actor CodexAppServerNotificationRouter {
         }
     }
 
-    package func stop() async {
-        routerTask?.cancel()
-        routerTask = nil
-        await finishAll(throwing: CodexAppServerError.connectionTerminated(.closedByCaller))
-    }
-
     package func accountEvents() async -> CodexAccountEvents {
-        await start()
         return await accountEventHub.events()
     }
 
@@ -208,7 +182,6 @@ package actor CodexAppServerNotificationRouter {
     ) async {
         await accountEventHub.replaceRateLimits(with: response)
     }
-
     package func turnSubscriberCountForTesting(for turnID: CodexTurnID) -> Int {
         turnSubscribersByTurnID[turnID]?.count ?? 0
     }
@@ -313,19 +286,10 @@ package actor CodexAppServerNotificationRouter {
         }
     }
 
-    private func route(_ notification: JSONRPC.Notification) async {
+    package func route(
+        _ decoded: AppServerNotificationDecoder.DecodedNotification
+    ) async throws {
         guard routingFailure == nil else {
-            return
-        }
-        let decoded: AppServerNotificationDecoder.DecodedNotification
-        do {
-            decoded = try notificationDecoder.decode(notification)
-        } catch {
-            await recordNotificationFailure(
-                error,
-                method: notification.method,
-                rawData: notification.params
-            )
             return
         }
         guard decoded.disposition != .explicitIgnore else {
@@ -345,18 +309,18 @@ package actor CodexAppServerNotificationRouter {
             for threadID in activeUnscopedDiagnosticThreadIDs() {
                 var routed = decoded
                 routed.context = .init(threadID: threadID)
-                await routeNotification(routed)
+                try await routeNotification(routed)
             }
             return
         }
         var routed = decoded
         routed.context = context
-        await routeNotification(routed)
+        try await routeNotification(routed)
     }
 
     private func routeNotification(
         _ notification: AppServerNotificationDecoder.DecodedNotification
-    ) async {
+    ) async throws {
         let context = notification.context
         switch notification.payload {
         case .turnCompleted(let turn):
@@ -366,56 +330,40 @@ package actor CodexAppServerNotificationRouter {
                     itemReducer.release(turnID: releasedTurnID)
                 }
             }
-            do {
-                let outcome = try terminalOutcome(from: turn, context: context)
-                let turnID = context.turnID ?? outcome.response.turnID
-                releasedTurnID = turnID
-                guard recordTerminalDecision(.outcome(outcome), turnID: turnID) else {
-                    return
-                }
-                if let threadID = context.threadID ?? threadIDByTurnID[turnID] {
-                    appendThreadEvent(.terminal(outcome), threadID: threadID)
-                }
-                let event = CodexTurnEvent.terminal(outcome)
-                turnHistoryByTurnID[turnID, default: []].append(event)
-                if let subscribers = turnSubscribersByTurnID[turnID] {
-                    for subscriber in subscribers.values {
-                        subscriber.continuation.yield(event)
-                    }
-                }
-                finishTurnSubscribers(turnID: turnID)
-            } catch {
-                await recordNotificationFailure(
-                    error,
-                    method: notification.methodName,
-                    rawData: notification.rawData
-                )
+            let outcome = try terminalOutcome(from: turn, context: context)
+            let turnID = context.turnID ?? outcome.response.turnID
+            releasedTurnID = turnID
+            guard recordTerminalDecision(.outcome(outcome), turnID: turnID) else {
+                return
             }
+            if let threadID = context.threadID ?? threadIDByTurnID[turnID] {
+                appendThreadEvent(.terminal(outcome), threadID: threadID)
+            }
+            let event = CodexTurnEvent.terminal(outcome)
+            turnHistoryByTurnID[turnID, default: []].append(event)
+            if let subscribers = turnSubscribersByTurnID[turnID] {
+                for subscriber in subscribers.values {
+                    subscriber.continuation.yield(event)
+                }
+            }
+            finishTurnSubscribers(turnID: turnID)
 
         case .item(let mutation):
-            do {
-                guard let turnID = context.turnID else {
-                    preconditionFailure("Validated item notification lost turnId.")
-                }
-                let event = try reduceItemEvent(mutation, turnID: turnID)
-                if let threadID = context.threadID ?? threadIDByTurnID[turnID] {
-                    appendThreadEvent(
-                        Self.threadEvent(from: event, turnID: turnID, threadID: threadID),
-                        threadID: threadID
-                    )
-                }
-                turnHistoryByTurnID[turnID, default: []].append(event)
-                if let subscribers = turnSubscribersByTurnID[turnID] {
-                    for subscriber in subscribers.values {
-                        subscriber.continuation.yield(event)
-                    }
-                }
-            } catch {
-                await recordNotificationFailure(
-                    error,
-                    method: notification.methodName,
-                    rawData: notification.rawData
+            guard let turnID = context.turnID else {
+                preconditionFailure("Validated item notification lost turnId.")
+            }
+            let event = try reduceItemEvent(mutation, turnID: turnID)
+            if let threadID = context.threadID ?? threadIDByTurnID[turnID] {
+                appendThreadEvent(
+                    Self.threadEvent(from: event, turnID: turnID, threadID: threadID),
+                    threadID: threadID
                 )
+            }
+            turnHistoryByTurnID[turnID, default: []].append(event)
+            if let subscribers = turnSubscribersByTurnID[turnID] {
+                for subscriber in subscribers.values {
+                    subscriber.continuation.yield(event)
+                }
             }
 
         case .turnStarted(let payloadTurnID):
@@ -458,6 +406,9 @@ package actor CodexAppServerNotificationRouter {
                 appendThreadEvent(.closed, threadID: threadID)
             }
 
+        case .serverRequestResolved:
+            preconditionFailure("Server-request resolution reached the domain router.")
+
         case .account(let mutation):
             switch mutation {
             case .updated(let update):
@@ -491,17 +442,6 @@ package actor CodexAppServerNotificationRouter {
         case .ignored:
             preconditionFailure("Explicit-ignore notification reached the router.")
         }
-    }
-
-    private func recordNotificationFailure(
-        _ error: Error,
-        method: String,
-        rawData: Data
-    ) async {
-        let failure = Self.notificationError(from: error, method: method, rawData: rawData)
-        routerTask?.cancel()
-        routerTask = nil
-        await finishAll(throwing: failure)
     }
 
     private func appendThreadEvent(_ event: CodexThreadEvent, threadID: CodexThreadID) {
@@ -938,7 +878,7 @@ package actor CodexAppServerNotificationRouter {
         }
     }
 
-    private func finishAll(throwing error: CodexAppServerError) async {
+    package func finishAll(throwing error: CodexAppServerError) async {
         let turnSubscribers = turnSubscribersByTurnID.values.flatMap(\.values)
         let threadSubscribers = threadSubscribersByThreadID.values.flatMap(\.values)
         routingFailure = routingFailure ?? error
@@ -973,44 +913,6 @@ package actor CodexAppServerNotificationRouter {
             )
         }
         return false
-    }
-
-    private nonisolated static func notificationError(
-        from error: Error,
-        method: String,
-        rawData: Data
-    ) -> CodexAppServerError {
-        if let error = error as? CodexAppServerError {
-            return error
-        }
-        return .malformedNotification(.init(
-            method: method,
-            message: error.localizedDescription,
-            rawData: rawData
-        ))
-    }
-
-    private nonisolated static func connectionError(from error: Error) -> CodexAppServerError {
-        if let error = error as? CodexAppServerError {
-            return error
-        }
-        if let error = error as? JSONRPC.Error {
-            switch error {
-            case .closed:
-                return .connectionTerminated(.transportFailure(.closed))
-            case .invalidMessage(let message):
-                return .connectionTerminated(.transportFailure(
-                    .protocolViolation(message: message, rawData: nil)
-                ))
-            case .responseError(let serverError):
-                return .connectionTerminated(.transportFailure(
-                    .protocolViolation(message: serverError.message, rawData: serverError.data)
-                ))
-            }
-        }
-        return .connectionTerminated(.transportFailure(
-            .io(errno: nil, message: error.localizedDescription)
-        ))
     }
 
     private func terminalOutcome(

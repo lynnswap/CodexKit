@@ -23,14 +23,39 @@ package enum JSONRPC {
         }
     }
 
+    package enum InboundEvent: Equatable, Sendable {
+        case notification(Notification)
+        case serverRequest(
+            id: CodexServerRequestID,
+            method: String,
+            params: Data
+        )
+    }
+
+    package enum ProcessExitObservation: Equatable, Sendable {
+        case unavailable
+        case exited(status: Int32?, observedBeforeTermination: Bool)
+        case failed(CodexTransportFailure)
+    }
+
     package protocol Transport: Sendable {
         func send(
             _ request: Request,
             acceptWrite: @Sendable () throws -> Void
         ) async throws -> Data
         func notify(_ notification: Notification) async throws
-        func notificationStream() async -> AsyncThrowingStream<Notification, Swift.Error>
-        func close() async
+        func nextInboundEvent() async throws -> InboundEvent?
+        func respond(
+            to requestID: CodexServerRequestID,
+            with response: CodexServerRequestResponse
+        ) async throws
+        func beginClose() async -> ProcessExitObservation?
+        func finishPendingResponsesAfterInboundDrain(
+            _ failure: CodexTransportFailure
+        ) async
+        func waitForProcessExit() async -> ProcessExitObservation
+        func waitUntilClosed() async
+        func reapProcess() async
     }
 
     package enum Error: Swift.Error, Equatable, Sendable, LocalizedError {
@@ -50,35 +75,58 @@ package enum JSONRPC {
         }
     }
 
+    package struct OutboundWriteFailure: Swift.Error, Equatable, Sendable {
+        package var failure: CodexTransportFailure
+
+        package init(_ failure: CodexTransportFailure) {
+            self.failure = failure
+        }
+    }
+
     package struct Framer: Sendable {
+        package static let maximumFrameByteCount = 16 * 1_024 * 1_024
+
         private var buffer = Data()
+        private let maximumFrameByteCount: Int
 
-        package init() {}
-
-        package mutating func append(_ data: Data) -> [Data] {
-            buffer.append(data)
-            return drainLines()
+        package init(maximumFrameByteCount: Int = Self.maximumFrameByteCount) {
+            precondition(maximumFrameByteCount > 0)
+            self.maximumFrameByteCount = maximumFrameByteCount
         }
 
-        package mutating func finish() -> [Data] {
+        package mutating func append(_ byte: UInt8) throws -> Data? {
+            if byte == 0x0A {
+                guard buffer.isEmpty == false else {
+                    return nil
+                }
+                let frame = buffer
+                buffer.removeAll(keepingCapacity: true)
+                return frame
+            }
+            guard buffer.count < maximumFrameByteCount else {
+                buffer.removeAll(keepingCapacity: false)
+                throw CodexTransportFailure.framing(
+                    message: "JSON-RPC frame exceeds \(maximumFrameByteCount) bytes.",
+                    rawData: nil
+                )
+            }
+            buffer.append(byte)
+            return nil
+        }
+
+        package mutating func finish() -> Data? {
             guard buffer.isEmpty == false else {
-                return []
+                return nil
             }
             defer { buffer.removeAll(keepingCapacity: false) }
-            return [buffer]
+            return buffer
         }
+    }
+}
 
-        private mutating func drainLines() -> [Data] {
-            var lines: [Data] = []
-            while let newline = buffer.firstIndex(of: 0x0A) {
-                let line = buffer[..<newline]
-                buffer.removeSubrange(...newline)
-                if line.isEmpty == false {
-                    lines.append(Data(line))
-                }
-            }
-            return lines
-        }
+package extension JSONRPC.Transport {
+    func send(_ request: JSONRPC.Request) async throws -> Data {
+        try await send(request, acceptWrite: {})
     }
 }
 

@@ -6,21 +6,19 @@ import Synchronization
 private let logger = Logger(subsystem: "CodexAppServerKit", category: "app-server-transport")
 
 package actor AppServerProcessTransport: JSONRPC.Transport {
+    package nonisolated static let stdoutReadChunkByteCount = 64 * 1_024
+
     package struct Configuration: Sendable {
         package var executable: String
         package var arguments: [String]
         package var environment: [String: String]
         package var codexHomeURL: URL
-        package var clock: CodexAppServerClock
-        package var serverRequestHandler: CodexAppServerRequestHandler?
 
         package init(
             executable: String? = nil,
             arguments: [String]? = nil,
             environment: [String: String] = ProcessInfo.processInfo.environment,
-            codexHomeURL: URL,
-            clock: CodexAppServerClock = .init(),
-            serverRequestHandler: CodexAppServerRequestHandler? = nil
+            codexHomeURL: URL
         ) {
             let resolvedExecutable = executable.map {
                 CodexAppServerExecutable.resolveExecutable($0, environment: environment)
@@ -36,31 +34,32 @@ package actor AppServerProcessTransport: JSONRPC.Transport {
                 codexHomeURL: codexHomeURL
             )
             self.codexHomeURL = codexHomeURL
-            self.clock = clock
-            self.serverRequestHandler = serverRequestHandler
         }
     }
 
-    private struct PendingResponse {
-        var continuation: CheckedContinuation<Data, Error>
+    private let process: AppServerSpawnedProcess
+    private let writer: AppServerJSONRPCWriter
+    private let mailbox: JSONRPCInboundFrameMailbox
+    private let terminationToken: ProcessTerminationToken
+    private let stdoutReadMetrics: AppServerStdoutReadMetrics
+    private let stdoutReaderTask: Task<Void, Never>
+    private let stderrDrainTask: Task<Void, Never>
+    private let processWaiterTask: Task<JSONRPC.ProcessExitObservation, Never>
+    private var pending: [Int: JSONRPCResponseWaiter] = [:]
+    private var acceptingOutbound = true
+    private var closeStarted = false
+    private var inboundTerminalObserved = false
+
+    package nonisolated var processTerminationToken: ProcessTerminationToken {
+        terminationToken
     }
 
-    private let process: AppServerSpawnedProcess
-    private let stdin: Pipe
-    private let stdout: Pipe
-    private let stderr: Pipe
-    private let stdoutEvents: AppServerPipeReadEventSource
-    private let stderrEvents: AppServerPipeReadEventSource
-    private let serverRequestCodec = CodexAppServerRequestCodec()
-    private let serverRequestHandler: CodexAppServerRequestHandler
-    private var framer = JSONRPC.Framer()
-    private var pending: [Int: PendingResponse] = [:]
-    private var notificationContinuations:
-        [UUID: AsyncThrowingStream<JSONRPC.Notification, Error>.Continuation] = [:]
-    private var stderrLogFilter = AppServerStderrLogFilter()
-    private var closed = false
-
-    package init(configuration: Configuration) throws {
+    package init(
+        configuration: Configuration,
+        writerFactory: @Sendable (FileHandle) -> AppServerJSONRPCWriter = {
+            AppServerJSONRPCWriter(fileHandle: $0)
+        }
+    ) throws {
         guard FileManager.default.isExecutableFile(atPath: configuration.executable) else {
             throw CodexLaunchFailure.executableNotFound(
                 command: configuration.executable,
@@ -94,21 +93,27 @@ package actor AppServerProcessTransport: JSONRPC.Transport {
         let stdout = launch.stdout
         let stderr = launch.stderr
         self.process = process
-        self.stdin = stdin
-        self.stdout = stdout
-        self.stderr = stderr
-        self.serverRequestHandler = configuration.serverRequestHandler
-            ?? CodexAppServer.Configuration.defaultServerRequestHandler(clock: configuration.clock)
-        let stdoutEvents = AppServerPipeReadEventSource(
-            fileHandle: stdout.fileHandleForReading,
-            label: "com.lynnpd.CodexAppServerKit.app-server.stdout"
-        )
-        let stderrEvents = AppServerPipeReadEventSource(
-            fileHandle: stderr.fileHandleForReading,
-            label: "com.lynnpd.CodexAppServerKit.app-server.stderr"
-        )
-        self.stdoutEvents = stdoutEvents
-        self.stderrEvents = stderrEvents
+        let writer = writerFactory(stdin.fileHandleForWriting)
+        self.writer = writer
+        let mailbox = JSONRPCInboundFrameMailbox()
+        self.mailbox = mailbox
+        let stdoutReadMetrics = AppServerStdoutReadMetrics()
+        self.stdoutReadMetrics = stdoutReadMetrics
+        let terminationToken = ProcessTerminationToken(processGroupID: process.processIdentifier)
+        self.terminationToken = terminationToken
+        self.stdoutReaderTask = Task {
+            await Self.readStdout(
+                stdout.fileHandleForReading,
+                into: mailbox,
+                metrics: stdoutReadMetrics
+            )
+        }
+        self.stderrDrainTask = Task {
+            await Self.drainStderr(stderr.fileHandleForReading)
+        }
+        self.processWaiterTask = Task {
+            await process.waitForExit(terminationToken: terminationToken)
+        }
         logger.info(
             "Launching codex app-server: \(configuration.executable, privacy: .public) \(configuration.arguments.joined(separator: " "), privacy: .public)"
         )
@@ -116,230 +121,173 @@ package actor AppServerProcessTransport: JSONRPC.Transport {
             "Using codex app-server home: \(configuration.codexHomeURL.path, privacy: .public)")
         logger.info(
             "codex app-server launched with pid \(process.processIdentifier, privacy: .public)")
-        Task { [weak self, events = stdoutEvents.events] in
-            for await event in events {
-                await self?.receiveStdout(event)
-            }
-        }
-        Task { [weak self, events = stderrEvents.events] in
-            for await event in events {
-                await self?.receiveStderr(event)
-            }
-        }
-        stdoutEvents.start()
-        stderrEvents.start()
     }
 
     package func send(
         _ request: JSONRPC.Request,
         acceptWrite: @Sendable () throws -> Void
     ) async throws -> Data {
-        try throwIfClosed()
+        try Task.checkCancellation()
+        try throwIfNotAcceptingOutbound()
+        precondition(
+            pending[request.id] == nil,
+            "JSON-RPC request IDs must be unique while a response is pending."
+        )
         let payload = try makeRequestPayload(request)
         try acceptWrite()
-        return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                pending[request.id] = .init(continuation: continuation)
-                do {
-                    try stdin.fileHandleForWriting.write(contentsOf: payload)
-                } catch {
-                    pending.removeValue(forKey: request.id)
-                    continuation.resume(throwing: error)
-                }
-            }
-        } onCancel: {
-            Task {
-                await self.cancelPendingResponse(id: request.id)
-            }
+
+        let waiter = JSONRPCResponseWaiter()
+        pending[request.id] = waiter
+        do {
+            try writer.write(payload)
+        } catch {
+            pending.removeValue(forKey: request.id)
+            let failure = Self.transportFailure(from: error)
+            await claimTerminal(failure)
+            throw JSONRPC.OutboundWriteFailure(failure)
         }
+        return try await waiter.wait()
     }
 
     package func notify(_ notification: JSONRPC.Notification) async throws {
-        try throwIfClosed()
+        try Task.checkCancellation()
+        try throwIfNotAcceptingOutbound()
         let payload = try makeNotificationPayload(notification)
-        try stdin.fileHandleForWriting.write(contentsOf: payload)
-    }
-
-    package func notificationStream() -> AsyncThrowingStream<JSONRPC.Notification, Error> {
-        AsyncThrowingStream(bufferingPolicy: .unbounded) { continuation in
-            if closed {
-                continuation.finish(throwing: JSONRPC.Error.closed)
-                return
-            }
-            let id = UUID()
-            notificationContinuations[id] = continuation
-            continuation.onTermination = { _ in
-                Task { await self.removeNotificationContinuation(id: id) }
-            }
-        }
-    }
-
-    package func close() async {
-        await closeTransport(terminateProcess: true)
-    }
-
-    private func closeTransport(terminateProcess: Bool) async {
-        guard closed == false else {
-            return
-        }
-        closed = true
-        stdoutEvents.cancel()
-        stderrEvents.cancel()
-        try? stdin.fileHandleForWriting.close()
-        if terminateProcess {
-            logger.info(
-                "Terminating codex app-server pid \(self.process.processIdentifier, privacy: .public)"
-            )
-            await process.terminateAndWait()
-        }
-        finishAll(throwing: JSONRPC.Error.closed)
-    }
-
-    private func receiveStdout(_ event: AppServerPipeReadEvent) async {
-        switch event {
-        case .data(let data):
-            receive(data)
-        case .end:
-            await finishReceiving()
-        }
-    }
-
-    private func receive(_ data: Data) {
-        let messages = framer.append(data)
-        for message in messages {
-            processMessage(message)
-        }
-    }
-
-    private func receiveStderr(_ event: AppServerPipeReadEvent) {
-        let events: [AppServerStderrLogFilter.Event]
-        switch event {
-        case .data(let data):
-            events = stderrLogFilter.append(data)
-        case .end:
-            events = stderrLogFilter.finish()
-        }
-        for event in events {
-            switch event.level {
-            case .error:
-                logger.error("codex app-server stderr: \(event.message, privacy: .public)")
-            case .warning:
-                logger.warning("codex app-server stderr: \(event.message, privacy: .public)")
-            }
-        }
-    }
-
-    private func finishReceiving() async {
-        guard closed == false else {
-            return
-        }
-        logger.info("codex app-server stdout reached EOF")
-        for message in framer.finish() {
-            processMessage(message)
-        }
-        await closeTransport(terminateProcess: true)
-    }
-
-    private func processMessage(_ data: Data) {
-        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return
-        }
-        if let method = object["method"] as? String {
-            if object.keys.contains("id") {
-                processServerRequest(method: method, object: object)
-                return
-            }
-            processNotification(method: method, object: object)
-        } else if let id = object["id"] as? Int {
-            processResponse(id: id, object: object)
-        }
-    }
-
-    private func processServerRequest(method: String, object: [String: Any]) {
-        guard let id = CodexServerRequestID(jsonObject: object["id"]) else {
-            logger.error(
-                "Failed to decode app-server request \(method, privacy: .public): invalid id"
-            )
-            return
-        }
         do {
-            let params = object["params"] ?? [:]
-            let data = try Self.responsePayloadData(from: params)
-            let request = try serverRequestCodec.decode(method: method, params: data)
-            Task {
-                await self.respond(to: id, request: request)
-            }
+            try writer.write(payload)
         } catch {
-            logger.error(
-                "Failed to decode app-server request \(method, privacy: .public): \(error.localizedDescription, privacy: .public)"
-            )
-            Task {
-                self.respond(
-                    to: id,
-                    response: CodexAppServerRequestCodec.internalError(
-                        "Failed to decode \(method): \(error.localizedDescription)"
+            let failure = Self.transportFailure(from: error)
+            await claimTerminal(failure)
+            throw failure
+        }
+    }
+
+    package func nextInboundEvent() async throws -> JSONRPC.InboundEvent? {
+        while true {
+            let frame: Data
+            do {
+                guard let next = try await mailbox.next() else {
+                    inboundTerminalObserved = true
+                    return nil
+                }
+                frame = next
+            } catch {
+                let snapshot = await mailbox.snapshot()
+                if snapshot.isTerminal, snapshot.acceptedFrameCount == 0 {
+                    inboundTerminalObserved = true
+                }
+                throw error
+            }
+
+            switch try JSONRPC.decodeInboundEnvelope(frame) {
+            case .response(let id, let result):
+                guard let waiter = pending.removeValue(forKey: id) else {
+                    if acceptingOutbound == false {
+                        logger.warning(
+                            "Ignoring late JSON-RPC response \(id, privacy: .public) after outbound close"
+                        )
+                        continue
+                    }
+                    let failure = CodexTransportFailure.protocolViolation(
+                        message: "Received a JSON-RPC response for unknown request id \(id).",
+                        rawData: frame
                     )
-                )
+                    await claimTerminal(failure)
+                    throw failure
+                }
+                waiter.resolve(result)
+            case .event(let event):
+                return event
             }
         }
     }
 
-    private func processResponse(id: Int, object: [String: Any]) {
-        guard let pendingResponse = pending.removeValue(forKey: id) else {
-            return
-        }
-        if let errorObject = object["error"] as? [String: Any] {
-            let code = errorObject["code"] as? Int ?? -1
-            let message = errorObject["message"] as? String ?? "JSON-RPC request failed."
-            let rawData = errorObject["data"].flatMap { try? Self.responsePayloadData(from: $0) }
-            let turnError = rawData
-                .flatMap { try? JSONDecoder().decode(AppServerAPI.Turn.Error.self, from: $0) }
-                .map(CodexAppServer.turnError(from:))
-            pendingResponse.continuation.resume(
-                throwing: JSONRPC.Error.responseError(.init(
-                    code: code,
-                    message: message,
-                    data: rawData,
-                    turnError: turnError
-                )))
-            return
-        }
-        let result = object["result"] ?? [:]
+    package func respond(
+        to requestID: CodexServerRequestID,
+        with response: CodexServerRequestResponse
+    ) async throws {
+        try throwIfNotAcceptingOutbound()
         do {
-            let data = try Self.responsePayloadData(from: result)
-            pendingResponse.continuation.resume(returning: data)
+            try writer.write(Self.serverRequestResponsePayload(id: requestID, response: response))
         } catch {
-            pendingResponse.continuation.resume(throwing: error)
+            let failure = Self.transportFailure(from: error)
+            await claimTerminal(failure)
+            throw failure
         }
+    }
+
+    package func beginClose() async -> JSONRPC.ProcessExitObservation? {
+        guard closeStarted == false else {
+            return process.observedExitForCloseArbitration()
+        }
+        closeStarted = true
+        acceptingOutbound = false
+        let exitObservation = process.markTerminationStarted()
+        writer.close()
+        await mailbox.finish()
+        logger.info(
+            "Terminating codex app-server pid \(self.process.processIdentifier, privacy: .public)"
+        )
+        terminationToken.terminateOnce()
+        return exitObservation
+    }
+
+    package func finishPendingResponsesAfterInboundDrain(
+        _ failure: CodexTransportFailure
+    ) {
+        precondition(
+            inboundTerminalObserved,
+            "Pending responses can finish only after inbound terminal was observed."
+        )
+        let responseFailure: JSONRPC.Error
+        switch failure {
+        case .closed:
+            responseFailure = .closed
+        case .io, .framing, .protocolViolation, .contractViolation:
+            responseFailure = .invalidMessage(failure.localizedDescription)
+        }
+        let waiters = pending.values
+        pending.removeAll(keepingCapacity: false)
+        for waiter in waiters {
+            waiter.resolve(.failure(responseFailure))
+        }
+    }
+
+    package func waitForProcessExit() async -> JSONRPC.ProcessExitObservation {
+        await processWaiterTask.value
+    }
+
+    package func waitUntilClosed() async {
+        await stdoutReaderTask.value
+        await stderrDrainTask.value
+    }
+
+    package func reapProcess() async {
+        await process.reap()
+    }
+
+    package func processLifecycleSnapshotForTesting() -> AppServerProcessLifecycleSnapshot {
+        process.lifecycleSnapshot()
+    }
+
+    package func inboundMailboxSnapshotForTesting() async -> JSONRPCInboundFrameMailbox.Snapshot {
+        await mailbox.snapshot()
+    }
+
+    package func waitForInboundAdmissionWaiterCountForTesting(atLeast minimumCount: Int) async {
+        await mailbox.waitForAdmissionWaiterCount(atLeast: minimumCount)
+    }
+
+    package func waitUntilInboundReceiverIsRegisteredForTesting() async {
+        await mailbox.waitUntilReceiverIsRegistered()
+    }
+
+    package func stdoutReadSnapshotForTesting() -> AppServerStdoutReadSnapshot {
+        stdoutReadMetrics.snapshot()
     }
 
     package static func responsePayloadData(from result: Any) throws -> Data {
-        if result is NSNull {
-            return Data("{}".utf8)
-        }
-        return try JSONSerialization.data(withJSONObject: result, options: [.fragmentsAllowed])
-    }
-
-    private func respond(
-        to id: CodexServerRequestID,
-        request: CodexAppServerRequest
-    ) async {
-        let response = await serverRequestCodec.handle(request, using: serverRequestHandler)
-        respond(to: id, response: response)
-    }
-
-    private func respond(
-        to id: CodexServerRequestID,
-        response: CodexServerRequestResponse
-    ) {
-        do {
-            let payload = try Self.serverRequestResponsePayload(id: id, response: response)
-            try stdin.fileHandleForWriting.write(contentsOf: payload)
-        } catch {
-            logger.error(
-                "Failed to respond to app-server request: \(error.localizedDescription, privacy: .public)"
-            )
-        }
+        try JSONRPC.payloadData(from: result)
     }
 
     package static func serverRequestResponsePayload(
@@ -370,41 +318,595 @@ package actor AppServerProcessTransport: JSONRPC.Transport {
         return data
     }
 
-    private func processNotification(method: String, object: [String: Any]) {
-        let params = object["params"] ?? [:]
-        guard let data = try? JSONSerialization.data(withJSONObject: params) else {
+    private func throwIfNotAcceptingOutbound() throws {
+        if acceptingOutbound == false {
+            throw JSONRPC.Error.closed
+        }
+    }
+
+    private func claimTerminal(_ failure: CodexTransportFailure) async {
+        if acceptingOutbound {
+            acceptingOutbound = false
+            writer.close()
+        }
+        await mailbox.finish(throwing: failure)
+    }
+
+    private nonisolated static func transportFailure(from error: Error) -> CodexTransportFailure {
+        if let failure = error as? CodexTransportFailure {
+            return failure
+        }
+        if let error = error as? JSONRPC.Error, error == .closed {
+            return .closed
+        }
+        return .io(
+            errno: (error as? POSIXError)?.code.rawValue,
+            message: error.localizedDescription
+        )
+    }
+
+    private nonisolated static func readStdout(
+        _ fileHandle: FileHandle,
+        into mailbox: JSONRPCInboundFrameMailbox,
+        metrics: AppServerStdoutReadMetrics
+    ) async {
+        var framer = JSONRPC.Framer()
+        var currentChunkRemainderByteCount = 0
+        let eventSource: AppServerPipeReadEventSource
+        do {
+            try makeNonblocking(fileHandle.fileDescriptor)
+            eventSource = AppServerPipeReadEventSource(
+                fileHandle: fileHandle,
+                label: "app-server-stdout",
+                onCancel: {
+                    metrics.sourceCancellationCompleted()
+                }
+            )
+        } catch {
+            try? fileHandle.close()
+            await mailbox.finish(throwing: .io(
+                errno: (error as? POSIXError)?.code.rawValue,
+                message: error.localizedDescription
+            ))
             return
         }
-        let notification = JSONRPC.Notification(method: method, params: data)
-        for continuation in notificationContinuations.values {
-            continuation.yield(notification)
+        do {
+            stdoutEvents: while true {
+                try Task.checkCancellation()
+                switch await eventSource.next() {
+                case .ready:
+                    readLoop: while true {
+                        switch try readNonblockingChunk(
+                            fileHandle.fileDescriptor,
+                            maximumByteCount: stdoutReadChunkByteCount
+                        ) {
+                        case .data(let data):
+                            metrics.beginChunk(byteCount: data.count)
+                            currentChunkRemainderByteCount = data.count
+                            for byte in data {
+                                currentChunkRemainderByteCount -= 1
+                                let frame = try framer.append(byte)
+                                if let frame {
+                                    metrics.updateRemainder(
+                                        byteCount: currentChunkRemainderByteCount
+                                    )
+                                    try await mailbox.send(frame)
+                                }
+                            }
+                            metrics.updateRemainder(byteCount: 0)
+                        case .wouldBlock:
+                            break readLoop
+                        case .end:
+                            if let frame = framer.finish() {
+                                try await mailbox.send(frame)
+                            }
+                            await mailbox.finish()
+                            break stdoutEvents
+                        }
+                    }
+                case .cancelled:
+                    throw CancellationError()
+                }
+            }
+        } catch is CancellationError {
+            metrics.dropRemainder(byteCount: currentChunkRemainderByteCount)
+            await mailbox.finish(throwing: .closed)
+        } catch let failure as CodexTransportFailure {
+            metrics.dropRemainder(byteCount: currentChunkRemainderByteCount)
+            await mailbox.finish(throwing: failure)
+        } catch {
+            metrics.dropRemainder(byteCount: currentChunkRemainderByteCount)
+            await mailbox.finish(throwing: .io(
+                errno: (error as? POSIXError)?.code.rawValue,
+                message: error.localizedDescription
+            ))
+        }
+        await eventSource.cancelAndWait()
+    }
+
+    private nonisolated static func drainStderr(_ fileHandle: FileHandle) async {
+        var filter = AppServerStderrLogFilter()
+        let eventSource: AppServerPipeReadEventSource
+        do {
+            try makeNonblocking(fileHandle.fileDescriptor)
+            eventSource = AppServerPipeReadEventSource(
+                fileHandle: fileHandle,
+                label: "app-server-stderr"
+            )
+        } catch {
+            try? fileHandle.close()
+            logger.error(
+                "codex app-server stderr setup failed: \(error.localizedDescription, privacy: .public)"
+            )
+            return
+        }
+        do {
+            eventLoop: while true {
+                try Task.checkCancellation()
+                switch await eventSource.next() {
+                case .ready:
+                    readLoop: while true {
+                        switch try readNonblockingChunk(fileHandle.fileDescriptor) {
+                        case .data(let data):
+                            for event in filter.append(data) {
+                                logStderr(event)
+                            }
+                        case .wouldBlock:
+                            break readLoop
+                        case .end:
+                            break eventLoop
+                        }
+                    }
+                case .cancelled:
+                    throw CancellationError()
+                }
+            }
+        } catch is CancellationError {
+        } catch {
+            logger.error(
+                "codex app-server stderr read failed: \(error.localizedDescription, privacy: .public)"
+            )
+        }
+        await eventSource.cancelAndWait()
+        for event in filter.finish() {
+            logStderr(event)
         }
     }
 
-    private func cancelPendingResponse(id: Int) {
-        pending.removeValue(forKey: id)?.continuation.resume(throwing: CancellationError())
+    private enum NonblockingChunkRead {
+        case data(Data)
+        case wouldBlock
+        case end
     }
 
-    private func removeNotificationContinuation(id: UUID) {
-        notificationContinuations.removeValue(forKey: id)
-    }
-
-    private func finishAll(throwing error: Error) {
-        let responses = pending.values
-        pending.removeAll()
-        for response in responses {
-            response.continuation.resume(throwing: error)
+    private nonisolated static func makeNonblocking(_ fileDescriptor: Int32) throws {
+        let flags = fcntl(fileDescriptor, F_GETFL)
+        guard flags != -1 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
-        let continuations = notificationContinuations.values
-        notificationContinuations.removeAll()
-        for continuation in continuations {
-            continuation.finish(throwing: error)
+        guard fcntl(fileDescriptor, F_SETFL, flags | O_NONBLOCK) != -1 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
     }
 
-    private func throwIfClosed() throws {
-        if closed {
-            throw JSONRPC.Error.closed
+    private nonisolated static func readNonblockingChunk(
+        _ fileDescriptor: Int32,
+        maximumByteCount: Int = 16 * 1_024
+    ) throws -> NonblockingChunkRead {
+        precondition(maximumByteCount > 0)
+        var bytes = [UInt8](repeating: 0, count: maximumByteCount)
+        let count: Int
+        while true {
+            let result = bytes.withUnsafeMutableBytes { buffer in
+                Darwin.read(fileDescriptor, buffer.baseAddress, buffer.count)
+            }
+            if result == -1, errno == EINTR {
+                continue
+            }
+            count = result
+            break
+        }
+        if count > 0 {
+            return .data(Data(bytes.prefix(count)))
+        }
+        if count == 0 {
+            return .end
+        }
+        if errno == EAGAIN || errno == EWOULDBLOCK {
+            return .wouldBlock
+        }
+        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+
+    private nonisolated static func logStderr(_ event: AppServerStderrLogFilter.Event) {
+        switch event.level {
+        case .error:
+            logger.error("codex app-server stderr: \(event.message, privacy: .public)")
+        case .warning:
+            logger.warning("codex app-server stderr: \(event.message, privacy: .public)")
+        }
+    }
+}
+
+private enum AppServerReadEvent: Sendable {
+    case ready
+    case cancelled
+}
+
+private final class AppServerOneBitReadSignal: Sendable {
+    private struct State {
+        var hasPendingReadiness = false
+        var isCancelled = false
+        var waiter: AppServerReadEventWaiter?
+    }
+
+    private let state = Mutex(State())
+
+    func next() async -> AppServerReadEvent {
+        if Task.isCancelled {
+            return .cancelled
+        }
+        let waiter = AppServerReadEventWaiter()
+        let immediate = state.withLock { state -> AppServerReadEvent? in
+            if state.hasPendingReadiness {
+                state.hasPendingReadiness = false
+                return .ready
+            }
+            if state.isCancelled {
+                return .cancelled
+            }
+            precondition(state.waiter == nil, "Read signal supports one consumer.")
+            state.waiter = waiter
+            return nil
+        }
+        if let immediate {
+            return immediate
+        }
+        let event = await waiter.wait()
+        state.withLock { state in
+            if state.waiter?.id == waiter.id {
+                state.waiter = nil
+            }
+        }
+        return event
+    }
+
+    func signalReadiness() {
+        let waiter = state.withLock { state -> AppServerReadEventWaiter? in
+            guard state.isCancelled == false else {
+                return nil
+            }
+            if let waiter = state.waiter {
+                state.waiter = nil
+                return waiter
+            }
+            state.hasPendingReadiness = true
+            return nil
+        }
+        if let waiter, waiter.resolve(.ready) == false {
+            state.withLock { state in
+                if state.isCancelled == false {
+                    state.hasPendingReadiness = true
+                }
+            }
+        }
+    }
+
+    func cancel() {
+        let waiter = state.withLock { state -> AppServerReadEventWaiter? in
+            guard state.isCancelled == false else {
+                return nil
+            }
+            state.isCancelled = true
+            state.hasPendingReadiness = false
+            defer { state.waiter = nil }
+            return state.waiter
+        }
+        _ = waiter?.resolve(.cancelled)
+    }
+}
+
+private final class AppServerReadEventWaiter: Sendable {
+    private enum State {
+        case pending(CheckedContinuation<AppServerReadEvent, Never>?)
+        case resolved(AppServerReadEvent)
+    }
+
+    let id = UUID()
+    private let state = Mutex<State>(.pending(nil))
+
+    func wait() async -> AppServerReadEvent {
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                let immediate = state.withLock { state -> AppServerReadEvent? in
+                    switch state {
+                    case .pending(nil):
+                        state = .pending(continuation)
+                        return nil
+                    case .pending(.some):
+                        preconditionFailure("Read waiter registered more than once.")
+                    case .resolved(let event):
+                        return event
+                    }
+                }
+                if let immediate {
+                    continuation.resume(returning: immediate)
+                }
+            }
+        } onCancel: {
+            _ = self.resolve(.cancelled)
+        }
+    }
+
+    @discardableResult
+    func resolve(_ event: AppServerReadEvent) -> Bool {
+        let result = state.withLock {
+            state -> (Bool, CheckedContinuation<AppServerReadEvent, Never>?) in
+            switch state {
+            case .pending(let continuation):
+                state = .resolved(event)
+                return (true, continuation)
+            case .resolved:
+                return (false, nil)
+            }
+        }
+        result.1?.resume(returning: event)
+        return result.0
+    }
+}
+
+private final class AppServerPipeReadEventSource: Sendable {
+    private struct State {
+        var source: DispatchSourceRead?
+    }
+
+    private let signal = AppServerOneBitReadSignal()
+    private let cancellationCompletion = AppServerCancellationCompletion()
+    private let state: Mutex<State>
+
+    init(
+        fileHandle: FileHandle,
+        label: String,
+        onCancel: @escaping @Sendable () -> Void = {}
+    ) {
+        let queue = DispatchQueue(label: "CodexAppServerKit.\(label)")
+        let source = DispatchSource.makeReadSource(
+            fileDescriptor: fileHandle.fileDescriptor,
+            queue: queue
+        )
+        self.state = Mutex(.init(source: source))
+        let signal = signal
+        source.setEventHandler {
+            signal.signalReadiness()
+        }
+        let cancellationCompletion = cancellationCompletion
+        source.setCancelHandler {
+            try? fileHandle.close()
+            onCancel()
+            signal.cancel()
+            cancellationCompletion.complete()
+        }
+        source.resume()
+    }
+
+    deinit {
+        cancel()
+    }
+
+    func next() async -> AppServerReadEvent {
+        await signal.next()
+    }
+
+    func cancel() {
+        let source = state.withLock { state in
+            defer { state.source = nil }
+            return state.source
+        }
+        source?.cancel()
+    }
+
+    func cancelAndWait() async {
+        cancel()
+        await cancellationCompletion.wait()
+    }
+}
+
+package struct AppServerStdoutReadSnapshot: Equatable, Sendable {
+    package var successfulReadCount: Int
+    package var maximumChunkByteCount: Int
+    package var currentChunkRemainderByteCount: Int
+    package var droppedRemainderByteCount: Int
+    package var sourceCancellationCompleted: Bool
+}
+
+private final class AppServerStdoutReadMetrics: Sendable {
+    private struct State {
+        var successfulReadCount = 0
+        var maximumChunkByteCount = 0
+        var currentChunkRemainderByteCount = 0
+        var droppedRemainderByteCount = 0
+        var didCompleteSourceCancellation = false
+    }
+
+    private let state = Mutex(State())
+
+    func beginChunk(byteCount: Int) {
+        state.withLock { state in
+            precondition(
+                state.currentChunkRemainderByteCount == 0,
+                "A new stdout chunk cannot be read before its predecessor is consumed."
+            )
+            state.successfulReadCount += 1
+            state.maximumChunkByteCount = max(state.maximumChunkByteCount, byteCount)
+            state.currentChunkRemainderByteCount = byteCount
+        }
+    }
+
+    func updateRemainder(byteCount: Int) {
+        state.withLock { state in
+            precondition(byteCount >= 0)
+            state.currentChunkRemainderByteCount = byteCount
+        }
+    }
+
+    func dropRemainder(byteCount: Int) {
+        state.withLock { state in
+            precondition(byteCount >= 0)
+            state.droppedRemainderByteCount += byteCount
+            state.currentChunkRemainderByteCount = 0
+        }
+    }
+
+    func sourceCancellationCompleted() {
+        state.withLock { $0.didCompleteSourceCancellation = true }
+    }
+
+    func snapshot() -> AppServerStdoutReadSnapshot {
+        state.withLock { state in
+            .init(
+                successfulReadCount: state.successfulReadCount,
+                maximumChunkByteCount: state.maximumChunkByteCount,
+                currentChunkRemainderByteCount: state.currentChunkRemainderByteCount,
+                droppedRemainderByteCount: state.droppedRemainderByteCount,
+                sourceCancellationCompleted: state.didCompleteSourceCancellation
+            )
+        }
+    }
+}
+
+private final class AppServerProcessExitEventSource: Sendable {
+    private struct State {
+        var source: DispatchSourceProcess?
+    }
+
+    private let signal = AppServerOneBitReadSignal()
+    private let cancellationCompletion = AppServerCancellationCompletion()
+    private let state: Mutex<State>
+
+    init(processIdentifier: pid_t) {
+        let queue = DispatchQueue(label: "CodexAppServerKit.app-server-process-exit")
+        let source = DispatchSource.makeProcessSource(
+            identifier: processIdentifier,
+            eventMask: .exit,
+            queue: queue
+        )
+        self.state = Mutex(.init(source: source))
+        let signal = signal
+        source.setEventHandler {
+            signal.signalReadiness()
+        }
+        let cancellationCompletion = cancellationCompletion
+        source.setCancelHandler {
+            signal.cancel()
+            cancellationCompletion.complete()
+        }
+        source.resume()
+    }
+
+    deinit {
+        cancel()
+    }
+
+    func next() async -> AppServerReadEvent {
+        await signal.next()
+    }
+
+    func cancel() {
+        let source = state.withLock { state in
+            defer { state.source = nil }
+            return state.source
+        }
+        source?.cancel()
+    }
+
+    func cancelAndWait() async {
+        cancel()
+        await cancellationCompletion.wait()
+    }
+}
+
+private final class AppServerCancellationCompletion: Sendable {
+    private enum State {
+        case pending([CheckedContinuation<Void, Never>])
+        case complete
+    }
+
+    private let state = Mutex<State>(.pending([]))
+
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            let isComplete = state.withLock { state in
+                switch state {
+                case .pending(var waiters):
+                    waiters.append(continuation)
+                    state = .pending(waiters)
+                    return false
+                case .complete:
+                    return true
+                }
+            }
+            if isComplete {
+                continuation.resume()
+            }
+        }
+    }
+
+    func complete() {
+        let waiters = state.withLock { state in
+            switch state {
+            case .pending(let waiters):
+                state = .complete
+                return waiters
+            case .complete:
+                return []
+            }
+        }
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
+}
+
+package final class AppServerJSONRPCWriter: Sendable {
+    private struct State {
+        var fileHandle: FileHandle?
+        var writeOverride: (@Sendable (Data) throws -> Void)?
+    }
+
+    private let state: Mutex<State>
+
+    package init(fileHandle: FileHandle) {
+        self.state = Mutex(.init(fileHandle: fileHandle, writeOverride: nil))
+    }
+
+    package init(
+        fileHandle: FileHandle,
+        writeOverride: @escaping @Sendable (Data) throws -> Void
+    ) {
+        self.state = Mutex(.init(
+            fileHandle: fileHandle,
+            writeOverride: writeOverride
+        ))
+    }
+
+    package func write(_ data: Data) throws {
+        try state.withLock { state in
+            guard let fileHandle = state.fileHandle else {
+                throw JSONRPC.Error.closed
+            }
+            if let writeOverride = state.writeOverride {
+                try writeOverride(data)
+                return
+            }
+            try fileHandle.write(contentsOf: data)
+        }
+    }
+
+    package func close() {
+        state.withLock { state in
+            try? state.fileHandle?.close()
+            state.fileHandle = nil
+            state.writeOverride = nil
         }
     }
 }
@@ -414,11 +916,6 @@ private struct AppServerProcessLaunch {
     var stdin: Pipe
     var stdout: Pipe
     var stderr: Pipe
-}
-
-private enum AppServerPipeReadEvent: Sendable {
-    case data(Data)
-    case end
 }
 
 package struct AppServerStderrLogFilter: Sendable {
@@ -574,73 +1071,27 @@ package struct AppServerStderrLogFilter: Sendable {
     }
 }
 
-private final class AppServerPipeReadEventSource: @unchecked Sendable {
-    let events: AsyncStream<AppServerPipeReadEvent>
-
-    private let fileHandle: FileHandle
-    private let queue: DispatchQueue
-    private let continuation = Mutex<AsyncStream<AppServerPipeReadEvent>.Continuation?>(nil)
-
-    init(fileHandle: FileHandle, label: String) {
-        self.fileHandle = fileHandle
-        self.queue = DispatchQueue(label: label)
-        var continuation: AsyncStream<AppServerPipeReadEvent>.Continuation?
-        self.events = AsyncStream(bufferingPolicy: .unbounded) { streamContinuation in
-            continuation = streamContinuation
-        }
-        self.continuation.withLock { storedContinuation in
-            storedContinuation = continuation
-        }
-    }
-
-    func start() {
-        fileHandle.readabilityHandler = { [weak self] handle in
-            self?.queue.async { [weak self] in
-                guard let self else {
-                    return
-                }
-                let data = handle.availableData
-                if data.isEmpty {
-                    finish(with: .end)
-                    return
-                }
-                yield(.data(data))
-            }
-        }
-    }
-
-    func cancel() {
-        fileHandle.readabilityHandler = nil
-        finish()
-    }
-
-    private func yield(_ event: AppServerPipeReadEvent) {
-        let continuation = continuation.withLock { $0 }
-        continuation?.yield(event)
-    }
-
-    private func finish(with finalEvent: AppServerPipeReadEvent? = nil) {
-        let continuation = continuation.withLock { continuation in
-            let storedContinuation = continuation
-            continuation = nil
-            return storedContinuation
-        }
-        if let finalEvent {
-            continuation?.yield(finalEvent)
-        }
-        continuation?.finish()
-    }
+package struct AppServerProcessLifecycleSnapshot: Equatable, Sendable {
+    package var observedExitStatus: Int32?
+    package var didObserveExit: Bool
+    package var didBeginTermination: Bool
+    package var didReap: Bool
+    package var reapSystemCallCount: Int
 }
 
 private final class AppServerSpawnedProcess: @unchecked Sendable {
     let processIdentifier: pid_t
 
-    private let processGroupID: pid_t
-    private let didReap = Mutex(false)
+    private struct ExitState {
+        var observation: JSONRPC.ProcessExitObservation?
+        var didBeginTermination = false
+        var didReap = false
+        var reapSystemCallCount = 0
+    }
+    private let exitState = Mutex(ExitState())
 
     private init(processIdentifier: pid_t) {
         self.processIdentifier = processIdentifier
-        self.processGroupID = processIdentifier
     }
 
     static func launch(
@@ -727,138 +1178,347 @@ private final class AppServerSpawnedProcess: @unchecked Sendable {
         )
     }
 
-    func terminateAndWait(
-        graceDuration: Duration = .seconds(2),
-        killDuration: Duration = .seconds(1)
-    ) async {
-        let trackedProcessIDs = descendantProcessIDs()
-        guard isFullyTerminated(trackedProcessIDs: trackedProcessIDs) == false else {
-            return
-        }
-        signalProcessTree(SIGTERM, trackedProcessIDs: trackedProcessIDs)
-        guard
-            await waitUntilExit(timeout: graceDuration, trackedProcessIDs: trackedProcessIDs)
-                == false
-        else {
-            return
-        }
-        signalProcessTree(SIGKILL, trackedProcessIDs: trackedProcessIDs)
-        _ = await waitUntilExit(timeout: killDuration, trackedProcessIDs: trackedProcessIDs)
-    }
-
-    private func signalProcessTree(_ signal: Int32, trackedProcessIDs: Set<pid_t>) {
-        if Darwin.kill(-processGroupID, signal) == 0 {
-            for processID in trackedProcessIDs {
-                _ = Darwin.kill(processID, signal)
+    func waitForExit(
+        terminationToken: ProcessTerminationToken,
+        graceDuration: Duration = .seconds(2)
+    ) async -> JSONRPC.ProcessExitObservation {
+        let exitSource = AppServerProcessExitEventSource(
+            processIdentifier: processIdentifier
+        )
+        let observation: JSONRPC.ProcessExitObservation
+        if let alreadyExited = observeExitIfAvailable() {
+            if case .failed = alreadyExited {
+                terminationToken.terminateOnce()
+                await Self.ensureExitAfterWaitFailure(
+                    exitSource: exitSource,
+                    terminationToken: terminationToken,
+                    graceDuration: graceDuration
+                )
             }
-            return
-        }
-        for processID in trackedProcessIDs {
-            _ = Darwin.kill(processID, signal)
-        }
-        _ = Darwin.kill(processIdentifier, signal)
-    }
-
-    private func waitUntilExit(timeout: Duration, trackedProcessIDs: Set<pid_t>) async -> Bool {
-        let clock = ContinuousClock()
-        let deadline = clock.now + timeout
-        while isFullyTerminated(trackedProcessIDs: trackedProcessIDs) == false {
-            if clock.now >= deadline {
-                return false
-            }
-            try? await Task.sleep(for: .milliseconds(50))
-        }
-        return true
-    }
-
-    private func isFullyTerminated(trackedProcessIDs: Set<pid_t>) -> Bool {
-        reapIfExited()
-            && processGroupIsEmpty()
-            && trackedProcessIDs.allSatisfy(Self.processIsGone)
-    }
-
-    private func processGroupIsEmpty() -> Bool {
-        if Darwin.kill(-processGroupID, 0) == 0 {
-            return false
-        }
-        return errno == ESRCH
-    }
-
-    private static func processIsGone(_ processID: pid_t) -> Bool {
-        if Darwin.kill(processID, 0) == 0 {
-            return false
-        }
-        return errno == ESRCH
-    }
-
-    private func descendantProcessIDs() -> Set<pid_t> {
-        let parentByProcessID = Self.parentProcessMap()
-        var descendants = Set<pid_t>()
-        var stack = [processIdentifier]
-        while let parent = stack.popLast() {
-            for (processID, parentProcessID) in parentByProcessID where parentProcessID == parent {
-                if descendants.insert(processID).inserted {
-                    stack.append(processID)
+            observation = alreadyExited
+        } else {
+            switch await Self.waitForExitOrTermination(
+                exitSource: exitSource,
+                terminationToken: terminationToken
+            ) {
+            case .exit:
+                observation = waitForExitObservationAfterReadiness()
+            case .termination:
+                if terminationToken.didRequestKill == false {
+                    let exitedDuringGrace = await Self.waitForExitDuringGrace(
+                        exitSource: exitSource,
+                        graceDuration: graceDuration
+                    )
+                    if exitedDuringGrace {
+                        observation = waitForExitObservationAfterReadiness()
+                        break
+                    }
+                    terminationToken.killOnce()
                 }
+                if case .ready = await exitSource.next() {
+                    observation = waitForExitObservationAfterReadiness()
+                } else {
+                    observation = .failed(.closed)
+                }
+            case .cancelled:
+                observation = .failed(.closed)
+            case .graceExpired:
+                preconditionFailure("Initial process wait cannot produce grace expiration.")
             }
         }
-        return descendants
+        await exitSource.cancelAndWait()
+        return observation
     }
 
-    private static func parentProcessMap() -> [pid_t: pid_t] {
-        let bytesNeeded = proc_listpids(UInt32(PROC_ALL_PIDS), 0, nil, 0)
-        guard bytesNeeded > 0 else {
-            return [:]
-        }
-        let processIDSize = MemoryLayout<pid_t>.stride
-        var processIDs = [pid_t](repeating: 0, count: Int(bytesNeeded) / processIDSize)
-        let bytesWritten = processIDs.withUnsafeMutableBufferPointer { buffer in
-            proc_listpids(
-                UInt32(PROC_ALL_PIDS),
-                0,
-                buffer.baseAddress,
-                Int32(buffer.count * processIDSize)
-            )
-        }
-        guard bytesWritten > 0 else {
-            return [:]
-        }
-        let count = min(Int(bytesWritten) / processIDSize, processIDs.count)
-        var parentByProcessID: [pid_t: pid_t] = [:]
-        for processID in processIDs.prefix(count) where processID > 0 {
-            var info = proc_bsdinfo()
-            let infoSize = MemoryLayout<proc_bsdinfo>.stride
-            let result = proc_pidinfo(
-                processID,
-                PROC_PIDTBSDINFO,
-                0,
-                &info,
-                Int32(infoSize)
-            )
-            if result == Int32(infoSize) {
-                parentByProcessID[processID] = pid_t(info.pbi_ppid)
+    func markTerminationStarted() -> JSONRPC.ProcessExitObservation? {
+        exitState.withLock { state in
+            if state.observation == nil {
+                state.observation = Self.probeExit(
+                    processIdentifier: processIdentifier,
+                    didBeginTermination: state.didBeginTermination
+                )
             }
+            state.didBeginTermination = true
+            return state.observation
         }
-        return parentByProcessID
     }
 
-    private func reapIfExited() -> Bool {
-        didReap.withLock { didReap in
-            if didReap {
-                return true
+    func observedExitForCloseArbitration() -> JSONRPC.ProcessExitObservation? {
+        exitState.withLock { $0.observation }
+    }
+
+    func reap() async {
+        reapAfterObservedExit()
+    }
+
+    func lifecycleSnapshot() -> AppServerProcessLifecycleSnapshot {
+        exitState.withLock { state in
+            let status: Int32?
+            let didObserveExit: Bool
+            if case .exited(let observedStatus, _) = state.observation {
+                status = observedStatus
+                didObserveExit = true
+            } else {
+                status = nil
+                didObserveExit = false
             }
-            var status: Int32 = 0
-            let result = waitpid(processIdentifier, &status, WNOHANG)
+            return .init(
+                observedExitStatus: status,
+                didObserveExit: didObserveExit,
+                didBeginTermination: state.didBeginTermination,
+                didReap: state.didReap,
+                reapSystemCallCount: state.reapSystemCallCount
+            )
+        }
+    }
+
+    private func observeExitIfAvailable() -> JSONRPC.ProcessExitObservation? {
+        exitState.withLock { state in
+            if let observation = state.observation {
+                return observation
+            }
+            let observation = Self.probeExit(
+                processIdentifier: processIdentifier,
+                didBeginTermination: state.didBeginTermination
+            )
+            state.observation = observation
+            return observation
+        }
+    }
+
+    private func reapAfterObservedExit() {
+        exitState.withLock { state in
+            if state.didReap {
+                return
+            }
+            var rawStatus: Int32 = 0
+            let result: pid_t
+            while true {
+                let current = waitpid(processIdentifier, &rawStatus, 0)
+                if current == -1, errno == EINTR {
+                    continue
+                }
+                result = current
+                break
+            }
             if result == processIdentifier {
-                didReap = true
-                return true
+                state.didReap = true
+                state.reapSystemCallCount += 1
+                if case .exited(let observedStatus, _) = state.observation {
+                    precondition(
+                        observedStatus == Self.exitCode(from: rawStatus),
+                        "waitid observation and waitpid reap status must agree."
+                    )
+                }
+                return
             }
             if result == -1, errno == ECHILD {
-                didReap = true
-                return true
+                state.didReap = true
+                logger.error(
+                    "codex app-server pid \(self.processIdentifier, privacy: .public) was reaped outside its transport owner"
+                )
+                return
             }
-            return false
+            preconditionFailure(
+                "waitpid failed while reaping app-server pid \(processIdentifier): \(Self.errnoMessage(errno))"
+            )
         }
+    }
+
+    private enum WaitEvent: Equatable, Sendable {
+        case exit
+        case termination
+        case graceExpired
+        case cancelled
+    }
+
+    private static func waitForExitOrTermination(
+        exitSource: AppServerProcessExitEventSource,
+        terminationToken: ProcessTerminationToken
+    ) async -> WaitEvent {
+        await withTaskGroup(of: WaitEvent.self) { group in
+            group.addTask {
+                switch await exitSource.next() {
+                case .ready: .exit
+                case .cancelled: .cancelled
+                }
+            }
+            group.addTask {
+                switch await terminationToken.nextTerminationRequest() {
+                case .ready: .termination
+                case .cancelled: .cancelled
+                }
+            }
+            guard let first = await group.next() else {
+                preconditionFailure("Process wait race requires a winner.")
+            }
+            group.cancelAll()
+            while await group.next() != nil {}
+            return first
+        }
+    }
+
+    private static func waitForExitDuringGrace(
+        exitSource: AppServerProcessExitEventSource,
+        graceDuration: Duration
+    ) async -> Bool {
+        await withTaskGroup(of: WaitEvent.self) { group in
+            group.addTask {
+                switch await exitSource.next() {
+                case .ready: .exit
+                case .cancelled: .cancelled
+                }
+            }
+            group.addTask {
+                do {
+                    try await Task.sleep(for: graceDuration)
+                    return .graceExpired
+                } catch {
+                    return .cancelled
+                }
+            }
+            guard let first = await group.next() else {
+                preconditionFailure("Process grace race requires a winner.")
+            }
+            group.cancelAll()
+            while await group.next() != nil {}
+            return first == .exit
+        }
+    }
+
+    private static func ensureExitAfterWaitFailure(
+        exitSource: AppServerProcessExitEventSource,
+        terminationToken: ProcessTerminationToken,
+        graceDuration: Duration
+    ) async {
+        if terminationToken.didRequestKill == false {
+            let exitedDuringGrace = await waitForExitDuringGrace(
+                exitSource: exitSource,
+                graceDuration: graceDuration
+            )
+            if exitedDuringGrace {
+                return
+            }
+            terminationToken.killOnce()
+        }
+        _ = await exitSource.next()
+    }
+
+    private func waitForExitObservationAfterReadiness() -> JSONRPC.ProcessExitObservation {
+        exitState.withLock { state in
+            if let observation = state.observation {
+                return observation
+            }
+            let observation = Self.waitForExitObservationAfterReadiness(
+                processIdentifier: processIdentifier,
+                didBeginTermination: state.didBeginTermination
+            )
+            state.observation = observation
+            return observation
+        }
+    }
+
+    private static func waitForExitObservationAfterReadiness(
+        processIdentifier: pid_t,
+        didBeginTermination: Bool
+    ) -> JSONRPC.ProcessExitObservation {
+        var info = siginfo_t()
+        let result: Int32
+        while true {
+            let current = waitid(
+                P_PID,
+                id_t(processIdentifier),
+                &info,
+                WEXITED | WNOWAIT
+            )
+            if current == -1, errno == EINTR {
+                continue
+            }
+            result = current
+            break
+        }
+        guard result == 0, info.si_pid == processIdentifier else {
+            let errorNumber = result == -1 ? errno : EPROTO
+            return .failed(.io(
+                errno: errorNumber,
+                message: "waitid failed for ready app-server pid \(processIdentifier): \(errnoMessage(errorNumber))"
+            ))
+        }
+        return terminalObservation(
+            from: info,
+            didBeginTermination: didBeginTermination
+        )
+    }
+
+    private static func probeExit(
+        processIdentifier: pid_t,
+        didBeginTermination: Bool
+    ) -> JSONRPC.ProcessExitObservation? {
+        var info = siginfo_t()
+        let result: Int32
+        while true {
+            let current = waitid(
+                P_PID,
+                id_t(processIdentifier),
+                &info,
+                WEXITED | WNOHANG | WNOWAIT
+            )
+            if current == -1, errno == EINTR {
+                continue
+            }
+            result = current
+            break
+        }
+        if result == 0, info.si_pid == 0 {
+            return nil
+        }
+        if result == 0, info.si_pid == processIdentifier {
+            return terminalObservation(
+                from: info,
+                didBeginTermination: didBeginTermination
+            )
+        }
+        let errorNumber = result == -1 ? errno : EPROTO
+        return .failed(.io(
+            errno: errorNumber,
+            message: "waitid failed for app-server pid \(processIdentifier): \(errnoMessage(errorNumber))"
+        ))
+    }
+
+    private static func terminalObservation(
+        from info: siginfo_t,
+        didBeginTermination: Bool
+    ) -> JSONRPC.ProcessExitObservation {
+        let status: Int32
+        switch info.si_code {
+        case CLD_EXITED:
+            status = info.si_status
+        case CLD_KILLED, CLD_DUMPED:
+            status = -info.si_status
+        default:
+            return .failed(.contractViolation(
+                message: "waitid returned nonterminal child status code \(info.si_code)."
+            ))
+        }
+        return .exited(
+            status: status,
+            observedBeforeTermination: didBeginTermination == false
+        )
+    }
+
+    private static func exitCode(from waitStatus: Int32) -> Int32 {
+        let terminationSignal = waitStatus & 0x7f
+        if terminationSignal == 0 {
+            return (waitStatus >> 8) & 0xff
+        }
+        if terminationSignal != 0x7f {
+            return -terminationSignal
+        }
+        return waitStatus
+    }
+
+    private static func errnoMessage(_ errorNumber: Int32) -> String {
+        String(cString: strerror(errorNumber))
     }
 
     private static func check(_ result: Int32) throws {
@@ -887,6 +1547,62 @@ private final class AppServerSpawnedProcess: @unchecked Sendable {
         return try pointers.withUnsafeMutableBufferPointer { buffer in
             try body(buffer.baseAddress)
         }
+    }
+}
+
+package final class ProcessTerminationToken: Sendable {
+    private struct State {
+        var didRequestTermination = false
+        var didRequestKill = false
+    }
+
+    private let processGroupID: pid_t?
+    private let state = Mutex(State())
+    private let terminationRequestSignal = AppServerOneBitReadSignal()
+
+    package init(processGroupID: pid_t? = nil) {
+        self.processGroupID = processGroupID
+    }
+
+    package var didRequestTermination: Bool {
+        state.withLock { $0.didRequestTermination }
+    }
+
+    package var didRequestKill: Bool {
+        state.withLock { $0.didRequestKill }
+    }
+
+    package func terminateOnce() {
+        let shouldSignal = state.withLock { state in
+            guard state.didRequestTermination == false else {
+                return false
+            }
+            state.didRequestTermination = true
+            return true
+        }
+        if shouldSignal, let processGroupID {
+            _ = Darwin.kill(-processGroupID, SIGTERM)
+        }
+        if shouldSignal {
+            terminationRequestSignal.signalReadiness()
+        }
+    }
+
+    package func killOnce() {
+        let shouldSignal = state.withLock { state in
+            guard state.didRequestKill == false else {
+                return false
+            }
+            state.didRequestKill = true
+            return true
+        }
+        if shouldSignal, let processGroupID {
+            _ = Darwin.kill(-processGroupID, SIGKILL)
+        }
+    }
+
+    fileprivate func nextTerminationRequest() async -> AppServerReadEvent {
+        await terminationRequestSignal.next()
     }
 }
 

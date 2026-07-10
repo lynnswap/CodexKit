@@ -424,8 +424,11 @@ public actor CodexAppServerTestTransport {
     private var responseHandlers: [String: ResponseHandler] = [:]
     private var requests: [JSONRPC.Request] = []
     private var notifications: [JSONRPC.Notification] = []
-    private var serverNotificationContinuations:
-        [AsyncThrowingStream<JSONRPC.Notification, Error>.Continuation] = []
+    private let mailbox = JSONRPCInboundFrameMailbox()
+    private var pendingResponses: [Int: JSONRPCResponseWaiter] = [:]
+    private var serverRequestResponses: [CodexAppServerTestServerResponse] = []
+    private var serverRequestResponseWaiters:
+        [CodexServerRequestID: [CheckedContinuation<CodexServerRequestResponse?, Never>]] = [:]
     private var activeByMethod: [String: Int] = [:]
     private var maxActiveByMethod: [String: Int] = [:]
     private var gatesByMethod: [String: RequestGate] = [:]
@@ -434,7 +437,13 @@ public actor CodexAppServerTestTransport {
     private var requestCountWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
     private var requestMethodWaiters: [(String, Int, CheckedContinuation<Void, Never>)] = []
     private var notificationStreamCountWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
+    private var inboundEventDeliveryGate: CodexAppServerTestGate?
+    private var isHoldingInboundEventDelivery = false
+    private var inboundEventDeliveryHeldWaiters: [CheckedContinuation<Void, Never>] = []
+    private var hasInboundConsumer = false
+    private var inboundTerminalObserved = false
     private var closed = false
+    private var closeStarted = false
 
     /// Creates an in-memory app-server transport.
     public init() {}
@@ -1005,11 +1014,13 @@ public actor CodexAppServerTestTransport {
 
     /// Suspends until at least `count` notification stream consumers are attached.
     public func waitForNotificationStreamCount(_ count: Int) async {
-        if serverNotificationContinuations.count >= count {
+        let consumerCount = hasInboundConsumer ? 1 : 0
+        if consumerCount >= count {
             return
         }
         await withCheckedContinuation { continuation in
-            if serverNotificationContinuations.count >= count {
+            let consumerCount = hasInboundConsumer ? 1 : 0
+            if consumerCount >= count {
                 continuation.resume()
             } else {
                 notificationStreamCountWaiters.append((count, continuation))
@@ -1023,7 +1034,7 @@ public actor CodexAppServerTestTransport {
     }
 
     package func notificationStreamCount() -> Int {
-        serverNotificationContinuations.count
+        hasInboundConsumer ? 1 : 0
     }
 
     package func isClosedForTesting() -> Bool {
@@ -1034,33 +1045,104 @@ public actor CodexAppServerTestTransport {
     public func emitServerNotification<Params: Encodable & Sendable>(
         method: String,
         params: Params
-    ) throws {
+    ) async throws {
         let notification = JSONRPC.Notification(
             method: method,
             params: try JSONEncoder().encode(params)
         )
-        for continuation in serverNotificationContinuations {
-            continuation.yield(notification)
-        }
+        try await mailbox.send(JSONRPC.notificationFrame(notification))
     }
 
     /// Emits a server notification from a raw JSON object string.
-    public func emitServerNotificationJSON(method: String, json: String) {
+    public func emitServerNotificationJSON(method: String, json: String) async throws {
         let notification = JSONRPC.Notification(
             method: method,
             params: Data(json.utf8)
         )
-        for continuation in serverNotificationContinuations {
-            continuation.yield(notification)
+        try await mailbox.send(JSONRPC.notificationFrame(notification))
+    }
+
+    package func emitServerNotification(method: String, params: Data) async throws {
+        try await mailbox.send(JSONRPC.notificationFrame(.init(
+            method: method,
+            params: params
+        )))
+    }
+
+    package func emitServerRequest(
+        id: CodexServerRequestID,
+        method: String,
+        params: Data
+    ) async throws {
+        try await mailbox.send(JSONRPC.serverRequestFrame(
+            id: id,
+            method: method,
+            params: params
+        ))
+    }
+
+    package func emitRawInboundFrame(_ frame: Data) async throws {
+        try await mailbox.send(frame)
+    }
+
+    package func inboundMailboxSnapshot() async -> JSONRPCInboundFrameMailbox.Snapshot {
+        await mailbox.snapshot()
+    }
+
+    package func holdNextInboundEventDelivery(at gate: CodexAppServerTestGate) {
+        precondition(
+            inboundEventDeliveryGate == nil,
+            "Only one inbound event delivery can be held at a time."
+        )
+        inboundEventDeliveryGate = gate
+    }
+
+    package func waitUntilInboundEventDeliveryIsHeld() async {
+        guard isHoldingInboundEventDelivery == false else {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            inboundEventDeliveryHeldWaiters.append(continuation)
+        }
+    }
+
+    package func recordedServerRequestResponses() -> [CodexAppServerTestServerResponse] {
+        serverRequestResponses
+    }
+
+    package func serverRequestResponse(
+        for id: CodexServerRequestID
+    ) async -> CodexServerRequestResponse? {
+        if let response = serverRequestResponses.last(where: { $0.requestID == id }) {
+            return response.response
+        }
+        return await withCheckedContinuation { continuation in
+            serverRequestResponseWaiters[id, default: []].append(continuation)
+        }
+    }
+
+    package func finishServerRequestWithoutResponse(_ id: CodexServerRequestID) {
+        let waiters = serverRequestResponseWaiters.removeValue(forKey: id) ?? []
+        for waiter in waiters {
+            waiter.resume(returning: nil)
+        }
+    }
+
+    package func finishAllServerRequestsWithoutResponse() {
+        let waiters = serverRequestResponseWaiters.values.flatMap { $0 }
+        serverRequestResponseWaiters.removeAll(keepingCapacity: false)
+        for waiter in waiters {
+            waiter.resume(returning: nil)
         }
     }
 
     /// Finishes all attached notification streams with `error`.
-    public func finishNotificationStreams(throwing error: any Error) {
-        for continuation in serverNotificationContinuations {
-            continuation.finish(throwing: error)
-        }
-        serverNotificationContinuations.removeAll()
+    public func finishNotificationStreams(throwing error: any Error) async {
+        let failure = (error as? CodexTransportFailure) ?? .io(
+            errno: (error as? POSIXError)?.code.rawValue,
+            message: error.localizedDescription
+        )
+        await mailbox.finish(throwing: failure)
     }
 
     package func enqueueInitialize(codexHome: String?, userAgent: String?) throws {
@@ -1116,7 +1198,7 @@ public actor CodexAppServerTestTransport {
     private func resumeNotificationStreamCountWaiters() {
         var remaining: [(Int, CheckedContinuation<Void, Never>)] = []
         for waiter in notificationStreamCountWaiters {
-            if serverNotificationContinuations.count >= waiter.0 {
+            if (hasInboundConsumer ? 1 : 0) >= waiter.0 {
                 waiter.1.resume()
             } else {
                 remaining.append(waiter)
@@ -1141,10 +1223,14 @@ extension CodexAppServerTestTransport: JSONRPC.Transport {
         _ request: JSONRPC.Request,
         acceptWrite: @Sendable () throws -> Void
     ) async throws -> Data {
+        try Task.checkCancellation()
         guard closed == false else {
             throw JSONRPC.Error.closed
         }
         try acceptWrite()
+
+        let responseWaiter = JSONRPCResponseWaiter()
+        pendingResponses[request.id] = responseWaiter
         requests.append(request)
         resumeRequestCountWaiters()
         resumeRequestMethodWaiters()
@@ -1160,51 +1246,164 @@ extension CodexAppServerTestTransport: JSONRPC.Transport {
             activeRequestGatesByRequestID.removeValue(forKey: request.id)
         }
         activeByMethod[request.method, default: 1] -= 1
-        guard closed == false else {
-            throw JSONRPC.Error.closed
-        }
-        if let queuedResponse {
-            switch queuedResponse {
-            case .success(let data):
-                return data
-            case .failure(let error):
-                throw error
+
+        let result: Result<Data, JSONRPC.Error>
+        do {
+            guard closed == false else {
+                return try await responseWaiter.wait()
             }
+            if let queuedResponse {
+                switch queuedResponse {
+                case .success(let data):
+                    result = .success(data)
+                case .failure(let error):
+                    result = .failure(error)
+                }
+            } else if let responseHandler = responseHandlers[request.method] {
+                result = .success(try await responseHandler(request.params))
+            } else {
+                result = .success(try JSONEncoder().encode(EmptyResponse()))
+            }
+            let frame = try JSONRPC.responseFrame(id: request.id, result: result)
+            try await mailbox.send(frame)
+        } catch is CancellationError {
+            pendingResponses.removeValue(forKey: request.id)
+            throw CancellationError()
+        } catch let failure as CodexTransportFailure {
+            await claimTerminal(failure)
+        } catch {
+            await claimTerminal(.io(
+                errno: (error as? POSIXError)?.code.rawValue,
+                message: error.localizedDescription
+            ))
         }
-        if let responseHandler = responseHandlers[request.method] {
-            return try await responseHandler(request.params)
-        }
-        return try JSONEncoder().encode(EmptyResponse())
+        return try await responseWaiter.wait()
     }
 
     package func notify(_ notification: JSONRPC.Notification) async throws {
+        guard closed == false else {
+            throw JSONRPC.Error.closed
+        }
         notifications.append(notification)
     }
 
-    package func notificationStream() -> AsyncThrowingStream<JSONRPC.Notification, Error> {
-        AsyncThrowingStream(bufferingPolicy: .unbounded) { continuation in
-            serverNotificationContinuations.append(continuation)
+    package func nextInboundEvent() async throws -> JSONRPC.InboundEvent? {
+        if hasInboundConsumer == false {
+            hasInboundConsumer = true
             resumeNotificationStreamCountWaiters()
+        }
+        while true {
+            let frame: Data
+            do {
+                guard let next = try await mailbox.next() else {
+                    inboundTerminalObserved = true
+                    return nil
+                }
+                frame = next
+            } catch {
+                let snapshot = await mailbox.snapshot()
+                if snapshot.isTerminal, snapshot.acceptedFrameCount == 0 {
+                    inboundTerminalObserved = true
+                }
+                throw error
+            }
+            if let gate = inboundEventDeliveryGate {
+                isHoldingInboundEventDelivery = true
+                let waiters = inboundEventDeliveryHeldWaiters
+                inboundEventDeliveryHeldWaiters.removeAll(keepingCapacity: false)
+                for waiter in waiters {
+                    waiter.resume()
+                }
+                await gate.waitIgnoringCancellation()
+                inboundEventDeliveryGate = nil
+                isHoldingInboundEventDelivery = false
+            }
+            switch try JSONRPC.decodeInboundEnvelope(frame) {
+            case .response(let id, let result):
+                guard let waiter = pendingResponses.removeValue(forKey: id) else {
+                    if closed {
+                        continue
+                    }
+                    let failure = CodexTransportFailure.protocolViolation(
+                        message: "Received a JSON-RPC response for unknown request id \(id).",
+                        rawData: frame
+                    )
+                    await claimTerminal(failure)
+                    throw failure
+                }
+                waiter.resolve(result)
+            case .event(let event):
+                return event
+            }
         }
     }
 
-    package func close() async {
+    package func respond(
+        to requestID: CodexServerRequestID,
+        with response: CodexServerRequestResponse
+    ) throws {
         guard closed == false else {
-            return
+            throw JSONRPC.Error.closed
         }
+        serverRequestResponses.append(.init(requestID: requestID, response: response))
+        let waiters = serverRequestResponseWaiters.removeValue(forKey: requestID) ?? []
+        for waiter in waiters {
+            waiter.resume(returning: response)
+        }
+    }
+
+    package func beginClose() async -> JSONRPC.ProcessExitObservation? {
+        guard closeStarted == false else {
+            return nil
+        }
+        closeStarted = true
         closed = true
         let requestGates = Array(activeRequestGatesByRequestID.values)
             + Array(gatesByMethod.values)
             + oneShotGatesByMethod.values.flatMap { $0 }
+        let inboundEventDeliveryGate = inboundEventDeliveryGate
         activeRequestGatesByRequestID.removeAll(keepingCapacity: false)
         gatesByMethod.removeAll(keepingCapacity: false)
         oneShotGatesByMethod.removeAll(keepingCapacity: false)
         for requestGate in requestGates {
             await requestGate.gate.open()
         }
-        for continuation in serverNotificationContinuations {
-            continuation.finish()
+        await inboundEventDeliveryGate?.open()
+        await mailbox.finish()
+        finishAllServerRequestsWithoutResponse()
+        return nil
+    }
+
+    package func finishPendingResponsesAfterInboundDrain(
+        _ failure: CodexTransportFailure
+    ) {
+        precondition(inboundTerminalObserved)
+        let responseFailure: JSONRPC.Error = switch failure {
+        case .closed: .closed
+        case .io, .framing, .protocolViolation, .contractViolation:
+            .invalidMessage(failure.localizedDescription)
         }
-        serverNotificationContinuations.removeAll()
+        let waiters = pendingResponses.values
+        pendingResponses.removeAll(keepingCapacity: false)
+        for waiter in waiters {
+            waiter.resolve(.failure(responseFailure))
+        }
+    }
+
+    package func waitForProcessExit() async -> JSONRPC.ProcessExitObservation {
+        .unavailable
+    }
+
+    package func waitUntilClosed() async {}
+
+    package func reapProcess() async {}
+
+    private func claimTerminal(_ failure: CodexTransportFailure) async {
+        closed = true
+        await mailbox.finish(throwing: failure)
+    }
+
+    public func close() async {
+        _ = await beginClose()
     }
 }

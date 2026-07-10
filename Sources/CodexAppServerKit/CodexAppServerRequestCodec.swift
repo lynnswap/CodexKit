@@ -1,6 +1,6 @@
 import Foundation
 
-package enum CodexServerRequestResponse: Sendable {
+package enum CodexServerRequestResponse: Equatable, Sendable {
     case result(Data)
     case error(code: Int, message: String)
 }

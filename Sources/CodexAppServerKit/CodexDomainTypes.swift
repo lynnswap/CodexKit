@@ -502,19 +502,22 @@ public struct CodexThread: Identifiable, Sendable {
 
     package let client: AppServerClient
     package let router: CodexAppServerNotificationRouter
+    package let connectionLease: AppServerConnectionLease
 
     package init(
         id: CodexThreadID,
         workspace: URL? = nil,
         model: String? = nil,
         client: AppServerClient,
-        router: CodexAppServerNotificationRouter
+        router: CodexAppServerNotificationRouter,
+        connectionLease: AppServerConnectionLease
     ) {
         self.id = id
         self.workspace = workspace
         self.model = model
         self.client = client
         self.router = router
+        self.connectionLease = connectionLease
     }
 }
 
@@ -894,17 +897,20 @@ package struct CodexTurn: Identifiable, Sendable {
 
     package let client: AppServerClient
     package let router: CodexAppServerNotificationRouter
+    package let connectionLease: AppServerConnectionLease
 
     package init(
         id: CodexTurnID,
         threadID: CodexThreadID,
         client: AppServerClient,
-        router: CodexAppServerNotificationRouter
+        router: CodexAppServerNotificationRouter,
+        connectionLease: AppServerConnectionLease
     ) {
         self.id = id
         self.threadID = threadID
         self.client = client
         self.router = router
+        self.connectionLease = connectionLease
     }
 }
 
@@ -2103,7 +2109,8 @@ package struct CodexResponseStream: AsyncSequence, Sendable {
             prompt: prompt,
             options: options,
             client: turn.client,
-            router: turn.router
+            router: turn.router,
+            connectionLease: turn.connectionLease
         )
         return .init(turn: turn)
     }
@@ -2128,8 +2135,7 @@ package struct CodexResponseStream: AsyncSequence, Sendable {
     }
 
     package func closeConnection() async {
-        await turn.router.stop()
-        await turn.client.close()
+        await turn.connectionLease.closeConnection()
     }
 
     private func cancelledTurn(for cancellation: CodexTurnCancellation) -> CodexTurn {
@@ -2141,7 +2147,8 @@ package struct CodexResponseStream: AsyncSequence, Sendable {
             id: cancelledTurnID,
             threadID: cancellation.threadID,
             client: turn.client,
-            router: turn.router
+            router: turn.router,
+            connectionLease: turn.connectionLease
         )
     }
 

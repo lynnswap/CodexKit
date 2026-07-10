@@ -212,6 +212,7 @@ package struct AppServerNotificationDecoder {
         case threadStatus(CodexThreadStatus)
         case tokenUsage(CodexTokenUsage)
         case threadClosed
+        case serverRequestResolved(CodexServerRequestID)
         case account(AccountMutation)
         case raw
         case ignored
@@ -341,6 +342,8 @@ package struct AppServerNotificationDecoder {
             return .tokenUsage(try decodeTokenUsage(from: object.requireObject("tokenUsage")))
         case .threadClosed:
             return .threadClosed
+        case .serverRequestResolved:
+            return .serverRequestResolved(try object.requireRequestID("requestId"))
         case .accountUpdated:
             return .account(.updated(try decodeAccountUpdate(from: object)))
         case .accountRateLimitsUpdated:
@@ -363,7 +366,6 @@ package struct AppServerNotificationDecoder {
              .threadNameUpdated,
              .turnDiffUpdated,
              .turnPlanUpdated,
-             .serverRequestResolved,
              .warning,
              .guardianWarning,
              .deprecationNotice,
@@ -1391,11 +1393,13 @@ private struct PayloadObject {
         return value
     }
 
-    func requireRequestID(_ key: String) throws -> AppServerJSONValue {
+    func requireRequestID(_ key: String) throws -> CodexServerRequestID {
         let value = try requireValue(key)
         switch value {
-        case .int, .string:
-            return value
+        case .int(let value):
+            return .integer(Int64(value))
+        case .string(let value):
+            return .string(value)
         default:
             throw NotificationContractError.typeMismatch(key)
         }

@@ -126,18 +126,17 @@ struct CodexAppServerKitTests {
                 executable: executableURL.path,
                 arguments: [],
                 environment: ["RESPONSE_PATH": responseURL.path],
-                codexHomeURL: rootURL.appendingPathComponent("codex-home", isDirectory: true),
-                serverRequestHandler: { request in
-                    await recorder.append(request)
-                    return .approval(.accept)
-                }
+                codexHomeURL: rootURL.appendingPathComponent("codex-home", isDirectory: true)
             )
         )
-        defer {
-            Task {
-                await transport.close()
+        let harness = await CodexAppServerTestConnectionHarness.start(
+            transport: transport,
+            processTerminationToken: transport.processTerminationToken,
+            handler: { request in
+                await recorder.append(request)
+                return .approval(.accept)
             }
-        }
+        )
 
         let wroteResponse = await eventually(attempts: 100) {
             FileManager.default.fileExists(atPath: responseURL.path)
@@ -162,6 +161,7 @@ struct CodexAppServerKitTests {
         #expect(response["id"] as? String == "approval-1")
         let result = try #require(response["result"] as? [String: Any])
         #expect(result["decision"] as? String == "accept")
+        await harness.close()
     }
 
     @Test func processSpawnClosePlanPreservesStandardIOFileDescriptors() {
@@ -194,7 +194,8 @@ struct CodexAppServerKitTests {
         let transport = CodexAppServerTestTransport()
         let gate = CodexAppServerTestGate()
         await transport.holdNext(method: "ping", gate: gate)
-        let client = AppServerClient(transport: transport)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
 
         let task = Task {
             let _: EmptyResponse = try await client.send(
@@ -209,6 +210,7 @@ struct CodexAppServerKitTests {
 
         await gate.open()
         try await task.value
+        await harness.close()
     }
 
     @Test func testTransportReservesQueuedResponseBeforeGateWait() async throws {
@@ -221,7 +223,8 @@ struct CodexAppServerKitTests {
         try await transport.enqueue(PingResponse(value: "second"), for: "ping")
         let gate = CodexAppServerTestGate()
         await transport.holdNext(method: "ping", gate: gate)
-        let client = AppServerClient(transport: transport)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
 
         let first = Task {
             try await client.send(
@@ -243,13 +246,15 @@ struct CodexAppServerKitTests {
         #expect(try await second.value == PingResponse(value: "second"))
         await gate.open()
         #expect(try await first.value == PingResponse(value: "first"))
+        await harness.close()
     }
 
     @Test func initializeSendsHandshakeAndInitializedNotification() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueue(
             AppServerAPI.Initialize.Response(codexHome: "/tmp/codex"), for: "initialize")
-        let client = AppServerClient(transport: transport)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
 
         let response = try await client.initialize(clientName: "TestClient", clientVersion: "1")
 
@@ -260,6 +265,47 @@ struct CodexAppServerKitTests {
         let decoded = try JSONDecoder().decode(AppServerAPI.Initialize.Params.self, from: params)
         #expect(decoded.clientInfo.name == "TestClient")
         #expect(decoded.clientInfo.version == "1")
+        await harness.close()
+    }
+
+    @Test func concurrentInitializeCallsShareOneHandshake() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueue(
+            AppServerAPI.Initialize.Response(codexHome: "/tmp/codex"), for: "initialize")
+        let gate = CodexAppServerTestGate()
+        await transport.hold(method: "initialize", gate: gate)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+
+        let first = Task {
+            try await client.initialize(clientName: "TestClient", clientVersion: "1")
+        }
+        await transport.waitForRequest(method: "initialize")
+        let gateOpener = Task {
+            do {
+                try await withTimeout {
+                    while await client.initializationWaiterCountForTesting() == 0 {
+                        await Task.yield()
+                    }
+                }
+            } catch {
+                await gate.open()
+                throw error
+            }
+            await gate.open()
+        }
+
+        let secondResponse = try await client.initialize(
+            clientName: "TestClient",
+            clientVersion: "1"
+        )
+        let firstResponse = try await first.value
+        try await gateOpener.value
+
+        #expect(firstResponse == secondResponse)
+        #expect(await transport.recordedRequests(method: "initialize").count == 1)
+        #expect(await transport.recordedNotifications().map(\.method) == ["initialized"])
+        await harness.close()
     }
 
     @Test func appServerClosesTransportWhenInitializationFails() async throws {
@@ -280,11 +326,8 @@ struct CodexAppServerKitTests {
             AppServerAPI.Thread.Start.Response(threadID: "thread-1", model: "gpt-5"),
             for: "thread/start"
         )
-        let client = AppServerClient(transport: transport)
-        let server = CodexAppServer(
-            client: client,
-            router: CodexAppServerNotificationRouter(client: client)
-        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let server = harness.server
         let workspace = URL(fileURLWithPath: "/tmp/project", isDirectory: true)
 
         let thread = try await server.startThread(
@@ -383,7 +426,7 @@ struct CodexAppServerKitTests {
         #expect(events.contains(.terminal(.completed(.init(turnID: "turn-resume-terminal")))))
     }
 
-    @Test func resumedThreadTransfersNestedMalformedTerminalFailureAfterAssociation() async throws {
+    @Test func resumedThreadTransfersNestedProtocolViolationAfterAssociation() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         let gate = CodexAppServerTestGate()
         try await runtime.transport.enqueueThreadResume(.init(
@@ -396,7 +439,7 @@ struct CodexAppServerKitTests {
             try await runtime.server.resumeThread("thread-resume-malformed")
         }
         await runtime.transport.waitForRequest(method: "thread/resume")
-        await runtime.transport.emitServerNotificationJSON(
+        try await runtime.transport.emitServerNotificationJSON(
             method: "turn/completed",
             json: #"{"turn":{"id":"turn-resume-malformed"}}"#
         )
@@ -407,12 +450,13 @@ struct CodexAppServerKitTests {
             _ = try await collect(thread.events)
             Issue.record("Expected associated malformed terminal failure.")
         } catch let error as CodexAppServerError {
-            guard case .malformedNotification(let failure) = error else {
-                Issue.record("Expected malformed terminal failure, got \(error).")
+            guard case .connectionTerminated(.transportFailure(
+                .protocolViolation(_, let rawData)
+            )) = error else {
+                Issue.record("Expected connection protocol violation, got \(error).")
                 return
             }
-            #expect(failure.method == "turn/completed")
-            #expect(failure.rawData == Data(#"{"turn":{"id":"turn-resume-malformed"}}"#.utf8))
+            #expect(rawData == Data(#"{"turn":{"id":"turn-resume-malformed"}}"#.utf8))
         }
     }
 
@@ -524,9 +568,10 @@ struct CodexAppServerKitTests {
             ),
             for: "review/start"
         )
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        let thread = CodexThread(id: "thread-1", model: "gpt-5", client: client, router: router)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
+        let thread = CodexThread(id: "thread-1", model: "gpt-5", client: client, router: router, connectionLease: harness.lease)
 
         let review = try await thread.startReview(target: .baseBranch("main"))
 
@@ -815,11 +860,8 @@ struct CodexAppServerKitTests {
             AppServerAPI.Thread.List.Response(data: [], nextCursor: "next"),
             for: "thread/list"
         )
-        let client = AppServerClient(transport: transport)
-        let server = CodexAppServer(
-            client: client,
-            router: CodexAppServerNotificationRouter(client: client)
-        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let server = harness.server
         let workspace = URL(fileURLWithPath: "/tmp/project", isDirectory: true)
 
         let page = try await server.listThreads(.init(
@@ -860,11 +902,8 @@ struct CodexAppServerKitTests {
             AppServerAPI.Thread.List.Response(data: []),
             for: "thread/list"
         )
-        let client = AppServerClient(transport: transport)
-        let server = CodexAppServer(
-            client: client,
-            router: CodexAppServerNotificationRouter(client: client)
-        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let server = harness.server
         let app = URL(fileURLWithPath: "/tmp/project/App", isDirectory: true)
         let tools = URL(fileURLWithPath: "/tmp/project/Tools", isDirectory: true)
 
@@ -884,11 +923,8 @@ struct CodexAppServerKitTests {
             AppServerAPI.Thread.List.Response(data: []),
             for: "thread/list"
         )
-        let client = AppServerClient(transport: transport)
-        let server = CodexAppServer(
-            client: client,
-            router: CodexAppServerNotificationRouter(client: client)
-        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let server = harness.server
         var query = CodexThreadQuery(
             workspaces: [URL(fileURLWithPath: "/tmp/project", isDirectory: true)]
         )
@@ -923,11 +959,8 @@ struct CodexAppServerKitTests {
             """,
             for: "thread/list"
         )
-        let client = AppServerClient(transport: transport)
-        let server = CodexAppServer(
-            client: client,
-            router: CodexAppServerNotificationRouter(client: client)
-        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let server = harness.server
 
         let page = try await server.listThreads()
         let snapshot = try #require(page.threads.first)
@@ -946,11 +979,8 @@ struct CodexAppServerKitTests {
             ]),
             for: "thread/list"
         )
-        let client = AppServerClient(transport: transport)
-        let server = CodexAppServer(
-            client: client,
-            router: CodexAppServerNotificationRouter(client: client)
-        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let server = harness.server
 
         let page = try await server.listThreads()
 
@@ -980,11 +1010,8 @@ struct CodexAppServerKitTests {
             ]),
             for: "thread/list"
         )
-        let client = AppServerClient(transport: transport)
-        let server = CodexAppServer(
-            client: client,
-            router: CodexAppServerNotificationRouter(client: client)
-        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let server = harness.server
 
         let page = try await server.listThreads()
 
@@ -1055,16 +1082,16 @@ struct CodexAppServerKitTests {
 
     @Test func terminalClassifierPreservesEveryCurrentV2OutcomeAndTiming() async throws {
         let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
 
-        let completed = CodexTurn(id: "turn-completed", threadID: "thread-1", client: client, router: router)
-        let interrupted = CodexTurn(id: "turn-interrupted", threadID: "thread-1", client: client, router: router)
-        let failed = CodexTurn(id: "turn-failed", threadID: "thread-1", client: client, router: router)
-        let future = CodexTurn(id: "turn-future", threadID: "thread-1", client: client, router: router)
-        let inProgress = CodexTurn(id: "turn-in-progress", threadID: "thread-1", client: client, router: router)
+        let completed = CodexTurn(id: "turn-completed", threadID: "thread-1", client: client, router: router, connectionLease: harness.lease)
+        let interrupted = CodexTurn(id: "turn-interrupted", threadID: "thread-1", client: client, router: router, connectionLease: harness.lease)
+        let failed = CodexTurn(id: "turn-failed", threadID: "thread-1", client: client, router: router, connectionLease: harness.lease)
+        let future = CodexTurn(id: "turn-future", threadID: "thread-1", client: client, router: router, connectionLease: harness.lease)
+        let inProgress = CodexTurn(id: "turn-in-progress", threadID: "thread-1", client: client, router: router, connectionLease: harness.lease)
 
         let completedTask = Task { try await completed.result() }
         let interruptedTask = Task { try await interrupted.result() }
@@ -1152,27 +1179,18 @@ struct CodexAppServerKitTests {
     }
 
     @Test func malformedTerminalPayloadsNeverBecomeOutcomes() async throws {
-        let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
-        await transport.waitForNotificationStreamCount(1)
-
         let cases: [(CodexTurnID, String)] = [
             ("turn-missing-status", #"{"turn":{"id":"turn-missing-status"}}"#),
             ("turn-failed-without-error", #"{"turn":{"id":"turn-failed-without-error","status":"failed"}}"#),
             ("turn-completed-with-error", #"{"turn":{"id":"turn-completed-with-error","status":"completed","error":{"message":"illegal"}}}"#),
             ("turn-malformed", #"{"turnId":"turn-malformed","turn":"not-an-object"}"#),
         ]
-        var streams: [(CodexTurnID, AsyncThrowingStream<CodexTurnEvent, Error>)] = []
-        for (turnID, _) in cases {
-            streams.append((turnID, await router.events(for: turnID)))
-        }
-        for (_, json) in cases {
-            await transport.emitServerNotificationJSON(method: "turn/completed", json: json)
-        }
-
-        for (turnID, stream) in streams {
+        for (turnID, json) in cases {
+            let transport = CodexAppServerTestTransport()
+            let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+            let stream = await harness.router.events(for: turnID)
+            await transport.waitForNotificationStreamCount(1)
+            try await transport.emitServerNotificationJSON(method: "turn/completed", json: json)
             do {
                 let events = try await collect(stream)
                 #expect(events.contains { event in
@@ -1180,21 +1198,21 @@ struct CodexAppServerKitTests {
                 } == false)
                 Issue.record("Expected malformed terminal failure for \(turnID.rawValue).")
             } catch let error as CodexAppServerError {
-                guard case .malformedNotification(let failure) = error else {
-                    Issue.record("Expected malformed notification, got \(error).")
+                guard case .connectionTerminated(.transportFailure(
+                    .protocolViolation(_, let rawData)
+                )) = error else {
+                    Issue.record("Expected connection protocol violation, got \(error).")
                     continue
                 }
-                #expect(failure.method == "turn/completed")
-                #expect(failure.rawData != nil)
+                #expect(rawData == Data(json.utf8))
             }
         }
     }
 
     @Test func terminalOutcomeAndMalformedFailureReplayToLateTurnSubscribers() async throws {
         let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
 
         let terminalTurnID = CodexTurnID(rawValue: "turn-terminal-replay")
@@ -1214,7 +1232,7 @@ struct CodexAppServerKitTests {
 
         let failureTurnID = CodexTurnID(rawValue: "turn-failure-replay")
         let firstFailureStream = await router.events(for: failureTurnID)
-        await transport.emitServerNotificationJSON(
+        try await transport.emitServerNotificationJSON(
             method: "turn/completed",
             json: #"{"turn":{"id":"turn-failure-replay"}}"#
         )
@@ -1223,8 +1241,11 @@ struct CodexAppServerKitTests {
             await router.events(for: failureTurnID)
         )
         #expect(firstFailure == lateFailure)
-        guard let firstFailure, case .malformedNotification = firstFailure else {
-            Issue.record("Expected replayed malformed notification.")
+        guard let firstFailure,
+              case .connectionTerminated(.transportFailure(
+                .protocolViolation(_, _)
+              )) = firstFailure else {
+            Issue.record("Expected replayed connection protocol violation.")
             return
         }
     }
@@ -1245,11 +1266,8 @@ struct CodexAppServerKitTests {
             """,
             for: "thread/list"
         )
-        let client = AppServerClient(transport: transport)
-        let server = CodexAppServer(
-            client: client,
-            router: CodexAppServerNotificationRouter(client: client)
-        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let server = harness.server
 
         let page = try await server.listThreads()
         let snapshot = try #require(page.threads.first)
@@ -1289,11 +1307,13 @@ struct CodexAppServerKitTests {
             AppServerAPI.Thread.Read.Response(thread: .init(id: "thread-empty", turns: [])),
             for: "thread/read"
         )
-        let client = AppServerClient(transport: transport)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
         let thread = CodexThread(
             id: .init(rawValue: "thread-empty"),
             client: client,
-            router: CodexAppServerNotificationRouter(client: client)
+            router: harness.router,
+            connectionLease: harness.lease
         )
 
         let metadataOnly = try await thread.read(includeTurns: false)
@@ -1317,11 +1337,13 @@ struct CodexAppServerKitTests {
             """,
             for: "thread/read"
         )
-        let client = AppServerClient(transport: transport)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
         let thread = CodexThread(
             id: .init(rawValue: "thread-empty"),
             client: client,
-            router: CodexAppServerNotificationRouter(client: client)
+            router: harness.router,
+            connectionLease: harness.lease
         )
 
         let snapshot = try await thread.read(includeTurns: true)
@@ -1356,11 +1378,13 @@ struct CodexAppServerKitTests {
             """,
             for: "thread/read"
         )
-        let client = AppServerClient(transport: transport)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
         let thread = CodexThread(
             id: .init(rawValue: "thread-summary"),
             client: client,
-            router: CodexAppServerNotificationRouter(client: client)
+            router: harness.router,
+            connectionLease: harness.lease
         )
 
         let snapshot = try await thread.read(includeTurns: true)
@@ -1393,11 +1417,13 @@ struct CodexAppServerKitTests {
             """,
             for: "thread/read"
         )
-        let client = AppServerClient(transport: transport)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
         let thread = CodexThread(
             id: .init(rawValue: "thread-missing-item-id"),
             client: client,
-            router: CodexAppServerNotificationRouter(client: client)
+            router: harness.router,
+            connectionLease: harness.lease
         )
 
         let snapshot = try await thread.read(includeTurns: true)
@@ -1540,11 +1566,8 @@ struct CodexAppServerKitTests {
     @Test func appServerArchiveThreadSerializesThreadID() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueueEmpty(for: "thread/archive")
-        let client = AppServerClient(transport: transport)
-        let server = CodexAppServer(
-            client: client,
-            router: CodexAppServerNotificationRouter(client: client)
-        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let server = harness.server
 
         try await server.archiveThread("thread-archive")
 
@@ -1566,11 +1589,11 @@ struct CodexAppServerKitTests {
             ),
             for: "review/start"
         )
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
 
         let review = try await thread.startReview(
             target: .baseBranch("main"),
@@ -1816,17 +1839,26 @@ struct CodexAppServerKitTests {
     }
 
     @Test func appServerResumeReviewRoutesThreadlessDiagnostics() async throws {
-        let runtime = try await CodexAppServerTestRuntime.start()
-        try await runtime.transport.emitServerNotification(
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueInitialize(codexHome: nil, userAgent: nil)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        _ = try await harness.client.initialize()
+        let priorEvents = await harness.router.liveEvents(for: "thread-review")
+        let priorClosed = Task {
+            var iterator = priorEvents.makeAsyncIterator()
+            return try await iterator.next()
+        }
+        try await transport.emitServerNotification(
             method: "thread/closed",
             params: ThreadIDParams(threadID: "thread-review")
         )
-        try await runtime.transport.enqueueThreadResume(.init(
+        #expect(try await priorClosed.value == .closed)
+        try await transport.enqueueThreadResume(.init(
             id: "thread-review",
             workspace: URL(fileURLWithPath: "/tmp/project", isDirectory: true)
         ))
         let gate = CodexAppServerTestGate()
-        await runtime.transport.holdNext(method: "thread/resume", gate: gate)
+        await transport.holdNext(method: "thread/resume", gate: gate)
         let identity = CodexReviewIdentity(
             threadID: "thread-source",
             turnID: "turn-review",
@@ -1835,16 +1867,16 @@ struct CodexAppServerKitTests {
         )
 
         let reviewTask = Task {
-            try await runtime.server.resumeReview(identity)
+            try await harness.server.resumeReview(identity)
         }
-        await runtime.transport.waitForRequest(method: "thread/resume")
-        try await runtime.transport.emitServerNotification(
+        await transport.waitForRequest(method: "thread/resume")
+        try await transport.emitServerNotification(
             method: "configWarning",
             params: ThreadlessDiagnosticParams(message: "using defaults")
         )
         await gate.open()
         let review = try await reviewTask.value
-        try await runtime.transport.emitServerNotification(
+        try await transport.emitServerNotification(
             method: "turn/completed",
             params: TurnCompletedParams(threadID: "thread-review", turn: .init(id: "turn-review", status: "completed"))
         )
@@ -1859,6 +1891,7 @@ struct CodexAppServerKitTests {
                 }
                 return false
             })
+        await harness.close()
     }
 
     @Test func appServerResumeReviewUsesThreadOptionModelOverride() async throws {
@@ -2665,11 +2698,11 @@ struct CodexAppServerKitTests {
             ),
             for: "review/start"
         )
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
 
         let review = try await thread.startReview(
             target: .baseBranch("main"),
@@ -2705,11 +2738,11 @@ struct CodexAppServerKitTests {
             AppServerAPI.Turn.Start.Response(turn: .init(id: "turn-1", status: "running")),
             for: "turn/start"
         )
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
         let eventTask = Task { () -> CodexThreadEvent? in
             var iterator = thread.events.makeAsyncIterator()
             return try await iterator.next()
@@ -2746,11 +2779,11 @@ struct CodexAppServerKitTests {
             ),
             for: "review/start"
         )
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
 
         let review = try await thread.startReview(
             target: .baseBranch("main"),
@@ -2781,11 +2814,11 @@ struct CodexAppServerKitTests {
             ),
             for: "review/start"
         )
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
 
         let review = try await thread.startReview(
             target: .baseBranch("main"),
@@ -2826,11 +2859,11 @@ struct CodexAppServerKitTests {
             ),
             for: "review/start"
         )
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
 
         let review = try await thread.startReview(
             target: .baseBranch("main"),
@@ -2874,11 +2907,11 @@ struct CodexAppServerKitTests {
             ),
             for: "review/start"
         )
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
 
         let review = try await thread.startReview(
             target: .baseBranch("main"),
@@ -2947,11 +2980,12 @@ struct CodexAppServerKitTests {
         let transport = CodexAppServerTestTransport()
         await transport.enqueueFailure(code: -32001, message: "server busy", for: "ping")
         try await transport.enqueue(EmptyResponse(), for: "ping")
-        let client = AppServerClient(
+        let harness = await CodexAppServerTestConnectionHarness.start(
             transport: transport,
             overloadRetryDelay: { $0 == 0 ? .zero : nil },
             retrySleep: { _ in }
         )
+        let client = harness.client
 
         let _: EmptyResponse = try await client.send(
             method: "ping",
@@ -2960,21 +2994,24 @@ struct CodexAppServerKitTests {
         )
 
         #expect(await transport.recordedRequests().map(\.method) == ["ping", "ping"])
+        await harness.close()
     }
 
     @Test func requestFailurePreservesCorrelationAndRawServerData() async throws {
         let transport = CodexAppServerTestTransport()
-        let rawData = Data(#"{"reason":"busy"}"#.utf8)
+        let rawData = Data(
+            #"{"reason":"busy","message":"turn rejected","codexErrorInfo":"serverOverloaded"}"#.utf8
+        )
         await transport.enqueueFailure(
             .responseError(.init(
                 code: -32_000,
                 message: "rejected",
-                data: rawData,
-                turnError: .init(message: "turn rejected", info: .serverOverloaded)
+                data: rawData
             )),
             for: "ping"
         )
-        let client = AppServerClient(transport: transport)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
 
         do {
             let _: EmptyResponse = try await client.send(
@@ -2993,8 +3030,42 @@ struct CodexAppServerKitTests {
             #expect(failure.requestID == 1)
             #expect(failure.method == "ping")
             #expect(failure.purpose == .operation("ping"))
-            #expect(serverError.data == rawData)
+            let serverData = try #require(serverError.data)
+            let serverDataObject = try #require(
+                JSONSerialization.jsonObject(with: serverData) as? [String: String]
+            )
+            #expect(serverDataObject == [
+                "reason": "busy",
+                "message": "turn rejected",
+                "codexErrorInfo": "serverOverloaded",
+            ])
             #expect(serverError.turnError == .init(message: "turn rejected", info: .serverOverloaded))
+        }
+        await harness.close()
+    }
+
+    @Test func outboundWriterFailurePreservesRequestCorrelation() async throws {
+        let failure = CodexTransportFailure.io(errno: EPIPE, message: "broken pipe")
+        let transport = TestOutboundWriteFailureTransport(failure: failure)
+        let client = AppServerClient(
+            transport: transport,
+            connectionCloseAction: testConnectionCloseAction(for: transport)
+        )
+
+        do {
+            let _: EmptyResponse = try await client.send(
+                method: "ping",
+                params: EmptyResponse(),
+                responseType: EmptyResponse.self
+            )
+            Issue.record("Expected an outbound write failure.")
+        } catch let error as CodexAppServerError {
+            #expect(error == .request(.init(
+                requestID: 1,
+                method: "ping",
+                purpose: .operation("ping"),
+                kind: .write(failure)
+            )))
         }
     }
 
@@ -3005,7 +3076,8 @@ struct CodexAppServerKitTests {
 
         let transport = CodexAppServerTestTransport()
         try await transport.enqueueJSON(#"{"unexpected":true}"#, for: "ping")
-        let client = AppServerClient(transport: transport)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
 
         do {
             let _: RequiredResponse = try await client.send(
@@ -3026,6 +3098,7 @@ struct CodexAppServerKitTests {
             #expect(failure.purpose == .operation("ping"))
             #expect(rawData == Data(#"{"unexpected":true}"#.utf8))
         }
+        await harness.close()
     }
 
     @Test func requestCancellationIsNeverWrapped() async throws {
@@ -3033,7 +3106,8 @@ struct CodexAppServerKitTests {
         await transport.handle(method: "ping") { _ in
             throw CancellationError()
         }
-        let client = AppServerClient(transport: transport)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
 
         do {
             let _: EmptyResponse = try await client.send(
@@ -3046,13 +3120,17 @@ struct CodexAppServerKitTests {
         } catch {
             Issue.record("Expected CancellationError, got \(error).")
         }
+        await harness.close()
     }
 
     @Test func cancellationBeforeTransportAcceptsWriteHasNoWireEffect() async throws {
         let transport = TestPreWriteSuspendingTransport(
             response: try JSONEncoder().encode(EmptyResponse())
         )
-        let client = AppServerClient(transport: transport)
+        let client = AppServerClient(
+            transport: transport,
+            connectionCloseAction: testConnectionCloseAction(for: transport)
+        )
         let scope = AppServerAPI.RequestScope.thread("thread-1")
         let task = Task {
             let _: EmptyResponse = try await client.send(
@@ -3076,7 +3154,8 @@ struct CodexAppServerKitTests {
     @Test func transportClosureIsConnectionTerminationNotRequestFailure() async throws {
         let transport = CodexAppServerTestTransport()
         await transport.enqueueFailure(.closed, for: "ping")
-        let client = AppServerClient(transport: transport)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
 
         do {
             let _: EmptyResponse = try await client.send(
@@ -3088,6 +3167,7 @@ struct CodexAppServerKitTests {
         } catch let error as CodexAppServerError {
             #expect(error == .connectionTerminated(.transportFailure(.closed)))
         }
+        await harness.close()
     }
 
     @Test func requestDeadlineUsesInjectedMonotonicClockAndKeepsCorrelation() async throws {
@@ -3101,7 +3181,8 @@ struct CodexAppServerKitTests {
                 #expect(duration == .seconds(5))
                 await deadlineGate.waitIgnoringCancellation()
                 deadlineReturned.signal()
-            }
+            },
+            connectionCloseAction: testConnectionCloseAction(for: transport)
         )
 
         let task = Task {
@@ -3144,7 +3225,7 @@ struct CodexAppServerKitTests {
         }
         let deadlineGate = CodexAppServerTestGate()
         let deadlineReturned = TestSignal()
-        let client = AppServerClient(
+        let harness = await CodexAppServerTestConnectionHarness.start(
             transport: transport,
             deadlineClock: .init { duration in
                 #expect(duration == .seconds(5))
@@ -3161,6 +3242,7 @@ struct CodexAppServerKitTests {
                 try await backoffWaiter.wait()
             }
         )
+        let client = harness.client
 
         let task = Task {
             let _: EmptyResponse = try await client.send(
@@ -3188,16 +3270,18 @@ struct CodexAppServerKitTests {
             )))
         }
         #expect(await transport.recordedRequests(method: "ping").count == 1)
+        await harness.close()
     }
 
     @Test func overloadBackoffCancellationIsNeverWrapped() async throws {
         let transport = CodexAppServerTestTransport()
         await transport.enqueueFailure(code: -32_001, message: "busy", for: "ping")
-        let client = AppServerClient(
+        let harness = await CodexAppServerTestConnectionHarness.start(
             transport: transport,
             overloadRetryDelay: { _ in .seconds(30) },
             retrySleep: { _ in throw CancellationError() }
         )
+        let client = harness.client
 
         do {
             let _: EmptyResponse = try await client.send(
@@ -3210,6 +3294,7 @@ struct CodexAppServerKitTests {
         } catch {
             Issue.record("Expected CancellationError, got \(error).")
         }
+        await harness.close()
     }
 
     @Test func callerCancellationStopsShieldedOverloadBackoff() async throws {
@@ -3220,7 +3305,7 @@ struct CodexAppServerKitTests {
         let backoffWaiter = TestCancellationWaiter {
             backoffCancelled.signal()
         }
-        let client = AppServerClient(
+        let harness = await CodexAppServerTestConnectionHarness.start(
             transport: transport,
             overloadRetryDelay: { _ in .seconds(30) },
             retrySleep: { _ in
@@ -3228,6 +3313,7 @@ struct CodexAppServerKitTests {
                 try await backoffWaiter.wait()
             }
         )
+        let client = harness.client
         let task = Task {
             let _: EmptyResponse = try await client.send(
                 method: "ping",
@@ -3243,6 +3329,7 @@ struct CodexAppServerKitTests {
             try await task.value
         }
         #expect(await transport.recordedRequests(method: "ping").count == 1)
+        await harness.close()
     }
 
     @Test func handshakeDeadlineTakesPrecedenceOverGenericRequestDeadline() async throws {
@@ -3258,7 +3345,8 @@ struct CodexAppServerKitTests {
                 #expect(duration == .seconds(7))
                 await deadlineGate.waitIgnoringCancellation()
                 deadlineReturned.signal()
-            }
+            },
+            connectionCloseAction: testConnectionCloseAction(for: transport)
         )
 
         let task = Task { try await client.initialize() }
@@ -3287,17 +3375,17 @@ struct CodexAppServerKitTests {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueueTurnStart(turnID: "turn-deadline", status: "inProgress")
         let deadlineGate = CodexAppServerTestGate()
-        let client = AppServerClient(
+        let harness = await CodexAppServerTestConnectionHarness.start(
             transport: transport,
             deadlineClock: .init { duration in
                 #expect(duration == .seconds(9))
                 await deadlineGate.waitIgnoringCancellation()
             }
         )
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
         let stream = try await thread.streamResponse(to: "Wait for terminal.")
 
         let task = Task { try await stream.collect(timeout: .seconds(9)) }
@@ -3324,11 +3412,11 @@ struct CodexAppServerKitTests {
     @Test func responseCollectionCancellationIsLocalAndTerminalRemainsReplayable() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueueTurnStart(turnID: "turn-local-cancel", status: "inProgress")
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
         let stream = try await thread.streamResponse(to: "Keep running.")
 
         let task = Task { try await stream.collect() }
@@ -3361,7 +3449,8 @@ struct CodexAppServerKitTests {
         let gate = CodexAppServerTestGate()
         await transport.holdNextIgnoringCancellation(method: "turn/start", gate: gate)
         try await transport.enqueueTurnStart(turnID: "turn-1", status: "running")
-        let client = AppServerClient(transport: transport)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
 
         let first = Task {
             try await client.send(AppServerAPI.Turn.Start.Request(
@@ -3395,6 +3484,7 @@ struct CodexAppServerKitTests {
         _ = try await first.value
         #expect(await transport.recordedRequests(method: "turn/start").count == 1)
         #expect(await client.requestLaneCountForTesting() == 0)
+        await harness.close()
     }
 
     @Test func postWriteCancellationKeepsLaneUntilCorrelatedResponse() async throws {
@@ -3403,7 +3493,8 @@ struct CodexAppServerKitTests {
         await transport.holdNextIgnoringCancellation(method: "ping", gate: responseGate)
         try await transport.enqueueEmpty(for: "ping")
         try await transport.enqueueEmpty(for: "ping")
-        let client = AppServerClient(transport: transport)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
         let scope = AppServerAPI.RequestScope.thread("thread-1")
 
         let first = Task {
@@ -3436,6 +3527,7 @@ struct CodexAppServerKitTests {
         try await second.value
         #expect(await transport.recordedRequests(method: "ping").count == 2)
         #expect(await client.requestLaneCountForTesting() == 0)
+        await harness.close()
     }
 
     @Test func postWriteCancellationKeepsLaneThroughRequiredCleanup() async throws {
@@ -3446,7 +3538,8 @@ struct CodexAppServerKitTests {
         await transport.holdNextIgnoringCancellation(method: "ping", gate: responseGate)
         try await transport.enqueueEmpty(for: "ping")
         try await transport.enqueueEmpty(for: "ping")
-        let client = AppServerClient(transport: transport)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
         let scope = AppServerAPI.RequestScope.thread("thread-1")
 
         let first = Task {
@@ -3484,6 +3577,7 @@ struct CodexAppServerKitTests {
         try await second.value
         #expect(await transport.recordedRequests(method: "ping").count == 2)
         #expect(await client.requestLaneCountForTesting() == 0)
+        await harness.close()
     }
 
     @Test func cleanupChildWithStaleLaneTokenQueuesBehindCurrentOwner() async throws {
@@ -3497,7 +3591,8 @@ struct CodexAppServerKitTests {
         try await transport.enqueueEmpty(for: "ping")
         try await transport.enqueueEmpty(for: "ping")
         try await transport.enqueueEmpty(for: "ping")
-        let client = AppServerClient(transport: transport)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
         let scope = AppServerAPI.RequestScope.thread("thread-1")
 
         let first = Task {
@@ -3548,6 +3643,7 @@ struct CodexAppServerKitTests {
         try await child.value
         #expect(await transport.recordedRequests(method: "ping").count == 3)
         #expect(await client.requestLaneCountForTesting() == 0)
+        await harness.close()
     }
 
     @Test func postWriteDeadlineClosesConnectionBeforeReleasingLane() async throws {
@@ -3556,13 +3652,14 @@ struct CodexAppServerKitTests {
         let deadlineGate = CodexAppServerTestGate()
         await transport.holdNextIgnoringCancellation(method: "ping", gate: responseGate)
         try await transport.enqueueEmpty(for: "ping")
-        let client = AppServerClient(
+        let harness = await CodexAppServerTestConnectionHarness.start(
             transport: transport,
             deadlineClock: .init { duration in
                 #expect(duration == .seconds(5))
                 await deadlineGate.waitIgnoringCancellation()
             }
         )
+        let client = harness.client
         let scope = AppServerAPI.RequestScope.thread("thread-1")
 
         let first = Task {
@@ -3609,9 +3706,9 @@ struct CodexAppServerKitTests {
 
     @Test func turnResultReplaysEarlyNotificationsAndKeepsUnknownEvents() async throws {
         let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
         try await transport.emitServerNotification(
             method: "future/notification",
@@ -3635,7 +3732,8 @@ struct CodexAppServerKitTests {
             id: "turn-1",
             threadID: "thread-1",
             client: client,
-            router: router
+            router: router,
+            connectionLease: harness.lease
         )
 
         let events = try await collect(turn.events)
@@ -3663,9 +3761,10 @@ struct CodexAppServerKitTests {
 
     @Test func threadEventStreamCancellationRemovesRouterSubscriber() async throws {
         let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
 
         let consumer = Task {
             var iterator = thread.events.makeAsyncIterator()
@@ -3687,8 +3786,8 @@ struct CodexAppServerKitTests {
 
     @Test func directThreadEventStreamCancellationRemovesRouterSubscriber() async throws {
         let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let router = harness.router
         let stream = await router.events(for: CodexThreadID(rawValue: "thread-1"))
         #expect(await router.threadSubscriberCountForTesting(for: "thread-1") == 1)
 
@@ -3706,9 +3805,8 @@ struct CodexAppServerKitTests {
 
     @Test func liveThreadEventStreamFinishesWhenHistoryIsAlreadyTerminal() async throws {
         let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
         try await transport.emitServerNotification(
             method: "thread/closed",
@@ -3736,9 +3834,8 @@ struct CodexAppServerKitTests {
 
     @Test func threadEventStreamsReplayOnlyCurrentGenerationAfterNewGenerationStarts() async throws {
         let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
         try await transport.emitServerNotification(
             method: "thread/closed",
@@ -3789,9 +3886,8 @@ struct CodexAppServerKitTests {
 
     @Test func threadGenerationIncludingTurnStartsAfterPriorTerminalTurn() async throws {
         let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
         try await transport.emitServerNotification(
             method: "turn/started",
@@ -3907,9 +4003,8 @@ struct CodexAppServerKitTests {
 
     @Test func threadGenerationStartPreservesActiveUnscopedDiagnostics() async throws {
         let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
 
         await router.activateUnscopedDiagnosticRouting(in: "thread-review", until: "turn-review")
@@ -3943,11 +4038,11 @@ struct CodexAppServerKitTests {
         try await transport.enqueueTurnStart(turnID: "turn-2", status: "running")
         let gate = CodexAppServerTestGate()
         await transport.holdNext(method: "turn/start", gate: gate)
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
 
         try await emitItemStarted(
             on: transport,
@@ -4021,11 +4116,11 @@ struct CodexAppServerKitTests {
         try await transport.enqueueReviewStart(turnID: "turn-review", status: .inProgress)
         let gate = CodexAppServerTestGate()
         await transport.holdNext(method: "review/start", gate: gate)
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
 
         try await emitItemStarted(
             on: transport,
@@ -4121,12 +4216,12 @@ struct CodexAppServerKitTests {
         )
         let gate = CodexAppServerTestGate()
         await transport.holdNext(method: "review/start", gate: gate)
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
-        let thread = CodexThread(id: "thread-source", client: client, router: router)
-        let reviewThread = CodexThread(id: "thread-review", client: client, router: router)
+        let thread = CodexThread(id: "thread-source", client: client, router: router, connectionLease: harness.lease)
+        let reviewThread = CodexThread(id: "thread-review", client: client, router: router, connectionLease: harness.lease)
         let repeatedDiagnostic = ThreadlessDiagnosticParams(message: "detached startup warning")
 
         let oldSourceEventsTask = Task {
@@ -4183,7 +4278,7 @@ struct CodexAppServerKitTests {
             try await thread.startReview(target: .baseBranch("main"), delivery: .detached)
         }
         await transport.waitForRequest(method: "review/start")
-        await transport.emitServerNotificationJSON(
+        try await transport.emitServerNotificationJSON(
             method: "thread/status/changed",
             json: #"{"threadId":"thread-review","status":{"type":"active","activeFlags":[]}}"#
         )
@@ -4274,11 +4369,11 @@ struct CodexAppServerKitTests {
     @Test func compactBeginsNewThreadEventGeneration() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueueEmpty(for: "thread/compact/start")
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
 
         try await emitItemStarted(
             on: transport,
@@ -4357,11 +4452,11 @@ struct CodexAppServerKitTests {
         )
         let gate = CodexAppServerTestGate()
         await transport.holdNext(method: "review/start", gate: gate)
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
 
         try await emitItemStarted(
             on: transport,
@@ -4462,13 +4557,15 @@ struct CodexAppServerKitTests {
 
     @Test func turnEventStreamCancellationRemovesRouterSubscriber() async throws {
         let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         let turn = CodexTurn(
             id: "turn-1",
             threadID: "thread-1",
             client: client,
-            router: router
+            router: router,
+            connectionLease: harness.lease
         )
 
         let consumer = Task {
@@ -4491,8 +4588,8 @@ struct CodexAppServerKitTests {
 
     @Test func directTurnEventStreamCancellationRemovesRouterSubscriber() async throws {
         let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let router = harness.router
         let stream = await router.events(for: CodexTurnID(rawValue: "turn-1"))
         #expect(await router.turnSubscriberCountForTesting(for: "turn-1") == 1)
 
@@ -4510,9 +4607,9 @@ struct CodexAppServerKitTests {
 
     @Test func threadStreamsReplayMessagesTranscriptLogsAndUsage() async throws {
         let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
         try await transport.emitServerNotification(
             method: "item/completed",
@@ -4575,7 +4672,8 @@ struct CodexAppServerKitTests {
         let thread = CodexThread(
             id: "thread-1",
             client: client,
-            router: router
+            router: router,
+            connectionLease: harness.lease
         )
 
         let messages = try await collect(thread.messages)
@@ -4603,9 +4701,9 @@ struct CodexAppServerKitTests {
 
     @Test func threadItemDecodeReadsTextObjectContentFragments() async throws {
         let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
         try await transport.emitServerNotification(
             method: "item/completed",
@@ -4630,7 +4728,7 @@ struct CodexAppServerKitTests {
             method: "thread/closed",
             params: ThreadIDParams(threadID: "thread-1")
         )
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
 
         let transcripts = try await collect(thread.transcriptUpdates)
 
@@ -4639,9 +4737,9 @@ struct CodexAppServerKitTests {
 
     @Test func threadTranscriptKeepsDistinctMessageDeltaItemIDs() async throws {
         let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
         try await transport.emitServerNotification(
             method: "turn/started",
@@ -4683,7 +4781,7 @@ struct CodexAppServerKitTests {
             method: "thread/closed",
             params: ThreadIDParams(threadID: "thread-1")
         )
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
 
         let transcripts = try await collect(thread.transcriptUpdates)
 
@@ -4696,14 +4794,15 @@ struct CodexAppServerKitTests {
             AppServerAPI.Turn.Start.Response(turn: .init(id: "turn-1", status: "running")),
             for: "turn/start"
         )
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
         let thread = CodexThread(
             id: "thread-1",
             client: client,
-            router: router
+            router: router,
+            connectionLease: harness.lease
         )
 
         let stream = try await thread.streamResponse {
@@ -4754,11 +4853,11 @@ struct CodexAppServerKitTests {
             AppServerAPI.Turn.Start.Response(turn: .init(id: "turn-1", status: "running")),
             for: "turn/start"
         )
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
 
         let stream = try await thread.streamResponse(to: "Summarize this.")
         try await emitItemStarted(
@@ -4792,11 +4891,11 @@ struct CodexAppServerKitTests {
             AppServerAPI.Turn.Start.Response(turn: .init(id: "turn-1", status: "running")),
             for: "turn/start"
         )
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
 
         let stream = try await thread.streamResponse(to: "Summarize this.")
         try await transport.emitServerNotification(
@@ -4827,11 +4926,11 @@ struct CodexAppServerKitTests {
             AppServerAPI.Turn.Start.Response(turn: .init(id: "turn-1", status: "running")),
             for: "turn/start"
         )
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
 
         let stream = try await thread.streamResponse(to: "Summarize usage.")
         try await transport.emitServerNotification(
@@ -4861,11 +4960,11 @@ struct CodexAppServerKitTests {
             AppServerAPI.Turn.Start.Response(turn: .init(id: "turn-1", status: "running")),
             for: "turn/start"
         )
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
 
         let stream = try await thread.streamResponse(to: "Try this.")
         try await emitItemStarted(
@@ -4916,9 +5015,10 @@ struct CodexAppServerKitTests {
             AppServerAPI.Turn.Start.Response(turn: .init(id: "turn-1", status: "running")),
             for: "turn/start"
         )
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
 
         _ = try await thread.streamResponse(
             to: "Explain the patch.",
@@ -4955,9 +5055,10 @@ struct CodexAppServerKitTests {
             AppServerAPI.Turn.Start.Response(turn: .init(id: "turn-1", status: "running")),
             for: "turn/start"
         )
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
 
         _ = try await thread.streamResponse(
             to: "Explain the patch.",
@@ -4984,9 +5085,10 @@ struct CodexAppServerKitTests {
             AppServerAPI.Turn.Start.Response(turn: .init(id: "turn-1", status: "running")),
             for: "turn/start"
         )
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
 
         _ = try await thread.streamResponse(
             to: "Explain the patch.",
@@ -5003,9 +5105,9 @@ struct CodexAppServerKitTests {
 
     @Test func messageDeltaLogEntriesUseUniqueEntryIDs() async throws {
         let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
         try await emitItemStarted(
             on: transport,
@@ -5026,7 +5128,7 @@ struct CodexAppServerKitTests {
             params: ThreadIDParams(threadID: "thread-1")
         )
 
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
         let logs = try await collect(thread.logEntries)
         let deltas = logs.filter { $0.phase == .delta }
         #expect(deltas.map(\.id) == ["message-1:0", "message-1:1"])
@@ -5035,9 +5137,9 @@ struct CodexAppServerKitTests {
 
     @Test func threadLogEntriesContinueAfterTurnCompletionUntilThreadClosed() async throws {
         let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
         try await emitItemStarted(
             on: transport,
@@ -5068,7 +5170,7 @@ struct CodexAppServerKitTests {
             params: ThreadIDParams(threadID: "thread-1")
         )
 
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
         let logs = try await collect(thread.logEntries)
         let deltas = logs.filter { $0.phase == .delta }
         #expect(deltas.map(\.id) == ["message-1:0", "message-1:1"])
@@ -5077,9 +5179,8 @@ struct CodexAppServerKitTests {
 
     @Test func messageDeltaWithoutItemIDFailsAsMalformedNotification() async throws {
         let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
         let events = await router.events(for: CodexTurnID(rawValue: "turn-1"))
         try await transport.emitServerNotification(
@@ -5092,18 +5193,19 @@ struct CodexAppServerKitTests {
         )
 
         let failure = try #require(await terminalStreamFailure(events))
-        guard case .malformedNotification(let malformed) = failure else {
-            Issue.record("Expected malformed notification, got \(failure).")
+        guard case .connectionTerminated(.transportFailure(
+            .protocolViolation(let message, _)
+        )) = failure else {
+            Issue.record("Expected connection protocol violation, got \(failure).")
             return
         }
-        #expect(malformed.method == "item/agentMessage/delta")
+        #expect(message.contains("item/agentMessage/delta"))
     }
 
     @Test func threadItemWithoutIDFailsAsMalformedNotification() async throws {
         let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
         let events = await router.events(for: CodexTurnID(rawValue: "turn-1"))
         try await transport.emitServerNotification(
@@ -5116,18 +5218,20 @@ struct CodexAppServerKitTests {
         )
 
         let failure = try #require(await terminalStreamFailure(events))
-        guard case .malformedNotification(let malformed) = failure else {
-            Issue.record("Expected malformed notification, got \(failure).")
+        guard case .connectionTerminated(.transportFailure(
+            .protocolViolation(let message, _)
+        )) = failure else {
+            Issue.record("Expected connection protocol violation, got \(failure).")
             return
         }
-        #expect(malformed.method == "item/completed")
+        #expect(message.contains("item/completed"))
     }
 
     @Test func threadLogEntriesIncludeProgressDeltaNotifications() async throws {
         let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
 
         try await emitItemStarted(
@@ -5202,7 +5306,7 @@ struct CodexAppServerKitTests {
             params: ThreadIDParams(threadID: "thread-1")
         )
 
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
         let logs = try await collect(thread.logEntries)
         let updates = logs.filter { $0.phase == .updated }
 
@@ -5234,9 +5338,8 @@ struct CodexAppServerKitTests {
 
     @Test func progressDeltaWithoutItemIDFailsAsMalformedNotification() async throws {
         let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
         let events = await router.events(for: CodexTurnID(rawValue: "turn-1"))
 
@@ -5250,18 +5353,20 @@ struct CodexAppServerKitTests {
         )
 
         let failure = try #require(await terminalStreamFailure(events))
-        guard case .malformedNotification(let malformed) = failure else {
-            Issue.record("Expected malformed notification, got \(failure).")
+        guard case .connectionTerminated(.transportFailure(
+            .protocolViolation(let message, _)
+        )) = failure else {
+            Issue.record("Expected connection protocol violation, got \(failure).")
             return
         }
-        #expect(malformed.method == "item/commandExecution/outputDelta")
+        #expect(message.contains("item/commandExecution/outputDelta"))
     }
 
     @Test func completedFileChangeItemsPreserveChangesOutput() async throws {
         let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
         try await transport.emitServerNotification(
             method: "item/completed",
@@ -5286,7 +5391,7 @@ struct CodexAppServerKitTests {
             method: "thread/closed",
             params: ThreadIDParams(threadID: "thread-1")
         )
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
 
         let logs = try await collect(thread.logEntries)
 
@@ -5296,9 +5401,9 @@ struct CodexAppServerKitTests {
 
     @Test func reasoningNotificationsRouteAsTypedEventsLogsAndTranscript() async throws {
         let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
 
         try await emitItemStarted(
@@ -5363,7 +5468,7 @@ struct CodexAppServerKitTests {
             params: ThreadIDParams(threadID: "thread-1")
         )
 
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
         let events = try await collect(thread.events)
         #expect(
             events.contains {
@@ -5442,11 +5547,8 @@ struct CodexAppServerKitTests {
             """,
             for: "config/read"
         )
-        let client = AppServerClient(transport: transport)
-        let server = CodexAppServer(
-            client: client,
-            router: CodexAppServerNotificationRouter(client: client)
-        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let server = harness.server
 
         let models = try await server.models()
         let reasoningEfforts = models.first?.supportedReasoningEfforts.map(\.reasoningEffort)
@@ -5460,11 +5562,8 @@ struct CodexAppServerKitTests {
     @Test func updateConfigurationSendsBatchWriteEdits() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueueJSON(#"{"status":"ok"}"#, for: "config/batchWrite")
-        let client = AppServerClient(transport: transport)
-        let server = CodexAppServer(
-            client: client,
-            router: CodexAppServerNotificationRouter(client: client)
-        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let server = harness.server
 
         var patch = CodexConfigurationPatch()
         patch.setReviewModel("gpt-5-codex-review")
@@ -5485,11 +5584,8 @@ struct CodexAppServerKitTests {
 
     @Test func updateConfigurationSkipsEmptyPatch() async throws {
         let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let server = CodexAppServer(
-            client: client,
-            router: CodexAppServerNotificationRouter(client: client)
-        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let server = harness.server
 
         try await server.updateConfiguration(.init())
 
@@ -5509,11 +5605,8 @@ struct CodexAppServerKitTests {
                 ),
             ]
         ))
-        let client = AppServerClient(transport: transport)
-        let server = CodexAppServer(
-            client: client,
-            router: CodexAppServerNotificationRouter(client: client)
-        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let server = harness.server
 
         let rateLimits = try await server.rateLimits()
 
@@ -5545,11 +5638,8 @@ struct CodexAppServerKitTests {
             """,
             for: "account/rateLimits/read"
         )
-        let client = AppServerClient(transport: transport)
-        let server = CodexAppServer(
-            client: client,
-            router: CodexAppServerNotificationRouter(client: client)
-        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let server = harness.server
 
         let rateLimits = try await server.rateLimits()
 
@@ -5578,11 +5668,8 @@ struct CodexAppServerKitTests {
             """,
             for: "account/read"
         )
-        let client = AppServerClient(transport: transport)
-        let server = CodexAppServer(
-            client: client,
-            router: CodexAppServerNotificationRouter(client: client)
-        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let server = harness.server
 
         let account = try #require(try await server.account())
 
@@ -5602,11 +5689,8 @@ struct CodexAppServerKitTests {
             AppServerAPI.Account.Login.Cancel.Response(),
             for: "account/login/cancel"
         )
-        let client = AppServerClient(transport: transport)
-        let server = CodexAppServer(
-            client: client,
-            router: CodexAppServerNotificationRouter(client: client)
-        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let server = harness.server
         let handle = try await server.loginChatGPT()
 
         #expect(handle == .chatGPT(
@@ -5642,11 +5726,8 @@ struct CodexAppServerKitTests {
             nativeWebAuthentication: .init(callbackURLScheme: "lynnpd.CodexReviewMonitor.auth")
         )
         try await transport.enqueue(EmptyResponse(), for: "account/login/complete")
-        let client = AppServerClient(transport: transport)
-        let server = CodexAppServer(
-            client: client,
-            router: CodexAppServerNotificationRouter(client: client)
-        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let server = harness.server
 
         let login = try await server.loginChatGPT(
             nativeWebAuthentication: .init(callbackURLScheme: "lynnpd.CodexReviewMonitor.auth")
@@ -5690,12 +5771,14 @@ struct CodexAppServerKitTests {
             for: "turn/start"
         )
         try await transport.enqueue(EmptyResponse(), for: "turn/interrupt")
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         let thread = CodexThread(
             id: "thread-1",
             client: client,
-            router: router
+            router: router,
+            connectionLease: harness.lease
         )
 
         let stream = try await thread.streamResponse(to: "Run the slow checks.")
@@ -5716,12 +5799,14 @@ struct CodexAppServerKitTests {
     @Test func threadCancelActiveTurnSendsExpectedTurnID() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueue(EmptyResponse(), for: "turn/interrupt")
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         let thread = CodexThread(
             id: "thread-1",
             client: client,
-            router: router
+            router: router,
+            connectionLease: harness.lease
         )
 
         let cancellation = try await thread.cancelActiveTurn(expectedTurnID: "turn-1")
@@ -5747,12 +5832,14 @@ struct CodexAppServerKitTests {
             for: "turn/interrupt"
         )
         try await transport.enqueue(EmptyResponse(), for: "turn/interrupt")
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         let thread = CodexThread(
             id: "thread-1",
             client: client,
-            router: router
+            router: router,
+            connectionLease: harness.lease
         )
 
         let stream = try await thread.streamResponse(to: "Run the slow checks.")
@@ -5781,9 +5868,10 @@ struct CodexAppServerKitTests {
             for: "turn/interrupt"
         )
         try await transport.enqueue(EmptyResponse(), for: "turn/interrupt")
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
 
         let stream = try await thread.streamResponse(to: "Run the slow checks.")
         let cancellation = try await stream.cancel()
@@ -5806,12 +5894,14 @@ struct CodexAppServerKitTests {
             AppServerAPI.Turn.Steer.Response(turnID: "turn-1"),
             for: "turn/steer"
         )
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         let thread = CodexThread(
             id: "thread-1",
             client: client,
-            router: router
+            router: router,
+            connectionLease: harness.lease
         )
 
         let stream = try await thread.streamResponse(to: "Run the slow checks.")
@@ -5840,14 +5930,15 @@ struct CodexAppServerKitTests {
             AppServerAPI.Turn.Start.Response(turn: .init(id: "turn-2", status: "running")),
             for: "turn/start"
         )
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
         let thread = CodexThread(
             id: "thread-1",
             client: client,
-            router: router
+            router: router,
+            connectionLease: harness.lease
         )
 
         let stream = try await thread.streamResponse(to: "First request.")
@@ -5886,14 +5977,15 @@ struct CodexAppServerKitTests {
             AppServerAPI.Turn.Start.Response(turn: .init(id: "turn-2", status: "running")),
             for: "turn/start"
         )
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
         let thread = CodexThread(
             id: "thread-1",
             client: client,
-            router: router
+            router: router,
+            connectionLease: harness.lease
         )
 
         let stream = try await thread.streamResponse(to: "Long request.")
@@ -5945,11 +6037,11 @@ struct CodexAppServerKitTests {
             AppServerAPI.Turn.Start.Response(turn: .init(id: "turn-follow-up", status: "running")),
             for: "turn/start"
         )
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
 
         let stream = try await thread.streamResponse(to: "Long request.")
         let followUpTask = Task {
@@ -6480,15 +6572,53 @@ private final class TestPreWriteSuspendingTransport: JSONRPC.Transport, Sendable
 
     func notify(_ notification: JSONRPC.Notification) async throws {}
 
-    func notificationStream() async -> AsyncThrowingStream<JSONRPC.Notification, Error> {
-        .init { continuation in
-            continuation.finish()
-        }
+    func nextInboundEvent() async throws -> JSONRPC.InboundEvent? { nil }
+
+    func respond(
+        to requestID: CodexServerRequestID,
+        with response: CodexServerRequestResponse
+    ) async throws {}
+
+    func beginClose() async -> JSONRPC.ProcessExitObservation? {
+        await writeAcceptanceGate.open()
+        return nil
     }
 
-    func close() async {
-        await writeAcceptanceGate.open()
+    func finishPendingResponsesAfterInboundDrain(_ failure: CodexTransportFailure) async {}
+
+    func waitForProcessExit() async -> JSONRPC.ProcessExitObservation { .unavailable }
+
+    func waitUntilClosed() async {}
+
+    func reapProcess() async {}
+}
+
+private final class TestOutboundWriteFailureTransport: JSONRPC.Transport, Sendable {
+    private let failure: CodexTransportFailure
+
+    init(failure: CodexTransportFailure) {
+        self.failure = failure
     }
+
+    func send(
+        _ request: JSONRPC.Request,
+        acceptWrite: @Sendable () throws -> Void
+    ) async throws -> Data {
+        try acceptWrite()
+        throw JSONRPC.OutboundWriteFailure(failure)
+    }
+
+    func notify(_ notification: JSONRPC.Notification) async throws {}
+    func nextInboundEvent() async throws -> JSONRPC.InboundEvent? { nil }
+    func respond(
+        to requestID: CodexServerRequestID,
+        with response: CodexServerRequestResponse
+    ) async throws {}
+    func beginClose() async -> JSONRPC.ProcessExitObservation? { nil }
+    func finishPendingResponsesAfterInboundDrain(_ failure: CodexTransportFailure) async {}
+    func waitForProcessExit() async -> JSONRPC.ProcessExitObservation { .unavailable }
+    func waitUntilClosed() async {}
+    func reapProcess() async {}
 }
 
 private final class TestSuspendingTransport: JSONRPC.Transport, Sendable {
@@ -6526,15 +6656,25 @@ private final class TestSuspendingTransport: JSONRPC.Transport, Sendable {
 
     func notify(_ notification: JSONRPC.Notification) async throws {}
 
-    func notificationStream() async -> AsyncThrowingStream<JSONRPC.Notification, Error> {
-        .init { continuation in
-            continuation.finish()
-        }
+    func nextInboundEvent() async throws -> JSONRPC.InboundEvent? { nil }
+
+    func respond(
+        to requestID: CodexServerRequestID,
+        with response: CodexServerRequestResponse
+    ) async throws {}
+
+    func beginClose() async -> JSONRPC.ProcessExitObservation? {
+        suspension.cancel()
+        return nil
     }
 
-    func close() async {
-        suspension.cancel()
-    }
+    func finishPendingResponsesAfterInboundDrain(_ failure: CodexTransportFailure) async {}
+
+    func waitForProcessExit() async -> JSONRPC.ProcessExitObservation { .unavailable }
+
+    func waitUntilClosed() async {}
+
+    func reapProcess() async {}
 }
 
 private final class TestSignal: Sendable {
@@ -6666,6 +6806,14 @@ private func eventually(
         try? await Task.sleep(for: .milliseconds(10))
     }
     return await condition()
+}
+
+private func testConnectionCloseAction(
+    for transport: any JSONRPC.Transport
+) -> ConnectionCloseAction {
+    ConnectionCloseAction(action: {
+        _ = await transport.beginClose()
+    })
 }
 
 private enum TestTimeoutError: Error {

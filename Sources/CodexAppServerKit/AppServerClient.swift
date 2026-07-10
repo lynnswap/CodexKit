@@ -4,6 +4,20 @@ import OSLog
 private let logger = Logger(subsystem: "CodexAppServerKit", category: "app-server-client")
 
 package actor AppServerClient {
+    private struct InitializationContract: Equatable {
+        var clientName: String
+        var clientVersion: String
+    }
+
+    private enum InitializationState {
+        case idle
+        case inFlight(
+            contract: InitializationContract,
+            waiters: [CheckedContinuation<AppServerAPI.Initialize.Response, any Error>]
+        )
+        case complete(AppServerAPI.Initialize.Response)
+    }
+
     private static let appServerOverloadedErrorCode = -32001
     private static let overloadRetryDelays: [Duration] = [
         .milliseconds(100),
@@ -16,17 +30,18 @@ package actor AppServerClient {
     private let retrySleep: @Sendable (Duration) async throws -> Void
     private let deadlines: CodexAppServer.Configuration.Deadlines
     private let deadlineClock: CodexDeadlineClock
+    private let connectionCloseAction: ConnectionCloseAction
     private let serializer = RequestSerializer()
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
     private var nextRequestID = 1
-    private var initializationResponse: AppServerAPI.Initialize.Response?
-    private var initializationTask: Task<AppServerAPI.Initialize.Response, Error>?
+    private var initializationState = InitializationState.idle
 
     package init(
         transport: any JSONRPC.Transport,
         deadlines: CodexAppServer.Configuration.Deadlines = .init(),
         deadlineClock: CodexDeadlineClock = .continuous,
+        connectionCloseAction: ConnectionCloseAction,
         overloadRetryDelay: @escaping @Sendable (Int) -> Duration? = AppServerClient
             .defaultOverloadRetryDelay,
         retrySleep: @escaping @Sendable (Duration) async throws -> Void = {
@@ -36,6 +51,7 @@ package actor AppServerClient {
         self.transport = transport
         self.deadlines = deadlines
         self.deadlineClock = deadlineClock
+        self.connectionCloseAction = connectionCloseAction
         self.overloadRetryDelay = overloadRetryDelay
         self.retrySleep = retrySleep
     }
@@ -44,24 +60,63 @@ package actor AppServerClient {
         clientName: String = "CodexAppServerKit",
         clientVersion: String = "2"
     ) async throws -> AppServerAPI.Initialize.Response {
-        if let initializationResponse {
-            return initializationResponse
+        let contract = InitializationContract(
+            clientName: clientName,
+            clientVersion: clientVersion
+        )
+        switch initializationState {
+        case .complete(let response):
+            return response
+        case .inFlight(let existingContract, var waiters):
+            precondition(
+                existingContract == contract,
+                "Concurrent initialization must use the same client name and version."
+            )
+            return try await withCheckedThrowingContinuation { continuation in
+                waiters.append(continuation)
+                initializationState = .inFlight(
+                    contract: existingContract,
+                    waiters: waiters
+                )
+            }
+        case .idle:
+            initializationState = .inFlight(contract: contract, waiters: [])
         }
-        if let initializationTask {
-            return try await initializationTask.value
-        }
-        let task = Task {
-            try await self.performInitialize(clientName: clientName, clientVersion: clientVersion)
-        }
-        initializationTask = task
+
         do {
-            let response = try await task.value
-            initializationResponse = response
-            initializationTask = nil
+            let response = try await performInitialize(
+                clientName: clientName,
+                clientVersion: clientVersion
+            )
+            finishInitialization(with: .success(response))
             return response
         } catch {
-            initializationTask = nil
+            finishInitialization(with: .failure(error))
             throw error
+        }
+    }
+
+    package func initializationWaiterCountForTesting() -> Int {
+        guard case .inFlight(_, let waiters) = initializationState else {
+            return 0
+        }
+        return waiters.count
+    }
+
+    private func finishInitialization(
+        with result: Result<AppServerAPI.Initialize.Response, any Error>
+    ) {
+        guard case .inFlight(_, let waiters) = initializationState else {
+            preconditionFailure("Initialization completed without an in-flight owner.")
+        }
+        switch result {
+        case .success(let response):
+            initializationState = .complete(response)
+        case .failure:
+            initializationState = .idle
+        }
+        for waiter in waiters {
+            waiter.resume(with: result)
         }
     }
 
@@ -242,6 +297,13 @@ package actor AppServerClient {
                     throw CancellationError()
                 } catch let error as JSONRPC.Error {
                     throw error
+                } catch let error as JSONRPC.OutboundWriteFailure {
+                    throw CodexAppServerError.request(.init(
+                        requestID: attemptRequestID,
+                        method: method,
+                        purpose: purpose,
+                        kind: .write(error.failure)
+                    ))
                 } catch {
                     throw CodexAppServerError.request(.init(
                         requestID: attemptRequestID,
@@ -340,14 +402,6 @@ package actor AppServerClient {
         }
     }
 
-    package func notificationStream() async -> AsyncThrowingStream<JSONRPC.Notification, Error> {
-        await transport.notificationStream()
-    }
-
-    package func close() async {
-        await transport.close()
-    }
-
     package func requestLaneCountForTesting() async -> Int {
         await serializer.laneCountForTesting()
     }
@@ -367,7 +421,6 @@ package actor AppServerClient {
             atLeast: minimumCount
         )
     }
-
     package func runTurnWithDeadline<Output: Sendable>(
         turnID: CodexTurnID,
         duration: Duration,
@@ -448,7 +501,7 @@ package actor AppServerClient {
                         deadlineWon = true
                     case .closeConnection:
                         deadlineWon = true
-                        await transport.close()
+                        await connectionCloseAction.closeConnection()
                     }
                 }
             }
