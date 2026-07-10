@@ -1,6 +1,7 @@
 import Foundation
 import Testing
 
+import CodexAppServerKitTesting
 @testable import CodexAppServerKit
 
 @Suite("Connection termination arbitration")
@@ -430,6 +431,101 @@ struct ConnectionEventHubTests {
         #expect(slowMessages == (8..<40).map { "warning-\($0)" })
         await fast.cancel()
         await slow.cancel()
+    }
+}
+
+@Suite("Connection event integration")
+struct ConnectionEventIntegrationTests {
+    @Test func stderrDiagnosticsPreserveFilterSeverityAndIOStage() {
+        #expect(ConnectionDiagnosticFactory.processStderr(.init(
+            level: .error,
+            message: "plain stderr"
+        )) == .init(
+            message: "plain stderr",
+            method: "process/stderr",
+            details: "severity: error"
+        ))
+        #expect(ConnectionDiagnosticFactory.processStderr(.init(
+            level: .warning,
+            message: "command output omitted"
+        )) == .init(
+            message: "command output omitted",
+            method: "process/stderr",
+            details: "severity: warning"
+        ))
+        #expect(ConnectionDiagnosticFactory.processStderrFailure(
+            .setup,
+            details: "Bad file descriptor"
+        ) == .init(
+            message: "App-server stderr setup failed.",
+            method: "process/stderr",
+            details: "Bad file descriptor"
+        ))
+        #expect(ConnectionDiagnosticFactory.processStderrFailure(
+            .read,
+            details: "Input/output error"
+        ) == .init(
+            message: "App-server stderr read failed.",
+            method: "process/stderr",
+            details: "Input/output error"
+        ))
+    }
+
+    @Test func publicStreamReceivesDecodedDiagnosticsAndTheCommittedTerminal() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let events = await runtime.server.connectionEvents()
+        var iterator = events.makeAsyncIterator()
+
+        try await runtime.transport.emitServerNotificationJSON(
+            method: "warning",
+            json: #"{"message":"wire warning"}"#
+        )
+        try await runtime.transport.emitServerNotificationJSON(
+            method: "deprecationNotice",
+            json: #"{"summary":"old API","details":"use new API"}"#
+        )
+        try await runtime.transport.emitServerNotificationJSON(
+            method: "configWarning",
+            json: #"{"summary":"bad key","details":"remove it","path":"config.toml","range":{"start":{"line":1,"column":2},"end":{"line":1,"column":5}}}"#
+        )
+        try await runtime.transport.emitServerNotificationJSON(
+            method: "future/notification",
+            json: #"{"threadId":"thread-1","turnId":"turn-1","value":1}"#
+        )
+
+        #expect(await iterator.next() == .warning(.init(
+            message: "wire warning",
+            method: "warning"
+        )))
+        #expect(await iterator.next() == .deprecation(.init(
+            summary: "old API",
+            details: "use new API"
+        )))
+        #expect(await iterator.next() == .warning(.init(
+            message: "bad key",
+            method: "configWarning",
+            details: "remove it"
+        )))
+        guard case .unknown(let raw) = await iterator.next() else {
+            Issue.record("Expected an unknown connection notification.")
+            return
+        }
+        #expect(raw.method == "future/notification")
+        #expect(raw.threadID == "thread-1")
+        #expect(raw.turnID == "turn-1")
+
+        await runtime.server.close()
+        #expect(await iterator.next() == .terminated(.closedByCaller))
+        #expect(await iterator.next() == nil)
+    }
+
+    @Test func latePublicSubscriberReplaysOnlyTheCommittedTerminal() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        await runtime.server.close()
+
+        var iterator = await runtime.server.connectionEvents().makeAsyncIterator()
+        #expect(await iterator.next() == .terminated(.closedByCaller))
+        #expect(await iterator.next() == nil)
     }
 }
 

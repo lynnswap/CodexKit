@@ -62,6 +62,9 @@ public struct CodexDeprecationNotice: Equatable, Sendable {
 ///
 /// The subscription does not retain the connection, its supervisor, or a connection lease.
 /// Cancelling iteration only releases this subscriber.
+/// Each subscriber keeps the newest 32 pending diagnostics. A terminal event supersedes
+/// pending diagnostics, is delivered exactly once, and is the only event replayed to a late
+/// subscriber.
 public struct CodexConnectionEvents: AsyncSequence, Sendable {
     public typealias Element = CodexConnectionEvent
 
@@ -149,6 +152,126 @@ package final class ConnectionEventHub: Sendable {
 
     package func snapshotForTesting() -> Snapshot {
         subscriptionRegistry.snapshot()
+    }
+}
+
+package enum ConnectionDiagnosticFactory {
+    package enum ProcessStderrFailureStage {
+        case setup
+        case read
+    }
+
+    package static func routingFailure(
+        message: String,
+        method: String? = nil
+    ) -> CodexDiagnostic {
+        .init(message: message, method: method)
+    }
+
+    package static func droppedNotification(method: String) -> CodexDiagnostic {
+        .init(
+            message: "Dropped notification while draining responses after routing failure.",
+            method: method
+        )
+    }
+
+    package static func droppedServerRequest(
+        id: CodexServerRequestID,
+        method: String
+    ) -> CodexDiagnostic {
+        .init(
+            message: "Dropped server request while draining responses after routing failure.",
+            method: method,
+            details: "requestId: \(requestIDDescription(id))"
+        )
+    }
+
+    package static func lateResponse(requestID: Int) -> CodexDiagnostic {
+        .init(
+            message: "Ignored late JSON-RPC response after outbound close.",
+            details: "requestId: \(requestID)"
+        )
+    }
+
+    package static func processStderrFailure(
+        _ stage: ProcessStderrFailureStage,
+        details: String
+    ) -> CodexDiagnostic {
+        let message = switch stage {
+        case .setup: "App-server stderr setup failed."
+        case .read: "App-server stderr read failed."
+        }
+        return .init(message: message, method: "process/stderr", details: details)
+    }
+
+    package static func processStderr(_ event: AppServerStderrLogFilter.Event) -> CodexDiagnostic {
+        let severity = switch event.level {
+        case .error: "error"
+        case .warning: "warning"
+        }
+        return .init(
+            message: event.message,
+            method: "process/stderr",
+            details: "severity: \(severity)"
+        )
+    }
+
+    package static func lateTermination(
+        winner: CodexConnectionTermination,
+        candidate: CodexConnectionTermination
+    ) -> CodexDiagnostic {
+        .init(
+            message: "Ignored late connection termination.",
+            details: "winner: \(String(describing: winner)); candidate: \(String(describing: candidate))"
+        )
+    }
+
+    package static func serverRequestRegistry(
+        _ diagnostic: ServerRequestRegistry.Diagnostic
+    ) -> CodexDiagnostic {
+        switch diagnostic {
+        case .duplicateRequest(let id):
+            .init(
+                message: "Received a duplicate server-request identifier.",
+                details: "requestId: \(requestIDDescription(id))"
+            )
+        case .rejectedWhileClosing(let id, let method):
+            .init(
+                message: "Rejected a server request while the connection was closing.",
+                method: method,
+                details: "requestId: \(requestIDDescription(id))"
+            )
+        case .decodeFailed(let id, let method, let message):
+            .init(
+                message: "Failed to decode a server request.",
+                method: method,
+                details: "requestId: \(requestIDDescription(id)); \(message)"
+            )
+        case .handlerFailed(let id, let method, let message):
+            .init(
+                message: "Server-request handler failed.",
+                method: method,
+                details: "requestId: \(requestIDDescription(id)); \(message)"
+            )
+        case .responseFailed(let id, let method, let message):
+            .init(
+                message: "Failed to write a server-request response.",
+                method: method,
+                details: "requestId: \(requestIDDescription(id)); \(message)"
+            )
+        case .ownedTaskRequestedClose(let id):
+            .init(
+                message: "A server-request handler requested connection close.",
+                details: "requestId: \(requestIDDescription(id))"
+            )
+        }
+    }
+
+    private static func requestIDDescription(_ id: CodexServerRequestID) -> String {
+        switch id {
+        case .integer(let value): String(value)
+        case .string(let value): value
+        }
     }
 }
 

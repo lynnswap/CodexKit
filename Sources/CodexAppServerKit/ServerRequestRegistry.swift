@@ -37,6 +37,7 @@ package actor ServerRequestRegistry {
     }
 
     private let codec: CodexAppServerRequestCodec
+    private let connectionEventHub: ConnectionEventHub
     private let handler: CodexAppServerRequestHandler
     private let responder: Responder
     private let diagnosticHandler: DiagnosticHandler
@@ -48,11 +49,13 @@ package actor ServerRequestRegistry {
 
     package init(
         codec: CodexAppServerRequestCodec = .init(),
+        connectionEventHub: ConnectionEventHub,
         handler: @escaping CodexAppServerRequestHandler,
         responder: @escaping Responder,
         diagnosticHandler: @escaping DiagnosticHandler = { _ in }
     ) {
         self.codec = codec
+        self.connectionEventHub = connectionEventHub
         self.handler = handler
         self.responder = responder
         self.diagnosticHandler = diagnosticHandler
@@ -66,11 +69,11 @@ package actor ServerRequestRegistry {
         receivedEventCount += 1
         resumeReceiveCountWaiters()
         guard phase == .open else {
-            diagnosticHandler(.rejectedWhileClosing(id, method: method))
+            emitDiagnostic(.rejectedWhileClosing(id, method: method))
             return
         }
         guard entries[id] == nil else {
-            diagnosticHandler(.duplicateRequest(id))
+            emitDiagnostic(.duplicateRequest(id))
             return
         }
 
@@ -163,7 +166,7 @@ package actor ServerRequestRegistry {
             entries[id] = entry
             entry.task.cancel()
         }
-        diagnosticHandler(.ownedTaskRequestedClose(context.requestID))
+        emitDiagnostic(.ownedTaskRequestedClose(context.requestID))
         return true
     }
 
@@ -208,7 +211,7 @@ package actor ServerRequestRegistry {
                 finishSuppressed(id: id, token: token)
                 return
             }
-            diagnosticHandler(.decodeFailed(
+            emitDiagnostic(.decodeFailed(
                 id,
                 method: method,
                 message: error.localizedDescription
@@ -237,7 +240,7 @@ package actor ServerRequestRegistry {
                 finishSuppressed(id: id, token: token)
                 return
             }
-            diagnosticHandler(.handlerFailed(
+            emitDiagnostic(.handlerFailed(
                 id,
                 method: method,
                 message: error.localizedDescription
@@ -293,7 +296,7 @@ package actor ServerRequestRegistry {
         do {
             try await responder(id, response)
         } catch {
-            diagnosticHandler(.responseFailed(
+            emitDiagnostic(.responseFailed(
                 id,
                 method: method,
                 message: error.localizedDescription
@@ -310,6 +313,13 @@ package actor ServerRequestRegistry {
         for waiter in waiters {
             waiter.resume()
         }
+    }
+
+    private func emitDiagnostic(_ diagnostic: Diagnostic) {
+        connectionEventHub.yield(.warning(
+            ConnectionDiagnosticFactory.serverRequestRegistry(diagnostic)
+        ))
+        diagnosticHandler(diagnostic)
     }
 
     private func resumeReceiveCountWaiters() {

@@ -39,6 +39,7 @@ package enum JSONRPC {
     }
 
     package protocol Transport: Sendable {
+        var connectionEventHub: ConnectionEventHub { get }
         func send(
             _ request: Request,
             acceptWrite: @Sendable () throws -> Void

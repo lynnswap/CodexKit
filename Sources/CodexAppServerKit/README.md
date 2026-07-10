@@ -31,6 +31,31 @@ await appServer.close()
 notifications, retries app-server overload responses, and preserves schema-new
 notifications as unknown domain events.
 
+Use the root-bound connection sequence for diagnostics and the single typed
+termination reason:
+
+```swift
+let connectionEvents = await appServer.connectionEvents()
+for await event in connectionEvents {
+    switch event {
+    case .warning(let diagnostic):
+        print(diagnostic.message)
+    case .retrying(let retry):
+        print("Retrying \(retry.method), attempt \(retry.attempt)")
+    case .deprecation(let notice):
+        print(notice.summary)
+    case .unknown(let notification):
+        print("Future notification: \(notification.method)")
+    case .terminated(let reason):
+        print("Connection ended: \(reason)")
+    }
+}
+```
+
+The sequence does not retain the app-server connection. Each subscriber keeps
+the newest 32 pending diagnostics; the terminal event supersedes pending
+diagnostics and is the only event replayed to a late subscriber.
+
 ## Configuration
 
 `CodexAppServer.Configuration` owns the container identity and local-process

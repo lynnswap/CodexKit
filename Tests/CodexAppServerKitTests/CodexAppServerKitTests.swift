@@ -127,7 +127,8 @@ struct CodexAppServerKitTests {
                 arguments: [],
                 environment: ["RESPONSE_PATH": responseURL.path],
                 codexHomeURL: rootURL.appendingPathComponent("codex-home", isDirectory: true)
-            )
+            ),
+            connectionEventHub: ConnectionEventHub()
         )
         let harness = await CodexAppServerTestConnectionHarness.start(
             transport: transport,
@@ -1838,62 +1839,6 @@ struct CodexAppServerKitTests {
         #expect(try await iterator.next() == nil)
     }
 
-    @Test func appServerResumeReviewRoutesThreadlessDiagnostics() async throws {
-        let transport = CodexAppServerTestTransport()
-        try await transport.enqueueInitialize(codexHome: nil, userAgent: nil)
-        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
-        _ = try await harness.client.initialize()
-        let priorEvents = await harness.router.liveEvents(for: "thread-review")
-        let priorClosed = Task {
-            var iterator = priorEvents.makeAsyncIterator()
-            return try await iterator.next()
-        }
-        try await transport.emitServerNotification(
-            method: "thread/closed",
-            params: ThreadIDParams(threadID: "thread-review")
-        )
-        #expect(try await priorClosed.value == .closed)
-        try await transport.enqueueThreadResume(.init(
-            id: "thread-review",
-            workspace: URL(fileURLWithPath: "/tmp/project", isDirectory: true)
-        ))
-        let gate = CodexAppServerTestGate()
-        await transport.holdNext(method: "thread/resume", gate: gate)
-        let identity = CodexReviewIdentity(
-            threadID: "thread-source",
-            turnID: "turn-review",
-            reviewThreadID: "thread-review",
-            model: "gpt-5"
-        )
-
-        let reviewTask = Task {
-            try await harness.server.resumeReview(identity)
-        }
-        await transport.waitForRequest(method: "thread/resume")
-        try await transport.emitServerNotification(
-            method: "configWarning",
-            params: ThreadlessDiagnosticParams(message: "using defaults")
-        )
-        await gate.open()
-        let review = try await reviewTask.value
-        try await transport.emitServerNotification(
-            method: "turn/completed",
-            params: TurnCompletedParams(threadID: "thread-review", turn: .init(id: "turn-review", status: "completed"))
-        )
-
-        let events = try await collect(review.events)
-        #expect(
-            events.contains {
-                if case .unknown(let raw) = $0 {
-                    return raw.method == "configWarning"
-                        && raw.threadID == "thread-review"
-                        && raw.turnID == nil
-                }
-                return false
-            })
-        await harness.close()
-    }
-
     @Test func appServerResumeReviewUsesThreadOptionModelOverride() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         try await runtime.transport.enqueueThreadResume(.init(id: "thread-review"))
@@ -2770,41 +2715,6 @@ struct CodexAppServerKitTests {
         }
     }
 
-    @Test func reviewEventsPreserveUnknownNotificationsAsRawDomainEvents() async throws {
-        let transport = CodexAppServerTestTransport()
-        try await transport.enqueue(
-            AppServerAPI.Review.Start.Response(
-                turnID: "turn-review",
-                reviewThreadID: "thread-review"
-            ),
-            for: "review/start"
-        )
-        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
-        let client = harness.client
-        let router = harness.router
-        await transport.waitForNotificationStreamCount(1)
-        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
-
-        let review = try await thread.startReview(
-            target: .baseBranch("main"),
-            delivery: .detached
-        )
-        try await transport.emitServerNotification(
-            method: "review/futureEvent",
-            params: TurnIDParams(turnID: "turn-review")
-        )
-
-        var iterator = review.events.makeAsyncIterator()
-        let event = try await iterator.next()
-        if case .unknown(let raw) = event {
-            #expect(raw.method == "review/futureEvent")
-            #expect(raw.threadID == "thread-review")
-            #expect(raw.turnID == "turn-review")
-        } else {
-            Issue.record("Expected unknown thread event to be preserved.")
-        }
-    }
-
     @Test func reviewEventsRouteTurnIdentifiedUnknownNotificationsThroughTurnSeed() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueue(
@@ -2848,102 +2758,6 @@ struct CodexAppServerKitTests {
                 }
                 return false
             })
-    }
-
-    @Test func reviewEventsRouteThreadlessDiagnosticsToActiveReviewThreads() async throws {
-        let transport = CodexAppServerTestTransport()
-        try await transport.enqueue(
-            AppServerAPI.Review.Start.Response(
-                turnID: "turn-review",
-                reviewThreadID: "thread-review"
-            ),
-            for: "review/start"
-        )
-        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
-        let client = harness.client
-        let router = harness.router
-        await transport.waitForNotificationStreamCount(1)
-        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
-
-        let review = try await thread.startReview(
-            target: .baseBranch("main"),
-            delivery: .detached
-        )
-        try await transport.emitServerNotification(
-            method: "deprecationNotice",
-            params: ThreadlessDiagnosticParams(message: "using defaults")
-        )
-        try await transport.emitServerNotification(
-            method: "turn/completed",
-            params: TurnCompletedParams(threadID: "thread-review", turn: .init(id: "turn-review", status: "completed"))
-        )
-        try await transport.emitServerNotification(
-            method: "deprecationNotice",
-            params: ThreadlessDiagnosticParams(message: "late warning")
-        )
-        try await transport.emitServerNotification(
-            method: "thread/closed",
-            params: ThreadIDParams(threadID: "thread-review")
-        )
-
-        let events = try await collect(review.events)
-        let diagnostics = events.filter {
-            if case .unknown(let raw) = $0 {
-                return raw.method == "deprecationNotice"
-                    && raw.threadID == "thread-review"
-                    && raw.turnID == nil
-            }
-            return false
-        }
-        #expect(diagnostics.count == 1)
-    }
-
-    @Test func inlineReviewEventsRouteThreadlessDiagnosticsToSourceThread() async throws {
-        let transport = CodexAppServerTestTransport()
-        try await transport.enqueue(
-            AppServerAPI.Review.Start.Response(
-                turnID: "turn-review",
-                reviewThreadID: "thread-1"
-            ),
-            for: "review/start"
-        )
-        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
-        let client = harness.client
-        let router = harness.router
-        await transport.waitForNotificationStreamCount(1)
-        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
-
-        let review = try await thread.startReview(
-            target: .baseBranch("main"),
-            delivery: .inline
-        )
-        try await transport.emitServerNotification(
-            method: "configWarning",
-            params: ThreadlessDiagnosticParams(message: "using defaults")
-        )
-        try await transport.emitServerNotification(
-            method: "turn/completed",
-            params: TurnCompletedParams(threadID: "thread-review", turn: .init(id: "turn-review", status: "completed"))
-        )
-        try await transport.emitServerNotification(
-            method: "configWarning",
-            params: ThreadlessDiagnosticParams(message: "late warning")
-        )
-        try await transport.emitServerNotification(
-            method: "thread/closed",
-            params: ThreadIDParams(threadID: "thread-1")
-        )
-
-        let events = try await collect(review.events)
-        let diagnostics = events.filter {
-            if case .unknown(let raw) = $0 {
-                return raw.method == "configWarning"
-                    && raw.threadID == "thread-1"
-                    && raw.turnID == nil
-            }
-            return false
-        }
-        #expect(diagnostics.count == 1)
     }
 
     @Test func promptPartsEncodeToAppServerInputItems() {
@@ -3243,6 +3057,7 @@ struct CodexAppServerKitTests {
             }
         )
         let client = harness.client
+        var connectionIterator = await harness.server.connectionEvents().makeAsyncIterator()
 
         let task = Task {
             let _: EmptyResponse = try await client.send(
@@ -3254,6 +3069,13 @@ struct CodexAppServerKitTests {
             )
         }
         await backoffStarted.wait()
+        #expect(await connectionIterator.next() == .retrying(.init(
+            requestID: 1,
+            method: "ping",
+            attempt: 1,
+            delay: .seconds(30),
+            serverError: .init(code: -32_001, message: "busy")
+        )))
         await deadlineGate.open()
         await deadlineReturned.wait()
         await backoffCancelled.wait()
@@ -3704,15 +3526,22 @@ struct CodexAppServerKitTests {
         #expect(await client.requestLaneCountForTesting() == 0)
     }
 
-    @Test func turnResultReplaysEarlyNotificationsAndKeepsUnknownEvents() async throws {
+    @Test func turnResultReplaysEarlyDomainEventsAndRoutesUnknownToConnection() async throws {
         let transport = CodexAppServerTestTransport()
         let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
         let client = harness.client
         let router = harness.router
+        let connectionEvents = await harness.server.connectionEvents()
+        let connectionEventTask = Task {
+            var iterator = connectionEvents.makeAsyncIterator()
+            return await iterator.next()
+        }
+        await connectionEvents.waitUntilNextSuspendsForTesting()
         await transport.waitForNotificationStreamCount(1)
+        let futureParams = TurnIDParams(turnID: "turn-1")
         try await transport.emitServerNotification(
             method: "future/notification",
-            params: TurnIDParams(turnID: "turn-1")
+            params: futureParams
         )
         try await emitItemStarted(
             on: transport,
@@ -3737,14 +3566,17 @@ struct CodexAppServerKitTests {
         )
 
         let events = try await collect(turn.events)
-        #expect(
-            events.contains {
-                if case .unknown(let raw) = $0 {
-                    raw.method == "future/notification"
-                } else {
-                    false
-                }
-            })
+        #expect(events.contains {
+            if case .unknown = $0 { true } else { false }
+        } == false)
+        guard case .unknown(let raw) = await connectionEventTask.value else {
+            Issue.record("Expected the future notification on the connection stream.")
+            return
+        }
+        #expect(raw.method == "future/notification")
+        #expect(raw.params == (try JSONEncoder().encode(futureParams)))
+        #expect(raw.threadID == nil)
+        #expect(raw.turnID == "turn-1")
         let result = try await CodexResponseCollector.collect(
             from: .init {
                 AsyncThrowingStream { continuation in
@@ -4001,38 +3833,6 @@ struct CodexAppServerKitTests {
         })
     }
 
-    @Test func threadGenerationStartPreservesActiveUnscopedDiagnostics() async throws {
-        let transport = CodexAppServerTestTransport()
-        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
-        let router = harness.router
-        await transport.waitForNotificationStreamCount(1)
-
-        await router.activateUnscopedDiagnosticRouting(in: "thread-review", until: "turn-review")
-        let cursor = await router.threadEventGenerationCursor("thread-review")
-        await router.beginThreadEventGeneration("thread-review", at: cursor)
-        try await transport.emitServerNotification(
-            method: "configWarning",
-            params: ThreadlessDiagnosticParams(message: "after resume")
-        )
-        try await transport.emitServerNotification(
-            method: "thread/closed",
-            params: ThreadIDParams(threadID: "thread-review")
-        )
-
-        let events = try await withTimeout {
-            try await collect(await router.observationEvents(for: "thread-review"))
-        }
-        #expect(events.contains { event in
-            if case .unknown(let raw) = event {
-                return raw.method == "configWarning"
-                    && raw.threadID == "thread-review"
-                    && raw.turnID == nil
-            }
-            return false
-        })
-        #expect(events.last == .closed)
-    }
-
     @Test func streamResponseBeginsNewThreadEventGeneration() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueueTurnStart(turnID: "turn-2", status: "running")
@@ -4162,10 +3962,6 @@ struct CodexAppServerKitTests {
                 delta: "During review start"
             )
         )
-        try await transport.emitServerNotification(
-            method: "configWarning",
-            params: ThreadlessDiagnosticParams(message: "startup warning")
-        )
         await gate.open()
         let review = try await reviewTask.value
         let eventsTask = Task {
@@ -4186,14 +3982,6 @@ struct CodexAppServerKitTests {
         #expect(events.contains { event in
             if case .messageDelta(let delta, let turnID) = event {
                 return delta.text == "During review start" && turnID == "turn-review"
-            }
-            return false
-        })
-        #expect(events.contains { event in
-            if case .unknown(let raw) = event {
-                return raw.method == "configWarning"
-                    && raw.threadID == "thread-1"
-                    && raw.turnID == nil
             }
             return false
         })
@@ -4222,7 +4010,6 @@ struct CodexAppServerKitTests {
         await transport.waitForNotificationStreamCount(1)
         let thread = CodexThread(id: "thread-source", client: client, router: router, connectionLease: harness.lease)
         let reviewThread = CodexThread(id: "thread-review", client: client, router: router, connectionLease: harness.lease)
-        let repeatedDiagnostic = ThreadlessDiagnosticParams(message: "detached startup warning")
 
         let oldSourceEventsTask = Task {
             try await collect(thread.events)
@@ -4230,11 +4017,6 @@ struct CodexAppServerKitTests {
         #expect(await eventually {
             await router.threadSubscriberCountForTesting(for: "thread-source") == 1
         })
-        await router.beginUnscopedDiagnosticRouting(in: "thread-source")
-        try await transport.emitServerNotification(
-            method: "configWarning",
-            params: repeatedDiagnostic
-        )
         try await transport.emitServerNotification(
             method: "thread/closed",
             params: ThreadIDParams(threadID: "thread-source")
@@ -4242,14 +4024,7 @@ struct CodexAppServerKitTests {
         let oldSourceEvents = try await withTimeout {
             try await oldSourceEventsTask.value
         }
-        #expect(oldSourceEvents.contains { event in
-            if case .unknown(let raw) = event {
-                return raw.method == "configWarning"
-                    && raw.threadID == "thread-source"
-                    && raw.turnID == nil
-            }
-            return false
-        })
+        #expect(oldSourceEvents.last == .closed)
 
         try await emitItemStarted(
             on: transport,
@@ -4296,14 +4071,6 @@ struct CodexAppServerKitTests {
                 delta: "During detached review start"
             )
         )
-        try await transport.emitServerNotification(
-            method: "configWarning",
-            params: repeatedDiagnostic
-        )
-        try await transport.emitServerNotification(
-            method: "configWarning",
-            params: repeatedDiagnostic
-        )
         await gate.open()
         let review = try await reviewTask.value
         let eventsTask = Task {
@@ -4322,15 +4089,6 @@ struct CodexAppServerKitTests {
             try await eventsTask.value
         }
         #expect(events.contains(.statusChanged(.active(activeFlags: []))))
-        let diagnostics = events.filter { event in
-            if case .unknown(let raw) = event {
-                return raw.method == "configWarning"
-                    && raw.threadID == "thread-review"
-                    && raw.turnID == nil
-            }
-            return false
-        }
-        #expect(diagnostics.count == 2)
         #expect(events.contains { event in
             if case .messageDelta(let delta, let turnID) = event {
                 return delta.text == "During detached review start" && turnID == "turn-review"
@@ -4349,21 +4107,6 @@ struct CodexAppServerKitTests {
             }
             return false
         } == false)
-
-        await router.beginThreadEventGeneration("thread-source", at: 0)
-        let sourceEventsTask = Task {
-            try await collect(thread.events)
-        }
-        let sourceEvents = try await withTimeout {
-            try await sourceEventsTask.value
-        }
-        let sourceDiagnostics = sourceEvents.filter { event in
-            if case .unknown(let raw) = event {
-                return raw.method == "configWarning"
-            }
-            return false
-        }
-        #expect(sourceDiagnostics.count == 1)
     }
 
     @Test func compactBeginsNewThreadEventGeneration() async throws {
@@ -6165,16 +5908,6 @@ private struct ReviewErrorParams: Encodable, Sendable {
     }
 }
 
-private struct ThreadlessDiagnosticParams: Encodable, Sendable {
-    var summary: String
-    var details: String?
-
-    init(message: String) {
-        self.summary = message
-        self.details = nil
-    }
-}
-
 private struct TurnDeltaParams: Encodable, Sendable {
     var threadID: String = "thread-1"
     var turnID: String
@@ -6538,6 +6271,7 @@ private actor ServerRequestRecorder {
 }
 
 private final class TestPreWriteSuspendingTransport: JSONRPC.Transport, Sendable {
+    let connectionEventHub = ConnectionEventHub()
     private let response: Data
     private let sendEntered = TestSignal()
     private let writeAcceptanceGate = CodexAppServerTestGate()
@@ -6594,6 +6328,7 @@ private final class TestPreWriteSuspendingTransport: JSONRPC.Transport, Sendable
 }
 
 private final class TestOutboundWriteFailureTransport: JSONRPC.Transport, Sendable {
+    let connectionEventHub = ConnectionEventHub()
     private let failure: CodexTransportFailure
 
     init(failure: CodexTransportFailure) {
@@ -6622,6 +6357,7 @@ private final class TestOutboundWriteFailureTransport: JSONRPC.Transport, Sendab
 }
 
 private final class TestSuspendingTransport: JSONRPC.Transport, Sendable {
+    let connectionEventHub = ConnectionEventHub()
     let response: Data
     private let started = TestSignal()
     private let cancelled: TestSignal

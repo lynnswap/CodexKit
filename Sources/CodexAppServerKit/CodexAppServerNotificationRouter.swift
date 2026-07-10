@@ -29,7 +29,6 @@ package actor CodexAppServerNotificationRouter {
     private var threadHistoryByThreadID: [CodexThreadID: [CodexThreadEvent]] = [:]
     private var threadFailureByThreadID: [CodexThreadID: CodexAppServerError] = [:]
     private var threadGenerationStartByThreadID: [CodexThreadID: ThreadGenerationStart] = [:]
-    private var unscopedDiagnosticRouting = UnscopedDiagnosticRoutingState()
     private var turnSubscribersByTurnID: [CodexTurnID: [UUID: TurnSubscriber]] = [:]
     private var threadSubscribersByThreadID: [CodexThreadID: [UUID: ThreadSubscriber]] = [:]
     private var itemReducer = CodexItemReducer()
@@ -46,46 +45,6 @@ package actor CodexAppServerNotificationRouter {
         case includingTurn(CodexTurnID, fallbackCursor: Int)
     }
 
-    private struct UnscopedDiagnosticRoutingState {
-        private var startupThreadIDs: Set<CodexThreadID> = []
-        private var turnIDByThreadID: [CodexThreadID: CodexTurnID] = [:]
-
-        mutating func beginStartup(in threadID: CodexThreadID) {
-            startupThreadIDs.insert(threadID)
-        }
-
-        mutating func activate(in threadID: CodexThreadID, until turnID: CodexTurnID) {
-            startupThreadIDs.remove(threadID)
-            turnIDByThreadID[threadID] = turnID
-        }
-
-        mutating func stop(in threadID: CodexThreadID) {
-            startupThreadIDs.remove(threadID)
-            turnIDByThreadID.removeValue(forKey: threadID)
-        }
-
-        mutating func stopActive(in threadID: CodexThreadID) {
-            turnIDByThreadID.removeValue(forKey: threadID)
-        }
-
-        func activeTurnID(in threadID: CodexThreadID) -> CodexTurnID? {
-            turnIDByThreadID[threadID]
-        }
-
-        mutating func activeThreadIDs(
-            isStillActive: (CodexThreadID, CodexTurnID) -> Bool
-        ) -> [CodexThreadID] {
-            turnIDByThreadID = turnIDByThreadID.filter {
-                isStillActive($0.key, $0.value)
-            }
-            return Array(Set(turnIDByThreadID.keys).union(startupThreadIDs))
-        }
-
-        mutating func reset() {
-            startupThreadIDs.removeAll()
-            turnIDByThreadID.removeAll()
-        }
-    }
     package init(
         client: AppServerClient,
         accountEventHub: AccountEventHub = .init()
@@ -222,68 +181,16 @@ package actor CodexAppServerNotificationRouter {
         )
     }
 
-    package func beginUnscopedDiagnosticRouting(in threadID: CodexThreadID) {
-        unscopedDiagnosticRouting.beginStartup(in: threadID)
-    }
-
-    package func activateUnscopedDiagnosticRouting(
-        in threadID: CodexThreadID,
-        until turnID: CodexTurnID
-    ) {
-        unscopedDiagnosticRouting.activate(in: threadID, until: turnID)
-    }
-
-    package func stopUnscopedDiagnosticRouting(in threadID: CodexThreadID) {
-        unscopedDiagnosticRouting.stop(in: threadID)
-    }
-
     package func beginDetachedThreadEventGeneration(
         _ threadID: CodexThreadID,
-        including turnID: CodexTurnID,
-        replacingUnscopedDiagnosticsIn sourceThreadID: CodexThreadID
+        including turnID: CodexTurnID
     ) {
         threadFailureByThreadID.removeValue(forKey: threadID)
         threadGenerationStartByThreadID[threadID] = .includingTurn(
             turnID,
             fallbackCursor: threadHistoryByThreadID[threadID]?.count ?? 0
         )
-        unscopedDiagnosticRouting.activate(in: threadID, until: turnID)
-        moveUnscopedDiagnostics(from: sourceThreadID, to: threadID)
         seedTurn(turnID, threadID: threadID)
-        if sourceThreadID != threadID {
-            unscopedDiagnosticRouting.stop(in: sourceThreadID)
-        }
-    }
-
-    private func moveUnscopedDiagnostics(
-        from sourceThreadID: CodexThreadID,
-        to destinationThreadID: CodexThreadID
-    ) {
-        guard sourceThreadID != destinationThreadID else {
-            return
-        }
-        let sourceHistory = threadHistoryByThreadID[sourceThreadID] ?? []
-        var movedEventIndices: [Array<CodexThreadEvent>.Index] = []
-        for eventIndex in currentGenerationEventIndices(in: sourceHistory, threadID: sourceThreadID) {
-            let event = sourceHistory[eventIndex]
-            guard case .unknown(var raw) = event,
-                raw.turnID == nil,
-                Self.isUnscopedDiagnosticNotification(raw.method)
-            else {
-                continue
-            }
-            raw.threadID = destinationThreadID
-            let replayedEvent = CodexThreadEvent.unknown(raw)
-            movedEventIndices.append(eventIndex)
-            appendThreadEvent(replayedEvent, threadID: destinationThreadID)
-        }
-        if movedEventIndices.isEmpty == false {
-            var updatedSourceHistory = threadHistoryByThreadID[sourceThreadID] ?? []
-            for eventIndex in movedEventIndices.sorted(by: >) {
-                updatedSourceHistory.remove(at: eventIndex)
-            }
-            threadHistoryByThreadID[sourceThreadID] = updatedSourceHistory
-        }
     }
 
     package func route(
@@ -301,17 +208,6 @@ package actor CodexAppServerNotificationRouter {
             threadIDByTurnID[turnID] = threadID
         } else if let turnID = context.turnID, let threadID = threadIDByTurnID[turnID] {
             context.threadID = threadID
-        }
-        if context.threadID == nil,
-            context.turnID == nil,
-            decoded.disposition == .diagnostic
-        {
-            for threadID in activeUnscopedDiagnosticThreadIDs() {
-                var routed = decoded
-                routed.context = .init(threadID: threadID)
-                try await routeNotification(routed)
-            }
-            return
         }
         var routed = decoded
         routed.context = context
@@ -406,8 +302,8 @@ package actor CodexAppServerNotificationRouter {
                 appendThreadEvent(.closed, threadID: threadID)
             }
 
-        case .serverRequestResolved:
-            preconditionFailure("Server-request resolution reached the domain router.")
+        case .serverRequestResolved, .connectionDiagnostic:
+            preconditionFailure("A connection-owned notification reached the domain router.")
 
         case .account(let mutation):
             switch mutation {
@@ -464,17 +360,12 @@ package actor CodexAppServerNotificationRouter {
             }
         }
         if case .closed = event {
-            unscopedDiagnosticRouting.stop(in: threadID)
             for turnID in threadIDByTurnID.compactMap({ entry in
                 entry.value == threadID ? entry.key : nil
             }) {
                 itemReducer.release(turnID: turnID)
             }
             finishThreadSubscribers(threadID: threadID)
-        } else if let trackedTurnID = unscopedDiagnosticRouting.activeTurnID(in: threadID),
-            Self.isTerminalThreadEvent(event, for: trackedTurnID)
-        {
-            unscopedDiagnosticRouting.stopActive(in: threadID)
         }
     }
 
@@ -677,22 +568,6 @@ package actor CodexAppServerNotificationRouter {
         }
     }
 
-    private func activeUnscopedDiagnosticThreadIDs() -> [CodexThreadID] {
-        unscopedDiagnosticRouting.activeThreadIDs { threadID, turnID in
-            isCurrentThreadEventGenerationFinished(threadID) == false
-                && hasTerminalTurnEvent(threadID: threadID, turnID: turnID) == false
-        }
-    }
-
-    private nonisolated static func isUnscopedDiagnosticNotification(
-        _ method: String
-    ) -> Bool {
-        guard let method = AppServerNotificationDecoder.Method(rawValue: method) else {
-            return true
-        }
-        return method.disposition == .diagnostic
-    }
-
     private nonisolated static func isThreadEventGenerationBoundary(_ event: CodexThreadEvent) -> Bool {
         switch event {
         case .closed, .terminal:
@@ -883,7 +758,6 @@ package actor CodexAppServerNotificationRouter {
         let threadSubscribers = threadSubscribersByThreadID.values.flatMap(\.values)
         routingFailure = routingFailure ?? error
         itemReducer.releaseAll()
-        unscopedDiagnosticRouting.reset()
         turnSubscribersByTurnID.removeAll()
         threadSubscribersByThreadID.removeAll()
         for subscriber in turnSubscribers {

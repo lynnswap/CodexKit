@@ -10,26 +10,23 @@ package enum ConnectionExitSignal: Equatable, Sendable {
     case transport(CodexTransportFailure)
     case processExited(status: Int32?, observedBeforeTermination: Bool)
 
-    package var termination: CodexConnectionTermination {
+    package var terminationCandidate: ConnectionTerminationArbiter.Candidate {
         switch self {
         case .transport(let failure):
-            .transportFailure(failure)
-        case .processExited(let status, _):
-            .processExited(status: status)
+            .init(.transportFailure(failure))
+        case .processExited(let status, let observedBeforeTermination):
+            .init(
+                .processExited(status: status),
+                observedBeforeTermination: observedBeforeTermination
+            )
         }
-    }
-
-    package var processExitObservedBeforeTermination: Bool {
-        if case .processExited(_, let observedBeforeTermination) = self {
-            return observedBeforeTermination
-        }
-        return false
     }
 }
 
 package actor AppServerConnection {
     package let client: AppServerClient
     package let router: CodexAppServerNotificationRouter
+    package nonisolated let connectionEventHub: ConnectionEventHub
 
     private let transport: any JSONRPC.Transport
     private let serverRequestRegistry: ServerRequestRegistry
@@ -47,10 +44,16 @@ package actor AppServerConnection {
             )
         }
     ) {
+        precondition(
+            client.connectionEventHub === transport.connectionEventHub,
+            "A connection must preserve its transport's event hub identity."
+        )
         self.transport = transport
         self.client = client
         self.router = router
+        self.connectionEventHub = client.connectionEventHub
         self.serverRequestRegistry = ServerRequestRegistry(
+            connectionEventHub: client.connectionEventHub,
             handler: serverRequestHandler,
             responder: { [transport] id, response in
                 try await transport.respond(to: id, with: response)
@@ -70,12 +73,28 @@ package actor AppServerConnection {
         } catch is CancellationError {
             return
         } catch let failure as CodexTransportFailure {
+            connectionEventHub.yield(.warning(
+                ConnectionDiagnosticFactory.routingFailure(
+                    message: failure.localizedDescription
+                )
+            ))
             await onExit(.transport(failure))
             await drainResponsesOnly()
         } catch let error as CodexAppServerError {
             connectionLogger.error(
                 "App-server domain routing failed: \(error.localizedDescription, privacy: .public)"
             )
+            let method: String? = if case .malformedNotification(let malformed) = error {
+                malformed.method
+            } else {
+                nil
+            }
+            connectionEventHub.yield(.warning(
+                ConnectionDiagnosticFactory.routingFailure(
+                    message: error.localizedDescription,
+                    method: method
+                )
+            ))
             await onExit(.transport(Self.transportFailure(for: error)))
             await drainResponsesOnly()
         } catch {
@@ -83,6 +102,11 @@ package actor AppServerConnection {
                 message: error.localizedDescription,
                 rawData: nil
             )
+            connectionEventHub.yield(.warning(
+                ConnectionDiagnosticFactory.routingFailure(
+                    message: error.localizedDescription
+                )
+            ))
             await onExit(.transport(failure))
             await drainResponsesOnly()
         }
@@ -111,8 +135,10 @@ package actor AppServerConnection {
         await serverRequestRegistry.cancelAllAndWait()
     }
 
-    package func finishDomains(throwing error: CodexAppServerError) async {
+    package func finishDomains(with termination: CodexConnectionTermination) async {
+        let error = CodexAppServerError.connectionTerminated(termination)
         await router.finishAll(throwing: error)
+        connectionEventHub.finish(with: termination)
     }
 
     package func waitUntilTransportClosed() async {
@@ -143,6 +169,10 @@ package actor AppServerConnection {
                 await serverRequestRegistry.resolve(requestID)
                 return
             }
+            if case .connectionDiagnostic(let event) = decoded.payload {
+                connectionEventHub.yield(event)
+                return
+            }
             try await router.route(decoded)
         case .serverRequest(let id, let method, let params):
             await serverRequestRegistry.receive(id: id, method: method, params: params)
@@ -157,10 +187,21 @@ package actor AppServerConnection {
                 }
                 switch event {
                 case .notification(let notification):
+                    connectionEventHub.yield(.warning(
+                        ConnectionDiagnosticFactory.droppedNotification(
+                            method: notification.method
+                        )
+                    ))
                     connectionLogger.error(
                         "Dropping \(notification.method, privacy: .public) while draining responses"
                     )
-                case .serverRequest(_, let method, _):
+                case .serverRequest(let id, let method, _):
+                    connectionEventHub.yield(.warning(
+                        ConnectionDiagnosticFactory.droppedServerRequest(
+                            id: id,
+                            method: method
+                        )
+                    ))
                     connectionLogger.error(
                         "Dropping server request \(method, privacy: .public) while draining responses"
                     )

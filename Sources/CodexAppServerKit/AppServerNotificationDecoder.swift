@@ -214,6 +214,7 @@ package struct AppServerNotificationDecoder {
         case threadClosed
         case serverRequestResolved(CodexServerRequestID)
         case account(AccountMutation)
+        case connectionDiagnostic(CodexConnectionEvent)
         case raw
         case ignored
     }
@@ -238,12 +239,18 @@ package struct AppServerNotificationDecoder {
 
     package func decode(_ notification: JSONRPC.Notification) throws -> DecodedNotification {
         guard let method = Method(rawValue: notification.method) else {
+            let context = Self.bestEffortContext(from: notification.params)
             return .init(
                 method: nil,
                 methodName: notification.method,
                 disposition: .diagnostic,
-                context: Self.bestEffortContext(from: notification.params),
-                payload: .raw,
+                context: context,
+                payload: .connectionDiagnostic(.unknown(.init(
+                    method: notification.method,
+                    params: notification.params,
+                    threadID: context.threadID,
+                    turnID: context.turnID
+                ))),
                 rawData: notification.params
             )
         }
@@ -358,6 +365,32 @@ package struct AppServerNotificationDecoder {
                 success: try object.requireBool("success"),
                 error: try object.optionalString("error")
             )))
+        case .warning, .guardianWarning:
+            return .connectionDiagnostic(.warning(.init(
+                message: try object.requireString("message"),
+                method: method.rawValue
+            )))
+        case .deprecationNotice:
+            return .connectionDiagnostic(.deprecation(.init(
+                summary: try object.requireString("summary"),
+                details: try object.optionalString("details")
+            )))
+        case .configWarning:
+            return .connectionDiagnostic(.warning(.init(
+                message: try object.requireString("summary"),
+                method: method.rawValue,
+                details: try object.optionalString("details")
+            )))
+        case .modelRerouted,
+             .modelVerification,
+             .turnModerationMetadata,
+             .modelSafetyBufferingUpdated,
+             .windowsWorldWritableWarning,
+             .windowsSandboxSetupCompleted:
+            return .connectionDiagnostic(.warning(.init(
+                message: method.rawValue,
+                method: method.rawValue
+            )))
         case .error,
              .threadStarted,
              .threadArchived,
@@ -365,17 +398,7 @@ package struct AppServerNotificationDecoder {
              .threadUnarchived,
              .threadNameUpdated,
              .turnDiffUpdated,
-             .turnPlanUpdated,
-             .warning,
-             .guardianWarning,
-             .deprecationNotice,
-             .configWarning,
-             .modelRerouted,
-             .modelVerification,
-             .turnModerationMetadata,
-             .modelSafetyBufferingUpdated,
-             .windowsWorldWritableWarning,
-             .windowsSandboxSetupCompleted:
+             .turnPlanUpdated:
             return .raw
         case .skillsChanged,
              .threadGoalUpdated,
@@ -513,8 +536,21 @@ package struct AppServerNotificationDecoder {
         case .guardianWarning:
             _ = try object.requireString("message")
             return .init(threadID: try object.requiredThreadID())
-        case .deprecationNotice, .configWarning:
+        case .deprecationNotice:
             _ = try object.requireString("summary")
+            _ = try object.optionalString("details")
+            return Self.context(from: object)
+        case .configWarning:
+            _ = try object.requireString("summary")
+            _ = try object.optionalString("details")
+            _ = try object.optionalString("path")
+            if let range = try object.optionalObject("range") {
+                for endpoint in ["start", "end"] {
+                    let position = try range.requireObject(endpoint)
+                    _ = try position.requireInt("line")
+                    _ = try position.requireInt("column")
+                }
+            }
             return Self.context(from: object)
         case .modelRerouted:
             for key in ["fromModel", "reason", "toModel"] {

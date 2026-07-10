@@ -166,6 +166,7 @@ public actor CodexAppServer {
 
     private let client: AppServerClient
     private let router: CodexAppServerNotificationRouter
+    private let connectionEventHub: ConnectionEventHub
     private let connectionLease: AppServerConnectionLease
     private var retainedReviewCleanupIdentitiesBySourceThreadID: [CodexThreadID: [CodexReviewIdentity]] = [:]
     private var reviewRestartContextsByTokenID: [CodexReviewRestartToken.ID: CodexReviewRestartContext] = [:]
@@ -189,8 +190,12 @@ public actor CodexAppServer {
             codexHomeURL: configuration.localProcess.codexHomeURL
         )
         let transport: AppServerProcessTransport
+        let connectionEventHub = ConnectionEventHub()
         do {
-            transport = try AppServerProcessTransport(configuration: transportConfiguration)
+            transport = try AppServerProcessTransport(
+                configuration: transportConfiguration,
+                connectionEventHub: connectionEventHub
+            )
         } catch let failure as CodexLaunchFailure {
             throw CodexAppServerError.launch(failure)
         } catch is CancellationError {
@@ -235,6 +240,7 @@ public actor CodexAppServer {
         }
         self.client = client
         self.router = router
+        self.connectionEventHub = client.connectionEventHub
         self.connectionLease = connectionLease
     }
 
@@ -274,6 +280,7 @@ public actor CodexAppServer {
         }
         self.client = client
         self.router = router
+        self.connectionEventHub = client.connectionEventHub
         self.connectionLease = connectionLease
     }
 
@@ -284,6 +291,7 @@ public actor CodexAppServer {
     ) {
         self.client = client
         self.router = router
+        self.connectionEventHub = client.connectionEventHub
         self.connectionLease = connectionLease
     }
 
@@ -299,6 +307,14 @@ public actor CodexAppServer {
     /// from the perspective of public callers.
     public func close() async {
         await connectionLease.closeConnection()
+    }
+
+    /// Returns connection-scoped diagnostics and the compact terminal event.
+    ///
+    /// This subscription does not retain the app-server connection or its lease.
+    /// Call ``CodexConnectionEvents/cancel()`` to release only this subscriber.
+    public func connectionEvents() -> CodexConnectionEvents {
+        connectionEventHub.events()
     }
 
     /// Returns account-related app-server notifications as typed domain events.
@@ -463,14 +479,10 @@ public actor CodexAppServer {
         if threadOptions.model == nil {
             threadOptions.model = identity.model
         }
-        await router.beginUnscopedDiagnosticRouting(in: identity.activeTurnThreadID)
-        let activeThread: CodexThread
-        do {
-            activeThread = try await resumeThread(identity.activeTurnThreadID, options: threadOptions)
-        } catch {
-            await router.stopUnscopedDiagnosticRouting(in: identity.activeTurnThreadID)
-            throw error
-        }
+        let activeThread = try await resumeThread(
+            identity.activeTurnThreadID,
+            options: threadOptions
+        )
         return await activeThread.reviewSession(
             identity,
             model: activeThread.model ?? identity.model

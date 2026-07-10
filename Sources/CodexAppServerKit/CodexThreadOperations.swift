@@ -168,23 +168,19 @@ extension CodexThread {
         delivery: CodexReviewDelivery = .inline,
         onPostWriteCancellation: @escaping @Sendable (CodexReviewSession) async throws -> Void
     ) async throws -> CodexReviewSession {
-        await router.beginUnscopedDiagnosticRouting(in: id)
-        let response: AppServerAPI.Review.Start.Response
-        do {
-            response = try await withThreadEventGeneration(id, router: router) {
-                try await client.send(
-                    AppServerAPI.Review.Start.Request(
-                        params: .init(threadID: id.rawValue, target: target, delivery: delivery)
-                    ),
-                    onPostWriteCancellation: { response in
-                        let review = await reviewSession(from: response)
-                        try await onPostWriteCancellation(review)
-                    }
-                )
-            }
-        } catch {
-            await router.stopUnscopedDiagnosticRouting(in: id)
-            throw error
+        let response: AppServerAPI.Review.Start.Response = try await withThreadEventGeneration(
+            id,
+            router: router
+        ) {
+            try await client.send(
+                AppServerAPI.Review.Start.Request(
+                    params: .init(threadID: id.rawValue, target: target, delivery: delivery)
+                ),
+                onPostWriteCancellation: { response in
+                    let review = await reviewSession(from: response)
+                    try await onPostWriteCancellation(review)
+                }
+            )
         }
         return await reviewSession(from: response)
     }
@@ -198,8 +194,7 @@ extension CodexThread {
         if let detachedReviewThreadID {
             await router.beginDetachedThreadEventGeneration(
                 detachedReviewThreadID,
-                including: turnID,
-                replacingUnscopedDiagnosticsIn: id
+                including: turnID
             )
         }
         let initialTurn = CodexAppServer.turnSnapshots(from: [response.turn])[0]
@@ -236,7 +231,6 @@ extension CodexThread {
     ) async -> CodexReviewSession {
         let reviewThreadID = identity.activeTurnThreadID
         await router.seedTurn(identity.turnID, threadID: reviewThreadID)
-        await router.activateUnscopedDiagnosticRouting(in: reviewThreadID, until: identity.turnID)
         let model = model ?? identity.model
         let turn = CodexTurn(
             id: identity.turnID,

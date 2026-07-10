@@ -26,6 +26,7 @@ package actor AppServerClient {
     ]
 
     private let transport: any JSONRPC.Transport
+    package nonisolated let connectionEventHub: ConnectionEventHub
     private let overloadRetryDelay: @Sendable (Int) -> Duration?
     private let retrySleep: @Sendable (Duration) async throws -> Void
     private let deadlines: CodexAppServer.Configuration.Deadlines
@@ -49,6 +50,7 @@ package actor AppServerClient {
         }
     ) {
         self.transport = transport
+        self.connectionEventHub = transport.connectionEventHub
         self.deadlines = deadlines
         self.deadlineClock = deadlineClock
         self.connectionCloseAction = connectionCloseAction
@@ -364,6 +366,13 @@ package actor AppServerClient {
                         ))
                     }
                     retryAttempt += 1
+                    connectionEventHub.yield(.retrying(.init(
+                        requestID: attemptRequestID,
+                        method: method,
+                        attempt: retryAttempt,
+                        delay: delay,
+                        serverError: serverError
+                    )))
                     logger.warning(
                         "JSON-RPC request \(attemptRequestID, privacy: .public) overloaded for \(method, privacy: .public); retrying in \(String(describing: delay), privacy: .public)"
                     )

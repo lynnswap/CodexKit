@@ -72,7 +72,10 @@ struct ServerRequestRegistryTests {
         let responseGate = RegistryTestManualGate()
         let responseCount = Mutex(0)
         let diagnostics = Mutex<[ServerRequestRegistry.Diagnostic]>([])
+        let connectionEventHub = ConnectionEventHub()
+        var connectionEventIterator = connectionEventHub.events().makeAsyncIterator()
         let registry = ServerRequestRegistry(
+            connectionEventHub: connectionEventHub,
             handler: { _ in
                 throw RegistryTestFailure.unexpectedResponse
             },
@@ -96,6 +99,18 @@ struct ServerRequestRegistryTests {
         await registry.waitUntilIdle()
 
         #expect(responseCount.withLock { $0 } == 1)
+        guard case .warning(let decodeWarning) = await connectionEventIterator.next() else {
+            Issue.record("Expected the decode failure on the connection event stream.")
+            return
+        }
+        #expect(decodeWarning.method == method)
+        #expect(decodeWarning.details?.contains("malformed-duplicate") == true)
+        guard case .warning(let duplicateWarning) = await connectionEventIterator.next() else {
+            Issue.record("Expected the duplicate request on the connection event stream.")
+            return
+        }
+        #expect(duplicateWarning.message == "Received a duplicate server-request identifier.")
+        #expect(duplicateWarning.details == "requestId: malformed-duplicate")
         #expect(diagnostics.withLock { values in
             values.contains(.duplicateRequest(id))
                 && values.contains { diagnostic in
@@ -143,6 +158,7 @@ struct ServerRequestRegistryTests {
         let responderCancelled = RegistryTestThreadSafeSignal()
         let closeCompleted = Mutex(false)
         let registry = ServerRequestRegistry(
+            connectionEventHub: ConnectionEventHub(),
             handler: { _ in .approval(.accept) },
             responder: { _, _ in
                 await responderStarted.signal()
@@ -429,7 +445,8 @@ struct ServerRequestRegistryTests {
                     "RESPONSE_PATH": responseURL.path,
                 ],
                 codexHomeURL: rootURL.appendingPathComponent("codex-home", isDirectory: true)
-            )
+            ),
+            connectionEventHub: ConnectionEventHub()
         )
         let harness = await CodexAppServerTestConnectionHarness.start(
             transport: transport,
@@ -488,7 +505,8 @@ struct ServerRequestRegistryTests {
                     "RESPONSE_PATH": responseURL.path,
                 ],
                 codexHomeURL: rootURL.appendingPathComponent("codex-home", isDirectory: true)
-            )
+            ),
+            connectionEventHub: ConnectionEventHub()
         )
         let harness = await CodexAppServerTestConnectionHarness.start(
             transport: transport,

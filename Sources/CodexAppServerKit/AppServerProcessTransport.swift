@@ -7,6 +7,7 @@ private let logger = Logger(subsystem: "CodexAppServerKit", category: "app-serve
 
 package actor AppServerProcessTransport: JSONRPC.Transport {
     package nonisolated static let stdoutReadChunkByteCount = 64 * 1_024
+    package nonisolated let connectionEventHub: ConnectionEventHub
 
     package struct Configuration: Sendable {
         package var executable: String
@@ -56,6 +57,7 @@ package actor AppServerProcessTransport: JSONRPC.Transport {
 
     package init(
         configuration: Configuration,
+        connectionEventHub: ConnectionEventHub,
         writerFactory: @Sendable (FileHandle) -> AppServerJSONRPCWriter = {
             AppServerJSONRPCWriter(fileHandle: $0)
         }
@@ -93,6 +95,7 @@ package actor AppServerProcessTransport: JSONRPC.Transport {
         let stdout = launch.stdout
         let stderr = launch.stderr
         self.process = process
+        self.connectionEventHub = connectionEventHub
         let writer = writerFactory(stdin.fileHandleForWriting)
         self.writer = writer
         let mailbox = JSONRPCInboundFrameMailbox()
@@ -109,7 +112,10 @@ package actor AppServerProcessTransport: JSONRPC.Transport {
             )
         }
         self.stderrDrainTask = Task {
-            await Self.drainStderr(stderr.fileHandleForReading)
+            await Self.drainStderr(
+                stderr.fileHandleForReading,
+                connectionEventHub: connectionEventHub
+            )
         }
         self.processWaiterTask = Task {
             await process.waitForExit(terminationToken: terminationToken)
@@ -183,6 +189,9 @@ package actor AppServerProcessTransport: JSONRPC.Transport {
             case .response(let id, let result):
                 guard let waiter = pending.removeValue(forKey: id) else {
                     if acceptingOutbound == false {
+                        connectionEventHub.yield(.warning(
+                            ConnectionDiagnosticFactory.lateResponse(requestID: id)
+                        ))
                         logger.warning(
                             "Ignoring late JSON-RPC response \(id, privacy: .public) after outbound close"
                         )
@@ -424,7 +433,10 @@ package actor AppServerProcessTransport: JSONRPC.Transport {
         await eventSource.cancelAndWait()
     }
 
-    private nonisolated static func drainStderr(_ fileHandle: FileHandle) async {
+    private nonisolated static func drainStderr(
+        _ fileHandle: FileHandle,
+        connectionEventHub: ConnectionEventHub
+    ) async {
         var filter = AppServerStderrLogFilter()
         let eventSource: AppServerPipeReadEventSource
         do {
@@ -435,6 +447,12 @@ package actor AppServerProcessTransport: JSONRPC.Transport {
             )
         } catch {
             try? fileHandle.close()
+            connectionEventHub.yield(.warning(
+                ConnectionDiagnosticFactory.processStderrFailure(
+                    .setup,
+                    details: error.localizedDescription
+                )
+            ))
             logger.error(
                 "codex app-server stderr setup failed: \(error.localizedDescription, privacy: .public)"
             )
@@ -449,7 +467,7 @@ package actor AppServerProcessTransport: JSONRPC.Transport {
                         switch try readNonblockingChunk(fileHandle.fileDescriptor) {
                         case .data(let data):
                             for event in filter.append(data) {
-                                logStderr(event)
+                                logStderr(event, connectionEventHub: connectionEventHub)
                             }
                         case .wouldBlock:
                             break readLoop
@@ -463,13 +481,19 @@ package actor AppServerProcessTransport: JSONRPC.Transport {
             }
         } catch is CancellationError {
         } catch {
+            connectionEventHub.yield(.warning(
+                ConnectionDiagnosticFactory.processStderrFailure(
+                    .read,
+                    details: error.localizedDescription
+                )
+            ))
             logger.error(
                 "codex app-server stderr read failed: \(error.localizedDescription, privacy: .public)"
             )
         }
         await eventSource.cancelAndWait()
         for event in filter.finish() {
-            logStderr(event)
+            logStderr(event, connectionEventHub: connectionEventHub)
         }
     }
 
@@ -518,7 +542,13 @@ package actor AppServerProcessTransport: JSONRPC.Transport {
         throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
     }
 
-    private nonisolated static func logStderr(_ event: AppServerStderrLogFilter.Event) {
+    private nonisolated static func logStderr(
+        _ event: AppServerStderrLogFilter.Event,
+        connectionEventHub: ConnectionEventHub
+    ) {
+        connectionEventHub.yield(.warning(
+            ConnectionDiagnosticFactory.processStderr(event)
+        ))
         switch event.level {
         case .error:
             logger.error("codex app-server stderr: \(event.message, privacy: .public)")

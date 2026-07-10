@@ -150,7 +150,8 @@ struct ConnectionLifecycleTests {
         let transport = try AppServerProcessTransport(
             configuration: fixture.configuration(environment: [
                 "PAYLOAD_PATH": fixture.payloadURL.path,
-            ])
+            ]),
+            connectionEventHub: ConnectionEventHub()
         )
         await transport.waitForInboundAdmissionWaiterCountForTesting(atLeast: 1)
 
@@ -211,7 +212,8 @@ struct ConnectionLifecycleTests {
             """
         )
         let transport = try AppServerProcessTransport(
-            configuration: fixture.configuration()
+            configuration: fixture.configuration(),
+            connectionEventHub: ConnectionEventHub()
         )
         guard case .notification = try await transport.nextInboundEvent() else {
             Issue.record("Expected the child readiness notification.")
@@ -240,7 +242,8 @@ struct ConnectionLifecycleTests {
 
         for _ in 0..<20 {
             let transport = try AppServerProcessTransport(
-                configuration: fixture.configuration()
+                configuration: fixture.configuration(),
+                connectionEventHub: ConnectionEventHub()
             )
             let observation = await transport.waitForProcessExit()
             #expect(observation == .exited(status: 0, observedBeforeTermination: true))
@@ -264,7 +267,8 @@ struct ConnectionLifecycleTests {
             """
         )
         let transport = try AppServerProcessTransport(
-            configuration: fixture.configuration()
+            configuration: fixture.configuration(),
+            connectionEventHub: ConnectionEventHub()
         )
         let harness = await CodexAppServerTestConnectionHarness.start(
             transport: transport,
@@ -285,6 +289,12 @@ struct ConnectionLifecycleTests {
     @Test func unknownResponseWhileOpenTerminatesTheConnection() async throws {
         let transport = CodexAppServerTestTransport()
         let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let connectionEvents = transport.connectionEventHub.events()
+        let warningTask = Task {
+            var iterator = connectionEvents.makeAsyncIterator()
+            return await iterator.next()
+        }
+        await connectionEvents.waitUntilNextSuspendsForTesting()
         await transport.waitForNotificationStreamCount(1)
         let frame = Data(#"{"id":999,"result":{}}"#.utf8)
 
@@ -296,11 +306,24 @@ struct ConnectionLifecycleTests {
         }
         #expect(rawData == frame)
         await harness.supervisor.waitUntilClosed()
+        guard case .warning(let warning) = await warningTask.value else {
+            Issue.record("Expected the open-state protocol violation diagnostic.")
+            return
+        }
+        #expect(warning.message.contains("unknown request id 999"))
+        var terminalIterator = connectionEvents.makeAsyncIterator()
+        #expect(await terminalIterator.next() == .terminated(termination))
     }
 
     @Test func unknownResponseAcceptedBeforeCloseDoesNotReplaceCloseWinner() async throws {
         let transport = CodexAppServerTestTransport()
         let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let connectionEvents = transport.connectionEventHub.events()
+        let warningTask = Task {
+            var iterator = connectionEvents.makeAsyncIterator()
+            return await iterator.next()
+        }
+        await connectionEvents.waitUntilNextSuspendsForTesting()
         await transport.waitForNotificationStreamCount(1)
         let gate = CodexAppServerTestGate()
         await transport.holdNextInboundEventDelivery(at: gate)
@@ -310,6 +333,173 @@ struct ConnectionLifecycleTests {
         await harness.close()
 
         #expect(await harness.supervisor.terminationForTesting() == .closedByCaller)
+        #expect(await warningTask.value == .warning(.init(
+            message: "Ignored late JSON-RPC response after outbound close.",
+            details: "requestId: 999"
+        )))
+        var terminalIterator = connectionEvents.makeAsyncIterator()
+        #expect(await terminalIterator.next() == .terminated(.closedByCaller))
+    }
+
+    @Test func responsesOnlyDrainReportsDroppedNotificationsAndServerRequests() async throws {
+        let transport = ResponsesOnlyDiagnosticTestTransport()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let connectionEvents = transport.connectionEventHub.events()
+
+        let routingFailureTask = Task {
+            var iterator = connectionEvents.makeAsyncIterator()
+            return await iterator.next()
+        }
+        await connectionEvents.waitUntilNextSuspendsForTesting()
+        await transport.releaseMalformedNotification()
+        guard case .warning(let routingFailure) = await routingFailureTask.value else {
+            Issue.record("Expected the routing-failure diagnostic.")
+            return
+        }
+        #expect(routingFailure.method == "turn/completed")
+
+        let droppedNotificationTask = Task {
+            var iterator = connectionEvents.makeAsyncIterator()
+            return await iterator.next()
+        }
+        await connectionEvents.waitUntilNextSuspendsForTesting()
+        await transport.releaseDroppedNotification()
+        #expect(await droppedNotificationTask.value == .warning(.init(
+            message: "Dropped notification while draining responses after routing failure.",
+            method: "future/notification"
+        )))
+
+        let droppedRequestTask = Task {
+            var iterator = connectionEvents.makeAsyncIterator()
+            return await iterator.next()
+        }
+        await connectionEvents.waitUntilNextSuspendsForTesting()
+        await transport.releaseDroppedServerRequest()
+        #expect(await droppedRequestTask.value == .warning(.init(
+            message: "Dropped server request while draining responses after routing failure.",
+            method: "item/commandExecution/requestApproval",
+            details: "requestId: request-after-failure"
+        )))
+
+        let terminalTask = Task {
+            var iterator = connectionEvents.makeAsyncIterator()
+            return await iterator.next()
+        }
+        await connectionEvents.waitUntilNextSuspendsForTesting()
+        await transport.releaseInboundTerminal()
+        await harness.supervisor.waitUntilClosed()
+        guard case .terminated(.transportFailure(.protocolViolation(_, _))) = await terminalTask.value
+        else {
+            Issue.record("Expected the malformed notification terminal.")
+            return
+        }
+    }
+
+    @Test func liveTransportReportsAcceptedResponseThatBecomesLateDuringClose() async throws {
+        let fixture = try ProcessFixture()
+        defer { fixture.remove() }
+        try fixture.installExecutable(
+            """
+            #!/bin/sh
+            printf '%s\n' '{"method":"ready","params":{}}'
+            printf '%s\n' '{"id":999,"result":{}}'
+            while :; do sleep 1; done
+            """
+        )
+        let connectionEventHub = ConnectionEventHub()
+        var connectionEvents = connectionEventHub.events().makeAsyncIterator()
+        let transport = try AppServerProcessTransport(
+            configuration: fixture.configuration(),
+            connectionEventHub: connectionEventHub
+        )
+        guard case .notification = try await transport.nextInboundEvent() else {
+            Issue.record("Expected the readiness notification.")
+            return
+        }
+        for _ in 0..<1_000 {
+            if await transport.inboundMailboxSnapshotForTesting().acceptedFrameCount > 0 {
+                break
+            }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        #expect(await transport.inboundMailboxSnapshotForTesting().acceptedFrameCount == 1)
+
+        _ = await transport.beginClose()
+        #expect(try await transport.nextInboundEvent() == nil)
+        #expect(await connectionEvents.next() == .warning(.init(
+            message: "Ignored late JSON-RPC response after outbound close.",
+            details: "requestId: 999"
+        )))
+        await transport.finishPendingResponsesAfterInboundDrain(.closed)
+        _ = await transport.waitForProcessExit()
+        await transport.waitUntilClosed()
+        await transport.reapProcess()
+    }
+
+    @Test func liveTransportProjectsStderrErrorAndWarningLevels() async throws {
+        let fixture = try ProcessFixture()
+        defer { fixture.remove() }
+        try fixture.installExecutable(
+            """
+            #!/bin/sh
+            printf '%s\n' 'plain stderr' 'codex_core::tools::router: error=failed' 'Output:' >&2
+            while :; do sleep 1; done
+            """
+        )
+        let connectionEventHub = ConnectionEventHub()
+        var connectionEvents = connectionEventHub.events().makeAsyncIterator()
+        let transport = try AppServerProcessTransport(
+            configuration: fixture.configuration(),
+            connectionEventHub: connectionEventHub
+        )
+
+        #expect(await connectionEvents.next() == .warning(.init(
+            message: "plain stderr",
+            method: "process/stderr",
+            details: "severity: error"
+        )))
+        #expect(await connectionEvents.next() == .warning(.init(
+            message: "codex_core::tools::router: error=failed",
+            method: "process/stderr",
+            details: "severity: error"
+        )))
+        #expect(await connectionEvents.next() == .warning(.init(
+            message: "command output omitted after tool error",
+            method: "process/stderr",
+            details: "severity: warning"
+        )))
+
+        _ = await transport.beginClose()
+        #expect(try await transport.nextInboundEvent() == nil)
+        await transport.finishPendingResponsesAfterInboundDrain(.closed)
+        _ = await transport.waitForProcessExit()
+        await transport.waitUntilClosed()
+        await transport.reapProcess()
+    }
+
+    @Test func lateTerminationIsDiagnosedBeforeTheWinningTerminalFinishesTheSameHub() async {
+        let transport = LateTerminationTestTransport()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let events = await harness.server.connectionEvents()
+        var iterator = events.makeAsyncIterator()
+        #expect(transport.connectionEventHub === harness.connection.connectionEventHub)
+
+        let closeTask = Task {
+            await harness.close()
+        }
+        guard case .warning(let warning) = await iterator.next() else {
+            Issue.record("Expected a late-termination diagnostic before terminal finish.")
+            return
+        }
+        #expect(warning.message == "Ignored late connection termination.")
+        #expect(warning.details?.contains("closedByCaller") == true)
+        #expect(warning.details?.contains("late process observation") == true)
+        #expect(transport.connectionEventHub.snapshotForTesting().terminal == nil)
+
+        await transport.releaseInbound()
+        await closeTask.value
+        #expect(await iterator.next() == .terminated(.closedByCaller))
+        #expect(await iterator.next() == nil)
     }
 
     @Test func writerFailureClaimsTypedTerminalAndRunsFullClose() async throws {
@@ -323,6 +513,7 @@ struct ConnectionLifecycleTests {
         )
         let transport = try AppServerProcessTransport(
             configuration: fixture.configuration(),
+            connectionEventHub: ConnectionEventHub(),
             writerFactory: { fileHandle in
                 AppServerJSONRPCWriter(fileHandle: fileHandle) { _ in
                     throw POSIXError(.EPIPE)
@@ -347,6 +538,138 @@ struct ConnectionLifecycleTests {
             try await transport.notify(.init(method: "after-close", params: Data("{}".utf8)))
         }
         await harness.supervisor.waitUntilClosed()
+    }
+}
+
+private actor LateTerminationTestTransport: JSONRPC.Transport {
+    nonisolated let connectionEventHub = ConnectionEventHub()
+    private let inboundGate = CodexAppServerTestGate()
+    private let processExitGate = CodexAppServerTestGate()
+
+    func send(
+        _ request: JSONRPC.Request,
+        acceptWrite: @Sendable () throws -> Void
+    ) async throws -> Data {
+        throw JSONRPC.Error.closed
+    }
+
+    func notify(_ notification: JSONRPC.Notification) async throws {
+        throw JSONRPC.Error.closed
+    }
+
+    func nextInboundEvent() async throws -> JSONRPC.InboundEvent? {
+        await inboundGate.wait()
+        return nil
+    }
+
+    func respond(
+        to requestID: CodexServerRequestID,
+        with response: CodexServerRequestResponse
+    ) async throws {
+        throw JSONRPC.Error.closed
+    }
+
+    func beginClose() async -> JSONRPC.ProcessExitObservation? {
+        await processExitGate.open()
+        return nil
+    }
+
+    func finishPendingResponsesAfterInboundDrain(_ failure: CodexTransportFailure) async {}
+
+    func waitForProcessExit() async -> JSONRPC.ProcessExitObservation {
+        await processExitGate.wait()
+        return .failed(.io(errno: EIO, message: "late process observation"))
+    }
+
+    func waitUntilClosed() async {}
+
+    func reapProcess() async {}
+
+    func releaseInbound() async {
+        await inboundGate.open()
+    }
+}
+
+private actor ResponsesOnlyDiagnosticTestTransport: JSONRPC.Transport {
+    nonisolated let connectionEventHub = ConnectionEventHub()
+    private let malformedNotificationGate = CodexAppServerTestGate()
+    private let droppedNotificationGate = CodexAppServerTestGate()
+    private let droppedServerRequestGate = CodexAppServerTestGate()
+    private let inboundTerminalGate = CodexAppServerTestGate()
+    private var inboundIndex = 0
+
+    func send(
+        _ request: JSONRPC.Request,
+        acceptWrite: @Sendable () throws -> Void
+    ) async throws -> Data {
+        throw JSONRPC.Error.closed
+    }
+
+    func notify(_ notification: JSONRPC.Notification) async throws {
+        throw JSONRPC.Error.closed
+    }
+
+    func nextInboundEvent() async throws -> JSONRPC.InboundEvent? {
+        defer { inboundIndex += 1 }
+        switch inboundIndex {
+        case 0:
+            await malformedNotificationGate.wait()
+            return .notification(.init(
+                method: "turn/completed",
+                params: Data(#"{}"#.utf8)
+            ))
+        case 1:
+            await droppedNotificationGate.wait()
+            return .notification(.init(
+                method: "future/notification",
+                params: Data(#"{}"#.utf8)
+            ))
+        case 2:
+            await droppedServerRequestGate.wait()
+            return .serverRequest(
+                id: .string("request-after-failure"),
+                method: "item/commandExecution/requestApproval",
+                params: Data(#"{}"#.utf8)
+            )
+        case 3:
+            await inboundTerminalGate.wait()
+            return nil
+        default:
+            preconditionFailure("The responses-only test transport has a fixed inbound script.")
+        }
+    }
+
+    func respond(
+        to requestID: CodexServerRequestID,
+        with response: CodexServerRequestResponse
+    ) async throws {
+        throw JSONRPC.Error.closed
+    }
+
+    func beginClose() async -> JSONRPC.ProcessExitObservation? { nil }
+
+    func finishPendingResponsesAfterInboundDrain(_ failure: CodexTransportFailure) async {}
+
+    func waitForProcessExit() async -> JSONRPC.ProcessExitObservation { .unavailable }
+
+    func waitUntilClosed() async {}
+
+    func reapProcess() async {}
+
+    func releaseMalformedNotification() async {
+        await malformedNotificationGate.open()
+    }
+
+    func releaseDroppedNotification() async {
+        await droppedNotificationGate.open()
+    }
+
+    func releaseDroppedServerRequest() async {
+        await droppedServerRequestGate.open()
+    }
+
+    func releaseInboundTerminal() async {
+        await inboundTerminalGate.open()
     }
 }
 

@@ -400,6 +400,7 @@ public actor CodexAppServerTestGate {
 
 /// An in-memory app-server transport for tests.
 public actor CodexAppServerTestTransport {
+    package nonisolated let connectionEventHub = ConnectionEventHub()
     private struct RequestGate: Sendable {
         var gate: CodexAppServerTestGate
         var ignoresCancellation: Bool
@@ -1322,6 +1323,9 @@ extension CodexAppServerTestTransport: JSONRPC.Transport {
             case .response(let id, let result):
                 guard let waiter = pendingResponses.removeValue(forKey: id) else {
                     if closed {
+                        connectionEventHub.yield(.warning(
+                            ConnectionDiagnosticFactory.lateResponse(requestID: id)
+                        ))
                         continue
                     }
                     let failure = CodexTransportFailure.protocolViolation(

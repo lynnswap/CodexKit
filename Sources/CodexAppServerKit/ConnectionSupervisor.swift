@@ -40,21 +40,24 @@ package actor ConnectionSupervisor {
     private enum Phase: Equatable {
         case initialized
         case running
+        case linearizingClose
         case closing
         case closed
     }
 
     private let connection: AppServerConnection
+    private let connectionEventHub: ConnectionEventHub
     private var phase: Phase = .initialized
     private var routerTask: Task<Void, Never>?
     private var processExitTask: Task<Void, Never>?
     private var closeTask: Task<Void, Never>?
-    private var firstTermination: CodexConnectionTermination?
+    private var terminationArbiter = ConnectionTerminationArbiter()
     private var terminationWaiters:
         [CheckedContinuation<CodexConnectionTermination, Never>] = []
 
     package init(connection: AppServerConnection) {
         self.connection = connection
+        self.connectionEventHub = connection.connectionEventHub
     }
 
     deinit {
@@ -94,13 +97,11 @@ package actor ConnectionSupervisor {
     }
 
     package func closeConnection() async {
+        let completion = recordTermination(.init(.closedByCaller))
         if let context = ServerRequestTaskContext.value,
            await connection.signalCloseIfOwned(by: context) {
-            _ = recordTermination(.closedByCaller)
             return
         }
-
-        let completion = recordTermination(.closedByCaller)
         await completion.value
     }
 
@@ -116,40 +117,54 @@ package actor ConnectionSupervisor {
     }
 
     package func terminationForTesting() -> CodexConnectionTermination? {
-        firstTermination
+        terminationArbiter.winner
     }
 
     package func waitForTerminationForTesting() async -> CodexConnectionTermination {
-        if let firstTermination {
-            return firstTermination
+        if let winner = terminationArbiter.winner {
+            return winner
         }
         return await withCheckedContinuation { continuation in
             terminationWaiters.append(continuation)
         }
     }
 
-    private func recordExitSignal(_ signal: ConnectionExitSignal) async {
-        _ = recordTermination(
-            signal.termination,
-            processExitObservedBeforeTermination: signal.processExitObservedBeforeTermination
-        )
+    private func recordExitSignal(_ signal: ConnectionExitSignal) {
+        _ = recordTermination(signal.terminationCandidate)
     }
 
     @discardableResult
     private func recordTermination(
-        _ termination: CodexConnectionTermination,
-        processExitObservedBeforeTermination: Bool = false
+        _ candidate: ConnectionTerminationArbiter.Candidate
     ) -> Task<Void, Never> {
-        if let firstTermination {
-            if Self.shouldReplaceEOF(
-                firstTermination,
-                with: termination,
-                processExitObservedBeforeTermination: processExitObservedBeforeTermination
-            ) {
-                self.firstTermination = termination
-            } else if firstTermination != termination {
+        switch terminationArbiter.claim(candidate) {
+        case .accepted:
+            precondition(
+                phase == .running,
+                "Connection termination can start only from the running phase."
+            )
+            phase = .linearizingClose
+            return startCloseTask()
+        case .refined:
+            guard let closeTask else {
+                preconditionFailure("A provisional terminal must publish its close task atomically.")
+            }
+            return closeTask
+        case .duplicate:
+            guard let closeTask else {
+                preconditionFailure("A provisional terminal must publish its close task atomically.")
+            }
+            return closeTask
+        case .late(let winner, let candidate):
+            if winner.termination != candidate.termination {
+                connectionEventHub.yield(.warning(
+                    ConnectionDiagnosticFactory.lateTermination(
+                        winner: winner.termination,
+                        candidate: candidate.termination
+                    )
+                ))
                 supervisorLogger.debug(
-                    "Ignoring late connection termination: \(String(describing: termination), privacy: .public)"
+                    "Ignoring late connection termination: \(String(describing: candidate.termination), privacy: .public); winner: \(String(describing: winner.termination), privacy: .public)"
                 )
             }
             guard let closeTask else {
@@ -157,15 +172,6 @@ package actor ConnectionSupervisor {
             }
             return closeTask
         }
-        firstTermination = termination
-        let terminationWaiters = terminationWaiters
-        self.terminationWaiters.removeAll(keepingCapacity: false)
-        for waiter in terminationWaiters {
-            waiter.resume(returning: termination)
-        }
-        phase = .closing
-        let closeTask = startCloseTask()
-        return closeTask
     }
 
     private func startCloseTask() -> Task<Void, Never> {
@@ -178,22 +184,28 @@ package actor ConnectionSupervisor {
             guard let self else {
                 return
             }
-            await self.runFullClose(observedAtClose: observedAtClose)
+            await self.commitAndRunFullClose(observedAtClose: observedAtClose)
         }
         closeTask = task
         return task
     }
 
-    private func runFullClose(
+    private func commitAndRunFullClose(
         observedAtClose: JSONRPC.ProcessExitObservation?
     ) async {
-        if case .transportFailure(.closed) = firstTermination {
-            applyCloseArbitrationObservation(observedAtClose)
+        let termination = terminationArbiter.commit(
+            closeObservation: Self.closeObservation(observedAtClose)
+        )
+        let terminationWaiters = terminationWaiters
+        self.terminationWaiters.removeAll(keepingCapacity: false)
+        for waiter in terminationWaiters {
+            waiter.resume(returning: termination)
         }
-        guard let termination = firstTermination else {
-            preconditionFailure("Full close requires a terminal reason.")
-        }
+        phase = .closing
+        await runFullClose(termination: termination)
+    }
 
+    private func runFullClose(termination: CodexConnectionTermination) async {
         await routerTask?.value
         await connection.finishPendingResponsesAfterInboundDrain(
             Self.pendingResponseFailure(for: termination)
@@ -204,38 +216,29 @@ package actor ConnectionSupervisor {
             serverRequestChildCount == 0,
             "Server-request registry must be empty before domain termination."
         )
-        await connection.finishDomains(
-            throwing: .connectionTerminated(termination)
-        )
+        await connection.finishDomains(with: termination)
         await connection.waitUntilTransportClosed()
         await processExitTask?.value
         await connection.reapProcess()
         phase = .closed
     }
 
-    private func applyCloseArbitrationObservation(
+    private nonisolated static func closeObservation(
         _ observation: JSONRPC.ProcessExitObservation?
-    ) {
+    ) -> ConnectionTerminationArbiter.CloseObservation? {
         switch observation {
-        case .exited(let status, observedBeforeTermination: true):
-            firstTermination = .processExited(status: status)
+        case nil:
+            nil
+        case .unavailable:
+            .unavailable
+        case .exited(let status, let observedBeforeTermination):
+            .exited(
+                status: status,
+                observedBeforeTermination: observedBeforeTermination
+            )
         case .failed(let failure):
-            firstTermination = .transportFailure(failure)
-        case .none, .unavailable, .exited:
-            break
+            .failed(failure)
         }
-    }
-
-    private nonisolated static func shouldReplaceEOF(
-        _ current: CodexConnectionTermination,
-        with candidate: CodexConnectionTermination,
-        processExitObservedBeforeTermination: Bool
-    ) -> Bool {
-        guard case .transportFailure(.closed) = current,
-              case .processExited = candidate else {
-            return false
-        }
-        return processExitObservedBeforeTermination
     }
 
     private nonisolated static func pendingResponseFailure(

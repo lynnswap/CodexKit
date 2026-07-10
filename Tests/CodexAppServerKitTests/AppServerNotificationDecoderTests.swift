@@ -170,14 +170,17 @@ struct AppServerNotificationDecoderTests {
         #expect(turn.status == "futureStatus")
     }
 
-    @Test func historicalAliasesAreDiagnosticsAndLegacyFileDeltaIsValidatedIgnore() throws {
+    @Test func historicalAliasesAreUnknownConnectionDiagnosticsAndLegacyFileDeltaIsValidatedIgnore() throws {
         let decoder = AppServerNotificationDecoder()
         for method in ["turn/failed", "turn/cancelled", "item/updated", "agent/message"] {
             let decoded = try decoder.decode(notification(method: method, json: #"{}"#))
             #expect(decoded.method == nil)
             #expect(decoded.methodName == method)
             #expect(decoded.disposition == .diagnostic)
-            #expect(decoded.payload == .raw)
+            #expect(decoded.payload == .connectionDiagnostic(.unknown(.init(
+                method: method,
+                params: Data(#"{}"#.utf8)
+            ))))
         }
 
         let legacy = try decoder.decode(notification(
