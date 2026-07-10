@@ -49,8 +49,10 @@ package struct CodexAppServerRequestCodec: Sendable {
         do {
             let encoder = JSONEncoder()
             switch (request, resolution) {
-            case (.commandExecutionApproval, .approval(let decision)),
-                 (.fileChangeApproval, .approval(let decision)):
+            case (.commandExecutionApproval, .approval(let decision)):
+                return .result(try encoder.encode(ApprovalResponse(decision: decision)))
+            case (.fileChangeApproval, .approval(let decision))
+                where decision.isValidForFileChange:
                 return .result(try encoder.encode(ApprovalResponse(decision: decision)))
             case (.userInput, .userInput(let response)):
                 return .result(try encoder.encode(response))

@@ -32,7 +32,7 @@ struct CodexAppServerRequestCodecTests {
         let fixtures: [(String, String, RequestKind)] = [
             (
                 "item/commandExecution/requestApproval",
-                #"{"threadId":"thread-1","turnId":"turn-1","itemId":"item-1","startedAtMs":1}"#,
+                #"{"threadId":"thread-1","turnId":"turn-1","itemId":"item-1","startedAtMs":1,"availableDecisions":["decline",{"acceptWithExecpolicyAmendment":{"execpolicy_amendment":["git","status"]}}]}"#,
                 .commandApproval
             ),
             (
@@ -75,9 +75,38 @@ struct CodexAppServerRequestCodecTests {
             let request = try codec.decode(method: method, params: data)
             #expect(kind(of: request) == expectedKind)
             #expect(request.method == method)
+            if case .commandExecutionApproval(let approval) = request {
+                #expect(approval.availableDecisions == [
+                    .decline,
+                    .acceptWithExecpolicyAmendment(.init(command: ["git", "status"])),
+                ])
+            }
+            if case .mcpElicitation(let elicitation) = request {
+                guard case .form(_, let message, let schema) = elicitation.elicitation else {
+                    Issue.record("Expected the MCP form tagged variant.")
+                    continue
+                }
+                #expect(message == "Value?")
+                #expect(schema == .object(["type": .string("object")]))
+            }
             if case .unknown(let raw) = request {
                 #expect(raw.params == data)
             }
+        }
+    }
+
+    @Test func mcpElicitationRejectsInvalidTaggedPayloads() throws {
+        #expect(throws: DecodingError.self) {
+            try decode(
+                "mcpServer/elicitation/request",
+                #"{"threadId":"thread-1","turnId":null,"serverName":"server","mode":"url","_meta":null,"message":"Open"}"#
+            )
+        }
+        #expect(throws: DecodingError.self) {
+            try decode(
+                "mcpServer/elicitation/request",
+                #"{"threadId":"thread-1","turnId":null,"serverName":"server","mode":"future","_meta":null,"message":"Unknown"}"#
+            )
         }
     }
 
@@ -228,6 +257,71 @@ struct CodexAppServerRequestCodecTests {
             return
         }
         #expect(encodeCode == -32603)
+    }
+
+    @Test func methodSpecificResponsesMatchCurrentV2TaggedAndNullShapes() throws {
+        let command = try decode(
+            "item/commandExecution/requestApproval",
+            #"{"threadId":"t","turnId":"u","itemId":"i","startedAtMs":1}"#
+        )
+        let execPolicyResponse = codec.response(
+            to: command,
+            resolution: .approval(.acceptWithExecpolicyAmendment(
+                .init(command: ["git", "status"])
+            ))
+        )
+        #expect(try jsonEqual(
+            resultData(from: execPolicyResponse),
+            Data(
+                #"{"decision":{"acceptWithExecpolicyAmendment":{"execpolicy_amendment":["git","status"]}}}"#.utf8
+            )
+        ))
+
+        let networkPolicyResponse = codec.response(
+            to: command,
+            resolution: .approval(.applyNetworkPolicyAmendment(.init(
+                host: "example.com",
+                action: .allow
+            )))
+        )
+        #expect(try jsonEqual(
+            resultData(from: networkPolicyResponse),
+            Data(
+                #"{"decision":{"applyNetworkPolicyAmendment":{"network_policy_amendment":{"host":"example.com","action":"allow"}}}}"#.utf8
+            )
+        ))
+
+        let file = try decode(
+            "item/fileChange/requestApproval",
+            #"{"threadId":"t","turnId":"u","itemId":"i","startedAtMs":1}"#
+        )
+        guard case .error(let fileMismatchCode, _) = codec.response(
+            to: file,
+            resolution: .approval(.acceptWithExecpolicyAmendment(.init(command: ["git"])))
+        ) else {
+            Issue.record("Expected command-only approval to be rejected for file changes.")
+            return
+        }
+        #expect(fileMismatchCode == -32603)
+
+        let refresh = try decode(
+            "account/chatgptAuthTokens/refresh",
+            #"{"reason":"unauthorized","previousAccountId":null}"#
+        )
+        let refreshResponse = codec.response(
+            to: refresh,
+            resolution: .chatGPTAuthTokensRefresh(.init(
+                accessToken: "access",
+                chatGPTAccountID: "account",
+                chatGPTPlanType: nil
+            ))
+        )
+        #expect(try jsonEqual(
+            resultData(from: refreshResponse),
+            Data(
+                #"{"accessToken":"access","chatgptAccountId":"account","chatgptPlanType":null}"#.utf8
+            )
+        ))
     }
 
     private func decode(_ method: String, _ json: String) throws -> CodexAppServerRequest {

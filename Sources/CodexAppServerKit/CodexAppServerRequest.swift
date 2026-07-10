@@ -101,9 +101,9 @@ package struct CodexCommandExecutionApprovalRequest: Codable, Equatable, Sendabl
     package var cwd: String?
     package var commandActions: [CodexJSONValue]?
     package var additionalPermissions: CodexJSONValue?
-    package var proposedExecpolicyAmendment: CodexJSONValue?
-    package var proposedNetworkPolicyAmendments: [CodexJSONValue]?
-    package var availableDecisions: [CodexJSONValue]?
+    package var proposedExecpolicyAmendment: CodexExecPolicyAmendment?
+    package var proposedNetworkPolicyAmendments: [CodexNetworkPolicyAmendment]?
+    package var availableDecisions: [CodexApprovalDecision]?
 
     private enum CodingKeys: String, CodingKey {
         case threadID = "threadId"
@@ -176,12 +176,7 @@ package struct CodexMCPElicitationRequest: Codable, Equatable, Sendable {
     package var threadID: String
     package var turnID: String?
     package var serverName: String
-    package var mode: String
-    package var meta: CodexJSONValue?
-    package var message: String
-    package var requestedSchema: CodexJSONValue?
-    package var url: String?
-    package var elicitationID: String?
+    package var elicitation: CodexMCPElicitation
 
     private enum CodingKeys: String, CodingKey {
         case threadID = "threadId"
@@ -194,6 +189,79 @@ package struct CodexMCPElicitationRequest: Codable, Equatable, Sendable {
         case url
         case elicitationID = "elicitationId"
     }
+
+    private enum Mode: String, Codable {
+        case form
+        case openAIForm = "openai/form"
+        case url
+    }
+
+    package init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.threadID = try container.decode(String.self, forKey: .threadID)
+        self.turnID = try container.decodeIfPresent(String.self, forKey: .turnID)
+        self.serverName = try container.decode(String.self, forKey: .serverName)
+        let meta = try container.decodeIfPresent(CodexJSONValue.self, forKey: .meta)
+        let message = try container.decode(String.self, forKey: .message)
+        switch try container.decode(Mode.self, forKey: .mode) {
+        case .form:
+            self.elicitation = .form(
+                meta: meta,
+                message: message,
+                requestedSchema: try container.decode(
+                    CodexJSONValue.self,
+                    forKey: .requestedSchema
+                )
+            )
+        case .openAIForm:
+            self.elicitation = .openAIForm(
+                meta: meta,
+                message: message,
+                requestedSchema: try container.decode(
+                    CodexJSONValue.self,
+                    forKey: .requestedSchema
+                )
+            )
+        case .url:
+            self.elicitation = .url(
+                meta: meta,
+                message: message,
+                url: try container.decode(String.self, forKey: .url),
+                elicitationID: try container.decode(String.self, forKey: .elicitationID)
+            )
+        }
+    }
+
+    package func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(threadID, forKey: .threadID)
+        try container.encode(turnID, forKey: .turnID)
+        try container.encode(serverName, forKey: .serverName)
+        switch elicitation {
+        case .form(let meta, let message, let requestedSchema):
+            try container.encode(Mode.form, forKey: .mode)
+            try container.encode(meta, forKey: .meta)
+            try container.encode(message, forKey: .message)
+            try container.encode(requestedSchema, forKey: .requestedSchema)
+        case .openAIForm(let meta, let message, let requestedSchema):
+            try container.encode(Mode.openAIForm, forKey: .mode)
+            try container.encode(meta, forKey: .meta)
+            try container.encode(message, forKey: .message)
+            try container.encode(requestedSchema, forKey: .requestedSchema)
+        case .url(let meta, let message, let url, let elicitationID):
+            try container.encode(Mode.url, forKey: .mode)
+            try container.encode(meta, forKey: .meta)
+            try container.encode(message, forKey: .message)
+            try container.encode(url, forKey: .url)
+            try container.encode(elicitationID, forKey: .elicitationID)
+        }
+    }
+}
+
+package enum CodexMCPElicitation: Equatable, Sendable {
+    case form(meta: CodexJSONValue?, message: String, requestedSchema: CodexJSONValue)
+    case openAIForm(meta: CodexJSONValue?, message: String, requestedSchema: CodexJSONValue)
+    case url(meta: CodexJSONValue?, message: String, url: String, elicitationID: String)
 }
 
 package struct CodexPermissionsRequest: Codable, Equatable, Sendable {
@@ -280,11 +348,128 @@ package enum CodexAppServerRequestResolution: Equatable, Sendable {
 package typealias CodexAppServerRequestHandler =
     @Sendable (CodexAppServerRequest) async throws -> CodexAppServerRequestResolution
 
-package enum CodexApprovalDecision: String, Codable, Equatable, Sendable {
+package enum CodexApprovalDecision: Codable, Equatable, Sendable {
     case accept
     case acceptForSession
+    case acceptWithExecpolicyAmendment(CodexExecPolicyAmendment)
+    case applyNetworkPolicyAmendment(CodexNetworkPolicyAmendment)
     case decline
     case cancel
+
+    private enum Scalar: String, Codable {
+        case accept
+        case acceptForSession
+        case decline
+        case cancel
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case acceptWithExecpolicyAmendment
+        case applyNetworkPolicyAmendment
+    }
+
+    private enum ExecPolicyCodingKeys: String, CodingKey {
+        case amendment = "execpolicy_amendment"
+    }
+
+    private enum NetworkPolicyCodingKeys: String, CodingKey {
+        case amendment = "network_policy_amendment"
+    }
+
+    package init(from decoder: Decoder) throws {
+        if let scalar = try? Scalar(from: decoder) {
+            self = switch scalar {
+            case .accept: .accept
+            case .acceptForSession: .acceptForSession
+            case .decline: .decline
+            case .cancel: .cancel
+            }
+            return
+        }
+
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        if container.contains(.acceptWithExecpolicyAmendment) {
+            let nested = try container.nestedContainer(
+                keyedBy: ExecPolicyCodingKeys.self,
+                forKey: .acceptWithExecpolicyAmendment
+            )
+            self = .acceptWithExecpolicyAmendment(
+                try nested.decode(CodexExecPolicyAmendment.self, forKey: .amendment)
+            )
+        } else {
+            let nested = try container.nestedContainer(
+                keyedBy: NetworkPolicyCodingKeys.self,
+                forKey: .applyNetworkPolicyAmendment
+            )
+            self = .applyNetworkPolicyAmendment(
+                try nested.decode(CodexNetworkPolicyAmendment.self, forKey: .amendment)
+            )
+        }
+    }
+
+    package func encode(to encoder: Encoder) throws {
+        switch self {
+        case .accept:
+            try Scalar.accept.encode(to: encoder)
+        case .acceptForSession:
+            try Scalar.acceptForSession.encode(to: encoder)
+        case .decline:
+            try Scalar.decline.encode(to: encoder)
+        case .cancel:
+            try Scalar.cancel.encode(to: encoder)
+        case .acceptWithExecpolicyAmendment(let amendment):
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            var nested = container.nestedContainer(
+                keyedBy: ExecPolicyCodingKeys.self,
+                forKey: .acceptWithExecpolicyAmendment
+            )
+            try nested.encode(amendment, forKey: .amendment)
+        case .applyNetworkPolicyAmendment(let amendment):
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            var nested = container.nestedContainer(
+                keyedBy: NetworkPolicyCodingKeys.self,
+                forKey: .applyNetworkPolicyAmendment
+            )
+            try nested.encode(amendment, forKey: .amendment)
+        }
+    }
+
+    package var isValidForFileChange: Bool {
+        switch self {
+        case .accept, .acceptForSession, .decline, .cancel:
+            true
+        case .acceptWithExecpolicyAmendment, .applyNetworkPolicyAmendment:
+            false
+        }
+    }
+}
+
+package struct CodexExecPolicyAmendment: Codable, Equatable, Sendable {
+    package var command: [String]
+
+    package init(command: [String]) {
+        self.command = command
+    }
+
+    package init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        self.command = try container.decode([String].self)
+    }
+
+    package func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(command)
+    }
+}
+
+package enum CodexNetworkPolicyRuleAction: String, Codable, Equatable, Sendable {
+    case allow
+    case deny
+}
+
+package struct CodexNetworkPolicyAmendment: Codable, Equatable, Sendable {
+    package var host: String
+    package var action: CodexNetworkPolicyRuleAction
 }
 
 package struct CodexUserInputAnswer: Codable, Equatable, Sendable {
@@ -388,6 +573,13 @@ package struct CodexChatGPTAuthTokensRefreshResponse: Codable, Equatable, Sendab
         case accessToken
         case chatGPTAccountID = "chatgptAccountId"
         case chatGPTPlanType = "chatgptPlanType"
+    }
+
+    package func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(accessToken, forKey: .accessToken)
+        try container.encode(chatGPTAccountID, forKey: .chatGPTAccountID)
+        try container.encode(chatGPTPlanType, forKey: .chatGPTPlanType)
     }
 }
 
