@@ -412,7 +412,6 @@ public struct CodexGenerationOptions: Equatable, Sendable {
     public var outputSchema: CodexJSONValue?
     public var personality: CodexPersonality?
     public var clientUserMessageID: String?
-    public var transcriptErrorHandlingPolicy: CodexTranscriptErrorHandlingPolicy
 
     public init(
         model: String? = nil,
@@ -424,8 +423,7 @@ public struct CodexGenerationOptions: Equatable, Sendable {
         summary: CodexReasoningSummary? = nil,
         outputSchema: CodexJSONValue? = nil,
         personality: CodexPersonality? = nil,
-        clientUserMessageID: String? = nil,
-        transcriptErrorHandlingPolicy: CodexTranscriptErrorHandlingPolicy = .preserveTranscript
+        clientUserMessageID: String? = nil
     ) {
         self.model = model
         self.approvalMode = approvalMode
@@ -437,27 +435,6 @@ public struct CodexGenerationOptions: Equatable, Sendable {
         self.outputSchema = outputSchema
         self.personality = personality
         self.clientUserMessageID = clientUserMessageID
-        self.transcriptErrorHandlingPolicy = transcriptErrorHandlingPolicy
-    }
-}
-
-public struct CodexTranscriptErrorHandlingPolicy: Equatable, Sendable {
-    private enum Kind: Equatable, Sendable {
-        case preserveTranscript
-        case revertTranscript
-    }
-
-    private var kind: Kind
-
-    private init(kind: Kind) {
-        self.kind = kind
-    }
-
-    public static let preserveTranscript = Self(kind: .preserveTranscript)
-    public static let revertTranscript = Self(kind: .revertTranscript)
-
-    package var shouldRevertTranscript: Bool {
-        kind == .revertTranscript
     }
 }
 
@@ -691,23 +668,11 @@ public struct CodexReviewRestartToken: Equatable, Identifiable, Sendable {
     }
 }
 
-/// Options for restoring a persisted review run as a live session handle.
-public struct CodexReviewResumeOptions: Equatable, Sendable {
-    /// How collection should treat transcript errors for the restored response.
-    public var transcriptErrorHandlingPolicy: CodexTranscriptErrorHandlingPolicy
-
-    public init(
-        transcriptErrorHandlingPolicy: CodexTranscriptErrorHandlingPolicy = .preserveTranscript
-    ) {
-        self.transcriptErrorHandlingPolicy = transcriptErrorHandlingPolicy
-    }
-}
-
 /// Thread events projected for a `CodexReviewSession`.
-public enum CodexReviewEvent: Equatable, Sendable {
+package enum CodexReviewEvent: Equatable, Sendable {
     case turnStarted(CodexTurnID)
-    case turnCompleted(CodexResponse)
-    case turnFailed(turnID: CodexTurnID?, message: String)
+    case snapshot(CodexTurnSnapshot)
+    case terminal(CodexTurnOutcome)
     case itemStarted(CodexThreadItem, turnID: CodexTurnID?)
     case itemUpdated(CodexThreadItem, turnID: CodexTurnID?)
     case itemCompleted(CodexThreadItem, turnID: CodexTurnID?)
@@ -724,10 +689,10 @@ public enum CodexReviewEvent: Equatable, Sendable {
         switch event {
         case .turnStarted(let turnID):
             self = .turnStarted(turnID)
-        case .turnCompleted(let response):
-            self = .turnCompleted(response)
-        case .turnFailed(let turnID, let message):
-            self = .turnFailed(turnID: turnID, message: message)
+        case .snapshot(let snapshot):
+            self = .snapshot(snapshot)
+        case .terminal(let outcome):
+            self = .terminal(outcome)
         case .itemStarted(let item, let turnID):
             self = .itemStarted(item, turnID: turnID)
         case .itemUpdated(let item, let turnID):
@@ -755,29 +720,9 @@ public enum CodexReviewEvent: Equatable, Sendable {
 }
 
 /// Incremental progress derived from the review turn's thread events.
-public struct CodexReviewProgress: Equatable, Sendable {
-    public enum Phase: Equatable, Sendable {
-        case running
-        case completed
-        case failed(CodexAppServerError)
-    }
-
-    public var phase: Phase
-    public var transcript: CodexTranscript
-    public var usage: CodexTokenUsage?
-    public var result: CodexResponse?
-
-    public init(
-        phase: Phase,
-        transcript: CodexTranscript = .init(),
-        usage: CodexTokenUsage? = nil,
-        result: CodexResponse? = nil
-    ) {
-        self.phase = phase
-        self.transcript = transcript
-        self.usage = usage
-        self.result = result
-    }
+package enum CodexReviewProgress: Equatable, Sendable {
+    case running(transcript: CodexTranscript, usage: CodexTokenUsage?)
+    case terminal(CodexTurnOutcome)
 }
 
 /// A review run started by `codex app-server`.
@@ -787,7 +732,7 @@ public struct CodexReviewSession: Identifiable, Sendable {
         turnID
     }
 
-    /// The thread where `startReview(target:delivery:transcriptErrorHandlingPolicy:)` was called.
+    /// The thread where `startReview(target:delivery:)` was called.
     public let threadID: CodexThreadID
 
     /// The app-server turn that is producing the review response.
@@ -810,7 +755,7 @@ public struct CodexReviewSession: Identifiable, Sendable {
     public let initialTurn: CodexTurnSnapshot
 
     /// The live response stream for the review turn.
-    public let response: CodexResponseStream
+    package let response: CodexResponseStream
 
     package let eventThread: CodexThread
 
@@ -870,33 +815,33 @@ public struct CodexReviewSession: Identifiable, Sendable {
     }
 
     /// Thread events filtered to the review turn.
-    public var events: CodexReviewEventSequence {
+    package var events: CodexReviewEventSequence {
         .init(events: eventThread.events, terminalTurnID: turnID)
     }
 
     /// Agent messages emitted by the review thread.
-    public var messages: CodexThreadMessageSequence {
+    package var messages: CodexThreadMessageSequence {
         eventThread.messages
     }
 
     /// Incremental transcript snapshots for the review thread.
-    public var transcriptUpdates: CodexThreadTranscriptSequence {
+    package var transcriptUpdates: CodexThreadTranscriptSequence {
         eventThread.transcriptUpdates
     }
 
     /// Log-oriented item events emitted by the review thread.
-    public var logEntries: CodexThreadLogSequence {
+    package var logEntries: CodexThreadLogSequence {
         .init(events: eventThread.events, terminalTurnID: turnID)
     }
 
     /// Incremental progress snapshots for the review thread.
-    public var progress: CodexReviewProgressSequence {
+    package var progress: CodexReviewProgressSequence {
         .init(events: eventThread.events, terminalTurnID: turnID)
     }
 
     /// Collects the review response until the turn finishes.
-    public func collect() async throws -> CodexResponse {
-        try await response.collect()
+    public func collect(timeout: Duration? = nil) async throws -> CodexTurnOutcome {
+        try await response.collect(timeout: timeout)
     }
 
     /// Cancels the running review turn.
@@ -909,20 +854,25 @@ public struct CodexReviewSession: Identifiable, Sendable {
     }
 
     @discardableResult
-    public func cancel(
+    package func cancel(
         willCancelActiveTurn: (@Sendable (CodexTurnCancellation) async -> Void)?
     ) async throws -> CodexTurnCancellation {
         try await response.cancel(willCancelActiveTurn: willCancelActiveTurn)
     }
 
     /// Sends additional input to the running review turn.
-    public func steer(with prompt: CodexPrompt) async throws {
+    package func steer(with prompt: CodexPrompt) async throws {
         try await response.steer(with: prompt)
     }
 
     /// Sends additional text input to the running review turn.
-    public func steer(with prompt: String) async throws {
+    package func steer(with prompt: String) async throws {
         try await response.steer(with: prompt)
+    }
+
+    /// Closes the app-server connection shared by this review session.
+    public func closeConnection() async {
+        await response.closeConnection()
     }
 }
 
@@ -1151,24 +1101,64 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
 }
 
 public struct CodexTurnSnapshot: Identifiable, Equatable, Sendable {
+    public enum State: Equatable, Sendable {
+        case inProgress
+        case completed
+        case interrupted
+        case failed(CodexTurnError)
+        case unknown(rawValue: String, error: CodexTurnError?)
+    }
+
     public var id: CodexTurnID
-    public var status: CodexTurnStatus?
-    public var errorMessage: String?
+    public var state: State
     public var itemsLoadState: CodexTurnItemsLoadState
     public var items: [CodexThreadItem]
+    public var startedAt: Date?
+    public var completedAt: Date?
+    public var duration: Duration?
+
+    public var status: CodexTurnStatus {
+        switch state {
+        case .inProgress:
+            .inProgress
+        case .completed:
+            .completed
+        case .interrupted:
+            .interrupted
+        case .failed:
+            .failed
+        case .unknown(let rawValue, _):
+            .unknown(rawValue: rawValue)
+        }
+    }
+
+    public var error: CodexTurnError? {
+        switch state {
+        case .failed(let error):
+            error
+        case .unknown(_, let error):
+            error
+        case .inProgress, .completed, .interrupted:
+            nil
+        }
+    }
 
     public init(
         id: CodexTurnID,
-        status: CodexTurnStatus? = nil,
-        errorMessage: String? = nil,
+        state: State,
         itemsLoadState: CodexTurnItemsLoadState = .full,
-        items: [CodexThreadItem] = []
+        items: [CodexThreadItem] = [],
+        startedAt: Date? = nil,
+        completedAt: Date? = nil,
+        duration: Duration? = nil
     ) {
         self.id = id
-        self.status = status
-        self.errorMessage = errorMessage
+        self.state = state
         self.itemsLoadState = itemsLoadState
         self.items = items
+        self.startedAt = startedAt
+        self.completedAt = completedAt
+        self.duration = duration
     }
 
     package var itemsAreAuthoritative: Bool {
@@ -1834,62 +1824,45 @@ public struct CodexRawItem: Equatable, Sendable {
 }
 
 public enum CodexTurnStatus: Equatable, Sendable {
-    case running
+    case inProgress
     case completed
-    case failed
     case interrupted
-    case cancelled
-    case unknown(String)
+    case failed
+    case unknown(rawValue: String)
 
     public init(rawValue: String) {
         switch rawValue {
-        case "running", "inProgress", "started":
-            self = .running
-        case "completed", "succeeded", "success":
+        case "inProgress":
+            self = .inProgress
+        case "completed":
             self = .completed
-        case "failed", "failure", "error":
-            self = .failed
         case "interrupted":
             self = .interrupted
-        case "cancelled", "canceled", "aborted":
-            self = .cancelled
+        case "failed":
+            self = .failed
         case let rawValue:
-            self = .unknown(rawValue)
+            self = .unknown(rawValue: rawValue)
         }
     }
 
     public var rawValue: String {
         switch self {
-        case .running:
-            "running"
+        case .inProgress:
+            "inProgress"
         case .completed:
             "completed"
-        case .failed:
-            "failed"
         case .interrupted:
             "interrupted"
-        case .cancelled:
-            "cancelled"
+        case .failed:
+            "failed"
         case .unknown(let rawValue):
             rawValue
-        }
-    }
-
-    public var isFailure: Bool {
-        switch self {
-        case .failed, .interrupted, .cancelled:
-            true
-        case .running, .completed, .unknown:
-            false
         }
     }
 }
 
 public struct CodexResponse: Identifiable, Equatable, Sendable {
     public var turnID: CodexTurnID
-    public var status: CodexTurnStatus?
-    public var errorMessage: String?
-    public var finalAnswer: String?
     public var transcript: CodexTranscript
     public var usage: CodexTokenUsage?
     public var startedAt: Date?
@@ -1902,9 +1875,6 @@ public struct CodexResponse: Identifiable, Equatable, Sendable {
 
     public init(
         turnID: CodexTurnID,
-        status: CodexTurnStatus? = nil,
-        errorMessage: String? = nil,
-        finalAnswer: String? = nil,
         transcript: CodexTranscript = .init(),
         usage: CodexTokenUsage? = nil,
         startedAt: Date? = nil,
@@ -1912,14 +1882,80 @@ public struct CodexResponse: Identifiable, Equatable, Sendable {
         duration: Duration? = nil
     ) {
         self.turnID = turnID
-        self.status = status
-        self.errorMessage = errorMessage
-        self.finalAnswer = finalAnswer
         self.transcript = transcript
         self.usage = usage
         self.startedAt = startedAt
         self.completedAt = completedAt
         self.duration = duration
+    }
+}
+
+public enum CodexErrorInfo: Equatable, Sendable {
+    case contextWindowExceeded
+    case sessionBudgetExceeded
+    case usageLimitExceeded
+    case serverOverloaded
+    case cyberPolicy
+    case httpConnectionFailed(httpStatusCode: UInt16?)
+    case responseStreamConnectionFailed(httpStatusCode: UInt16?)
+    case internalServerError
+    case unauthorized
+    case badRequest
+    case threadRollbackFailed
+    case sandboxError
+    case responseStreamDisconnected(httpStatusCode: UInt16?)
+    case responseTooManyFailedAttempts(httpStatusCode: UInt16?)
+    case activeTurnNotSteerable(turnKind: String)
+    case other
+    case unknown(rawValue: String)
+}
+
+public struct CodexTurnError: Error, Equatable, LocalizedError, Sendable {
+    public var message: String
+    public var info: CodexErrorInfo?
+    public var additionalDetails: String?
+
+    public init(
+        message: String,
+        info: CodexErrorInfo? = nil,
+        additionalDetails: String? = nil
+    ) {
+        self.message = message
+        self.info = info
+        self.additionalDetails = additionalDetails
+    }
+
+    public var errorDescription: String? { message }
+}
+
+public enum CodexTurnOutcome: Equatable, Sendable {
+    case completed(CodexResponse)
+    case interrupted(CodexResponse)
+    case failed(CodexFailedTurn)
+    case invalidTerminalStatus(
+        rawStatus: String,
+        error: CodexTurnError?,
+        response: CodexResponse
+    )
+
+    public var response: CodexResponse {
+        switch self {
+        case .completed(let response), .interrupted(let response),
+             .invalidTerminalStatus(_, _, let response):
+            response
+        case .failed(let failedTurn):
+            failedTurn.response
+        }
+    }
+}
+
+public struct CodexFailedTurn: Equatable, Sendable {
+    public var response: CodexResponse
+    public var error: CodexTurnError
+
+    package init(response: CodexResponse, error: CodexTurnError) {
+        self.response = response
+        self.error = error
     }
 }
 
@@ -1944,20 +1980,20 @@ public struct CodexTurnCancellation: Equatable, Sendable {
     }
 }
 
-public struct CodexResponseStream: AsyncSequence, Sendable {
-    public enum SubmissionMode: Equatable, Sendable {
+package struct CodexResponseStream: AsyncSequence, Sendable {
+    package enum SubmissionMode: Equatable, Sendable {
         case queueAfterCurrentResponse
         case cancelCurrentResponse
     }
 
-    public struct Snapshot: Equatable, Sendable {
-        public var turnID: CodexTurnID
-        public var content: String?
-        public var transcript: CodexTranscript
-        public var usage: CodexTokenUsage?
-        public var response: CodexResponse?
+    package struct Snapshot: Equatable, Sendable {
+        package var turnID: CodexTurnID
+        package var content: String?
+        package var transcript: CodexTranscript
+        package var usage: CodexTokenUsage?
+        package var response: CodexResponse?
 
-        public init(
+        package init(
             turnID: CodexTurnID,
             content: String? = nil,
             transcript: CodexTranscript = .init(),
@@ -1973,38 +2009,28 @@ public struct CodexResponseStream: AsyncSequence, Sendable {
     }
 
     private let turn: CodexTurn
-    private let transcriptErrorHandlingPolicy: CodexTranscriptErrorHandlingPolicy
 
-    package init(
-        turn: CodexTurn,
-        transcriptErrorHandlingPolicy: CodexTranscriptErrorHandlingPolicy
-    ) {
+    package init(turn: CodexTurn) {
         self.turn = turn
-        self.transcriptErrorHandlingPolicy = transcriptErrorHandlingPolicy
     }
 
-    public func makeAsyncIterator() -> Iterator {
+    package func makeAsyncIterator() -> Iterator {
         Iterator(
             turn: turn,
-            transcriptErrorHandlingPolicy: transcriptErrorHandlingPolicy,
             progress: turn.progress.makeAsyncIterator()
         )
     }
 
-    public func collect() async throws -> CodexResponse {
-        try await withTaskCancellationHandler {
-            do {
-                return try await turn.result()
-            } catch {
-                try await handleFailure()
-                throw error
-            }
-        } onCancel: {
-            let turn = turn
-            Task {
-                try? await turn.interrupt()
+    package func collect(timeout: Duration? = nil) async throws -> CodexTurnOutcome {
+        if let timeout {
+            return try await turn.client.runTurnWithDeadline(
+                turnID: turn.id,
+                duration: timeout
+            ) {
+                try await turn.result()
             }
         }
+        return try await turn.result()
     }
 
     /// Cancels the running response.
@@ -2013,7 +2039,7 @@ public struct CodexResponseStream: AsyncSequence, Sendable {
     ///   differ from the stream's original turn when the app-server reports a
     ///   newer active turn.
     @discardableResult
-    public func cancel() async throws -> CodexTurnCancellation {
+    package func cancel() async throws -> CodexTurnCancellation {
         try await turn.interrupt()
     }
 
@@ -2024,26 +2050,26 @@ public struct CodexResponseStream: AsyncSequence, Sendable {
         try await turn.interrupt(willCancelActiveTurn: willCancelActiveTurn)
     }
 
-    public func steer(with prompt: CodexPrompt) async throws {
+    package func steer(with prompt: CodexPrompt) async throws {
         try await turn.steer(with: prompt)
     }
 
-    public func steer(with prompt: String) async throws {
+    package func steer(with prompt: String) async throws {
         try await steer(with: CodexPrompt(prompt))
     }
 
-    public func steer(@CodexPromptBuilder prompt: () throws -> CodexPrompt) async throws {
+    package func steer(@CodexPromptBuilder prompt: () throws -> CodexPrompt) async throws {
         try await steer(with: try prompt())
     }
 
-    public func submit(
+    package func submit(
         _ prompt: CodexPrompt,
         mode: SubmissionMode,
         options: CodexGenerationOptions = .init()
     ) async throws -> CodexResponseStream {
         switch mode {
         case .queueAfterCurrentResponse:
-            _ = try await collect()
+            _ = try await collect(timeout: nil)
             return try await startFollowUp(to: prompt, options: options)
         case .cancelCurrentResponse:
             let cancellation = try await cancel()
@@ -2052,7 +2078,7 @@ public struct CodexResponseStream: AsyncSequence, Sendable {
         }
     }
 
-    public func submit(
+    package func submit(
         _ prompt: String,
         mode: SubmissionMode,
         options: CodexGenerationOptions = .init()
@@ -2060,7 +2086,7 @@ public struct CodexResponseStream: AsyncSequence, Sendable {
         try await submit(CodexPrompt(prompt), mode: mode, options: options)
     }
 
-    public func submit(
+    package func submit(
         mode: SubmissionMode,
         options: CodexGenerationOptions = .init(),
         @CodexPromptBuilder prompt: () throws -> CodexPrompt
@@ -2079,36 +2105,31 @@ public struct CodexResponseStream: AsyncSequence, Sendable {
             client: turn.client,
             router: turn.router
         )
-        return .init(
-            turn: turn,
-            transcriptErrorHandlingPolicy: options.transcriptErrorHandlingPolicy
-        )
+        return .init(turn: turn)
     }
 
     package func waitForCancelledResponse(_ cancellation: CodexTurnCancellation) async throws {
         let cancelledTurn = cancelledTurn(for: cancellation)
         for try await event in cancelledTurn.events {
             switch event {
-            case .completed(let response):
-                if let message = response.errorMessage {
-                    throw CodexAppServerError.turnFailed(message)
-                }
-                switch response.status {
-                case .interrupted, .cancelled:
+            case .terminal(let outcome):
+                switch outcome {
+                case .interrupted, .completed, .invalidTerminalStatus:
                     return
-                case .failed:
-                    throw CodexAppServerError.turnFailed(CodexTurnStatus.failed.rawValue)
-                case .running, .completed, .unknown, nil:
-                    return
+                case .failed(let failedTurn):
+                    throw failedTurn.error
                 }
-            case .failed(let message):
-                throw CodexAppServerError.turnFailed(message)
-            case .started, .itemStarted, .itemUpdated, .itemCompleted, .message, .messageDelta,
+            case .started, .snapshot, .itemStarted, .itemUpdated, .itemCompleted, .message, .messageDelta,
                 .reasoningSummaryPartAdded, .reasoningDelta, .tokenUsageUpdated, .unknown:
                 continue
             }
         }
-        throw CodexAppServerError.transportClosed
+        throw CodexAppServerError.connectionTerminated(.transportFailure(.closed))
+    }
+
+    package func closeConnection() async {
+        await turn.router.stop()
+        await turn.client.close()
     }
 
     private func cancelledTurn(for cancellation: CodexTurnCancellation) -> CodexTurn {
@@ -2124,72 +2145,41 @@ public struct CodexResponseStream: AsyncSequence, Sendable {
         )
     }
 
-    private func handleFailure() async throws {
-        guard transcriptErrorHandlingPolicy.shouldRevertTranscript else {
-            return
-        }
-        let _: EmptyResponse = try await turn.client.send(
-            AppServerAPI.Thread.Rollback.Request(
-                params: .init(threadID: turn.threadID.rawValue, numTurns: 1)
-            ))
-    }
-
-    public struct Iterator: AsyncIteratorProtocol {
+    package struct Iterator: AsyncIteratorProtocol {
         private let turn: CodexTurn
-        private let transcriptErrorHandlingPolicy: CodexTranscriptErrorHandlingPolicy
         private var progress: CodexTurnProgressSequence.Iterator
-        private var pendingError: Error?
 
         fileprivate init(
             turn: CodexTurn,
-            transcriptErrorHandlingPolicy: CodexTranscriptErrorHandlingPolicy,
             progress: CodexTurnProgressSequence.Iterator
         ) {
             self.turn = turn
-            self.transcriptErrorHandlingPolicy = transcriptErrorHandlingPolicy
             self.progress = progress
         }
 
-        public mutating func next() async throws -> Snapshot? {
-            if let error = pendingError {
-                pendingError = nil
-                throw error
-            }
+        package mutating func next() async throws -> Snapshot? {
             guard let progress = try await progress.next() else {
+                try Task.checkCancellation()
                 return nil
             }
-            if case .failed(let error) = progress.phase {
-                try await handleFailure()
-                if let response = progress.result {
-                    pendingError = error
-                    return Snapshot(
-                        turnID: turn.id,
-                        content: response.finalAnswer ?? response.transcript.responseText,
-                        transcript: response.transcript,
-                        usage: response.usage,
-                        response: response
-                    )
-                }
-                throw error
+            switch progress {
+            case .running(let transcript, let usage):
+                return Snapshot(
+                    turnID: turn.id,
+                    content: transcript.responseText,
+                    transcript: transcript,
+                    usage: usage
+                )
+            case .terminal(let outcome):
+                let response = outcome.response
+                return Snapshot(
+                    turnID: turn.id,
+                    content: response.transcript.responseText,
+                    transcript: response.transcript,
+                    usage: response.usage,
+                    response: response
+                )
             }
-            let usage = progress.result?.usage ?? progress.usage
-            return Snapshot(
-                turnID: turn.id,
-                content: progress.result?.finalAnswer ?? progress.transcript.responseText,
-                transcript: progress.transcript,
-                usage: usage,
-                response: progress.result
-            )
-        }
-
-        private func handleFailure() async throws {
-            guard transcriptErrorHandlingPolicy.shouldRevertTranscript else {
-                return
-            }
-            let _: EmptyResponse = try await turn.client.send(
-                AppServerAPI.Thread.Rollback.Request(
-                    params: .init(threadID: turn.threadID.rawValue, numTurns: 1)
-                ))
         }
     }
 }
@@ -2292,6 +2282,7 @@ public struct CodexReasoningDelta: Identifiable, Equatable, Sendable {
 
 package enum CodexTurnEvent: Equatable, Sendable {
     case started(CodexTurnID)
+    case snapshot(CodexTurnSnapshot)
     case itemStarted(CodexThreadItem)
     case itemUpdated(CodexThreadItem)
     case itemCompleted(CodexThreadItem)
@@ -2300,15 +2291,14 @@ package enum CodexTurnEvent: Equatable, Sendable {
     case reasoningSummaryPartAdded(CodexReasoningPart)
     case reasoningDelta(CodexReasoningDelta)
     case tokenUsageUpdated(CodexTokenUsage)
-    case completed(CodexResponse)
-    case failed(String)
+    case terminal(CodexTurnOutcome)
     case unknown(CodexRawNotification)
 }
 
-public enum CodexThreadEvent: Equatable, Sendable {
+package enum CodexThreadEvent: Equatable, Sendable {
     case turnStarted(CodexTurnID)
-    case turnCompleted(CodexResponse)
-    case turnFailed(turnID: CodexTurnID?, message: String)
+    case snapshot(CodexTurnSnapshot)
+    case terminal(CodexTurnOutcome)
     case itemStarted(CodexThreadItem, turnID: CodexTurnID?)
     case itemUpdated(CodexThreadItem, turnID: CodexTurnID?)
     case itemCompleted(CodexThreadItem, turnID: CodexTurnID?)
@@ -2418,11 +2408,11 @@ public enum CodexThreadStatus: Equatable, Sendable {
     case idle
     case systemError
     case active(activeFlags: [CodexThreadActiveFlag])
-    case unknown(String)
+    case unknown(rawValue: String)
 
     public init(rawValue: String) {
         switch rawValue {
-        case "notLoaded", "closed":
+        case "notLoaded":
             self = .notLoaded
         case "idle":
             self = .idle
@@ -2431,7 +2421,7 @@ public enum CodexThreadStatus: Equatable, Sendable {
         case "active":
             self = .active(activeFlags: [])
         case let rawValue:
-            self = .unknown(rawValue)
+            self = .unknown(rawValue: rawValue)
         }
     }
 
@@ -2474,29 +2464,9 @@ public enum CodexThreadStatus: Equatable, Sendable {
     }
 }
 
-package struct CodexTurnProgress: Equatable, Sendable {
-    package enum Phase: Equatable, Sendable {
-        case running
-        case completed
-        case failed(CodexAppServerError)
-    }
-
-    package var phase: Phase
-    package var transcript: CodexTranscript
-    package var usage: CodexTokenUsage?
-    package var result: CodexResponse?
-
-    package init(
-        phase: Phase,
-        transcript: CodexTranscript = .init(),
-        usage: CodexTokenUsage? = nil,
-        result: CodexResponse? = nil
-    ) {
-        self.phase = phase
-        self.transcript = transcript
-        self.usage = usage
-        self.result = result
-    }
+package enum CodexTurnProgress: Equatable, Sendable {
+    case running(transcript: CodexTranscript, usage: CodexTokenUsage?)
+    case terminal(CodexTurnOutcome)
 }
 
 public struct CodexRawNotification: Equatable, Sendable {
@@ -2834,40 +2804,201 @@ public enum CodexLoginHandle: Equatable, Sendable {
 }
 
 public enum CodexAppServerError: Error, Equatable, LocalizedError, Sendable {
-    case transportClosed
-    case jsonRPC(code: Int, message: String)
-    case serverBusy(String)
-    case retryLimitExceeded
-    case malformedNotification(String)
-    case turnFailed(String)
-    case turnFailedWithResponse(CodexResponse)
+    case launch(CodexLaunchFailure)
+    case request(CodexRequestFailure)
+    case connectionTerminated(CodexConnectionTermination)
+    case turnDeadlineExceeded(turnID: CodexTurnID, duration: Duration)
+    case malformedNotification(CodexMalformedNotification)
     case reviewRestartUnavailable(CodexReviewRestartToken.ID)
+    case loginAlreadyInProgress
 
     public var errorDescription: String? {
         switch self {
-        case .transportClosed:
-            "The Codex app-server connection is closed."
-        case .jsonRPC(_, let message):
-            message
-        case .serverBusy(let message):
-            message
-        case .retryLimitExceeded:
-            "The Codex app-server remained busy after all retry attempts."
-        case .malformedNotification(let message):
-            message
-        case .turnFailed(let message):
-            message
-        case .turnFailedWithResponse(let response):
-            response.errorMessage ?? response.status?.rawValue ?? "Turn failed."
+        case .launch(let failure):
+            failure.localizedDescription
+        case .request(let failure):
+            failure.localizedDescription
+        case .connectionTerminated(let termination):
+            termination.errorDescription
+        case .turnDeadlineExceeded(let turnID, let duration):
+            "Turn \(turnID.rawValue) did not reach a terminal outcome within \(duration)."
+        case .malformedNotification(let failure):
+            failure.localizedDescription
         case .reviewRestartUnavailable(let tokenID):
             "Prepared review restart is no longer available for token \(tokenID)."
+        case .loginAlreadyInProgress:
+            "A ChatGPT login is already in progress."
         }
     }
+}
 
-    public var response: CodexResponse? {
-        if case .turnFailedWithResponse(let response) = self {
-            return response
+public struct CodexRequestFailure: Error, Equatable, LocalizedError, Sendable {
+    public enum Kind: Equatable, Sendable {
+        case encode(message: String)
+        case write(CodexTransportFailure)
+        case transport(CodexTransportFailure)
+        case server(CodexServerError)
+        case invalidResponse(expectedType: String, message: String, rawData: Data?)
+        case deadlineExceeded(Duration)
+        case overloadRetryExhausted(last: CodexServerError, attempts: Int)
+    }
+
+    public var requestID: Int
+    public var method: String
+    public var purpose: CodexRequestPurpose
+    public var kind: Kind
+
+    package init(
+        requestID: Int,
+        method: String,
+        purpose: CodexRequestPurpose,
+        kind: Kind
+    ) {
+        self.requestID = requestID
+        self.method = method
+        self.purpose = purpose
+        self.kind = kind
+    }
+
+    public var errorDescription: String? {
+        let prefix = "JSON-RPC request \(requestID) (\(method))"
+        return switch kind {
+        case .encode(let message):
+            "\(prefix) could not be encoded: \(message)"
+        case .write(let failure):
+            "\(prefix) could not be written: \(failure.localizedDescription)"
+        case .transport(let failure):
+            "\(prefix) failed in transport: \(failure.localizedDescription)"
+        case .server(let error):
+            "\(prefix) was rejected by the server: \(error.message)"
+        case .invalidResponse(_, let message, _):
+            "\(prefix) returned an invalid response: \(message)"
+        case .deadlineExceeded(let duration):
+            "\(prefix) exceeded its deadline of \(duration)."
+        case .overloadRetryExhausted(let last, let attempts):
+            "\(prefix) remained overloaded after \(attempts) attempts: \(last.message)"
         }
-        return nil
+    }
+}
+
+public enum CodexRequestPurpose: Equatable, Sendable {
+    case handshake
+    case operation(String)
+}
+
+public struct CodexServerError: Error, Equatable, LocalizedError, Sendable {
+    public var code: Int
+    public var message: String
+    public var data: Data?
+    public var turnError: CodexTurnError?
+
+    public init(
+        code: Int,
+        message: String,
+        data: Data? = nil,
+        turnError: CodexTurnError? = nil
+    ) {
+        self.code = code
+        self.message = message
+        self.data = data
+        self.turnError = turnError
+    }
+
+    public var errorDescription: String? { message }
+}
+
+public enum CodexTransportFailure: Error, Equatable, LocalizedError, Sendable {
+    case closed
+    case io(errno: Int32?, message: String)
+    case framing(message: String, rawData: Data?)
+    case protocolViolation(message: String, rawData: Data?)
+    case contractViolation(message: String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .closed:
+            "The Codex app-server transport is closed."
+        case .io(_, let message), .framing(let message, _),
+             .protocolViolation(let message, _), .contractViolation(let message):
+            message
+        }
+    }
+}
+
+public enum CodexLaunchFailure: Error, Equatable, LocalizedError, Sendable {
+    case executableNotFound(command: String, searchedPath: String?)
+    case scaffold(path: String, message: String)
+    case spawn(executable: String, errno: Int32?, message: String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .executableNotFound(let command, let searchedPath):
+            if let searchedPath, searchedPath.isEmpty == false {
+                "Unable to locate \(command) executable in PATH: \(searchedPath)"
+            } else {
+                "Unable to locate \(command) executable."
+            }
+        case .scaffold(let path, let message):
+            "Unable to prepare Codex home at \(path): \(message)"
+        case .spawn(let executable, _, let message):
+            "Unable to launch \(executable): \(message)"
+        }
+    }
+}
+
+public struct CodexMalformedNotification: Error, Equatable, LocalizedError, Sendable {
+    public var method: String
+    public var message: String
+    public var rawData: Data?
+
+    package init(method: String, message: String, rawData: Data?) {
+        self.method = method
+        self.message = message
+        self.rawData = rawData
+    }
+
+    public var errorDescription: String? {
+        "Malformed \(method) notification: \(message)"
+    }
+}
+
+public enum CodexConnectionTermination: Equatable, Sendable {
+    case closedByCaller
+    case transportFailure(CodexTransportFailure)
+    case processExited(status: Int32?)
+
+    package var errorDescription: String {
+        switch self {
+        case .closedByCaller:
+            "The Codex app-server connection was closed by the caller."
+        case .transportFailure(let failure):
+            "The Codex app-server connection terminated: \(failure.localizedDescription)"
+        case .processExited(let status):
+            if let status {
+                "The Codex app-server process exited with status \(status)."
+            } else {
+                "The Codex app-server process exited."
+            }
+        }
+    }
+}
+
+package struct CodexAppServerClock: Sendable {
+    package var now: @Sendable () -> Date
+
+    package init(now: @escaping @Sendable () -> Date = { Date() }) {
+        self.now = now
+    }
+}
+
+package struct CodexDeadlineClock: Sendable {
+    package var sleep: @Sendable (Duration) async throws -> Void
+
+    package init(sleep: @escaping @Sendable (Duration) async throws -> Void) {
+        self.sleep = sleep
+    }
+
+    package static var continuous: Self {
+        .init { try await Task.sleep(for: $0) }
     }
 }

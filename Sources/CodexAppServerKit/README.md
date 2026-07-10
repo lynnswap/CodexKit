@@ -18,8 +18,10 @@ import CodexAppServerKit
 let appServer = try await CodexAppServer()
 let thread = try await appServer.startThread(in: workspaceURL)
 
-let response = try await thread.respond(to: "Review this workspace.")
-print(response.finalAnswer ?? "")
+let outcome = try await thread.respond(to: "Review this workspace.")
+if case .completed(let response) = outcome {
+    print(response.transcript.finalAnswer ?? "")
+}
 
 await appServer.close()
 ```
@@ -48,7 +50,7 @@ let appServer = try await CodexAppServer(configuration: configuration)
 
 ## Threads
 
-`CodexThread` is the long-lived session handle for a Codex conversation in a workspace. Use `respond` for a single final response, or `streamResponse` when the UI needs partial snapshots.
+`CodexThread` is the long-lived session handle for a Codex conversation in a workspace. Use `respond` to wait for an exhaustive terminal outcome.
 
 ```swift
 let thread = try await appServer.startThread(
@@ -57,7 +59,7 @@ let thread = try await appServer.startThread(
     options: .init(model: "gpt-5", approvalMode: .autoReview)
 )
 
-let response = try await thread.respond {
+let outcome = try await thread.respond {
     "Run the checks."
     "Focus on failing tests."
 }
@@ -71,13 +73,14 @@ try await thread.rename(to: "Release review")
 try await thread.compact()
 try await thread.archive()
 let restored = try await thread.unarchive()
-try await thread.rollback(turnCount: 1)
 try await thread.delete()
 ```
 
-## Streaming
+## Package-Internal Streaming
 
-Use `streamResponse` when callers need partial response state before the final `CodexResponse`. The stream yields snapshots of the accumulated response state and can be collected into the final result.
+`streamResponse` and the derived event sequences are package-level implementation
+details used by DataKit and package tests. Public consumers use `respond`, or a
+`CodexReviewSession` returned from `startReview`.
 
 ```swift
 let stream = try await thread.streamResponse(to: "Summarize the changes.")
@@ -99,8 +102,8 @@ try await stream.steer(with: "Prefer the smallest fix.")
 try await stream.cancel()
 ```
 
-If the task awaiting `stream.collect()` is cancelled, the stream also sends the
-same cancellation request to app-server.
+Cancelling a task that awaits `stream.collect()` only stops that local
+consumer. Explicit `stream.cancel()` owns the server-side interrupt.
 
 When a UI needs to accept another prompt while a response is in flight, submit
 it with an explicit follow-up mode:
@@ -123,19 +126,10 @@ starting the next turn. `.cancelCurrentResponse` sends `turn/interrupt`,
 waits for app-server's terminal event, and then starts the next turn in the
 same thread.
 
-`CodexGenerationOptions` includes `transcriptErrorHandlingPolicy` for controlling transcript handling after failed turns:
-
-```swift
-let stream = try await thread.streamResponse(
-    to: "Try the risky change.",
-    options: .init(transcriptErrorHandlingPolicy: .revertTranscript)
-)
-```
-
 It also exposes reasoning controls with domain values instead of raw strings:
 
 ```swift
-let response = try await thread.respond(
+let outcome = try await thread.respond(
     to: "Find the risky part of this change.",
     options: .init(
         effort: .high,
@@ -144,13 +138,15 @@ let response = try await thread.respond(
     )
 )
 
-print(response.usage?.reasoningOutputTokens ?? 0)
+if case .completed(let response) = outcome {
+    print(response.usage?.reasoningOutputTokens ?? 0)
+}
 ```
 
 Structured final answers can be constrained with a JSON schema:
 
 ```swift
-let response = try await thread.respond(
+let outcome = try await thread.respond(
     to: "Summarize the change as JSON.",
     options: .init(outputSchema: .object([
         "type": .string("object"),
@@ -163,9 +159,8 @@ let response = try await thread.respond(
 )
 ```
 
-Threads also expose async sequences for chat, transcript updates, and log-style
-consumers. This is the API surface intended for higher-level products that need
-to render Codex output continuously outside a single response stream.
+The package-internal thread handle also exposes async sequences for chat,
+transcript updates, and log-style consumers.
 
 ```swift
 for try await message in thread.messages {
@@ -271,8 +266,10 @@ for try await progress in review.progress {
     }
 }
 
-let response = try await review.collect()
-print(response.transcript.reviewOutputText ?? "")
+let outcome = try await review.collect()
+if case .completed(let response) = outcome {
+    print(response.transcript.reviewOutputText ?? "")
+}
 ```
 
 Use `CodexThread.startReview` when a thread owner is already explicit:
@@ -290,7 +287,7 @@ try await appServer.startReview(in: workspaceURL, target: .commit(sha: sha, titl
 try await appServer.startReview(in: workspaceURL, target: .custom(instructions: instructions))
 ```
 
-`CodexReviewSession.events` yields `CodexReviewEvent`, preserving unknown
+The package-level `CodexReviewSession.events` yields `CodexReviewEvent`, preserving unknown
 schema-new notifications as `CodexRawNotification`. Review output is exposed as
 `CodexTranscript.reviewOutputText` from the `exitedReviewMode` item. Normal
 assistant-message final answers remain available through `finalAnswer` for
@@ -338,8 +335,13 @@ await appServer.cleanupReview(restarted.identity)
 
 ## Responses
 
-`CodexResponse` is the final result from `respond` or `ResponseStream.collect()`.
-It carries the final answer, transcript, status, token usage, and `turnID`.
+`CodexThread.respond` and `CodexReviewSession.collect` return
+`CodexTurnOutcome`: `.completed`, `.interrupted`, `.failed`, or
+`.invalidTerminalStatus`. Every case carries a `CodexResponse`; failed turns
+also carry a non-optional `CodexTurnError`. Caller cancellation throws
+`CancellationError` and is not a terminal outcome.
+
+`CodexResponse` carries transcript, token usage, timing, and `turnID`.
 
 Final answers are derived from assistant messages whose phase is
 `.finalAnswer`. If no final-answer phase is present, the last normal assistant
@@ -364,7 +366,7 @@ try await thread.respond(to: "What changed?")
 ```
 
 For dynamic prompts, use the result-builder initializer or the builder overloads
-on `respond` and `streamResponse`:
+on `respond` and the package-level `streamResponse`:
 
 ```swift
 let response = try await thread.respond {
@@ -460,7 +462,7 @@ import Testing
 }
 ```
 
-For concurrency-sensitive tests, hold a request with
+Package tests can hold a request with
 `CodexAppServerTestGate` and release it explicitly. This avoids depending on
 sleep duration or repeated `Task.yield()` calls.
 
@@ -496,19 +498,21 @@ The public boundary is:
 - `CodexReviewSession`
 - `CodexReviewIdentity`
 - `CodexReviewRestartToken`
-- `CodexReviewResumeOptions`
-- `CodexReviewEvent`
-- `CodexReviewProgress`
-- `CodexReviewEventSequence`
-- `CodexReviewProgressSequence`
+- `CodexTurnSnapshot`
+- `CodexTurnStatus`
+- `CodexThreadStatus`
+- `CodexTurnOutcome`
+- `CodexFailedTurn`
+- `CodexTurnError`
+- `CodexErrorInfo`
 - `CodexResponse`
-- `CodexResponseStream`
+- `CodexAppServerError`
+- `CodexRequestFailure`
+- `CodexServerError`
 - `CodexGenerationOptions`
-- `CodexTranscriptErrorHandlingPolicy`
 - `CodexPrompt`
 - `CodexTranscript`
 - `CodexThreadItem`
-- `CodexThreadEvent`
 - `CodexModel`
 - `CodexAccount`
 - `CodexAccountEvent`

@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import Testing
 
 import CodexAppServerKitTesting
@@ -359,7 +360,7 @@ struct CodexAppServerKitTests {
             target: .baseBranch("main"),
             instructions: .init(base: "Base", developer: "Developer"),
             options: .init(model: "gpt-5"),
-            transcriptErrorHandlingPolicy: .revertTranscript
+            delivery: .inline
         )
 
         #expect(review.threadID == "thread-source")
@@ -760,7 +761,7 @@ struct CodexAppServerKitTests {
     }
 
     @Test func threadSnapshotEqualityIgnoresTurnAuthorityFlag() {
-        let turns = [CodexTurnSnapshot(id: "turn-1", status: .completed)]
+        let turns = [CodexTurnSnapshot(id: "turn-1", state: .completed)]
         let publicSnapshot = CodexThreadSnapshot(id: "thread-1", turns: turns)
         let summarySnapshot = CodexThreadSnapshot(
             id: "thread-1",
@@ -775,10 +776,10 @@ struct CodexAppServerKitTests {
         let partiallyLoadedSnapshot = CodexThreadSnapshot(
             id: "thread-1",
             turns: [
-                CodexTurnSnapshot(id: "turn-full", status: .completed),
+                CodexTurnSnapshot(id: "turn-full", state: .completed),
                 CodexTurnSnapshot(
                     id: "turn-summary",
-                    status: .completed,
+                    state: .completed,
                     itemsLoadState: .summary
                 ),
             ],
@@ -788,7 +789,7 @@ struct CodexAppServerKitTests {
 
         let fullyLoadedSnapshot = CodexThreadSnapshot(
             id: "thread-1",
-            turns: [CodexTurnSnapshot(id: "turn-full", status: .completed)],
+            turns: [CodexTurnSnapshot(id: "turn-full", state: .completed)],
             turnItemsAreAuthoritative: true
         )
         #expect(fullyLoadedSnapshot.turnItemsAreAuthoritative)
@@ -805,10 +806,190 @@ struct CodexAppServerKitTests {
         #expect(CodexThreadStatus(rawValue: "idle") == .idle)
         #expect(CodexThreadStatus(rawValue: "systemError") == .systemError)
         #expect(CodexThreadStatus(rawValue: "active") == .active(activeFlags: []))
-        #expect(CodexThreadStatus(rawValue: "loaded") == .unknown("loaded"))
+        #expect(CodexThreadStatus(rawValue: "loaded") == .unknown(rawValue: "loaded"))
         #expect(CodexThreadStatus(rawValue: "loaded").isActive == false)
-        #expect(CodexThreadStatus(rawValue: "running") == .unknown("running"))
+        #expect(CodexThreadStatus(rawValue: "running") == .unknown(rawValue: "running"))
         #expect(CodexThreadStatus(rawValue: "running").isActive == false)
+        #expect(CodexThreadStatus(rawValue: "closed") == .unknown(rawValue: "closed"))
+    }
+
+    @Test func turnStatusPreservesHistoricalAliasesAsUnknown() {
+        #expect(CodexTurnStatus.inProgress.rawValue == "inProgress")
+        for rawValue in ["success", "succeeded", "cancelled", "aborted", "started", "running"] {
+            #expect(CodexTurnStatus(rawValue: rawValue) == .unknown(rawValue: rawValue))
+        }
+    }
+
+    @Test func terminalClassifierPreservesEveryCurrentV2OutcomeAndTiming() async throws {
+        let transport = CodexAppServerTestTransport()
+        let client = AppServerClient(transport: transport)
+        let router = CodexAppServerNotificationRouter(client: client)
+        await router.start()
+        await transport.waitForNotificationStreamCount(1)
+
+        let completed = CodexTurn(id: "turn-completed", threadID: "thread-1", client: client, router: router)
+        let interrupted = CodexTurn(id: "turn-interrupted", threadID: "thread-1", client: client, router: router)
+        let failed = CodexTurn(id: "turn-failed", threadID: "thread-1", client: client, router: router)
+        let future = CodexTurn(id: "turn-future", threadID: "thread-1", client: client, router: router)
+        let inProgress = CodexTurn(id: "turn-in-progress", threadID: "thread-1", client: client, router: router)
+
+        let completedTask = Task { try await completed.result() }
+        let interruptedTask = Task { try await interrupted.result() }
+        let failedTask = Task { try await failed.result() }
+        let futureTask = Task { try await future.result() }
+        let inProgressTask = Task { try await inProgress.result() }
+
+        try await transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(
+                id: "turn-completed",
+                status: "completed",
+                startedAt: 1_700_000_000,
+                completedAt: 1_700_000_002,
+                durationMS: 2_000
+            ))
+        )
+        try await transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(id: "turn-interrupted", status: "interrupted"))
+        )
+        try await transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(
+                id: "turn-failed",
+                status: "failed",
+                error: .init(message: "failed", codexErrorInfo: .serverOverloaded)
+            ))
+        )
+        try await transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(
+                id: "turn-future",
+                status: "futureStatus",
+                error: .init(
+                    message: "future failure",
+                    codexErrorInfo: .httpConnectionFailed(httpStatusCode: 503),
+                    additionalDetails: "upstream detail"
+                )
+            ))
+        )
+        try await transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(id: "turn-in-progress", status: "inProgress"))
+        )
+
+        let completedOutcome = try await completedTask.value
+        guard case .completed(let response) = completedOutcome else {
+            Issue.record("Expected completed outcome.")
+            return
+        }
+        #expect(response.startedAt == Date(timeIntervalSince1970: 1_700_000_000))
+        #expect(response.completedAt == Date(timeIntervalSince1970: 1_700_000_002))
+        #expect(response.duration == .milliseconds(2_000))
+        let interruptedOutcome = try await interruptedTask.value
+        guard case .interrupted(let interruptedResponse) = interruptedOutcome else {
+            Issue.record("Expected interrupted outcome.")
+            return
+        }
+        #expect(interruptedResponse.turnID == "turn-interrupted")
+
+        guard case .failed(let failedTurn) = try await failedTask.value else {
+            Issue.record("Expected failed outcome.")
+            return
+        }
+        #expect(failedTurn.error == .init(message: "failed", info: .serverOverloaded))
+
+        guard case .invalidTerminalStatus(let rawStatus, let error, _) = try await futureTask.value else {
+            Issue.record("Expected future terminal status to remain invalid.")
+            return
+        }
+        #expect(rawStatus == "futureStatus")
+        #expect(error == .init(
+            message: "future failure",
+            info: .httpConnectionFailed(httpStatusCode: 503),
+            additionalDetails: "upstream detail"
+        ))
+
+        guard case .invalidTerminalStatus(let rawStatus, let error, _) = try await inProgressTask.value else {
+            Issue.record("Expected in-progress terminal status to remain invalid.")
+            return
+        }
+        #expect(rawStatus == "inProgress")
+        #expect(error == nil)
+    }
+
+    @Test func malformedTerminalPayloadsNeverBecomeOutcomes() async throws {
+        let transport = CodexAppServerTestTransport()
+        let client = AppServerClient(transport: transport)
+        let router = CodexAppServerNotificationRouter(client: client)
+        await router.start()
+        await transport.waitForNotificationStreamCount(1)
+
+        let cases: [(CodexTurnID, String)] = [
+            ("turn-missing-status", #"{"turn":{"id":"turn-missing-status"}}"#),
+            ("turn-failed-without-error", #"{"turn":{"id":"turn-failed-without-error","status":"failed"}}"#),
+            ("turn-completed-with-error", #"{"turn":{"id":"turn-completed-with-error","status":"completed","error":{"message":"illegal"}}}"#),
+            ("turn-malformed", #"{"turnId":"turn-malformed","turn":"not-an-object"}"#),
+        ]
+        var streams: [(CodexTurnID, AsyncThrowingStream<CodexTurnEvent, Error>)] = []
+        for (turnID, _) in cases {
+            streams.append((turnID, await router.events(for: turnID)))
+        }
+        for (_, json) in cases {
+            await transport.emitServerNotificationJSON(method: "turn/completed", json: json)
+        }
+
+        for (turnID, stream) in streams {
+            do {
+                let events = try await collect(stream)
+                #expect(events.contains { event in
+                    if case .terminal = event { true } else { false }
+                } == false)
+                Issue.record("Expected malformed terminal failure for \(turnID.rawValue).")
+            } catch let error as CodexAppServerError {
+                guard case .malformedNotification(let failure) = error else {
+                    Issue.record("Expected malformed notification, got \(error).")
+                    continue
+                }
+                #expect(failure.method == "turn/completed")
+                #expect(failure.rawData != nil)
+            }
+        }
+    }
+
+    @Test func terminalOutcomeAndMalformedFailureReplayToLateTurnSubscribers() async throws {
+        let transport = CodexAppServerTestTransport()
+        let client = AppServerClient(transport: transport)
+        let router = CodexAppServerNotificationRouter(client: client)
+        await router.start()
+        await transport.waitForNotificationStreamCount(1)
+
+        let terminalTurnID = CodexTurnID(rawValue: "turn-terminal-replay")
+        let firstTerminalStream = await router.events(for: terminalTurnID)
+        try await transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(id: "turn-terminal-replay", status: "completed"))
+        )
+        let firstTerminalEvents = try await collect(firstTerminalStream)
+        let lateTerminalEvents = try await collect(await router.events(for: terminalTurnID))
+        #expect(firstTerminalEvents == lateTerminalEvents)
+        #expect(firstTerminalEvents.count == 1)
+
+        let failureTurnID = CodexTurnID(rawValue: "turn-failure-replay")
+        let firstFailureStream = await router.events(for: failureTurnID)
+        await transport.emitServerNotificationJSON(
+            method: "turn/completed",
+            json: #"{"turn":{"id":"turn-failure-replay"}}"#
+        )
+        let firstFailure = await terminalStreamFailure(firstFailureStream)
+        let lateFailure = await terminalStreamFailure(
+            await router.events(for: failureTurnID)
+        )
+        #expect(firstFailure == lateFailure)
+        guard let firstFailure, case .malformedNotification = firstFailure else {
+            Issue.record("Expected replayed malformed notification.")
+            return
+        }
     }
 
     @Test func threadSnapshotsTrackOmittedAndNullFields() async throws {
@@ -922,6 +1103,7 @@ struct CodexAppServerKitTests {
                 "turns": [
                   {
                     "id": "turn-summary",
+                    "status": "completed",
                     "itemsView": "summary",
                     "items": [
                       {
@@ -960,6 +1142,7 @@ struct CodexAppServerKitTests {
                 "turns": [
                   {
                     "id": "turn-missing-item-id",
+                    "status": "completed",
                     "items": [
                       {
                         "type": "diagnostic",
@@ -1010,7 +1193,7 @@ struct CodexAppServerKitTests {
             name: "B",
             preview: "Updated",
             modelProvider: "openai",
-            turns: [CodexTurnSnapshot(id: "turn-b", status: .completed)]
+            turns: [CodexTurnSnapshot(id: "turn-b", state: .completed)]
         )
         await store.upsert(updated)
 
@@ -1043,7 +1226,7 @@ struct CodexAppServerKitTests {
     @Test func threadStoreThreadReadHonorsIncludeTurns() async throws {
         let stored = CodexThreadSnapshot(
             id: "thread-with-turns",
-            turns: [CodexTurnSnapshot(id: "turn-from-store", status: .completed)]
+            turns: [CodexTurnSnapshot(id: "turn-from-store", state: .completed)]
         )
         let runtime = try await CodexAppServerTestRuntime.start(threads: [stored])
         let thread = try await runtime.server.resumeThread("thread-with-turns")
@@ -1081,9 +1264,9 @@ struct CodexAppServerKitTests {
 
     @Test func threadStoreHonorsThreadTurnListPagination() async throws {
         let turns = [
-            CodexTurnSnapshot(id: "turn-a", status: .completed),
-            CodexTurnSnapshot(id: "turn-b", status: .completed),
-            CodexTurnSnapshot(id: "turn-c", status: .completed),
+            CodexTurnSnapshot(id: "turn-a", state: .completed),
+            CodexTurnSnapshot(id: "turn-b", state: .completed),
+            CodexTurnSnapshot(id: "turn-c", state: .completed),
         ]
         let runtime = try await CodexAppServerTestRuntime.start(threads: [
             CodexThreadSnapshot(id: "thread-turns", turns: turns)
@@ -1387,7 +1570,7 @@ struct CodexAppServerKitTests {
 
         var iterator = review.events.makeAsyncIterator()
         let event = try await iterator.next()
-        if case .turnCompleted(let response) = event {
+        if case .terminal(.completed(let response)) = event {
             #expect(response.turnID == "turn-review")
         } else {
             Issue.record("Expected resumed review.events to receive turn-only completion.")
@@ -1518,8 +1701,8 @@ struct CodexAppServerKitTests {
             CodexThreadEvent.message(oldMessage, turnID: "turn-old"),
             .statusChanged(.active(activeFlags: [])),
             .message(currentMessage, turnID: "turn-current"),
-            .turnCompleted(.init(turnID: "turn-old", status: .completed)),
-            .turnCompleted(.init(turnID: "turn-current", status: .completed)),
+            .terminal(.completed(.init(turnID: "turn-old"))),
+            .terminal(.completed(.init(turnID: "turn-current"))),
             .message(followUpMessage, turnID: "turn-follow-up"),
         ]
         let eventSequence = CodexThreadEventSequence {
@@ -1547,11 +1730,13 @@ struct CodexAppServerKitTests {
         #expect(reviewEvents.count == 3)
         #expect(reviewEvents.contains(.statusChanged(.active(activeFlags: []))))
         #expect(progress.count == 3)
-        #expect(progress.last?.result?.turnID == "turn-current")
-        #expect(progress.last?.result?.finalAnswer == "Current review")
-        #expect(progress.last?.transcript.responseText == "Current review")
-        if case .turnCompleted(let response) = reviewEvents.last {
-            #expect(response.finalAnswer == "Current review")
+        if case .terminal(let outcome) = progress.last {
+            #expect(outcome.response.turnID == "turn-current")
+            #expect(outcome.response.transcript.finalAnswer == "Current review")
+        } else {
+            Issue.record("Expected terminal review progress.")
+        }
+        if case .terminal(.completed(let response)) = reviewEvents.last {
             #expect(response.transcript.responseText == "Current review")
         } else {
             Issue.record("Expected a terminal review response.")
@@ -1566,7 +1751,7 @@ struct CodexAppServerKitTests {
                 .init(text: "Final", itemID: "message-1", phase: .finalAnswer),
                 turnID: "turn-review"
             ),
-            .turnCompleted(.init(turnID: "turn-review", status: .completed)),
+            .terminal(.completed(.init(turnID: "turn-review"))),
         ]
         let eventSequence = CodexThreadEventSequence {
             AsyncThrowingStream { continuation in
@@ -1586,14 +1771,16 @@ struct CodexAppServerKitTests {
             terminalTurnID: "turn-review"
         ))
 
-        if case .turnCompleted(let response) = reviewEvents.last {
-            #expect(response.finalAnswer == "Final")
+        if case .terminal(.completed(let response)) = reviewEvents.last {
             #expect(response.transcript.finalAnswer == "Final")
         } else {
             Issue.record("Expected a terminal review response.")
         }
-        #expect(progress.last?.result?.finalAnswer == "Final")
-        #expect(progress.last?.transcript.finalAnswer == "Final")
+        if case .terminal(let outcome) = progress.last {
+            #expect(outcome.response.transcript.finalAnswer == "Final")
+        } else {
+            Issue.record("Expected terminal review progress.")
+        }
     }
 
     @Test func reviewEventSequenceIgnoresEmptyAssistantMessagesWhenFinalizing() async throws {
@@ -1613,7 +1800,7 @@ struct CodexAppServerKitTests {
                 turnID: "turn-review"
             ),
             CodexThreadEvent.message(emptyMessage, turnID: "turn-review"),
-            .turnCompleted(.init(turnID: "turn-review", status: .completed, finalAnswer: "")),
+            .terminal(.completed(.init(turnID: "turn-review"))),
         ]
         let eventSequence = CodexThreadEventSequence {
             AsyncThrowingStream { continuation in
@@ -1633,14 +1820,16 @@ struct CodexAppServerKitTests {
             terminalTurnID: "turn-review"
         ))
 
-        if case .turnCompleted(let response) = reviewEvents.last {
-            #expect(response.finalAnswer == "Final review")
+        if case .terminal(.completed(let response)) = reviewEvents.last {
             #expect(response.transcript.finalAnswer == "Final review")
         } else {
             Issue.record("Expected a terminal review response.")
         }
-        #expect(progress.last?.result?.finalAnswer == "Final review")
-        #expect(progress.last?.transcript.finalAnswer == "Final review")
+        if case .terminal(let outcome) = progress.last {
+            #expect(outcome.response.transcript.finalAnswer == "Final review")
+        } else {
+            Issue.record("Expected terminal review progress.")
+        }
     }
 
     @Test func reviewEventSequenceFinalizesCompletedResponseFromExitedReviewMode() async throws {
@@ -1653,7 +1842,7 @@ struct CodexAppServerKitTests {
                 ),
                 turnID: "turn-review"
             ),
-            .turnCompleted(.init(turnID: "turn-review", status: .completed)),
+            .terminal(.completed(.init(turnID: "turn-review"))),
         ]
         let eventSequence = CodexThreadEventSequence {
             AsyncThrowingStream { continuation in
@@ -1673,14 +1862,16 @@ struct CodexAppServerKitTests {
             terminalTurnID: "turn-review"
         ))
 
-        if case .turnCompleted(let response) = reviewEvents.last {
-            #expect(response.finalAnswer == nil)
+        if case .terminal(.completed(let response)) = reviewEvents.last {
             #expect(response.transcript.reviewOutputText == "No issues found.")
         } else {
             Issue.record("Expected a terminal review response.")
         }
-        #expect(progress.last?.result?.finalAnswer == nil)
-        #expect(progress.last?.transcript.reviewOutputText == "No issues found.")
+        if case .terminal(let outcome) = progress.last {
+            #expect(outcome.response.transcript.reviewOutputText == "No issues found.")
+        } else {
+            Issue.record("Expected terminal review progress.")
+        }
     }
 
     @Test func reviewEventSequencePreservesLiveReviewOutputWithSparseCompletionTranscript() async throws {
@@ -1698,9 +1889,8 @@ struct CodexAppServerKitTests {
                 ),
                 turnID: "turn-review"
             ),
-            .turnCompleted(.init(
+            .terminal(.completed(.init(
                 turnID: "turn-review",
-                status: .completed,
                 transcript: .init(items: [
                     .init(
                         id: terminalMessage.id,
@@ -1708,7 +1898,7 @@ struct CodexAppServerKitTests {
                         content: .message(terminalMessage)
                     ),
                 ])
-            )),
+            ))),
         ]
         let eventSequence = CodexThreadEventSequence {
             AsyncThrowingStream { continuation in
@@ -1728,15 +1918,18 @@ struct CodexAppServerKitTests {
             terminalTurnID: "turn-review"
         ))
 
-        if case .turnCompleted(let response) = reviewEvents.last {
+        if case .terminal(.completed(let response)) = reviewEvents.last {
             #expect(response.transcript.finalAnswer == "Terminal summary")
             #expect(response.transcript.reviewOutputText == "No issues found.")
             #expect(response.transcript.items.map(\.kind) == [.agentMessage, .exitedReviewMode])
         } else {
             Issue.record("Expected a terminal review response.")
         }
-        #expect(progress.last?.result?.transcript.reviewOutputText == "No issues found.")
-        #expect(progress.last?.transcript.reviewOutputText == "No issues found.")
+        if case .terminal(let outcome) = progress.last {
+            #expect(outcome.response.transcript.reviewOutputText == "No issues found.")
+        } else {
+            Issue.record("Expected terminal review progress.")
+        }
     }
 
     @Test func threadTurnsListRequestUsesThreadScope() {
@@ -2231,7 +2424,7 @@ struct CodexAppServerKitTests {
 
         var eventIterator = review.events.makeAsyncIterator()
         let event = try await eventIterator.next()
-        if case .turnCompleted(let response) = event {
+        if case .terminal(.completed(let response)) = event {
             #expect(response.turnID == "turn-review")
         } else {
             Issue.record("Expected review.events to receive turn-only completion.")
@@ -2240,8 +2433,11 @@ struct CodexAppServerKitTests {
 
         var progressIterator = review.progress.makeAsyncIterator()
         let progress = try #require(try await progressIterator.next())
-        #expect(progress.phase == .completed)
-        #expect(progress.result?.turnID == "turn-review")
+        if case .terminal(let outcome) = progress {
+            #expect(outcome.response.turnID == "turn-review")
+        } else {
+            Issue.record("Expected terminal review progress.")
+        }
         #expect(try await progressIterator.next() == nil)
     }
 
@@ -2276,7 +2472,7 @@ struct CodexAppServerKitTests {
         let event = try await withTimeout {
             try await eventTask.value
         }
-        if case .turnCompleted(let response) = event {
+        if case .terminal(.completed(let response)) = event {
             #expect(response.turnID == "turn-1")
         } else {
             Issue.record("Expected thread.events to receive turn-only completion.")
@@ -2503,6 +2699,264 @@ struct CodexAppServerKitTests {
         #expect(await transport.recordedRequests().map(\.method) == ["ping", "ping"])
     }
 
+    @Test func requestFailurePreservesCorrelationAndRawServerData() async throws {
+        let transport = CodexAppServerTestTransport()
+        let rawData = Data(#"{"reason":"busy"}"#.utf8)
+        await transport.enqueueFailure(
+            .responseError(.init(
+                code: -32_000,
+                message: "rejected",
+                data: rawData,
+                turnError: .init(message: "turn rejected", info: .serverOverloaded)
+            )),
+            for: "ping"
+        )
+        let client = AppServerClient(transport: transport)
+
+        do {
+            let _: EmptyResponse = try await client.send(
+                method: "ping",
+                params: EmptyResponse(),
+                responseType: EmptyResponse.self
+            )
+            Issue.record("Expected request failure.")
+        } catch let error as CodexAppServerError {
+            guard case .request(let failure) = error,
+                  case .server(let serverError) = failure.kind
+            else {
+                Issue.record("Expected typed server request failure, got \(error).")
+                return
+            }
+            #expect(failure.requestID == 1)
+            #expect(failure.method == "ping")
+            #expect(failure.purpose == .operation("ping"))
+            #expect(serverError.data == rawData)
+            #expect(serverError.turnError == .init(message: "turn rejected", info: .serverOverloaded))
+        }
+    }
+
+    @Test func requestInvalidResponsePreservesCorrelationAndRawBytes() async throws {
+        struct RequiredResponse: Decodable, Sendable {
+            var value: String
+        }
+
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueJSON(#"{"unexpected":true}"#, for: "ping")
+        let client = AppServerClient(transport: transport)
+
+        do {
+            let _: RequiredResponse = try await client.send(
+                method: "ping",
+                params: EmptyResponse(),
+                responseType: RequiredResponse.self
+            )
+            Issue.record("Expected invalid response failure.")
+        } catch let error as CodexAppServerError {
+            guard case .request(let failure) = error,
+                  case .invalidResponse(_, _, let rawData) = failure.kind
+            else {
+                Issue.record("Expected typed invalid response, got \(error).")
+                return
+            }
+            #expect(failure.requestID == 1)
+            #expect(failure.method == "ping")
+            #expect(failure.purpose == .operation("ping"))
+            #expect(rawData == Data(#"{"unexpected":true}"#.utf8))
+        }
+    }
+
+    @Test func requestCancellationIsNeverWrapped() async throws {
+        let transport = CodexAppServerTestTransport()
+        await transport.handle(method: "ping") { _ in
+            throw CancellationError()
+        }
+        let client = AppServerClient(transport: transport)
+
+        do {
+            let _: EmptyResponse = try await client.send(
+                method: "ping",
+                params: EmptyResponse(),
+                responseType: EmptyResponse.self
+            )
+            Issue.record("Expected CancellationError.")
+        } catch is CancellationError {
+        } catch {
+            Issue.record("Expected CancellationError, got \(error).")
+        }
+    }
+
+    @Test func transportClosureIsConnectionTerminationNotRequestFailure() async throws {
+        let transport = CodexAppServerTestTransport()
+        await transport.enqueueFailure(.closed, for: "ping")
+        let client = AppServerClient(transport: transport)
+
+        do {
+            let _: EmptyResponse = try await client.send(
+                method: "ping",
+                params: EmptyResponse(),
+                responseType: EmptyResponse.self
+            )
+            Issue.record("Expected connection termination.")
+        } catch let error as CodexAppServerError {
+            #expect(error == .connectionTerminated(.transportFailure(.closed)))
+        }
+    }
+
+    @Test func requestDeadlineUsesInjectedMonotonicClockAndKeepsCorrelation() async throws {
+        let transport = TestSuspendingTransport(response: try JSONEncoder().encode(EmptyResponse()))
+        let deadlineGate = CodexAppServerTestGate()
+        let deadlineReturned = TestSignal()
+        let client = AppServerClient(
+            transport: transport,
+            deadlines: .init(request: .seconds(5)),
+            deadlineClock: .init { duration in
+                #expect(duration == .seconds(5))
+                await deadlineGate.waitIgnoringCancellation()
+                deadlineReturned.signal()
+            }
+        )
+
+        let task = Task {
+            let _: EmptyResponse = try await client.send(
+                method: "ping",
+                params: EmptyResponse(),
+                responseType: EmptyResponse.self,
+                purpose: .operation("ping"),
+                deadline: .seconds(5)
+            )
+        }
+        await transport.waitUntilStarted()
+        await deadlineGate.open()
+        await deadlineReturned.wait()
+        await transport.waitUntilCancelled()
+        do {
+            try await task.value
+            Issue.record("Expected request deadline.")
+        } catch let error as CodexAppServerError {
+            guard case .request(let failure) = error,
+                  case .deadlineExceeded(let duration) = failure.kind
+            else {
+                Issue.record("Expected request deadline, got \(error).")
+                return
+            }
+            #expect(failure.requestID == 1)
+            #expect(failure.method == "ping")
+            #expect(failure.purpose == .operation("ping"))
+            #expect(duration == .seconds(5))
+        }
+    }
+
+    @Test func handshakeDeadlineTakesPrecedenceOverGenericRequestDeadline() async throws {
+        let transport = TestSuspendingTransport(response: try JSONEncoder().encode(
+            AppServerAPI.Initialize.Response(codexHome: "/tmp/codex")
+        ))
+        let deadlineGate = CodexAppServerTestGate()
+        let deadlineReturned = TestSignal()
+        let client = AppServerClient(
+            transport: transport,
+            deadlines: .init(handshake: .seconds(7), request: .seconds(2)),
+            deadlineClock: .init { duration in
+                #expect(duration == .seconds(7))
+                await deadlineGate.waitIgnoringCancellation()
+                deadlineReturned.signal()
+            }
+        )
+
+        let task = Task { try await client.initialize() }
+        await transport.waitUntilStarted()
+        await deadlineGate.open()
+        await deadlineReturned.wait()
+        await transport.waitUntilCancelled()
+        do {
+            _ = try await task.value
+            Issue.record("Expected handshake deadline.")
+        } catch let error as CodexAppServerError {
+            guard case .request(let failure) = error,
+                  case .deadlineExceeded(let duration) = failure.kind
+            else {
+                Issue.record("Expected handshake deadline, got \(error).")
+                return
+            }
+            #expect(failure.requestID == 1)
+            #expect(failure.method == "initialize")
+            #expect(failure.purpose == .handshake)
+            #expect(duration == .seconds(7))
+        }
+    }
+
+    @Test func turnDeadlineKeepsHandleAndDoesNotInterruptServerTurn() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueTurnStart(turnID: "turn-deadline", status: "inProgress")
+        let deadlineGate = CodexAppServerTestGate()
+        let client = AppServerClient(
+            transport: transport,
+            deadlineClock: .init { duration in
+                #expect(duration == .seconds(9))
+                await deadlineGate.waitIgnoringCancellation()
+            }
+        )
+        let router = CodexAppServerNotificationRouter(client: client)
+        await router.start()
+        await transport.waitForNotificationStreamCount(1)
+        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let stream = try await thread.streamResponse(to: "Wait for terminal.")
+
+        let task = Task { try await stream.collect(timeout: .seconds(9)) }
+        await deadlineGate.open()
+        do {
+            _ = try await task.value
+            Issue.record("Expected turn deadline.")
+        } catch let error as CodexAppServerError {
+            #expect(error == .turnDeadlineExceeded(turnID: "turn-deadline", duration: .seconds(9)))
+        }
+        #expect(await transport.recordedRequests(method: "turn/interrupt").isEmpty)
+
+        try await transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(id: "turn-deadline", status: "completed"))
+        )
+        guard case .completed(let response) = try await stream.collect() else {
+            Issue.record("Expected terminal replay after deadline.")
+            return
+        }
+        #expect(response.turnID == "turn-deadline")
+    }
+
+    @Test func responseCollectionCancellationIsLocalAndTerminalRemainsReplayable() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueTurnStart(turnID: "turn-local-cancel", status: "inProgress")
+        let client = AppServerClient(transport: transport)
+        let router = CodexAppServerNotificationRouter(client: client)
+        await router.start()
+        await transport.waitForNotificationStreamCount(1)
+        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let stream = try await thread.streamResponse(to: "Keep running.")
+
+        let task = Task { try await stream.collect() }
+        #expect(await eventually {
+            await router.turnSubscriberCountForTesting(for: "turn-local-cancel") == 1
+        })
+        task.cancel()
+        do {
+            _ = try await task.value
+            Issue.record("Expected local collection cancellation.")
+        } catch is CancellationError {
+        } catch {
+            Issue.record("Expected CancellationError, got \(error).")
+        }
+        #expect(await transport.recordedRequests(method: "turn/interrupt").isEmpty)
+
+        try await transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(id: "turn-local-cancel", status: "completed"))
+        )
+        guard case .completed(let response) = try await stream.collect() else {
+            Issue.record("Expected replayed terminal outcome.")
+            return
+        }
+        #expect(response.turnID == "turn-local-cancel")
+    }
+
     @Test func scopedRequestCancelledWhileQueuedDoesNotSend() async throws {
         let transport = CodexAppServerTestTransport()
         let gate = CodexAppServerTestGate()
@@ -2583,9 +3037,9 @@ struct CodexAppServerKitTests {
                     continuation.finish()
                 }
             })
-        #expect(result.turnID == "turn-1")
-        #expect(result.status == .completed)
-        #expect(result.finalAnswer == "Done")
+        #expect(result.response.turnID == "turn-1")
+        #expect(result == .completed(result.response))
+        #expect(result.response.transcript.finalAnswer == "Done")
     }
 
     @Test func threadEventStreamCancellationRemovesRouterSubscriber() async throws {
@@ -2909,7 +3363,7 @@ struct CodexAppServerKitTests {
 
     @Test func startReviewBeginsNewThreadEventGeneration() async throws {
         let transport = CodexAppServerTestTransport()
-        try await transport.enqueueReviewStart(turnID: "turn-review", status: .running)
+        try await transport.enqueueReviewStart(turnID: "turn-review", status: .inProgress)
         let gate = CodexAppServerTestGate()
         await transport.holdNext(method: "review/start", gate: gate)
         let client = AppServerClient(transport: transport)
@@ -2996,7 +3450,7 @@ struct CodexAppServerKitTests {
         try await transport.enqueueReviewStart(
             turnID: "turn-review",
             reviewThreadID: "thread-review",
-            status: .running
+            status: .inProgress
         )
         let gate = CodexAppServerTestGate()
         await transport.holdNext(method: "review/start", gate: gate)
@@ -3115,7 +3569,12 @@ struct CodexAppServerKitTests {
             }
             return false
         } == false)
-        #expect(events.last == .closed)
+        #expect(events.contains { event in
+            if case .closed = event {
+                return true
+            }
+            return false
+        } == false)
 
         await router.beginThreadEventGeneration("thread-source", at: 0)
         let sourceEventsTask = Task {
@@ -3628,8 +4087,8 @@ struct CodexAppServerKitTests {
         #expect(first?.content == "Final")
 
         let response = try await stream.collect()
-        #expect(response.turnID == "turn-1")
-        #expect(response.finalAnswer == "Final")
+        #expect(response.response.turnID == "turn-1")
+        #expect(response.response.transcript.finalAnswer == "Final")
 
         let request = try #require(await transport.recordedRequests().first)
         let params = try JSONDecoder().decode(
@@ -3669,8 +4128,8 @@ struct CodexAppServerKitTests {
 
         let response = try await stream.collect()
 
-        #expect(response.finalAnswer == "Final")
-        #expect(response.transcript.items.first?.text == "Final")
+        #expect(response.response.transcript.finalAnswer == "Final")
+        #expect(response.response.transcript.items.first?.text == "Final")
     }
 
     @Test func responseStreamReconcilesCompleteAgentMessageWithoutItemIDWithPriorDelta() async throws {
@@ -3701,8 +4160,8 @@ struct CodexAppServerKitTests {
 
         let response = try await stream.collect()
 
-        #expect(response.finalAnswer == "Final")
-        #expect(response.transcript.items.compactMap(\.text) == ["Final"])
+        #expect(response.response.transcript.finalAnswer == "Final")
+        #expect(response.response.transcript.items.compactMap(\.text) == ["Final"])
     }
 
     @Test func responseStreamReconcilesCompleteAgentMessageRealItemIDWithFallbackDelta() async throws {
@@ -3733,9 +4192,9 @@ struct CodexAppServerKitTests {
 
         let response = try await stream.collect()
 
-        #expect(response.finalAnswer == "Final")
-        #expect(response.transcript.items.map(\.id) == ["message-1"])
-        #expect(response.transcript.items.compactMap(\.text) == ["Final"])
+        #expect(response.response.transcript.finalAnswer == "Final")
+        #expect(response.response.transcript.items.map(\.id) == ["message-1"])
+        #expect(response.response.transcript.items.compactMap(\.text) == ["Final"])
     }
 
     @Test func responseStreamCollectsTranscriptFromCompletedTurnItems() async throws {
@@ -3769,8 +4228,8 @@ struct CodexAppServerKitTests {
 
         let response = try await stream.collect()
 
-        #expect(response.finalAnswer == "Final from payload")
-        #expect(response.transcript.items.first?.text == "Final from payload")
+        #expect(response.response.transcript.finalAnswer == "Final from payload")
+        #expect(response.response.transcript.items.first?.text == "Final from payload")
     }
 
     @Test func responseStreamSnapshotsIncludeIncrementalTokenUsage() async throws {
@@ -3840,25 +4299,17 @@ struct CodexAppServerKitTests {
         let first = try await iterator.next()
         #expect(first?.content == "Partial")
         let terminal = try await iterator.next()
-        #expect(terminal?.response?.status == .failed)
-        #expect(terminal?.response?.errorMessage == "Tool failed.")
         #expect(terminal?.response?.transcript.responseText == "Partial")
         #expect(terminal?.response?.startedAt == Date(timeIntervalSince1970: 1_700_000_000))
         #expect(terminal?.response?.duration == .milliseconds(1_000))
-        do {
-            _ = try await iterator.next()
-            Issue.record("Expected failed stream to throw after terminal snapshot.")
-        } catch let error as CodexAppServerError {
-            #expect(error.response?.status == .failed)
-            #expect(error.response?.transcript.responseText == "Partial")
-        }
+        #expect(try await iterator.next() == nil)
 
-        do {
-            _ = try await stream.collect()
-            Issue.record("Expected collect() to throw for failed turn.")
-        } catch let error as CodexAppServerError {
-            #expect(error.response?.status == .failed)
-            #expect(error.response?.transcript.responseText == "Partial")
+        let outcome = try await stream.collect()
+        if case .failed(let failedTurn) = outcome {
+            #expect(failedTurn.error.message == "Tool failed.")
+            #expect(failedTurn.response.transcript.responseText == "Partial")
+        } else {
+            Issue.record("Expected failed turn outcome.")
         }
     }
 
@@ -5382,6 +5833,148 @@ private actor ServerRequestRecorder {
 
     func requests() -> [CodexAppServerRequest] {
         recordedRequests
+    }
+}
+
+private final class TestSuspendingTransport: JSONRPC.Transport, Sendable {
+    let response: Data
+    private let started = TestSignal()
+    private let cancelled: TestSignal
+    private let suspension: TestCancellationWaiter
+
+    init(response: Data) {
+        self.response = response
+        let cancelled = TestSignal()
+        self.cancelled = cancelled
+        self.suspension = TestCancellationWaiter {
+            cancelled.signal()
+        }
+    }
+
+    func send(_ request: JSONRPC.Request) async throws -> Data {
+        started.signal()
+        try await suspension.wait()
+        return response
+    }
+
+    func waitUntilStarted() async {
+        await started.wait()
+    }
+
+    func waitUntilCancelled() async {
+        await cancelled.wait()
+    }
+
+    func notify(_ notification: JSONRPC.Notification) async throws {}
+
+    func notificationStream() async -> AsyncThrowingStream<JSONRPC.Notification, Error> {
+        .init { continuation in
+            continuation.finish()
+        }
+    }
+
+    func close() async {}
+}
+
+private final class TestSignal: Sendable {
+    private struct State {
+        var isSignalled = false
+        var waiters: [UUID: CheckedContinuation<Void, Never>] = [:]
+    }
+
+    private let state = Mutex(State())
+
+    func wait() async {
+        let waiterID = UUID()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                let shouldResume = state.withLock { state in
+                    if state.isSignalled || Task.isCancelled {
+                        return true
+                    }
+                    state.waiters[waiterID] = continuation
+                    return false
+                }
+                if shouldResume {
+                    continuation.resume()
+                }
+            }
+        } onCancel: {
+            let waiter = state.withLock { state in
+                state.waiters.removeValue(forKey: waiterID)
+            }
+            waiter?.resume()
+        }
+    }
+
+    func signal() {
+        let waiters = state.withLock { state in
+            state.isSignalled = true
+            let waiters = Array(state.waiters.values)
+            state.waiters.removeAll(keepingCapacity: false)
+            return waiters
+        }
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
+}
+
+private final class TestCancellationWaiter: Sendable {
+    private struct State {
+        var continuation: CheckedContinuation<Void, Never>?
+        var isCancelled = false
+    }
+
+    private let state = Mutex(State())
+    private let onCancel: @Sendable () -> Void
+
+    init(onCancel: @escaping @Sendable () -> Void) {
+        self.onCancel = onCancel
+    }
+
+    func wait() async throws {
+        try Task.checkCancellation()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                let shouldResume = state.withLock { state in
+                    if state.isCancelled {
+                        return true
+                    }
+                    precondition(state.continuation == nil)
+                    state.continuation = continuation
+                    return false
+                }
+                if shouldResume {
+                    continuation.resume()
+                }
+            }
+        } onCancel: {
+            onCancel()
+            let continuation = state.withLock { state in
+                state.isCancelled = true
+                let continuation = state.continuation
+                state.continuation = nil
+                return continuation
+            }
+            continuation?.resume()
+        }
+        try Task.checkCancellation()
+    }
+}
+
+private func terminalStreamFailure(
+    _ stream: AsyncThrowingStream<CodexTurnEvent, Error>
+) async -> CodexAppServerError? {
+    do {
+        _ = try await collect(stream)
+        Issue.record("Expected terminal stream failure.")
+        return nil
+    } catch let error as CodexAppServerError {
+        return error
+    } catch {
+        Issue.record("Expected CodexAppServerError, got \(error).")
+        return nil
     }
 }
 

@@ -6,7 +6,7 @@ extension CodexThread {
     /// The sequence replays buffered events for this thread before yielding
     /// live notifications. It finishes when the app-server reports the thread
     /// as closed or when the app-server connection closes.
-    public var events: CodexThreadEventSequence {
+    package var events: CodexThreadEventSequence {
         .init {
             AsyncThrowingStream { continuation in
                 let task = Task {
@@ -41,12 +41,12 @@ extension CodexThread {
     ///
     /// This sequence is derived from `events` and is useful when callers only
     /// need the conversational output rather than every item lifecycle event.
-    public var messages: CodexThreadMessageSequence {
+    package var messages: CodexThreadMessageSequence {
         .init(events: events)
     }
 
     /// Incremental transcript snapshots derived from this thread's events.
-    public var transcriptUpdates: CodexThreadTranscriptSequence {
+    package var transcriptUpdates: CodexThreadTranscriptSequence {
         .init(events: events)
     }
 
@@ -54,7 +54,7 @@ extension CodexThread {
     ///
     /// This includes command, tool, file-change, diagnostic, and unknown
     /// app-server items that are useful for output logs or progress views.
-    public var logEntries: CodexThreadLogSequence {
+    package var logEntries: CodexThreadLogSequence {
         .init(events: events)
     }
 
@@ -69,25 +69,41 @@ extension CodexThread {
     /// - Returns: The completed response collected from app-server events.
     public func respond(
         to prompt: CodexPrompt,
-        options: CodexGenerationOptions = .init()
-    ) async throws -> CodexResponse {
-        try await streamResponse(to: prompt, options: options).collect()
+        options: CodexGenerationOptions = .init(),
+        timeout: Duration? = nil
+    ) async throws -> CodexTurnOutcome {
+        let stream = try await streamResponse(to: prompt, options: options)
+        do {
+            let outcome = try await stream.collect(timeout: timeout)
+            try Task.checkCancellation()
+            return outcome
+        } catch is CancellationError {
+            try await interruptAndAwaitTerminal(stream)
+            throw CancellationError()
+        } catch let error as CodexAppServerError {
+            if case .turnDeadlineExceeded = error {
+                try await interruptAndAwaitTerminal(stream)
+            }
+            throw error
+        }
     }
 
     /// Sends a text prompt to the thread and waits for the final response.
     public func respond(
         to prompt: String,
-        options: CodexGenerationOptions = .init()
-    ) async throws -> CodexResponse {
-        try await respond(to: CodexPrompt(prompt), options: options)
+        options: CodexGenerationOptions = .init(),
+        timeout: Duration? = nil
+    ) async throws -> CodexTurnOutcome {
+        try await respond(to: CodexPrompt(prompt), options: options, timeout: timeout)
     }
 
     /// Builds a structured prompt, sends it to the thread, and waits for the final response.
     public func respond(
         options: CodexGenerationOptions = .init(),
+        timeout: Duration? = nil,
         @CodexPromptBuilder prompt: () throws -> CodexPrompt
-    ) async throws -> CodexResponse {
-        try await respond(to: try prompt(), options: options)
+    ) async throws -> CodexTurnOutcome {
+        try await respond(to: try prompt(), options: options, timeout: timeout)
     }
 
     /// Sends a prompt and returns a live response stream.
@@ -99,19 +115,16 @@ extension CodexThread {
     ///   - prompt: The structured prompt to send.
     ///   - options: Per-turn generation options.
     /// - Returns: A live response stream for the started turn.
-    public func streamResponse(
+    package func streamResponse(
         to prompt: CodexPrompt,
         options: CodexGenerationOptions = .init()
     ) async throws -> CodexResponseStream {
         let turn = try await startTurn(prompt, options: options)
-        return .init(
-            turn: turn,
-            transcriptErrorHandlingPolicy: options.transcriptErrorHandlingPolicy
-        )
+        return .init(turn: turn)
     }
 
     /// Sends a text prompt and returns a live response stream.
-    public func streamResponse(
+    package func streamResponse(
         to prompt: String,
         options: CodexGenerationOptions = .init()
     ) async throws -> CodexResponseStream {
@@ -119,7 +132,7 @@ extension CodexThread {
     }
 
     /// Builds a structured prompt, sends it, and returns a live response stream.
-    public func streamResponse(
+    package func streamResponse(
         options: CodexGenerationOptions = .init(),
         @CodexPromptBuilder prompt: () throws -> CodexPrompt
     ) async throws -> CodexResponseStream {
@@ -136,12 +149,10 @@ extension CodexThread {
     /// - Parameters:
     ///   - target: The repository changes or custom instructions to review.
     ///   - delivery: Whether the app-server should run the review inline or in a detached review thread.
-    ///   - transcriptErrorHandlingPolicy: How collection should treat transcript errors.
     /// - Returns: A live review session.
     public func startReview(
         target: CodexReviewTarget,
-        delivery: CodexReviewDelivery = .inline,
-        transcriptErrorHandlingPolicy: CodexTranscriptErrorHandlingPolicy = .preserveTranscript
+        delivery: CodexReviewDelivery = .inline
     ) async throws -> CodexReviewSession {
         await router.beginUnscopedDiagnosticRouting(in: id)
         let response: AppServerAPI.Review.Start.Response
@@ -174,16 +185,14 @@ extension CodexThread {
         )
         return await reviewSession(
             identity,
-            initialTurn: initialTurn,
-            transcriptErrorHandlingPolicy: transcriptErrorHandlingPolicy
+            initialTurn: initialTurn
         )
     }
 
     package func reviewSession(
         _ identity: CodexReviewIdentity,
         model: String? = nil,
-        initialTurn: CodexTurnSnapshot? = nil,
-        transcriptErrorHandlingPolicy: CodexTranscriptErrorHandlingPolicy = .preserveTranscript
+        initialTurn: CodexTurnSnapshot? = nil
     ) async -> CodexReviewSession {
         let reviewThreadID = identity.activeTurnThreadID
         await router.seedTurn(identity.turnID, threadID: reviewThreadID)
@@ -207,11 +216,8 @@ extension CodexThread {
             turnID: turn.id,
             reviewThreadID: reviewThreadID,
             model: model,
-            initialTurn: initialTurn ?? CodexTurnSnapshot(id: turn.id, status: .running),
-            response: .init(
-                turn: turn,
-                transcriptErrorHandlingPolicy: transcriptErrorHandlingPolicy
-            ),
+            initialTurn: initialTurn ?? CodexTurnSnapshot(id: turn.id, state: .inProgress),
+            response: .init(turn: turn),
             eventThread: eventThread
         )
     }
@@ -332,7 +338,7 @@ extension CodexThread {
     /// Rolls this thread back by the specified number of turns.
     ///
     /// - Parameter turnCount: The number of latest turns to remove.
-    public func rollback(turnCount: Int = 1) async throws {
+    package func rollback(turnCount: Int = 1) async throws {
         let _: EmptyResponse = try await client.send(
             AppServerAPI.Thread.Rollback.Request(
                 params: .init(threadID: id.rawValue, numTurns: turnCount)
@@ -346,6 +352,20 @@ extension CodexThread {
                 params: .init(threadID: id.rawValue)
             ))
     }
+
+    /// Closes the app-server connection shared by this thread.
+    public func closeConnection() async {
+        await router.stop()
+        await client.close()
+    }
+}
+
+private func interruptAndAwaitTerminal(_ stream: CodexResponseStream) async throws {
+    let cleanup = Task {
+        let cancellation = try await stream.cancel()
+        try await stream.waitForCancelledResponse(cancellation)
+    }
+    try await cleanup.value
 }
 
 package func startCodexTurn(
@@ -425,7 +445,7 @@ extension CodexTurn {
         .init(events: events)
     }
 
-    package func result() async throws -> CodexResponse {
+    package func result() async throws -> CodexTurnOutcome {
         try await CodexResponseCollector.collect(from: events)
     }
 
@@ -511,7 +531,7 @@ private func sendInterrupt(
 }
 
 private func activeTurnID(from error: Error) -> String? {
-    guard case JSONRPC.Error.responseError(_, let message) = error,
+    guard let message = serverError(from: error)?.message,
           let range = message.range(of: " but found ")
     else {
         return nil
@@ -523,12 +543,23 @@ private func activeTurnID(from error: Error) -> String? {
 
 private func isExpectedTurnNotActive(_ error: Error, turnID: CodexTurnID?) -> Bool {
     guard turnID != nil,
-          case JSONRPC.Error.responseError(_, let message) = error
+          let message = serverError(from: error)?.message
     else {
         return false
     }
     let normalized = message.lowercased()
     return normalized.contains("no active turn") && normalized.contains("interrupt")
+}
+
+private func serverError(from error: Error) -> CodexServerError? {
+    if case CodexAppServerError.request(let failure) = error,
+       case .server(let serverError) = failure.kind {
+        return serverError
+    }
+    if case JSONRPC.Error.responseError(let serverError) = error {
+        return serverError
+    }
+    return nil
 }
 
 private extension String {

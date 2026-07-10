@@ -123,10 +123,10 @@ public actor CodexAppServerTestThreadStore {
         guard let threadID = request.threadID,
             let thread = snapshotsByID[threadID]
         else {
-            throw JSONRPC.Error.responseError(
+            throw JSONRPC.Error.responseError(.init(
                 code: -32004,
                 message: "No stubbed thread matches thread/resume."
-            )
+            ))
         }
         return try JSONEncoder().encode(
             AppServerAPI.Thread.Resume.Response(
@@ -138,10 +138,10 @@ public actor CodexAppServerTestThreadStore {
     func readThreadResponse(for params: Data) throws -> Data {
         let request = try JSONDecoder().decode(AppServerAPI.Thread.Read.Params.self, from: params)
         guard let thread = snapshotsByID[request.threadID] else {
-            throw JSONRPC.Error.responseError(
+            throw JSONRPC.Error.responseError(.init(
                 code: -32004,
                 message: "No stubbed thread matches thread/read."
-            )
+            ))
         }
         return try JSONEncoder().encode(
             AppServerAPI.Thread.Read.Response(
@@ -158,10 +158,10 @@ public actor CodexAppServerTestThreadStore {
             from: params
         )
         guard let thread = snapshotsByID[request.threadID] else {
-            throw JSONRPC.Error.responseError(
+            throw JSONRPC.Error.responseError(.init(
                 code: -32004,
                 message: "No stubbed thread matches thread/turns/list."
-            )
+            ))
         }
         var turns = thread.turns ?? []
         if request.sortDirection == .descending {
@@ -488,10 +488,10 @@ public actor CodexAppServerTestTransport {
 
     /// Enqueues a JSON-RPC response error for `method`.
     public func enqueueFailure(code: Int, message: String, for method: String) {
-        responses[method, default: []].append(.failure(.responseError(
+        responses[method, default: []].append(.failure(.responseError(.init(
             code: code,
             message: message
-        )))
+        ))))
     }
 
     package func enqueueFailure(_ error: JSONRPC.Error, for method: String) {
@@ -593,7 +593,7 @@ public actor CodexAppServerTestTransport {
     }
 
     /// Enqueues a turn-start response.
-    public func enqueueTurnStart(turnID: String, status: String? = nil) throws {
+    public func enqueueTurnStart(turnID: String, status: String = "inProgress") throws {
         try enqueue(
             AppServerAPI.Turn.Start.Response(turn: .init(id: turnID, status: status)),
             for: "turn/start"
@@ -604,11 +604,11 @@ public actor CodexAppServerTestTransport {
     public func enqueueReviewStart(
         turnID: String,
         reviewThreadID: String? = nil,
-        status: CodexTurnStatus? = .running,
+        status: CodexTurnStatus = .inProgress,
         items: [CodexThreadItem] = []
     ) throws {
         try enqueueReviewStart(
-            .init(id: .init(rawValue: turnID), status: status, items: items),
+            .init(id: .init(rawValue: turnID), state: Self.state(from: status), items: items),
             reviewThreadID: reviewThreadID
         )
     }
@@ -767,11 +767,69 @@ public actor CodexAppServerTestTransport {
     fileprivate static func apiTurn(from snapshot: CodexTurnSnapshot) -> AppServerAPI.Turn.Payload {
         .init(
             id: snapshot.id.rawValue,
-            status: snapshot.status?.rawValue,
-            error: snapshot.errorMessage.map { .init(message: $0) },
+            status: snapshot.status.rawValue,
+            error: snapshot.error.map(Self.apiTurnError(from:)),
+            startedAt: snapshot.startedAt.map { Int($0.timeIntervalSince1970) },
+            completedAt: snapshot.completedAt.map { Int($0.timeIntervalSince1970) },
+            durationMS: snapshot.duration.map(Self.milliseconds(from:)),
             itemsLoadState: snapshot.itemsLoadState,
             items: snapshot.items.map(Self.apiItem(from:))
         )
+    }
+
+    private static func state(from status: CodexTurnStatus) -> CodexTurnSnapshot.State {
+        switch status {
+        case .inProgress: .inProgress
+        case .completed: .completed
+        case .interrupted: .interrupted
+        case .failed:
+            preconditionFailure("Use the snapshot overload to enqueue a failed review turn.")
+        case .unknown(let rawValue): .unknown(rawValue: rawValue, error: nil)
+        }
+    }
+
+    private static func apiTurnError(
+        from error: CodexTurnError
+    ) -> AppServerAPI.Turn.Error {
+        .init(
+            message: error.message,
+            codexErrorInfo: error.info.map(Self.apiErrorInfo(from:)),
+            additionalDetails: error.additionalDetails
+        )
+    }
+
+    private static func apiErrorInfo(
+        from info: CodexErrorInfo
+    ) -> AppServerAPI.CodexErrorInfo {
+        switch info {
+        case .contextWindowExceeded: .contextWindowExceeded
+        case .sessionBudgetExceeded: .sessionBudgetExceeded
+        case .usageLimitExceeded: .usageLimitExceeded
+        case .serverOverloaded: .serverOverloaded
+        case .cyberPolicy: .cyberPolicy
+        case .httpConnectionFailed(let status): .httpConnectionFailed(httpStatusCode: status)
+        case .responseStreamConnectionFailed(let status):
+            .responseStreamConnectionFailed(httpStatusCode: status)
+        case .internalServerError: .internalServerError
+        case .unauthorized: .unauthorized
+        case .badRequest: .badRequest
+        case .threadRollbackFailed: .threadRollbackFailed
+        case .sandboxError: .sandboxError
+        case .responseStreamDisconnected(let status):
+            .responseStreamDisconnected(httpStatusCode: status)
+        case .responseTooManyFailedAttempts(let status):
+            .responseTooManyFailedAttempts(httpStatusCode: status)
+        case .activeTurnNotSteerable(let kind): .activeTurnNotSteerable(turnKind: kind)
+        case .other: .other
+        case .unknown(let rawValue): .unknown(rawValue: rawValue)
+        }
+    }
+
+    private static func milliseconds(from duration: Duration) -> Int {
+        let components = duration.components
+        let milliseconds = components.seconds * 1_000
+            + components.attoseconds / 1_000_000_000_000_000
+        return Int(milliseconds)
     }
 
     private static func apiItem(from item: CodexThreadItem) -> AppServerJSONValue {

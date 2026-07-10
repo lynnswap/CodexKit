@@ -8,6 +8,19 @@ import Foundation
 public actor CodexAppServer {
     /// Options for creating a Codex app-server container.
     public struct Configuration: Sendable {
+        public struct Deadlines: Equatable, Sendable {
+            public var handshake: Duration?
+            public var request: Duration?
+
+            public init(
+                handshake: Duration? = nil,
+                request: Duration? = nil
+            ) {
+                self.handshake = handshake
+                self.request = request
+            }
+        }
+
         /// Options for launching a local `codex app-server` process.
         public struct LocalProcess: Sendable {
             /// The `codex` executable path or command name.
@@ -95,6 +108,12 @@ public actor CodexAppServer {
         /// The client version sent in the app-server `initialize` request.
         public var clientVersion: String
 
+        /// Monotonic request and handshake deadlines. `nil` disables the
+        /// corresponding deadline.
+        public var deadlines: Deadlines
+
+        package var deadlineClock: CodexDeadlineClock
+
         /// Handles JSON-RPC requests initiated by the app-server.
         ///
         /// App-server uses these requests for host-side decisions such as
@@ -112,12 +131,32 @@ public actor CodexAppServer {
             localProcess: LocalProcess = .init(),
             clientName: String = "CodexAppServerKit",
             clientVersion: String = "1",
+            deadlines: Deadlines = .init(),
             serverRequestHandler: @escaping CodexAppServerRequestHandler =
                 Self.defaultServerRequestHandler
         ) {
             self.localProcess = localProcess
             self.clientName = clientName
             self.clientVersion = clientVersion
+            self.deadlines = deadlines
+            self.deadlineClock = .continuous
+            self.serverRequestHandler = serverRequestHandler
+        }
+
+        package init(
+            localProcess: LocalProcess = .init(),
+            clientName: String = "CodexAppServerKit",
+            clientVersion: String = "1",
+            deadlines: Deadlines = .init(),
+            deadlineClock: CodexDeadlineClock,
+            serverRequestHandler: @escaping CodexAppServerRequestHandler =
+                Self.defaultServerRequestHandler
+        ) {
+            self.localProcess = localProcess
+            self.clientName = clientName
+            self.clientVersion = clientVersion
+            self.deadlines = deadlines
+            self.deadlineClock = deadlineClock
             self.serverRequestHandler = serverRequestHandler
         }
 
@@ -162,8 +201,25 @@ public actor CodexAppServer {
             codexHomeURL: configuration.localProcess.codexHomeURL,
             serverRequestHandler: configuration.serverRequestHandler
         )
-        let transport = try AppServerProcessTransport(configuration: transportConfiguration)
-        let client = AppServerClient(transport: transport)
+        let transport: AppServerProcessTransport
+        do {
+            transport = try AppServerProcessTransport(configuration: transportConfiguration)
+        } catch let failure as CodexLaunchFailure {
+            throw CodexAppServerError.launch(failure)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw CodexAppServerError.launch(.spawn(
+                executable: transportConfiguration.executable,
+                errno: (error as? POSIXError)?.code.rawValue,
+                message: error.localizedDescription
+            ))
+        }
+        let client = AppServerClient(
+            transport: transport,
+            deadlines: configuration.deadlines,
+            deadlineClock: configuration.deadlineClock
+        )
         do {
             _ = try await client.initialize(
                 clientName: configuration.clientName,
@@ -312,7 +368,6 @@ public actor CodexAppServer {
     ///   - instructions: Optional base and developer instructions for the source thread.
     ///   - options: Thread creation options, including model, approval, and sandbox settings.
     ///   - delivery: Whether the app-server should run the review inline or in a detached review thread.
-    ///   - transcriptErrorHandlingPolicy: How collection should treat transcript errors.
     /// - Returns: A live review session.
     /// - Throws: A transport, JSON-RPC, or app-server request error.
     public func startReview(
@@ -320,8 +375,7 @@ public actor CodexAppServer {
         target: CodexReviewTarget,
         instructions: CodexInstructions? = nil,
         options: CodexThread.Options = .init(),
-        delivery: CodexReviewDelivery = .inline,
-        transcriptErrorHandlingPolicy: CodexTranscriptErrorHandlingPolicy = .preserveTranscript
+        delivery: CodexReviewDelivery = .inline
     ) async throws -> CodexReviewSession {
         try Task.checkCancellation()
         let thread = try await startThreadIgnoringCallerCancellation(
@@ -341,8 +395,7 @@ public actor CodexAppServer {
             review = try await startReviewIgnoringCallerCancellation(
                 thread: thread,
                 target: target,
-                delivery: delivery,
-                transcriptErrorHandlingPolicy: transcriptErrorHandlingPolicy
+                delivery: delivery
             )
         } catch {
             await deleteThreadIgnoringCallerCancellation(thread.id)
@@ -390,14 +443,12 @@ public actor CodexAppServer {
     ///
     /// - Parameters:
     ///   - identity: Persisted review run identity.
-    ///   - options: Options for the restored review response stream.
     ///   - threadOptions: Resume options for the active turn thread. When `model` is
     ///     `nil`, `identity.model` is used.
     /// - Returns: A live review session handle for the persisted run.
     /// - Throws: A transport, JSON-RPC, or app-server request error.
     public func resumeReview(
         _ identity: CodexReviewIdentity,
-        options: CodexReviewResumeOptions = .init(),
         threadOptions: CodexThread.ResumeOptions = .init()
     ) async throws -> CodexReviewSession {
         var threadOptions = threadOptions
@@ -414,8 +465,7 @@ public actor CodexAppServer {
         }
         return await activeThread.reviewSession(
             identity,
-            model: activeThread.model ?? identity.model,
-            transcriptErrorHandlingPolicy: options.transcriptErrorHandlingPolicy
+            model: activeThread.model ?? identity.model
         )
     }
 
@@ -428,17 +478,15 @@ public actor CodexAppServer {
     ///
     /// - Parameters:
     ///   - identity: Persisted review run identity to interrupt.
-    ///   - options: Options for the restored review response stream used during cancellation.
     ///   - threadOptions: Resume options for the active turn thread. When `model` is
     ///     `nil`, `identity.model` is used.
-    /// - Returns: A token that can be passed to ``restartPreparedReview(_:target:delivery:threadOptions:transcriptErrorHandlingPolicy:)``.
+    /// - Returns: A token that can be passed to ``restartPreparedReview(_:target:delivery:threadOptions:)``.
     /// - Throws: A transport, JSON-RPC, or app-server request error.
     public func prepareReviewRestart(
         _ identity: CodexReviewIdentity,
-        options: CodexReviewResumeOptions = .init(),
         threadOptions: CodexThread.ResumeOptions = .init()
     ) async throws -> CodexReviewRestartToken {
-        let review = try await resumeReview(identity, options: options, threadOptions: threadOptions)
+        let review = try await resumeReview(identity, threadOptions: threadOptions)
         let cancellation = try await review.cancel { retryCancellation in
             if retryCancellation.turnID != Optional(identity.turnID) {
                 await self.rememberReviewCleanupIdentity(
@@ -469,29 +517,27 @@ public actor CodexAppServer {
         return token
     }
 
-    /// Restarts a review that was previously prepared by ``prepareReviewRestart(_:options:threadOptions:)``.
+    /// Restarts a review that was previously prepared by ``prepareReviewRestart(_:threadOptions:)``.
     ///
     /// The restart first reloads and rolls back the thread that owned the
     /// interrupted active turn, then reloads the source thread and starts a new
     /// review from that source.
     ///
     /// - Parameters:
-    ///   - token: Token returned by ``prepareReviewRestart(_:options:threadOptions:)``.
+    ///   - token: Token returned by ``prepareReviewRestart(_:threadOptions:)``.
     ///   - target: The repository changes or custom instructions to review.
     ///   - delivery: Whether the app-server should run the review inline or in a detached review thread.
     ///   - threadOptions: Resume options for the source thread. For inline
     ///     reviews, `token.interruptedIdentity.model` is used when `model` is
     ///     `nil`; detached review restarts leave source-thread model selection
     ///     to app-server unless the caller supplies an explicit model.
-    ///   - transcriptErrorHandlingPolicy: How collection should treat transcript errors for the new review.
     /// - Returns: A live review session for the restarted review.
     /// - Throws: ``CodexAppServerError/reviewRestartUnavailable(_:)`` when the token is stale.
     public func restartPreparedReview(
         _ token: CodexReviewRestartToken,
         target: CodexReviewTarget,
         delivery: CodexReviewDelivery = .inline,
-        threadOptions: CodexThread.ResumeOptions = .init(),
-        transcriptErrorHandlingPolicy: CodexTranscriptErrorHandlingPolicy = .preserveTranscript
+        threadOptions: CodexThread.ResumeOptions = .init()
     ) async throws -> CodexReviewSession {
         try Task.checkCancellation()
         guard var context = reviewRestartContextsByTokenID[token.id],
@@ -527,8 +573,7 @@ public actor CodexAppServer {
             let review = try await startReviewIgnoringCallerCancellation(
                 thread: sourceThread,
                 target: target,
-                delivery: delivery,
-                transcriptErrorHandlingPolicy: transcriptErrorHandlingPolicy
+                delivery: delivery
             )
             do {
                 try Task.checkCancellation()
@@ -940,14 +985,12 @@ public actor CodexAppServer {
     private func startReviewIgnoringCallerCancellation(
         thread: CodexThread,
         target: CodexReviewTarget,
-        delivery: CodexReviewDelivery,
-        transcriptErrorHandlingPolicy: CodexTranscriptErrorHandlingPolicy
+        delivery: CodexReviewDelivery
     ) async throws -> CodexReviewSession {
         try await Task.detached {
             try await thread.startReview(
                 target: target,
-                delivery: delivery,
-                transcriptErrorHandlingPolicy: transcriptErrorHandlingPolicy
+                delivery: delivery
             )
         }.value
     }
@@ -1062,13 +1105,74 @@ public actor CodexAppServer {
         from turns: [AppServerAPI.Turn.Payload]
     ) -> [CodexTurnSnapshot] {
         turns.map {
-            CodexTurnSnapshot(
+            let status = CodexTurnStatus(rawValue: $0.status)
+            let state: CodexTurnSnapshot.State = switch status {
+            case .inProgress:
+                .inProgress
+            case .completed:
+                .completed
+            case .interrupted:
+                .interrupted
+            case .failed:
+                .failed(Self.requiredTurnError(from: $0))
+            case .unknown(let rawValue):
+                .unknown(rawValue: rawValue, error: $0.error.map(Self.turnError(from:)))
+            }
+            return CodexTurnSnapshot(
                 id: .init(rawValue: $0.id),
-                status: $0.status.map(CodexTurnStatus.init(rawValue:)),
-                errorMessage: $0.error?.message,
+                state: state,
                 itemsLoadState: $0.itemsLoadState ?? ($0.items == nil ? .notLoaded : .full),
-                items: AppServerThreadItemMapping.threadItems(from: $0.items)
+                items: AppServerThreadItemMapping.threadItems(from: $0.items),
+                startedAt: $0.startedAt.map { Date(timeIntervalSince1970: TimeInterval($0)) },
+                completedAt: $0.completedAt.map { Date(timeIntervalSince1970: TimeInterval($0)) },
+                duration: $0.durationMS.map { .milliseconds(Int64($0)) }
             )
+        }
+    }
+
+    private nonisolated static func requiredTurnError(
+        from turn: AppServerAPI.Turn.Payload
+    ) -> CodexTurnError {
+        guard let error = turn.error else {
+            preconditionFailure("Strict Turn.Payload decoding requires failed turns to carry an error.")
+        }
+        return turnError(from: error)
+    }
+
+    package nonisolated static func turnError(
+        from error: AppServerAPI.Turn.Error
+    ) -> CodexTurnError {
+        .init(
+            message: error.message,
+            info: error.codexErrorInfo.map(Self.errorInfo(from:)),
+            additionalDetails: error.additionalDetails
+        )
+    }
+
+    private nonisolated static func errorInfo(
+        from info: AppServerAPI.CodexErrorInfo
+    ) -> CodexErrorInfo {
+        switch info {
+        case .contextWindowExceeded: .contextWindowExceeded
+        case .sessionBudgetExceeded: .sessionBudgetExceeded
+        case .usageLimitExceeded: .usageLimitExceeded
+        case .serverOverloaded: .serverOverloaded
+        case .cyberPolicy: .cyberPolicy
+        case .httpConnectionFailed(let status): .httpConnectionFailed(httpStatusCode: status)
+        case .responseStreamConnectionFailed(let status):
+            .responseStreamConnectionFailed(httpStatusCode: status)
+        case .internalServerError: .internalServerError
+        case .unauthorized: .unauthorized
+        case .badRequest: .badRequest
+        case .threadRollbackFailed: .threadRollbackFailed
+        case .sandboxError: .sandboxError
+        case .responseStreamDisconnected(let status):
+            .responseStreamDisconnected(httpStatusCode: status)
+        case .responseTooManyFailedAttempts(let status):
+            .responseTooManyFailedAttempts(httpStatusCode: status)
+        case .activeTurnNotSteerable(let kind): .activeTurnNotSteerable(turnKind: kind)
+        case .other: .other
+        case .unknown(let rawValue): .unknown(rawValue: rawValue)
         }
     }
 
@@ -1102,14 +1206,20 @@ public actor CodexAppServer {
             return .apiKey
         case .chatgpt(let loginID, let authURL, _):
             guard let url = URL(string: authURL) else {
-                throw CodexAppServerError.jsonRPC(
-                    code: -32602, message: "Invalid ChatGPT authentication URL.")
+                throw CodexAppServerError.malformedNotification(.init(
+                    method: "account/login/start response",
+                    message: "Invalid ChatGPT authentication URL.",
+                    rawData: nil
+                ))
             }
             return .chatGPT(id: .init(rawValue: loginID), authenticationURL: url)
         case .chatgptDeviceCode(let loginID, let verificationURL, let userCode):
             guard let url = URL(string: verificationURL) else {
-                throw CodexAppServerError.jsonRPC(
-                    code: -32602, message: "Invalid ChatGPT device-code verification URL.")
+                throw CodexAppServerError.malformedNotification(.init(
+                    method: "account/login/start response",
+                    message: "Invalid ChatGPT device-code verification URL.",
+                    rawData: nil
+                ))
             }
             return .chatGPTDeviceCode(
                 id: .init(rawValue: loginID),
@@ -1125,14 +1235,18 @@ public actor CodexAppServer {
         from response: AppServerAPI.Account.Login.Response
     ) throws -> CodexChatGPTLogin {
         guard case .chatgpt(let loginID, let authURL, let nativeWebAuthentication) = response else {
-            throw CodexAppServerError.jsonRPC(
-                code: -32602, message: "Expected ChatGPT login response."
-            )
+            throw CodexAppServerError.malformedNotification(.init(
+                method: "account/login/start response",
+                message: "Expected ChatGPT login response.",
+                rawData: nil
+            ))
         }
         guard let url = URL(string: authURL) else {
-            throw CodexAppServerError.jsonRPC(
-                code: -32602, message: "Invalid ChatGPT authentication URL."
-            )
+            throw CodexAppServerError.malformedNotification(.init(
+                method: "account/login/start response",
+                message: "Invalid ChatGPT authentication URL.",
+                rawData: nil
+            ))
         }
         return CodexChatGPTLogin(
             id: .init(rawValue: loginID),

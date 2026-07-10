@@ -165,20 +165,17 @@ public struct CodexReviewInput: Sendable {
     public var instructions: CodexInstructions?
     public var options: CodexThread.Options
     public var delivery: CodexReviewDelivery
-    public var transcriptErrorHandlingPolicy: CodexTranscriptErrorHandlingPolicy
 
     public init(
         target: CodexReviewTarget,
         instructions: CodexInstructions? = nil,
         options: CodexThread.Options = .init(),
-        delivery: CodexReviewDelivery = .inline,
-        transcriptErrorHandlingPolicy: CodexTranscriptErrorHandlingPolicy = .preserveTranscript
+        delivery: CodexReviewDelivery = .inline
     ) {
         self.target = target
         self.instructions = instructions
         self.options = options
         self.delivery = delivery
-        self.transcriptErrorHandlingPolicy = transcriptErrorHandlingPolicy
     }
 }
 
@@ -246,9 +243,9 @@ public final class CodexWorkspaceGroup: CodexPersistentModel {
 private extension CodexTurnStatus {
     var isTerminal: Bool {
         switch self {
-        case .running, .unknown:
+        case .inProgress, .unknown:
             false
-        case .completed, .failed, .interrupted, .cancelled:
+        case .completed, .failed, .interrupted:
             true
         }
     }
@@ -692,8 +689,12 @@ public final class CodexChat: CodexPersistentModel {
                 )
             }
             for turn in turns {
-                if let status = turn.status, status.isTerminal {
-                    _ = terminalizeActiveItems(in: turn.id, status: status, completedAt: updatedAt)
+                if turn.status.isTerminal {
+                    _ = terminalizeActiveItems(
+                        in: turn.id,
+                        status: turn.status,
+                        completedAt: updatedAt
+                    )
                 }
             }
         }
@@ -744,7 +745,7 @@ public final class CodexChat: CodexPersistentModel {
     @discardableResult
     public nonisolated(nonsending) func send(
         _ input: CodexChatMessageInput
-    ) async throws -> CodexResponse {
+    ) async throws -> CodexTurnOutcome {
         guard let modelContext else {
             throw CodexModelContextError.modelIsDetached
         }
@@ -755,11 +756,6 @@ public final class CodexChat: CodexPersistentModel {
             await modelContext.syncPhaseAfterSend(in: self)
             return response
         } catch {
-            if input.options.transcriptErrorHandlingPolicy != .revertTranscript,
-                let response = (error as? CodexAppServerError)?.response
-            {
-                await modelContext.apply(response, to: self)
-            }
             fail(with: error)
             throw error
         }
@@ -769,7 +765,7 @@ public final class CodexChat: CodexPersistentModel {
     public nonisolated(nonsending) func send(
         _ text: String,
         options: CodexGenerationOptions = .init()
-    ) async throws -> CodexResponse {
+    ) async throws -> CodexTurnOutcome {
         try await send(.init(text, options: options))
     }
 
@@ -843,7 +839,7 @@ public final class CodexChat: CodexPersistentModel {
         turns = records.map { record in
             let turn = existingByID[record.id] ?? contextTurn(id: record.id)
             turn.status = record.status
-            turn.errorDescription = record.errorMessage
+            turn.errorDescription = record.error?.message
             turn.itemsLoadState = record.itemsLoadState
             return turn
         }
@@ -957,7 +953,7 @@ public final class CodexChat: CodexPersistentModel {
             upsertTurn(
                 id: record.id,
                 status: record.status,
-                errorDescription: record.errorMessage,
+                errorDescription: record.error?.message,
                 itemsLoadState: record.itemsLoadState,
                 preservesExistingUsage: true
             )
@@ -1095,9 +1091,26 @@ public final class CodexChat: CodexPersistentModel {
     }
 
     @discardableResult
-    package func apply(_ response: CodexResponse) -> [CodexChatUpdate] {
+    package func apply(_ outcome: CodexTurnOutcome) -> [CodexChatUpdate] {
         let previousPhase = phase
         var changes: [CodexChatUpdate] = []
+        let response = outcome.response
+        let status: CodexTurnStatus
+        let errorDescription: String?
+        switch outcome {
+        case .completed:
+            status = .completed
+            errorDescription = nil
+        case .interrupted:
+            status = .interrupted
+            errorDescription = nil
+        case .failed(let failedTurn):
+            status = .failed
+            errorDescription = failedTurn.error.message
+        case .invalidTerminalStatus(let rawStatus, let error, _):
+            status = .unknown(rawValue: rawStatus)
+            errorDescription = error?.message
+        }
         if let completedAt = response.completedAt,
             updatedAt.map({ completedAt > $0 }) ?? true
         {
@@ -1105,19 +1118,17 @@ public final class CodexChat: CodexPersistentModel {
         }
         changes.appendIfPresent(upsertTurn(
             id: response.turnID,
-            status: response.status,
-            errorDescription: response.errorMessage,
+            status: status,
+            errorDescription: errorDescription,
             usage: response.usage,
             preservesExistingUsage: true
         ))
         changes.append(contentsOf: mergeItems(response.transcript.items, turnID: response.turnID))
-        if let status = response.status, status.isTerminal {
-            changes.append(contentsOf: terminalizeActiveItems(
-                in: response.turnID,
-                status: status,
-                completedAt: response.completedAt
-            ))
-        }
+        changes.append(contentsOf: terminalizeActiveItems(
+            in: response.turnID,
+            status: status,
+            completedAt: response.completedAt
+        ))
         changes.appendIfPresent(markIdleIfActive())
         appendPhaseChange(to: &changes, previousPhase: previousPhase)
         markAppliedLiveTurnItemUpdatesIfNeeded(changes)
@@ -1133,38 +1144,30 @@ public final class CodexChat: CodexPersistentModel {
             removeProvisionalSeedTurnIfNeeded(for: turnID, into: &changes)
             changes.appendIfPresent(upsertTurn(
                 id: turnID,
-                status: .running,
+                status: .inProgress,
                 errorDescription: nil,
                 preservesExistingUsage: true
             ))
             changes.appendIfPresent(markRunningIfNeeded())
             lastErrorDescription = nil
-        case .turnCompleted(let response):
-            changes.append(contentsOf: apply(response))
+        case .snapshot(let snapshot):
+            changes.appendIfPresent(upsertTurn(
+                id: snapshot.id,
+                status: snapshot.status,
+                errorDescription: snapshot.error?.message,
+                itemsLoadState: snapshot.itemsLoadState,
+                preservesExistingUsage: true
+            ))
+            changes.append(contentsOf: mergeItems(snapshot.items, turnID: snapshot.id))
+        case .terminal(let outcome):
+            changes.append(contentsOf: apply(outcome))
             changes.appendIfPresent(markIdleIfActive())
-            if response.errorMessage != nil || response.status?.isFailure == true {
-                let message = response.errorMessage ?? response.status?.rawValue ?? "Turn failed"
-                fail(with: message)
+            if case .failed(let failedTurn) = outcome {
+                fail(with: failedTurn.error.message)
             } else {
                 phase = .loaded
                 lastErrorDescription = nil
             }
-        case .turnFailed(let turnID, let message):
-            if let turnID {
-                changes.appendIfPresent(upsertTurn(
-                    id: turnID,
-                    status: .failed,
-                    errorDescription: message,
-                    preservesExistingUsage: true
-                ))
-                changes.append(contentsOf: terminalizeActiveItems(
-                    in: turnID,
-                    status: .failed,
-                    completedAt: Date()
-                ))
-            }
-            changes.appendIfPresent(markIdleIfActive())
-            fail(with: message)
         case .itemStarted(let item, let turnID):
             insertRunningTurnIfMissing(turnID, into: &changes)
             changes.append(contentsOf: terminalizeActiveItemsBeforeAppending(
@@ -1172,7 +1175,7 @@ public final class CodexChat: CodexPersistentModel {
                 turnID: turnID
             ))
             changes.append(contentsOf: mergeItems([
-                itemByApplyingLifecycleStatus(.running, to: item),
+                itemByApplyingLifecycleStatus(.inProgress, to: item),
             ], turnID: turnID))
             changes.appendIfPresent(markRunningIfNeeded())
         case .itemCompleted(let item, let turnID):
@@ -1836,7 +1839,7 @@ public final class CodexChat: CodexPersistentModel {
         }
         changes.appendIfPresent(upsertTurn(
             id: turnID,
-            status: .running,
+            status: .inProgress,
             errorDescription: nil,
             preservesExistingUsage: true
         ))
@@ -2369,12 +2372,12 @@ public final class CodexChat: CodexPersistentModel {
             return phase == previousPhase ? nil : .phaseChanged(phase)
         }
         switch latestTurn.status {
-        case .running:
+        case .inProgress:
             phase = .loading
             lastErrorDescription = nil
-        case .failed, .interrupted, .cancelled:
+        case .failed:
             fail(with: latestTurn.errorDescription ?? latestTurn.status?.rawValue ?? "Turn failed")
-        case .completed, .unknown, .none:
+        case .completed, .interrupted, .unknown, .none:
             phase = status?.isActive == true ? .loading : .loaded
             lastErrorDescription = nil
         }

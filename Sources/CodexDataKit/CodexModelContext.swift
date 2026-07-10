@@ -752,7 +752,13 @@ public final class CodexModelContext {
     }
 
     private static func isThreadNotLoadedError(_ error: Error) -> Bool {
-        guard case JSONRPC.Error.responseError(_, let message) = error else {
+        let message: String
+        if case JSONRPC.Error.responseError(let serverError) = error {
+            message = serverError.message
+        } else if case CodexAppServerError.request(let failure) = error,
+                  case .server(let serverError) = failure.kind {
+            message = serverError.message
+        } else {
             return false
         }
         return message.lowercased().contains("thread not loaded")
@@ -1093,8 +1099,7 @@ public final class CodexModelContext {
             target: input.target,
             instructions: input.instructions,
             options: input.options,
-            delivery: input.delivery,
-            transcriptErrorHandlingPolicy: input.transcriptErrorHandlingPolicy
+            delivery: input.delivery
         )
         return await applyStartedReview(
             review,
@@ -1178,31 +1183,19 @@ public final class CodexModelContext {
     public nonisolated(nonsending) func send(
         _ input: CodexChatMessageInput,
         in chat: CodexChat
-    ) async throws -> CodexResponse {
+    ) async throws -> CodexTurnOutcome {
         let thread = try await eventThread(for: chat)
-        do {
-            let response = try await thread.respond(to: input.prompt, options: input.options)
-            await apply(response, to: chat)
-            return response
-        } catch {
-            if input.options.transcriptErrorHandlingPolicy == .revertTranscript {
-                try? await refresh(
-                    chat,
-                    using: thread,
-                    includeTurns: true,
-                    replaysBufferedEvents: false
-                )
-            }
-            throw error
-        }
+        let response = try await thread.respond(to: input.prompt, options: input.options)
+        await apply(response, to: chat)
+        return response
     }
 
     @discardableResult
-    package func apply(_ response: CodexResponse, to chat: CodexChat) async -> [CodexChatUpdate] {
+    package func apply(_ outcome: CodexTurnOutcome, to chat: CodexChat) async -> [CodexChatUpdate] {
         let previousWorkspace = chat.workspace
         let previousGroup = previousWorkspace?.workspaceGroup
         let previousUpdatedAt = chat.updatedAt
-        let changes = chat.apply(response)
+        let changes = chat.apply(outcome)
         if let workspace = chat.workspace,
             let updatedAt = chat.updatedAt,
             previousUpdatedAt.map({ updatedAt > $0 }) ?? true

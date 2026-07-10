@@ -59,17 +59,33 @@ package actor AppServerProcessTransport: JSONRPC.Transport {
 
     package init(configuration: Configuration) throws {
         guard FileManager.default.isExecutableFile(atPath: configuration.executable) else {
-            throw AppServerProcessTransportError.executableNotFound(
+            throw CodexLaunchFailure.executableNotFound(
                 command: configuration.executable,
-                path: configuration.environment["PATH"]
+                searchedPath: configuration.environment["PATH"]
             )
         }
-        try AppServerCodexHome.ensureScaffold(at: configuration.codexHomeURL)
-        let launch = try AppServerSpawnedProcess.launch(
-            executable: configuration.executable,
-            arguments: configuration.arguments,
-            environment: configuration.environment
-        )
+        do {
+            try AppServerCodexHome.ensureScaffold(at: configuration.codexHomeURL)
+        } catch {
+            throw CodexLaunchFailure.scaffold(
+                path: configuration.codexHomeURL.path,
+                message: error.localizedDescription
+            )
+        }
+        let launch: AppServerProcessLaunch
+        do {
+            launch = try AppServerSpawnedProcess.launch(
+                executable: configuration.executable,
+                arguments: configuration.arguments,
+                environment: configuration.environment
+            )
+        } catch {
+            throw CodexLaunchFailure.spawn(
+                executable: configuration.executable,
+                errno: (error as? POSIXError)?.code.rawValue,
+                message: error.localizedDescription
+            )
+        }
         let process = launch.process
         let stdin = launch.stdin
         let stdout = launch.stdout
@@ -251,11 +267,17 @@ package actor AppServerProcessTransport: JSONRPC.Transport {
         if let errorObject = object["error"] as? [String: Any] {
             let code = errorObject["code"] as? Int ?? -1
             let message = errorObject["message"] as? String ?? "JSON-RPC request failed."
+            let rawData = errorObject["data"].flatMap { try? Self.responsePayloadData(from: $0) }
+            let turnError = rawData
+                .flatMap { try? JSONDecoder().decode(AppServerAPI.Turn.Error.self, from: $0) }
+                .map(CodexAppServer.turnError(from:))
             pendingResponse.continuation.resume(
-                throwing: JSONRPC.Error.responseError(
+                throwing: JSONRPC.Error.responseError(.init(
                     code: code,
-                    message: message
-                ))
+                    message: message,
+                    data: rawData,
+                    turnError: turnError
+                )))
             return
         }
         let result = object["result"] ?? [:]
@@ -866,21 +888,6 @@ package enum AppServerProcessFileDescriptorPlan {
             fileDescriptor != STDIN_FILENO
                 && fileDescriptor != STDOUT_FILENO
                 && fileDescriptor != STDERR_FILENO
-        }
-    }
-}
-
-private enum AppServerProcessTransportError: LocalizedError {
-    case executableNotFound(command: String, path: String?)
-
-    var errorDescription: String? {
-        switch self {
-        case .executableNotFound(let command, let path):
-            let resolvedPath = path?.trimmingCharacters(in: .whitespacesAndNewlines)
-            if let resolvedPath, resolvedPath.isEmpty == false {
-                return "Unable to locate \(command) executable in PATH: \(resolvedPath)"
-            }
-            return "Unable to locate \(command) executable. Set PATH so codex can be found."
         }
     }
 }

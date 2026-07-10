@@ -29,11 +29,10 @@ struct CodexItemIdentityPromotionTests {
             rawPayload: rawPayload
         )
 
-        _ = chat.apply(CodexResponse(
+        _ = chat.apply(.completed(CodexResponse(
             turnID: turnID,
-            status: .completed,
             transcript: .init(items: [authoritativeItem])
-        ))
+        )))
 
         let promotedItem = try #require(chat.items.first)
         #expect(chat.items.count == 1)
@@ -56,13 +55,12 @@ struct CodexItemIdentityPromotionTests {
             CodexMessageDelta(text: "Hello"),
             turnID: turnID
         ))
-        _ = chat.apply(CodexResponse(
+        _ = chat.apply(.completed(CodexResponse(
             turnID: turnID,
-            status: .completed,
             transcript: .init(items: [
                 agentMessageItem(id: "item-snapshot-real", text: "Hello"),
             ])
-        ))
+        )))
         let promotedItem = try #require(chat.items.first)
         #expect(promotedItem.itemID == "item-snapshot-real")
 
@@ -96,13 +94,12 @@ struct CodexItemIdentityPromotionTests {
             text: "Hello"
         )
 
-        _ = chat.apply(CodexResponse(
+        _ = chat.apply(.completed(CodexResponse(
             turnID: turnID,
-            status: .completed,
             transcript: .init(items: [
                 agentMessageItem(id: "item-context-real", text: "Hello"),
             ])
-        ))
+        )))
         let promotedItem = try #require(chat.items.first)
         #expect(promotedItem.itemID == "item-context-real")
 
@@ -267,7 +264,7 @@ struct CodexItemIdentityPromotionTests {
                 turns: [
                     .init(
                         id: turnID,
-                        status: .completed,
+                        state: .completed,
                         itemsLoadState: .full,
                         items: [
                             agentMessageItem(
@@ -308,7 +305,7 @@ struct CodexItemIdentityPromotionTests {
                 turns: [
                     .init(
                         id: turnID,
-                        status: .completed,
+                        state: .completed,
                         itemsLoadState: .full,
                         items: [
                             reviewMarkerItem(

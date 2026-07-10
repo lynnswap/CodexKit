@@ -33,7 +33,7 @@ package enum JSONRPC {
     package enum Error: Swift.Error, Equatable, Sendable, LocalizedError {
         case closed
         case invalidMessage(String)
-        case responseError(code: Int, message: String)
+        case responseError(CodexServerError)
 
         package var errorDescription: String? {
             switch self {
@@ -41,8 +41,8 @@ package enum JSONRPC {
                 "JSON-RPC transport is closed."
             case .invalidMessage(let message):
                 "Invalid JSON-RPC message: \(message)"
-            case .responseError(_, let message):
-                message
+            case .responseError(let error):
+                error.message
             }
         }
     }

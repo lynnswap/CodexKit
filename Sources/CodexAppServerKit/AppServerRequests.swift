@@ -102,7 +102,10 @@ extension AppServerAPI.Review.Start {
         }
 
         package init(turnID: String, reviewThreadID: String? = nil) {
-            self.init(turn: AppServerAPI.Turn.Payload(id: turnID), reviewThreadID: reviewThreadID)
+            self.init(
+                turn: AppServerAPI.Turn.Payload(id: turnID, status: "inProgress"),
+                reviewThreadID: reviewThreadID
+            )
         }
 
         package init(
@@ -782,7 +785,7 @@ extension AppServerAPI.Thread.Fork {
 extension AppServerAPI.Turn {
     package struct Payload: Codable, Equatable, Sendable {
         package var id: String
-        package var status: String?
+        package var status: String
         package var error: AppServerAPI.Turn.Error?
         package var startedAt: Int?
         package var completedAt: Int?
@@ -803,7 +806,7 @@ extension AppServerAPI.Turn {
 
         package init(
             id: String,
-            status: String? = nil,
+            status: String,
             error: AppServerAPI.Turn.Error? = nil,
             startedAt: Int? = nil,
             completedAt: Int? = nil,
@@ -819,6 +822,42 @@ extension AppServerAPI.Turn {
             self.durationMS = durationMS
             self.itemsLoadState = itemsLoadState
             self.items = items
+        }
+
+        package init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            id = try container.decode(String.self, forKey: .id)
+            status = try container.decode(String.self, forKey: .status)
+            error = try container.decodeIfPresent(AppServerAPI.Turn.Error.self, forKey: .error)
+            startedAt = try container.decodeIfPresent(Int.self, forKey: .startedAt)
+            completedAt = try container.decodeIfPresent(Int.self, forKey: .completedAt)
+            durationMS = try container.decodeIfPresent(Int.self, forKey: .durationMS)
+            itemsLoadState = try container.decodeIfPresent(
+                CodexTurnItemsLoadState.self,
+                forKey: .itemsLoadState
+            )
+            items = try container.decodeIfPresent([AppServerJSONValue].self, forKey: .items)
+
+            switch CodexTurnStatus(rawValue: status) {
+            case .failed:
+                guard error != nil else {
+                    throw DecodingError.dataCorruptedError(
+                        forKey: .error,
+                        in: container,
+                        debugDescription: "A failed turn requires an error payload."
+                    )
+                }
+            case .inProgress, .completed, .interrupted:
+                guard error == nil else {
+                    throw DecodingError.dataCorruptedError(
+                        forKey: .error,
+                        in: container,
+                        debugDescription: "Known non-failed turn status \(status) cannot carry an error."
+                    )
+                }
+            case .unknown:
+                break
+            }
         }
     }
 }
@@ -1139,9 +1178,137 @@ extension AppServerAPI.Thread.Compact.Start {
 extension AppServerAPI.Turn {
     package struct Error: Codable, Equatable, Sendable {
         package var message: String
+        package var codexErrorInfo: AppServerAPI.CodexErrorInfo?
+        package var additionalDetails: String?
 
-        package init(message: String) {
+        package init(
+            message: String,
+            codexErrorInfo: AppServerAPI.CodexErrorInfo? = nil,
+            additionalDetails: String? = nil
+        ) {
             self.message = message
+            self.codexErrorInfo = codexErrorInfo
+            self.additionalDetails = additionalDetails
+        }
+    }
+}
+
+extension AppServerAPI {
+    package enum CodexErrorInfo: Codable, Equatable, Sendable {
+        case contextWindowExceeded
+        case sessionBudgetExceeded
+        case usageLimitExceeded
+        case serverOverloaded
+        case cyberPolicy
+        case httpConnectionFailed(httpStatusCode: UInt16?)
+        case responseStreamConnectionFailed(httpStatusCode: UInt16?)
+        case internalServerError
+        case unauthorized
+        case badRequest
+        case threadRollbackFailed
+        case sandboxError
+        case responseStreamDisconnected(httpStatusCode: UInt16?)
+        case responseTooManyFailedAttempts(httpStatusCode: UInt16?)
+        case activeTurnNotSteerable(turnKind: String)
+        case other
+        case unknown(rawValue: String)
+
+        package init(from decoder: Decoder) throws {
+            if let value = try? decoder.singleValueContainer().decode(String.self) {
+                self = Self(simpleRawValue: value)
+                return
+            }
+            let object = try decoder.singleValueContainer().decode([String: Payload].self)
+            guard object.count == 1, let (key, payload) = object.first else {
+                throw DecodingError.dataCorrupted(
+                    .init(codingPath: decoder.codingPath, debugDescription: "Invalid codexErrorInfo payload.")
+                )
+            }
+            switch key {
+            case "httpConnectionFailed":
+                self = .httpConnectionFailed(httpStatusCode: payload.httpStatusCode)
+            case "responseStreamConnectionFailed":
+                self = .responseStreamConnectionFailed(httpStatusCode: payload.httpStatusCode)
+            case "responseStreamDisconnected":
+                self = .responseStreamDisconnected(httpStatusCode: payload.httpStatusCode)
+            case "responseTooManyFailedAttempts":
+                self = .responseTooManyFailedAttempts(httpStatusCode: payload.httpStatusCode)
+            case "activeTurnNotSteerable":
+                guard let turnKind = payload.turnKind else {
+                    throw DecodingError.dataCorrupted(
+                        .init(codingPath: decoder.codingPath, debugDescription: "Missing turnKind.")
+                    )
+                }
+                self = .activeTurnNotSteerable(turnKind: turnKind)
+            default:
+                self = .unknown(rawValue: key)
+            }
+        }
+
+        package func encode(to encoder: Encoder) throws {
+            var container = encoder.singleValueContainer()
+            switch self {
+            case .httpConnectionFailed(let code):
+                try container.encode(["httpConnectionFailed": Payload(httpStatusCode: code)])
+            case .responseStreamConnectionFailed(let code):
+                try container.encode(["responseStreamConnectionFailed": Payload(httpStatusCode: code)])
+            case .responseStreamDisconnected(let code):
+                try container.encode(["responseStreamDisconnected": Payload(httpStatusCode: code)])
+            case .responseTooManyFailedAttempts(let code):
+                try container.encode(["responseTooManyFailedAttempts": Payload(httpStatusCode: code)])
+            case .activeTurnNotSteerable(let turnKind):
+                try container.encode(["activeTurnNotSteerable": Payload(turnKind: turnKind)])
+            default:
+                try container.encode(simpleRawValue)
+            }
+        }
+
+        private struct Payload: Codable, Equatable, Sendable {
+            var httpStatusCode: UInt16?
+            var turnKind: String?
+
+            init(httpStatusCode: UInt16? = nil, turnKind: String? = nil) {
+                self.httpStatusCode = httpStatusCode
+                self.turnKind = turnKind
+            }
+        }
+
+        private init(simpleRawValue: String) {
+            switch simpleRawValue {
+            case "contextWindowExceeded": self = .contextWindowExceeded
+            case "sessionBudgetExceeded": self = .sessionBudgetExceeded
+            case "usageLimitExceeded": self = .usageLimitExceeded
+            case "serverOverloaded": self = .serverOverloaded
+            case "cyberPolicy": self = .cyberPolicy
+            case "internalServerError": self = .internalServerError
+            case "unauthorized": self = .unauthorized
+            case "badRequest": self = .badRequest
+            case "threadRollbackFailed": self = .threadRollbackFailed
+            case "sandboxError": self = .sandboxError
+            case "other": self = .other
+            default: self = .unknown(rawValue: simpleRawValue)
+            }
+        }
+
+        private var simpleRawValue: String {
+            switch self {
+            case .contextWindowExceeded: "contextWindowExceeded"
+            case .sessionBudgetExceeded: "sessionBudgetExceeded"
+            case .usageLimitExceeded: "usageLimitExceeded"
+            case .serverOverloaded: "serverOverloaded"
+            case .cyberPolicy: "cyberPolicy"
+            case .internalServerError: "internalServerError"
+            case .unauthorized: "unauthorized"
+            case .badRequest: "badRequest"
+            case .threadRollbackFailed: "threadRollbackFailed"
+            case .sandboxError: "sandboxError"
+            case .other: "other"
+            case .unknown(let rawValue): rawValue
+            case .httpConnectionFailed, .responseStreamConnectionFailed,
+                 .responseStreamDisconnected, .responseTooManyFailedAttempts,
+                 .activeTurnNotSteerable:
+                preconditionFailure("Associated codexErrorInfo has no simple raw value.")
+            }
         }
     }
 }

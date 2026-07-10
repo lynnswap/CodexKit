@@ -431,7 +431,7 @@ struct CodexModelContextTests {
                         modelProvider: "openai",
                         createdAt: createdAt,
                         updatedAt: updatedAt,
-                        turns: [.init(id: "turn-1", status: .running)]
+                        turns: [.init(id: "turn-1", state: .inProgress)]
                     )
                 ],
                 nextCursor: "next"
@@ -446,7 +446,7 @@ struct CodexModelContextTests {
         #expect(first.modelProvider == "openai")
         #expect(first.createdAt == createdAt)
         #expect(first.updatedAt == updatedAt)
-        #expect(firstTurn.status == CodexTurnStatus.running)
+        #expect(firstTurn.status == CodexTurnStatus.inProgress)
         #expect(first.modelContext === context)
         #expect(results.nextCursor == "next")
 
@@ -458,7 +458,7 @@ struct CodexModelContextTests {
                     modelProvider: "openai",
                     createdAt: createdAt,
                     updatedAt: Date(timeIntervalSince1970: 3_000),
-                    turns: [.init(id: "turn-1", status: .completed)]
+                    turns: [.init(id: "turn-1", state: .completed)]
                 ),
                 .init(id: "thread-2", name: "Second"),
             ]))
@@ -2104,7 +2104,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueReviewStart(
             .init(
                 id: "turn-review",
-                status: .running,
+                state: .inProgress,
                 items: [
                     .init(
                         id: "review-mode",
@@ -4880,7 +4880,7 @@ struct CodexModelContextTests {
                     name: "Before",
                     modelProvider: "openai",
                     updatedAt: updatedAt,
-                    turns: [.init(id: "turn-refresh", status: .running)]
+                    turns: [.init(id: "turn-refresh", state: .inProgress)]
                 )
             ]))
 
@@ -4904,7 +4904,7 @@ struct CodexModelContextTests {
         #expect(chat.modelProvider == "openai")
         #expect(chat.updatedAt == updatedAt)
         #expect(chat.turns.first === turn)
-        #expect(turn.status == CodexTurnStatus.running)
+        #expect(turn.status == CodexTurnStatus.inProgress)
 
         let request = try #require(
             await runtime.transport.recordedRequests(method: "thread/read").first)
@@ -4922,7 +4922,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadRead(.init(
             id: "thread-metadata-phase",
             status: .active(activeFlags: []),
-            turns: [.init(id: "turn-stale", status: .running)]
+            turns: [.init(id: "turn-stale", state: .inProgress)]
         ))
 
         let chat = context.model(for: CodexThreadID(rawValue: "thread-metadata-phase"))
@@ -4961,14 +4961,14 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadTurns(.init(turns: [
             .init(
                 id: "turn-running-after-idle",
-                status: .running,
+                state: .inProgress,
                 items: [
                     .init(
                         id: "command-running-after-idle",
                         kind: .commandExecution,
                         content: .command(.init(
                             command: "/bin/zsh -lc",
-                            status: .running,
+                            status: .inProgress,
                             startedAt: Date(timeIntervalSince1970: 4_000)
                         ))
                     ),
@@ -4985,8 +4985,8 @@ struct CodexModelContextTests {
             Issue.record("Expected command item")
             return
         }
-        #expect(turn.status == .running)
-        #expect(command.status == .running)
+        #expect(turn.status == .inProgress)
+        #expect(command.status == .inProgress)
         #expect(command.completedAt == nil)
         #expect(chat.status == .idle)
         #expect(chat.phase == .loading)
@@ -5001,14 +5001,14 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadTurns(.init(turns: [
             .init(
                 id: "turn-stale-running",
-                status: .running,
+                state: .inProgress,
                 items: [
                     .init(
                         id: "command-stale-running",
                         kind: .commandExecution,
                         content: .command(.init(
                             command: "/bin/zsh -lc",
-                            status: .running,
+                            status: .inProgress,
                             startedAt: Date(timeIntervalSince1970: 4_500)
                         ))
                     ),
@@ -5189,7 +5189,7 @@ struct CodexModelContextTests {
                 turns: [
                     .init(
                         id: "turn-clear",
-                        status: .completed,
+                        state: .completed,
                         items: [
                             .init(
                                 id: "message-clear",
@@ -5234,7 +5234,7 @@ struct CodexModelContextTests {
                 turns: [
                     .init(
                         id: "turn-summary",
-                        status: .running,
+                        state: .inProgress,
                         items: [
                             .init(
                                 id: "message-summary",
@@ -5250,7 +5250,7 @@ struct CodexModelContextTests {
                     ),
                     .init(
                         id: "turn-omitted",
-                        status: .running
+                        state: .inProgress
                     )
                 ]
             )
@@ -5268,7 +5268,7 @@ struct CodexModelContextTests {
                 turns: [
                     .init(
                         id: "turn-summary",
-                        status: .completed,
+                        state: .completed,
                         itemsLoadState: .summary,
                         items: [
                             .init(
@@ -5309,7 +5309,7 @@ struct CodexModelContextTests {
                 turns: [
                     .init(
                         id: "turn-clear",
-                        status: .completed,
+                        state: .completed,
                         items: [
                             .init(
                                 id: "message-clear",
@@ -5356,7 +5356,7 @@ struct CodexModelContextTests {
                 turns: [
                     .init(
                         id: "turn-omitted-read",
-                        status: .completed,
+                        state: .completed,
                         items: [
                             .init(
                                 id: "message-omitted-read",
@@ -5409,7 +5409,7 @@ struct CodexModelContextTests {
             turns: [
                 .init(
                     id: "turn-history",
-                    status: .completed,
+                    state: .completed,
                     items: [
                         .init(
                             id: "message-history",
@@ -5446,7 +5446,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadTurns(.init(turns: [
             .init(
                 id: "turn-live",
-                status: .running,
+                state: .inProgress,
                 items: [
                     .init(
                         id: "message-live",
@@ -5486,7 +5486,7 @@ struct CodexModelContextTests {
             turns: [
                 .init(
                     id: "turn-page-1",
-                    status: .completed,
+                    state: .completed,
                     items: [
                         .init(
                             id: "message-page-1",
@@ -5505,7 +5505,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadTurns(.init(turns: [
             .init(
                 id: "turn-page-2",
-                status: .completed,
+                state: .completed,
                 items: [
                     .init(
                         id: "message-page-2",
@@ -5548,7 +5548,7 @@ struct CodexModelContextTests {
             turns: [
                 .init(
                     id: "turn-alpha",
-                    status: .completed,
+                    state: .completed,
                     items: [
                         .init(
                             id: "message-alpha-user",
@@ -5573,7 +5573,7 @@ struct CodexModelContextTests {
                 ),
                 .init(
                     id: "turn-beta",
-                    status: .running,
+                    state: .inProgress,
                     items: [
                         .init(
                             id: "message-beta",
@@ -5619,7 +5619,7 @@ struct CodexModelContextTests {
             turns: [
                 .init(
                     id: "turn-completed",
-                    status: .completed,
+                    state: .completed,
                     items: [
                         .init(
                             id: "message-completed",
@@ -5635,8 +5635,7 @@ struct CodexModelContextTests {
                 ),
                 .init(
                     id: "turn-failed",
-                    status: .failed,
-                    errorMessage: "Tool failed",
+                    state: .failed(.init(message: "Tool failed")),
                     items: [
                         .init(
                             id: "message-failed",
@@ -5722,7 +5721,7 @@ struct CodexModelContextTests {
 
         let response = try await sendTask.value
         let item = try #require(chat.items.first)
-        #expect(response.turnID == "turn-send")
+        #expect(response.response.turnID == "turn-send")
         #expect(chat.turns.first?.status == CodexTurnStatus.completed)
         #expect(item.text == "Done")
         #expect(item.turnID == "turn-send")
@@ -5738,7 +5737,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadRead(.init(
             id: "thread-send-phase",
             status: .active(activeFlags: []),
-            turns: [.init(id: "turn-existing", status: .running)]
+            turns: [.init(id: "turn-existing", state: .inProgress)]
         ))
 
         let chat = context.model(for: CodexThreadID(rawValue: "thread-send-phase"))
@@ -5858,7 +5857,7 @@ struct CodexModelContextTests {
             Issue.record("Expected command item")
             return
         }
-        #expect(startedCommand.status == .running)
+        #expect(startedCommand.status == .inProgress)
         #expect(startedCommand.startedAt != nil)
 
         try await runtime.transport.emitServerNotification(
@@ -5879,7 +5878,7 @@ struct CodexModelContextTests {
             Issue.record("Expected command item")
             return
         }
-        #expect(updatedCommand.status == .running)
+        #expect(updatedCommand.status == .inProgress)
 
         try await runtime.transport.emitServerNotification(
             method: "item/completed",
@@ -6032,7 +6031,7 @@ struct CodexModelContextTests {
             Issue.record("Expected command item")
             return
         }
-        #expect(startedCommand.status == .running)
+        #expect(startedCommand.status == .inProgress)
 
         try await runtime.transport.emitServerNotification(
             method: "item/agentMessage/delta",
@@ -6105,7 +6104,7 @@ struct CodexModelContextTests {
             Issue.record("Expected command item")
             return
         }
-        #expect(startedCommand.status == .running)
+        #expect(startedCommand.status == .inProgress)
 
         try await runtime.transport.emitServerNotification(
             method: "item/agentMessage/delta",
@@ -6192,7 +6191,7 @@ struct CodexModelContextTests {
             else {
                 return false
             }
-            return first.status == .completed && second.status == .running
+            return first.status == .completed && second.status == .inProgress
         })
 
         try await runtime.transport.emitServerNotification(
@@ -6218,66 +6217,9 @@ struct CodexModelContextTests {
             }
             return first.status == .completed
                 && first.output == "late output"
-                && second.status == .running
+                && second.status == .inProgress
         })
         withExtendedLifetime(changes) {}
-    }
-
-    @Test("chat send with revert policy refreshes observed transcript after failure")
-    func chatSendWithRevertPolicyRefreshesObservedTranscriptAfterFailure() async throws {
-        let runtime = try await CodexAppServerTestRuntime.start()
-        let context = CodexModelContainer(appServer: runtime.server).mainContext
-
-        try await runtime.transport.enqueueThreadResume(.init(id: "thread-revert"))
-        try await runtime.transport.enqueueThreadRead(.init(id: "thread-revert", turns: []))
-
-        let chat = context.model(for: CodexThreadID(rawValue: "thread-revert"))
-        let observation = try await chat.observe()
-        defer {
-            observation.cancel()
-        }
-
-        try await runtime.transport.enqueueThreadResume(.init(id: "thread-revert"))
-        try await runtime.transport.enqueueTurnStart(turnID: "turn-revert", status: "running")
-        try await runtime.transport.enqueueEmpty(for: "thread/rollback")
-        try await runtime.transport.enqueueThreadRead(.init(id: "thread-revert", turns: []))
-
-        let sendTask = Task {
-            try await chat.send(
-                "hello",
-                options: .init(transcriptErrorHandlingPolicy: .revertTranscript)
-            )
-        }
-
-        await runtime.transport.waitForRequest(method: "turn/start")
-        try await runtime.transport.emitServerNotification(
-            method: "item/completed",
-            params: ThreadItemParams(
-                threadID: "thread-revert",
-                turnID: "turn-revert",
-                item: .init(
-                    id: "message-revert",
-                    type: "agentMessage",
-                    text: "Failed output",
-                    phase: "final_answer"
-                )
-            )
-        )
-        try await runtime.transport.emitServerNotification(
-            method: "turn/completed",
-            params: TurnCompletedParams(turn: .init(id: "turn-revert", status: "failed"))
-        )
-
-        do {
-            _ = try await sendTask.value
-            Issue.record("Expected failed send to throw.")
-        } catch {
-        }
-
-        #expect(await runtime.transport.recordedRequests(method: "thread/rollback").count == 1)
-        #expect(await runtime.transport.recordedRequests(method: "thread/read").count == 2)
-        #expect(chat.items.isEmpty)
-        #expect(chat.turns.isEmpty)
     }
 
     @Test("chat observation refreshes a snapshot and applies live events in place")
@@ -6292,7 +6234,7 @@ struct CodexModelContextTests {
             turns: [
                 .init(
                     id: "turn-existing",
-                    status: .completed,
+                    state: .completed,
                     items: [
                         .init(
                             id: "message-existing",
@@ -6407,7 +6349,7 @@ struct CodexModelContextTests {
             turns: [
                 .init(
                     id: "turn-live",
-                    status: .completed,
+                    state: .completed,
                     items: [
                         .init(
                             id: "message-live",
@@ -6467,7 +6409,7 @@ struct CodexModelContextTests {
             turns: [
                 .init(
                     id: "turn-history",
-                    status: .completed,
+                    state: .completed,
                     items: [
                         .init(
                             id: "message-history",
@@ -6526,7 +6468,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadResume(.init(id: "thread-finished"))
         try await runtime.transport.enqueueThreadRead(.init(
             id: "thread-finished",
-            turns: [.init(id: "turn-restarted", status: .completed)]
+            turns: [.init(id: "turn-restarted", state: .completed)]
         ))
 
         let restartedObservation = try await chat.observe()
@@ -6618,7 +6560,7 @@ struct CodexModelContextTests {
             turns: [
                 .init(
                     id: "turn-replay",
-                    status: .running,
+                    state: .inProgress,
                     items: [
                         .init(
                             id: "command-replay",
@@ -6655,7 +6597,7 @@ struct CodexModelContextTests {
             turns: [
                 .init(
                     id: "turn-message-replay",
-                    status: .running,
+                    state: .inProgress,
                     items: [
                         .init(
                             id: "message-replay",
@@ -6759,7 +6701,7 @@ struct CodexModelContextTests {
             turns: [
                 .init(
                     id: "turn-duplicate-history",
-                    status: .running,
+                    state: .inProgress,
                     items: [
                         .init(
                             id: "review-a",
@@ -6871,7 +6813,7 @@ struct CodexModelContextTests {
             turns: [
                 .init(
                     id: "turn-replay-a",
-                    status: .completed,
+                    state: .completed,
                     items: [
                         .init(
                             id: "review-a",
@@ -6911,7 +6853,7 @@ struct CodexModelContextTests {
                 ),
                 .init(
                     id: "turn-replay-b",
-                    status: .completed,
+                    state: .completed,
                     items: [
                         .init(
                             id: "review-b",
@@ -6951,7 +6893,7 @@ struct CodexModelContextTests {
                 ),
                 .init(
                     id: "turn-replay-c",
-                    status: .completed,
+                    state: .completed,
                     items: [
                         .init(
                             id: "reasoning-c",
@@ -7226,7 +7168,7 @@ struct CodexModelContextTests {
             turns: [
                 .init(
                     id: "turn-existing",
-                    status: .completed,
+                    state: .completed,
                     items: [
                         .init(
                             id: "message-existing",
@@ -7369,7 +7311,7 @@ struct CodexModelContextTests {
                 turns: [
                     .init(
                         id: "turn-kind-change",
-                        status: .running,
+                        state: .inProgress,
                         items: [
                             .init(
                                 id: "item-kind-change",
@@ -7417,7 +7359,7 @@ struct CodexModelContextTests {
                 turns: [
                     .init(
                         id: "turn-tool-progress",
-                        status: .running,
+                        state: .inProgress,
                         items: [
                             .init(
                                 id: "tool-progress",
@@ -7427,7 +7369,7 @@ struct CodexModelContextTests {
                                     server: "github",
                                     name: "search_issues",
                                     arguments: #"{"q":"is:open"}"#,
-                                    status: .running
+                                    status: .inProgress
                                 ))
                             ),
                         ]
@@ -7457,7 +7399,7 @@ struct CodexModelContextTests {
         #expect(toolCall.name == "search_issues")
         #expect(toolCall.arguments == #"{"q":"is:open"}"#)
         #expect(toolCall.result == "Searching GitHub")
-        #expect(toolCall.status == .running)
+        #expect(toolCall.status == .inProgress)
     }
 
     @Test("active chat refresh emits snapshots after phase reconciliation")
@@ -7469,7 +7411,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadRead(.init(
             id: "thread-refresh-stream",
             status: .active(activeFlags: []),
-            turns: [.init(id: "turn-running", status: .running)]
+            turns: [.init(id: "turn-running", state: .inProgress)]
         ))
 
         let chat = context.model(for: CodexThreadID(rawValue: "thread-refresh-stream"))
@@ -7505,7 +7447,7 @@ struct CodexModelContextTests {
             turns: [
                 .init(
                     id: "turn-existing",
-                    status: .running,
+                    state: .inProgress,
                     items: [
                         .init(
                             id: "message-existing",
@@ -7544,7 +7486,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadTurns(.init(turns: [
             .init(
                 id: "turn-existing",
-                status: .running,
+                state: .inProgress,
                 items: [
                     .init(
                         id: "message-existing",
@@ -7606,7 +7548,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadTurns(.init(turns: [
             .init(
                 id: "turn-snapshot",
-                status: .running,
+                state: .inProgress,
                 items: [
                     .init(
                         id: "reasoning-snapshot",
@@ -7663,7 +7605,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadTurns(.init(turns: [
             .init(
                 id: "turn-authoritative",
-                status: .completed,
+                state: .completed,
                 items: [
                     .init(
                         id: "message-authoritative",
@@ -7724,7 +7666,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadTurns(.init(turns: [
             .init(
                 id: "turn-authoritative",
-                status: .completed,
+                state: .completed,
                 items: [
                     .init(
                         id: "message-authoritative",
@@ -7772,7 +7714,7 @@ struct CodexModelContextTests {
                 turns: [
                     .init(
                         id: fullTurnID,
-                        status: .running,
+                        state: .inProgress,
                         itemsLoadState: .full,
                         items: [
                             messageItem("message-kept", text: "Keep me"),
@@ -7781,7 +7723,7 @@ struct CodexModelContextTests {
                     ),
                     .init(
                         id: summaryTurnID,
-                        status: .running,
+                        state: .inProgress,
                         itemsLoadState: .summary,
                         items: []
                     ),
@@ -7797,7 +7739,7 @@ struct CodexModelContextTests {
                 turns: [
                     .init(
                         id: fullTurnID,
-                        status: .running,
+                        state: .inProgress,
                         itemsLoadState: .full,
                         items: [
                             messageItem("message-kept", text: "Still here"),
@@ -7805,7 +7747,7 @@ struct CodexModelContextTests {
                     ),
                     .init(
                         id: summaryTurnID,
-                        status: .running,
+                        state: .inProgress,
                         itemsLoadState: .summary,
                         items: []
                     ),
@@ -7863,7 +7805,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadTurns(.init(turns: [
             .init(
                 id: "turn-summary",
-                status: .interrupted,
+                state: .interrupted,
                 items: [
                     .init(
                         id: "message-interrupted",
@@ -7904,7 +7846,7 @@ struct CodexModelContextTests {
             turns: [
                 .init(
                     id: "turn-existing",
-                    status: .running,
+                    state: .inProgress,
                     items: [
                         .init(
                             id: "message-existing",
@@ -7944,7 +7886,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadTurns(.init(turns: [
             .init(
                 id: "turn-existing",
-                status: .running,
+                state: .inProgress,
                 items: [
                     .init(
                         id: "message-existing",
@@ -8059,7 +8001,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadRead(.init(
             id: "thread-running",
             status: .active(activeFlags: []),
-            turns: [.init(id: "turn-running", status: .running)]
+            turns: [.init(id: "turn-running", state: .inProgress)]
         ))
 
         let chat = context.model(for: CodexThreadID(rawValue: "thread-running"))
@@ -8069,7 +8011,7 @@ struct CodexModelContextTests {
         }
 
         #expect(chat.phase == .loading)
-        #expect(chat.turn(id: "turn-running")?.status == .running)
+        #expect(chat.turn(id: "turn-running")?.status == .inProgress)
     }
 
     @Test("thread closed notifications preserve failed chat phase")
@@ -8087,15 +8029,13 @@ struct CodexModelContextTests {
         }
         let changes = ChatUpdateRecorder(stream: observation.updates)
 
-        await runtime.transport.emitServerNotificationJSON(
-            method: "turn/failed",
-            json: """
-            {
-              "threadId": "thread-failed",
-              "turnId": "turn-failed",
-              "error": { "message": "Tool failed" }
-            }
-            """
+        try await runtime.transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(
+                id: "turn-failed",
+                status: "failed",
+                error: .init(message: "Tool failed")
+            ))
         )
 
         #expect(await eventually { chat.phase == .failed("Tool failed") })
@@ -8534,7 +8474,7 @@ struct CodexModelContextTests {
             turns: [
                 .init(
                     id: "turn-existing-user",
-                    status: .completed,
+                    state: .completed,
                     itemsLoadState: .full,
                     items: [
                         .init(
@@ -8550,7 +8490,7 @@ struct CodexModelContextTests {
                 ),
                 .init(
                     id: "turn-existing-agent",
-                    status: .completed,
+                    state: .completed,
                     itemsLoadState: .full,
                     items: [
                         .init(
@@ -8575,7 +8515,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueReviewStart(
             .init(
                 id: "turn-seed",
-                status: .running,
+                state: .inProgress,
                 itemsLoadState: .full,
                 items: [
                     .init(
@@ -8758,7 +8698,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadTurns(.init(turns: [
             .init(
                 id: "turn-review",
-                status: .running,
+                state: .inProgress,
                 items: [
                     .init(
                         id: "turn-review",
@@ -8813,7 +8753,7 @@ struct CodexModelContextTests {
             try await runtime.transport.enqueueThreadTurns(.init(turns: [
                 .init(
                     id: "turn-review",
-                    status: .running,
+                    state: .inProgress,
                     items: [
                         .init(
                             id: "turn-review",
@@ -9011,7 +8951,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadTurns(.init(turns: [
             .init(
                 id: "turn-review",
-                status: .completed,
+                state: .completed,
                 itemsLoadState: .full,
                 items: [
                     .init(
@@ -9165,7 +9105,7 @@ struct CodexModelContextTests {
                 turns: [
                     .init(
                         id: "turn-live",
-                        status: .running,
+                        state: .inProgress,
                         items: [
                             .init(
                                 id: "review-mode",
@@ -9177,7 +9117,7 @@ struct CodexModelContextTests {
                                 kind: .commandExecution,
                                 content: .command(.init(
                                     command: "/bin/zsh -lc",
-                                    status: .running
+                                    status: .inProgress
                                 ))
                             ),
                         ]
@@ -9218,7 +9158,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadTurns(.init(turns: [
             .init(
                 id: "turn-review",
-                status: .running,
+                state: .inProgress,
                 items: [
                     .init(
                         id: "turn-review",
@@ -9255,7 +9195,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueReviewStart(
             .init(
                 id: "turn-review",
-                status: .running,
+                state: .inProgress,
                 itemsLoadState: .notLoaded,
                 items: [
                     .init(
@@ -9270,7 +9210,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadTurns(.init(turns: [
             .init(
                 id: "turn-review",
-                status: .running,
+                state: .inProgress,
                 itemsLoadState: .full,
                 items: [
                     .init(
@@ -9283,7 +9223,7 @@ struct CodexModelContextTests {
                         kind: .commandExecution,
                         content: .command(.init(
                             command: "/bin/zsh -lc",
-                            status: .running
+                            status: .inProgress
                         ))
                     ),
                 ]
@@ -9319,7 +9259,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueReviewStart(
             .init(
                 id: "turn-review",
-                status: .running,
+                state: .inProgress,
                 itemsLoadState: .full,
                 items: [
                     .init(
@@ -9334,7 +9274,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadTurns(.init(turns: [
             .init(
                 id: "turn-review",
-                status: .running,
+                state: .inProgress,
                 itemsLoadState: .full,
                 items: [
                     .init(
@@ -9395,7 +9335,7 @@ struct CodexModelContextTests {
                 content: .command(.init(
                     command: "/bin/zsh -lc 'git status --short'",
                     cwd: workspaceURL.path,
-                    status: .running,
+                    status: .inProgress,
                     startedAt: startedAt,
                     processID: "123",
                     source: .agent
@@ -9415,7 +9355,7 @@ struct CodexModelContextTests {
                 turns: [
                     .init(
                         id: "turn-review",
-                        status: .running,
+                        state: .inProgress,
                         itemsLoadState: .full,
                         items: [
                             .init(
@@ -9423,7 +9363,7 @@ struct CodexModelContextTests {
                                 kind: .commandExecution,
                                 content: .command(.init(
                                     command: "/bin/zsh -lc 'git status --short'",
-                                    status: .running
+                                    status: .inProgress
                                 ))
                             ),
                         ]
@@ -9492,7 +9432,7 @@ struct CodexModelContextTests {
                 content: .command(.init(
                     command: "/bin/zsh -lc 'git status --short'",
                     cwd: workspaceURL.path,
-                    status: .running,
+                    status: .inProgress,
                     startedAt: startedAt,
                     processID: "123",
                     source: .agent
@@ -9514,7 +9454,7 @@ struct CodexModelContextTests {
                 turns: [
                     .init(
                         id: "turn-live",
-                        status: .running,
+                        state: .inProgress,
                         itemsLoadState: .full,
                         items: [
                             .init(
@@ -9523,7 +9463,7 @@ struct CodexModelContextTests {
                                 content: .command(.init(
                                     command: "/bin/zsh -lc 'git status --short'",
                                     cwd: workspaceURL.path,
-                                    status: .running,
+                                    status: .inProgress,
                                     processID: "123",
                                     source: .agent
                                 ))
@@ -9602,11 +9542,10 @@ struct CodexModelContextTests {
             ),
             turnID: "turn-review"
         ))
-        _ = started.chat.apply(.turnCompleted(.init(
+        _ = started.chat.apply(.terminal(.completed(.init(
             turnID: "turn-review",
-            status: .completed,
             completedAt: Date(timeIntervalSince1970: 10)
-        )))
+        ))))
 
         started.chat.apply(
             .init(
@@ -9616,7 +9555,7 @@ struct CodexModelContextTests {
                 turns: [
                     .init(
                         id: "turn-review",
-                        status: .completed,
+                        state: .completed,
                         itemsLoadState: .full,
                         items: [
                             .init(
@@ -9695,7 +9634,7 @@ struct CodexModelContextTests {
                 content: .command(.init(
                     command: "/bin/zsh -lc 'git status --short'",
                     cwd: workspaceURL.path,
-                    status: .running,
+                    status: .inProgress,
                     startedAt: startedAt,
                     processID: "123",
                     source: .agent
@@ -9712,7 +9651,7 @@ struct CodexModelContextTests {
                 turns: [
                     .init(
                         id: "turn-rollout",
-                        status: .running,
+                        state: .inProgress,
                         itemsLoadState: .full,
                         items: [
                             .init(
@@ -9735,7 +9674,7 @@ struct CodexModelContextTests {
                                 content: .command(.init(
                                     command: "/bin/zsh -lc 'git status --short'",
                                     cwd: workspaceURL.path,
-                                    status: .running,
+                                    status: .inProgress,
                                     processID: "123",
                                     source: .agent
                                 ))
@@ -9824,7 +9763,7 @@ struct CodexModelContextTests {
                 turns: [
                     .init(
                         id: "rollout-read-1",
-                        status: .running,
+                        state: .inProgress,
                         itemsLoadState: .full,
                         items: [
                             .init(
@@ -9853,7 +9792,7 @@ struct CodexModelContextTests {
                 content: .command(.init(
                     command: "/bin/zsh -lc 'swift test'",
                     cwd: workspaceURL.path,
-                    status: .running,
+                    status: .inProgress,
                     startedAt: startedAt,
                     processID: "42",
                     source: .agent
@@ -9871,7 +9810,7 @@ struct CodexModelContextTests {
                 turns: [
                     .init(
                         id: "rollout-read-2",
-                        status: .running,
+                        state: .inProgress,
                         itemsLoadState: .full,
                         items: [
                             .init(
@@ -9894,7 +9833,7 @@ struct CodexModelContextTests {
                                 content: .command(.init(
                                     command: "/bin/zsh -lc 'swift test'",
                                     cwd: workspaceURL.path,
-                                    status: .running,
+                                    status: .inProgress,
                                     processID: "42",
                                     source: .agent
                                 ))
@@ -9983,7 +9922,7 @@ struct CodexModelContextTests {
                 turns: [
                     .init(
                         id: "rollout-read-1",
-                        status: .running,
+                        state: .inProgress,
                         itemsLoadState: .full,
                         items: [
                             .init(
@@ -10056,7 +9995,7 @@ struct CodexModelContextTests {
                 turns: [
                     .init(
                         id: "rollout-old-review",
-                        status: .completed,
+                        state: .completed,
                         itemsLoadState: .full,
                         items: [
                             .init(
@@ -10101,7 +10040,7 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadTurns(.init(turns: [
             .init(
                 id: "turn-review",
-                status: .running,
+                state: .inProgress,
                 itemsLoadState: .full,
                 items: [
                     .init(
@@ -10405,8 +10344,25 @@ private struct TurnCompletedParams: Encodable, Sendable {
 
     struct Turn: Encodable, Sendable {
         var id: String
-        var status: String?
+        var status: String
         var completedAt: Int?
+        var error: Error?
+
+        init(
+            id: String,
+            status: String,
+            completedAt: Int? = nil,
+            error: Error? = nil
+        ) {
+            self.id = id
+            self.status = status
+            self.completedAt = completedAt
+            self.error = error
+        }
+    }
+
+    struct Error: Encodable, Sendable {
+        var message: String
     }
 }
 
