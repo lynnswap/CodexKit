@@ -11,15 +11,16 @@ package actor AppServerProcessTransport: JSONRPC.Transport {
         package var arguments: [String]
         package var environment: [String: String]
         package var codexHomeURL: URL
-        package var serverRequestHandler: CodexAppServerRequestHandler
+        package var clock: CodexAppServerClock
+        package var serverRequestHandler: CodexAppServerRequestHandler?
 
         package init(
             executable: String? = nil,
             arguments: [String]? = nil,
             environment: [String: String] = ProcessInfo.processInfo.environment,
             codexHomeURL: URL,
-            serverRequestHandler: @escaping CodexAppServerRequestHandler =
-                CodexAppServer.Configuration.defaultServerRequestHandler
+            clock: CodexAppServerClock = .init(),
+            serverRequestHandler: CodexAppServerRequestHandler? = nil
         ) {
             let resolvedExecutable = executable.map {
                 CodexAppServerExecutable.resolveExecutable($0, environment: environment)
@@ -35,6 +36,7 @@ package actor AppServerProcessTransport: JSONRPC.Transport {
                 codexHomeURL: codexHomeURL
             )
             self.codexHomeURL = codexHomeURL
+            self.clock = clock
             self.serverRequestHandler = serverRequestHandler
         }
     }
@@ -49,6 +51,7 @@ package actor AppServerProcessTransport: JSONRPC.Transport {
     private let stderr: Pipe
     private let stdoutEvents: AppServerPipeReadEventSource
     private let stderrEvents: AppServerPipeReadEventSource
+    private let serverRequestCodec = CodexAppServerRequestCodec()
     private let serverRequestHandler: CodexAppServerRequestHandler
     private var framer = JSONRPC.Framer()
     private var pending: [Int: PendingResponse] = [:]
@@ -95,6 +98,7 @@ package actor AppServerProcessTransport: JSONRPC.Transport {
         self.stdout = stdout
         self.stderr = stderr
         self.serverRequestHandler = configuration.serverRequestHandler
+            ?? CodexAppServer.Configuration.defaultServerRequestHandler(clock: configuration.clock)
         let stdoutEvents = AppServerPipeReadEventSource(
             fileHandle: stdout.fileHandleForReading,
             label: "com.lynnpd.CodexAppServerKit.app-server.stdout"
@@ -248,15 +252,31 @@ package actor AppServerProcessTransport: JSONRPC.Transport {
     }
 
     private func processServerRequest(method: String, object: [String: Any]) {
+        guard let id = CodexServerRequestID(jsonObject: object["id"]) else {
+            logger.error(
+                "Failed to decode app-server request \(method, privacy: .public): invalid id"
+            )
+            return
+        }
         do {
-            let request = try Self.serverRequest(method: method, object: object)
+            let params = object["params"] ?? [:]
+            let data = try Self.responsePayloadData(from: params)
+            let request = try serverRequestCodec.decode(method: method, params: data)
             Task {
-                await self.respond(to: request)
+                await self.respond(to: id, request: request)
             }
         } catch {
             logger.error(
                 "Failed to decode app-server request \(method, privacy: .public): \(error.localizedDescription, privacy: .public)"
             )
+            Task {
+                self.respond(
+                    to: id,
+                    response: CodexAppServerRequestCodec.internalError(
+                        "Failed to decode \(method): \(error.localizedDescription)"
+                    )
+                )
+            }
         }
     }
 
@@ -296,50 +316,34 @@ package actor AppServerProcessTransport: JSONRPC.Transport {
         return try JSONSerialization.data(withJSONObject: result, options: [.fragmentsAllowed])
     }
 
-    private static func serverRequest(
-        method: String,
-        object: [String: Any]
-    ) throws -> CodexAppServerRequest {
-        guard let id = CodexAppServerRequest.ID(jsonObject: object["id"]) else {
-            throw JSONRPC.Error.invalidMessage("Server request has an invalid id.")
-        }
-        let params = object["params"] ?? [:]
-        let data = try responsePayloadData(from: params)
-        return CodexAppServerRequest(id: id, method: method, params: data)
+    private func respond(
+        to id: CodexServerRequestID,
+        request: CodexAppServerRequest
+    ) async {
+        let response = await serverRequestCodec.handle(request, using: serverRequestHandler)
+        respond(to: id, response: response)
     }
 
-    private func respond(to request: CodexAppServerRequest) async {
+    private func respond(
+        to id: CodexServerRequestID,
+        response: CodexServerRequestResponse
+    ) {
         do {
-            let response = try await serverRequestHandler(request)
-            let payload = try Self.serverRequestResponsePayload(
-                id: request.id,
-                response: response
-            )
+            let payload = try Self.serverRequestResponsePayload(id: id, response: response)
             try stdin.fileHandleForWriting.write(contentsOf: payload)
         } catch {
-            do {
-                let payload = try Self.serverRequestResponsePayload(
-                    id: request.id,
-                    response: .error(
-                        code: -32000,
-                        message: "App-server request failed: \(error.localizedDescription)"
-                    )
-                )
-                try stdin.fileHandleForWriting.write(contentsOf: payload)
-            } catch {
-                logger.error(
-                    "Failed to respond to app-server request \(request.method, privacy: .public): \(error.localizedDescription, privacy: .public)"
-                )
-            }
+            logger.error(
+                "Failed to respond to app-server request: \(error.localizedDescription, privacy: .public)"
+            )
         }
     }
 
     package static func serverRequestResponsePayload(
-        id: CodexAppServerRequest.ID,
-        response: CodexAppServerResponse
+        id: CodexServerRequestID,
+        response: CodexServerRequestResponse
     ) throws -> Data {
         let payload: [String: Any]
-        switch response.payload {
+        switch response {
         case .result(let result):
             payload = [
                 "id": id.jsonObject,

@@ -113,12 +113,8 @@ public actor CodexAppServer {
         public var deadlines: Deadlines
 
         package var deadlineClock: CodexDeadlineClock
-
-        /// Handles JSON-RPC requests initiated by the app-server.
-        ///
-        /// App-server uses these requests for host-side decisions such as
-        /// command approvals, file-change approvals, and user-input prompts.
-        public var serverRequestHandler: CodexAppServerRequestHandler
+        package var clock: CodexAppServerClock
+        package var serverRequestHandler: CodexAppServerRequestHandler?
 
         /// Creates a configuration for a Codex app-server container.
         ///
@@ -126,21 +122,19 @@ public actor CodexAppServer {
         ///   - localProcess: Local process launch settings.
         ///   - clientName: Client name sent during app-server initialization.
         ///   - clientVersion: Client version sent during app-server initialization.
-        ///   - serverRequestHandler: Handler for app-server-initiated JSON-RPC requests.
         public init(
             localProcess: LocalProcess = .init(),
             clientName: String = "CodexAppServerKit",
             clientVersion: String = "1",
-            deadlines: Deadlines = .init(),
-            serverRequestHandler: @escaping CodexAppServerRequestHandler =
-                Self.defaultServerRequestHandler
+            deadlines: Deadlines = .init()
         ) {
             self.localProcess = localProcess
             self.clientName = clientName
             self.clientVersion = clientVersion
             self.deadlines = deadlines
             self.deadlineClock = .continuous
-            self.serverRequestHandler = serverRequestHandler
+            self.clock = .init()
+            self.serverRequestHandler = nil
         }
 
         package init(
@@ -149,30 +143,23 @@ public actor CodexAppServer {
             clientVersion: String = "1",
             deadlines: Deadlines = .init(),
             deadlineClock: CodexDeadlineClock,
-            serverRequestHandler: @escaping CodexAppServerRequestHandler =
-                Self.defaultServerRequestHandler
+            clock: CodexAppServerClock = .init(),
+            serverRequestHandler: CodexAppServerRequestHandler? = nil
         ) {
             self.localProcess = localProcess
             self.clientName = clientName
             self.clientVersion = clientVersion
             self.deadlines = deadlines
             self.deadlineClock = deadlineClock
+            self.clock = clock
             self.serverRequestHandler = serverRequestHandler
         }
 
-        private struct ApprovalDeclineResponse: Encodable {
-            var decision: String
-        }
-
-        public static func defaultServerRequestHandler(
-            request: CodexAppServerRequest
-        ) async throws -> CodexAppServerResponse {
-            switch request.method {
-            case "item/commandExecution/requestApproval",
-                 "item/fileChange/requestApproval":
-                try .result(ApprovalDeclineResponse(decision: "decline"))
-            default:
-                try .emptyResult()
+        package static func defaultServerRequestHandler(
+            clock: CodexAppServerClock
+        ) -> CodexAppServerRequestHandler {
+            { request in
+                CodexAppServerRequestCodec.builtInResolution(for: request, clock: clock)
             }
         }
     }
@@ -199,6 +186,7 @@ public actor CodexAppServer {
             arguments: configuration.localProcess.arguments,
             environment: configuration.localProcess.environment,
             codexHomeURL: configuration.localProcess.codexHomeURL,
+            clock: configuration.clock,
             serverRequestHandler: configuration.serverRequestHandler
         )
         let transport: AppServerProcessTransport

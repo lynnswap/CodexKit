@@ -110,7 +110,7 @@ struct CodexAppServerKitTests {
 
         try """
             #!/bin/sh
-            printf '%s\\n' '{"id":"approval-1","method":"item/commandExecution/requestApproval","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"item-1"}}'
+            printf '%s\\n' '{"id":"approval-1","method":"item/commandExecution/requestApproval","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"item-1","startedAtMs":123}}'
             IFS= read -r line
             printf '%s\\n' "$line" > "$RESPONSE_PATH"
             """
@@ -129,7 +129,7 @@ struct CodexAppServerKitTests {
                 codexHomeURL: rootURL.appendingPathComponent("codex-home", isDirectory: true),
                 serverRequestHandler: { request in
                     await recorder.append(request)
-                    return try .result(["decision": "accept"])
+                    return .approval(.accept)
                 }
             )
         )
@@ -145,12 +145,15 @@ struct CodexAppServerKitTests {
         #expect(wroteResponse)
 
         let request = try #require(await recorder.requests().first)
-        #expect(request.id == .string("approval-1"))
         #expect(request.method == "item/commandExecution/requestApproval")
-        let requestParams = try #require(
-            JSONSerialization.jsonObject(with: request.params) as? [String: Any]
-        )
-        #expect(requestParams["threadId"] as? String == "thread-1")
+        guard case .commandExecutionApproval(let approval) = request else {
+            Issue.record("Expected a command execution approval request.")
+            return
+        }
+        #expect(approval.threadID == "thread-1")
+        #expect(approval.turnID == "turn-1")
+        #expect(approval.itemID == "item-1")
+        #expect(approval.startedAtMs == 123)
 
         let responseData = try Data(contentsOf: responseURL)
         let response = try #require(
