@@ -349,6 +349,128 @@ struct CodexAppServerKitTests {
         #expect(params.model == nil)
     }
 
+    @Test func resumedThreadSeedsNestedTerminalReceivedBeforeResumeResponse() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let gate = CodexAppServerTestGate()
+        try await runtime.transport.enqueueThreadResume(.init(
+            id: "thread-resume-terminal",
+            turns: [.init(id: "turn-resume-terminal", state: .inProgress)]
+        ))
+        await runtime.transport.holdNext(method: "thread/resume", gate: gate)
+
+        let resumeTask = Task {
+            try await runtime.server.resumeThread("thread-resume-terminal")
+        }
+        await runtime.transport.waitForRequest(method: "thread/resume")
+        try await runtime.transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(
+                id: "turn-resume-terminal",
+                status: "completed"
+            ))
+        )
+        await gate.open()
+        let thread = try await resumeTask.value
+        try await runtime.transport.emitServerNotification(
+            method: "thread/closed",
+            params: ThreadIDParams(threadID: "thread-resume-terminal")
+        )
+
+        let events = try await collect(thread.events)
+        #expect(events.contains(.terminal(.completed(.init(turnID: "turn-resume-terminal")))))
+    }
+
+    @Test func resumedThreadTransfersNestedMalformedTerminalFailureAfterAssociation() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let gate = CodexAppServerTestGate()
+        try await runtime.transport.enqueueThreadResume(.init(
+            id: "thread-resume-malformed",
+            turns: [.init(id: "turn-resume-malformed", state: .inProgress)]
+        ))
+        await runtime.transport.holdNext(method: "thread/resume", gate: gate)
+
+        let resumeTask = Task {
+            try await runtime.server.resumeThread("thread-resume-malformed")
+        }
+        await runtime.transport.waitForRequest(method: "thread/resume")
+        await runtime.transport.emitServerNotificationJSON(
+            method: "turn/completed",
+            json: #"{"turn":{"id":"turn-resume-malformed"}}"#
+        )
+        await gate.open()
+        let thread = try await resumeTask.value
+
+        do {
+            _ = try await collect(thread.events)
+            Issue.record("Expected associated malformed terminal failure.")
+        } catch let error as CodexAppServerError {
+            guard case .malformedNotification(let failure) = error else {
+                Issue.record("Expected malformed terminal failure, got \(error).")
+                return
+            }
+            #expect(failure.method == "turn/completed")
+            #expect(failure.rawData == Data(#"{"turn":{"id":"turn-resume-malformed"}}"#.utf8))
+        }
+    }
+
+    @Test func threadReadSeedsNestedTerminalReceivedBeforeReadResponse() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-read-terminal"))
+        let thread = try await runtime.server.resumeThread("thread-read-terminal")
+        let gate = CodexAppServerTestGate()
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-read-terminal",
+            turns: [.init(id: "turn-read-terminal", state: .inProgress)]
+        ))
+        await runtime.transport.holdNext(method: "thread/read", gate: gate)
+
+        let readTask = Task { try await thread.read(includeTurns: true) }
+        await runtime.transport.waitForRequest(method: "thread/read")
+        try await runtime.transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(id: "turn-read-terminal", status: "completed"))
+        )
+        await gate.open()
+        _ = try await readTask.value
+        try await runtime.transport.emitServerNotification(
+            method: "thread/closed",
+            params: ThreadIDParams(threadID: "thread-read-terminal")
+        )
+
+        let events = try await collect(thread.events)
+        #expect(events.contains(.terminal(.completed(.init(turnID: "turn-read-terminal")))))
+    }
+
+    @Test func turnListSeedsNestedTerminalReceivedBeforeListResponse() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-list-turns-terminal"))
+        let thread = try await runtime.server.resumeThread("thread-list-turns-terminal")
+        let gate = CodexAppServerTestGate()
+        try await runtime.transport.enqueueThreadTurns(.init(turns: [
+            .init(id: "turn-list-turns-terminal", state: .inProgress),
+        ]))
+        await runtime.transport.holdNext(method: "thread/turns/list", gate: gate)
+
+        let listTask = Task { try await thread.listTurns() }
+        await runtime.transport.waitForRequest(method: "thread/turns/list")
+        try await runtime.transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(
+                id: "turn-list-turns-terminal",
+                status: "completed"
+            ))
+        )
+        await gate.open()
+        _ = try await listTask.value
+        try await runtime.transport.emitServerNotification(
+            method: "thread/closed",
+            params: ThreadIDParams(threadID: "thread-list-turns-terminal")
+        )
+
+        let events = try await collect(thread.events)
+        #expect(events.contains(.terminal(.completed(.init(turnID: "turn-list-turns-terminal")))))
+    }
+
     @Test func appServerStartReviewStartsThreadThenReview() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         try await runtime.transport.enqueueThreadStart(threadID: "thread-source", model: "gpt-5")
@@ -971,6 +1093,14 @@ struct CodexAppServerKitTests {
             params: TurnCompletedParams(turn: .init(id: "turn-terminal-replay", status: "completed"))
         )
         let firstTerminalEvents = try await collect(firstTerminalStream)
+        await transport.emitServerNotificationJSON(
+            method: "turn/completed",
+            json: #"{"turn":{"id":"turn-terminal-replay"}}"#
+        )
+        try await transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(id: "turn-terminal-replay", status: "completed"))
+        )
         let lateTerminalEvents = try await collect(await router.events(for: terminalTurnID))
         #expect(firstTerminalEvents == lateTerminalEvents)
         #expect(firstTerminalEvents.count == 1)
@@ -982,6 +1112,10 @@ struct CodexAppServerKitTests {
             json: #"{"turn":{"id":"turn-failure-replay"}}"#
         )
         let firstFailure = await terminalStreamFailure(firstFailureStream)
+        try await transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(id: "turn-failure-replay", status: "completed"))
+        )
         let lateFailure = await terminalStreamFailure(
             await router.events(for: failureTurnID)
         )
@@ -2843,6 +2977,84 @@ struct CodexAppServerKitTests {
             #expect(failure.method == "ping")
             #expect(failure.purpose == .operation("ping"))
             #expect(duration == .seconds(5))
+        }
+    }
+
+    @Test func requestDeadlineBoundsOverloadBackoffAndEntireRetryLoop() async throws {
+        let transport = CodexAppServerTestTransport()
+        await transport.enqueueFailure(code: -32_001, message: "busy", for: "ping")
+        let backoffStarted = TestSignal()
+        let backoffCancelled = TestSignal()
+        let backoffWaiter = TestCancellationWaiter {
+            backoffCancelled.signal()
+        }
+        let deadlineGate = CodexAppServerTestGate()
+        let deadlineReturned = TestSignal()
+        let client = AppServerClient(
+            transport: transport,
+            deadlineClock: .init { duration in
+                #expect(duration == .seconds(5))
+                await deadlineGate.waitIgnoringCancellation()
+                deadlineReturned.signal()
+            },
+            overloadRetryDelay: { attempt in
+                #expect(attempt == 0)
+                return .seconds(30)
+            },
+            retrySleep: { duration in
+                #expect(duration == .seconds(30))
+                backoffStarted.signal()
+                try await backoffWaiter.wait()
+            }
+        )
+
+        let task = Task {
+            let _: EmptyResponse = try await client.send(
+                method: "ping",
+                params: EmptyResponse(),
+                responseType: EmptyResponse.self,
+                purpose: .operation("ping"),
+                deadline: .seconds(5)
+            )
+        }
+        await backoffStarted.wait()
+        await deadlineGate.open()
+        await deadlineReturned.wait()
+        await backoffCancelled.wait()
+
+        do {
+            try await task.value
+            Issue.record("Expected request deadline during overload backoff.")
+        } catch let error as CodexAppServerError {
+            #expect(error == .request(.init(
+                requestID: 1,
+                method: "ping",
+                purpose: .operation("ping"),
+                kind: .deadlineExceeded(.seconds(5))
+            )))
+        }
+        #expect(await transport.recordedRequests(method: "ping").count == 1)
+    }
+
+    @Test func overloadBackoffCancellationIsNeverWrapped() async throws {
+        let transport = CodexAppServerTestTransport()
+        await transport.enqueueFailure(code: -32_001, message: "busy", for: "ping")
+        let client = AppServerClient(
+            transport: transport,
+            overloadRetryDelay: { _ in .seconds(30) },
+            retrySleep: { _ in throw CancellationError() }
+        )
+
+        do {
+            let _: EmptyResponse = try await client.send(
+                method: "ping",
+                params: EmptyResponse(),
+                responseType: EmptyResponse.self
+            )
+            Issue.record("Expected CancellationError.")
+        } catch is CancellationError {
+        } catch {
+            Issue.record("Expected CancellationError, got \(error).")
         }
     }
 

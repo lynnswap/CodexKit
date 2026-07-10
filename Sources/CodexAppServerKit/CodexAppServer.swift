@@ -432,7 +432,7 @@ public actor CodexAppServer {
                     params: threadStartParams(options: options)
                 ))
         }
-        return thread(from: response.thread, model: response.model ?? options.model)
+        return await thread(from: response.thread, model: response.model ?? options.model)
     }
 
     /// Restores a persisted app-server review run as a live review session handle.
@@ -641,7 +641,7 @@ public actor CodexAppServer {
                 threadID: id.rawValue,
                 params: threadStartParams(options: options)
             ))
-        return thread(from: response.thread)
+        return await thread(from: response.thread)
     }
 
     /// Restores an archived Codex thread.
@@ -651,12 +651,14 @@ public actor CodexAppServer {
     /// - Throws: A transport, JSON-RPC, or app-server request error.
     public func unarchiveThread(_ id: CodexThreadID) async throws -> CodexThread {
         let response = try await sendUnarchiveThread(id)
-        return thread(from: response.thread)
+        return await thread(from: response.thread)
     }
 
     package func unarchiveThreadSnapshot(_ id: CodexThreadID) async throws -> CodexThreadSnapshot {
         let response = try await sendUnarchiveThread(id)
-        return Self.threadSnapshot(from: response.thread, includesTurns: false)
+        let snapshot = Self.threadSnapshot(from: response.thread, includesTurns: false)
+        await router.seedTurns(snapshot.turns, threadID: id)
+        return snapshot
     }
 
     private func sendUnarchiveThread(
@@ -710,8 +712,12 @@ public actor CodexAppServer {
                     sourceKinds: query.sourceKinds?.map(\.rawValue),
                     useStateDbOnly: query.useStateDBOnly
                 )))
+        let snapshots = response.data.map { Self.threadSnapshot(from: $0, includesTurns: false) }
+        for snapshot in snapshots {
+            await router.seedTurns(snapshot.turns, threadID: snapshot.id)
+        }
         return .init(
-            threads: response.data.map { Self.threadSnapshot(from: $0, includesTurns: false) },
+            threads: snapshots,
             nextCursor: response.nextCursor,
             backwardsCursor: response.backwardsCursor
         )
@@ -931,9 +937,17 @@ public actor CodexAppServer {
         )
     }
 
-    private func thread(from snapshot: AppServerAPI.Thread.Snapshot, model: String? = nil) -> CodexThread {
-        CodexThread(
-            id: .init(rawValue: snapshot.id),
+    private func thread(
+        from snapshot: AppServerAPI.Thread.Snapshot,
+        model: String? = nil
+    ) async -> CodexThread {
+        let threadID = CodexThreadID(rawValue: snapshot.id)
+        await router.seedTurns(
+            snapshot.turns.map(Self.turnSnapshots(from:)),
+            threadID: threadID
+        )
+        return CodexThread(
+            id: threadID,
             workspace: snapshot.cwd.map { URL(fileURLWithPath: $0, isDirectory: true) },
             model: model,
             client: client,

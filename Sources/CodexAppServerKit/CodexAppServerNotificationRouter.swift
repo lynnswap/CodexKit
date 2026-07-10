@@ -1,4 +1,10 @@
 import Foundation
+import OSLog
+
+private let notificationRouterLogger = Logger(
+    subsystem: "CodexAppServerKit",
+    category: "notification-router"
+)
 
 package actor CodexAppServerNotificationRouter {
     private struct TurnSubscriber {
@@ -15,11 +21,16 @@ package actor CodexAppServerNotificationRouter {
         var turnID: CodexTurnID?
     }
 
+    private enum TurnTerminalDecision: Equatable {
+        case outcome(CodexTurnOutcome)
+        case failure(CodexAppServerError)
+    }
+
     private let client: AppServerClient
     private var routerTask: Task<Void, Never>?
     private var threadIDByTurnID: [CodexTurnID: CodexThreadID] = [:]
     private var turnHistoryByTurnID: [CodexTurnID: [CodexTurnEvent]] = [:]
-    private var turnFailureByTurnID: [CodexTurnID: CodexAppServerError] = [:]
+    private var terminalDecisionByTurnID: [CodexTurnID: TurnTerminalDecision] = [:]
     private var threadHistoryByThreadID: [CodexThreadID: [CodexThreadEvent]] = [:]
     private var threadFailureByThreadID: [CodexThreadID: CodexAppServerError] = [:]
     private var threadGenerationStartByThreadID: [CodexThreadID: ThreadGenerationStart] = [:]
@@ -151,10 +162,7 @@ package actor CodexAppServerNotificationRouter {
 
     package func seedTurn(_ turnID: CodexTurnID, threadID: CodexThreadID) {
         threadIDByTurnID[turnID] = threadID
-        guard let turnHistory = turnHistoryByTurnID[turnID] else {
-            return
-        }
-        for turnEvent in turnHistory {
+        for turnEvent in turnHistoryByTurnID[turnID] ?? [] {
             let threadEvent = Self.threadEvent(
                 from: turnEvent,
                 turnID: turnID,
@@ -164,6 +172,19 @@ package actor CodexAppServerNotificationRouter {
                 continue
             }
             appendThreadEvent(threadEvent, threadID: threadID)
+        }
+        if case .failure(let failure) = terminalDecisionByTurnID[turnID] {
+            threadFailureByThreadID[threadID] = failure
+            finishThreadSubscribers(threadID: threadID, throwing: failure)
+        }
+    }
+
+    package func seedTurns(
+        _ turns: [CodexTurnSnapshot]?,
+        threadID: CodexThreadID
+    ) {
+        for turn in turns ?? [] {
+            seedTurn(turn.id, threadID: threadID)
         }
     }
 
@@ -301,23 +322,27 @@ package actor CodexAppServerNotificationRouter {
         if method == "turn/completed" {
             do {
                 let outcome = try terminalOutcome(from: params, context: context)
-                if let threadID = context.threadID {
+                let turnID = context.turnID ?? outcome.response.turnID
+                guard recordTerminalDecision(.outcome(outcome), turnID: turnID) else {
+                    return
+                }
+                if let threadID = context.threadID ?? threadIDByTurnID[turnID] {
                     appendThreadEvent(.terminal(outcome), threadID: threadID)
                 }
-                if let turnID = context.turnID {
-                    let event = CodexTurnEvent.terminal(outcome)
-                    turnHistoryByTurnID[turnID, default: []].append(event)
-                    if let subscribers = turnSubscribersByTurnID[turnID] {
-                        for subscriber in subscribers.values {
-                            subscriber.continuation.yield(event)
-                        }
+                let event = CodexTurnEvent.terminal(outcome)
+                turnHistoryByTurnID[turnID, default: []].append(event)
+                if let subscribers = turnSubscribersByTurnID[turnID] {
+                    for subscriber in subscribers.values {
+                        subscriber.continuation.yield(event)
                     }
-                    finishTurnSubscribers(turnID: turnID)
                 }
+                finishTurnSubscribers(turnID: turnID)
             } catch {
                 let failure = Self.notificationError(from: error, method: method, rawData: params)
                 if let turnID = context.turnID {
-                    turnFailureByTurnID[turnID] = failure
+                    guard recordTerminalDecision(.failure(failure), turnID: turnID) else {
+                        return
+                    }
                     finishTurnSubscribers(turnID: turnID, throwing: failure)
                 }
                 if let threadID = context.threadID {
@@ -384,12 +409,13 @@ package actor CodexAppServerNotificationRouter {
         for event in history {
             continuation.yield(event)
         }
-        if history.contains(where: Self.isTerminalTurnEvent) {
-            continuation.finish()
-            return
-        }
-        if let failure = turnFailureByTurnID[turnID] {
-            continuation.finish(throwing: failure)
+        if let decision = terminalDecisionByTurnID[turnID] {
+            switch decision {
+            case .outcome:
+                continuation.finish()
+            case .failure(let failure):
+                continuation.finish(throwing: failure)
+            }
             return
         }
         turnSubscribersByTurnID[turnID, default: [:]][subscriptionID] = .init(
@@ -605,7 +631,7 @@ package actor CodexAppServerNotificationRouter {
     }
 
     private func hasTerminalTurnEvent(threadID: CodexThreadID, turnID: CodexTurnID) -> Bool {
-        if turnHistoryByTurnID[turnID]?.contains(where: Self.isTerminalTurnEvent) == true {
+        if terminalDecisionByTurnID[turnID] != nil {
             return true
         }
         return threadHistoryByThreadID[threadID]?.contains {
@@ -928,6 +954,26 @@ package actor CodexAppServerNotificationRouter {
         for subscriber in threadSubscribers {
             subscriber.continuation.finish(throwing: error)
         }
+    }
+
+    private func recordTerminalDecision(
+        _ decision: TurnTerminalDecision,
+        turnID: CodexTurnID
+    ) -> Bool {
+        guard let existing = terminalDecisionByTurnID[turnID] else {
+            terminalDecisionByTurnID[turnID] = decision
+            return true
+        }
+        if existing != decision {
+            notificationRouterLogger.error(
+                "Ignoring conflicting terminal decision for turn \(turnID.rawValue, privacy: .public)"
+            )
+        } else {
+            notificationRouterLogger.debug(
+                "Ignoring duplicate terminal decision for turn \(turnID.rawValue, privacy: .public)"
+            )
+        }
+        return false
     }
 
     private nonisolated static func notificationError(

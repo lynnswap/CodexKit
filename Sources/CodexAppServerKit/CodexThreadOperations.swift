@@ -270,7 +270,12 @@ extension CodexThread {
             AppServerAPI.Thread.Read.Request(
                 params: .init(threadID: id.rawValue, includeTurns: includeTurns)
             ))
-        return CodexAppServer.threadSnapshot(from: response.thread, includesTurns: includeTurns)
+        let snapshot = CodexAppServer.threadSnapshot(
+            from: response.thread,
+            includesTurns: includeTurns
+        )
+        await router.seedTurns(snapshot.turns, threadID: id)
+        return snapshot
     }
 
     /// Lists this thread's turns.
@@ -289,8 +294,10 @@ extension CodexThread {
                     itemsLoadState: query.itemsLoadState
                 )
             ))
+        let turns = CodexAppServer.turnSnapshots(from: response.data)
+        await router.seedTurns(turns, threadID: id)
         return .init(
-            turns: CodexAppServer.turnSnapshots(from: response.data),
+            turns: turns,
             nextCursor: response.nextCursor,
             backwardsCursor: response.backwardsCursor
         )
@@ -332,7 +339,9 @@ extension CodexThread {
             AppServerAPI.Thread.Unarchive.Request(
                 params: .init(threadID: id.rawValue)
             ))
-        return CodexAppServer.threadSnapshot(from: response.thread, includesTurns: false)
+        let snapshot = CodexAppServer.threadSnapshot(from: response.thread, includesTurns: false)
+        await router.seedTurns(snapshot.turns, threadID: id)
+        return snapshot
     }
 
     /// Rolls this thread back by the specified number of turns.

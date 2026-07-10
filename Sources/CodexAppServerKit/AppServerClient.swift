@@ -126,8 +126,8 @@ package actor AppServerClient {
         deadline: Duration? = nil,
         afterResponse: @escaping @Sendable (Response) async throws -> Void = { _ in }
     ) async throws -> Response {
-        try await serializer.run(scope: scope) { [transport, encoder, decoder, self] in
-            var requestID = await self.allocateRequestID()
+        try await serializer.run(scope: scope) { [encoder, self] in
+            let requestID = await self.allocateRequestID()
             let requestPurpose = purpose ?? .operation(method)
             let encodedParams: Data
             do {
@@ -142,141 +142,149 @@ package actor AppServerClient {
                     kind: .encode(message: error.localizedDescription)
                 ))
             }
-            var retryAttempt = 0
-            while true {
-                let attemptRequestID = requestID
-                logger.debug(
-                    "JSON-RPC request \(attemptRequestID, privacy: .public) -> \(method, privacy: .public)"
+            let initialRequestID = requestID
+            let operation = { @Sendable [self] in
+                try await performRequestWithRetries(
+                    initialRequestID: initialRequestID,
+                    method: method,
+                    encodedParams: encodedParams,
+                    responseType: responseType,
+                    purpose: requestPurpose,
+                    afterResponse: afterResponse
                 )
+            }
+            guard let deadline else {
+                return try await operation()
+            }
+            do {
+                return try await self.runWithDeadline(deadline, operation: operation)
+            } catch is RequestDeadlineExpired {
+                throw CodexAppServerError.request(.init(
+                    requestID: initialRequestID,
+                    method: method,
+                    purpose: requestPurpose,
+                    kind: .deadlineExceeded(deadline)
+                ))
+            }
+        }
+    }
+
+    private func performRequestWithRetries<Response: Decodable & Sendable>(
+        initialRequestID: Int,
+        method: String,
+        encodedParams: Data,
+        responseType: Response.Type,
+        purpose: CodexRequestPurpose,
+        afterResponse: @escaping @Sendable (Response) async throws -> Void
+    ) async throws -> Response {
+        var requestID = initialRequestID
+        var retryAttempt = 0
+        while true {
+            let attemptRequestID = requestID
+            logger.debug(
+                "JSON-RPC request \(attemptRequestID, privacy: .public) -> \(method, privacy: .public)"
+            )
+            do {
+                let rawResponse: Data
                 do {
-                    let operation = { @Sendable () async throws -> Response in
-                        let rawResponse: Data
-                        do {
-                            rawResponse = try await transport.send(
-                                .init(
-                                    id: attemptRequestID,
-                                    method: method,
-                                    params: encodedParams
-                                ))
-                        } catch is CancellationError {
-                            throw CancellationError()
-                        } catch let error as JSONRPC.Error {
-                            throw error
-                        } catch {
-                            throw CodexAppServerError.request(.init(
-                                requestID: attemptRequestID,
-                                method: method,
-                                purpose: requestPurpose,
-                                kind: .transport(Self.transportFailure(from: error))
-                            ))
-                        }
-                        let response: Response
-                        do {
-                            response = try decoder.decode(responseType, from: rawResponse)
-                        } catch is CancellationError {
-                            throw CancellationError()
-                        } catch {
-                            throw CodexAppServerError.request(.init(
-                                requestID: attemptRequestID,
-                                method: method,
-                                purpose: requestPurpose,
-                                kind: .invalidResponse(
-                                    expectedType: String(reflecting: responseType),
-                                    message: error.localizedDescription,
-                                    rawData: rawResponse
-                                )
-                            ))
-                        }
-                        do {
-                            try await afterResponse(response)
-                        } catch is CancellationError {
-                            throw CancellationError()
-                        } catch {
-                            throw CodexAppServerError.request(.init(
-                                requestID: attemptRequestID,
-                                method: method,
-                                purpose: requestPurpose,
-                                kind: .write(Self.transportFailure(from: error))
-                            ))
-                        }
-                        return response
-                    }
-                    let response: Response
-                    if let deadline {
-                        do {
-                            response = try await self.runWithDeadline(deadline, operation: operation)
-                        } catch is RequestDeadlineExpired {
-                            throw CodexAppServerError.request(.init(
-                                requestID: attemptRequestID,
-                                method: method,
-                                purpose: requestPurpose,
-                                kind: .deadlineExceeded(deadline)
-                            ))
-                        }
-                    } else {
-                        response = try await operation()
-                    }
-                    logger.debug(
-                        "JSON-RPC response \(attemptRequestID, privacy: .public) <- \(method, privacy: .public)"
-                    )
-                    return response
+                    rawResponse = try await transport.send(.init(
+                        id: attemptRequestID,
+                        method: method,
+                        params: encodedParams
+                    ))
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch let error as JSONRPC.Error {
-                    if case .responseError(let serverError) = error,
-                       serverError.code == Self.appServerOverloadedErrorCode {
-                        guard let delay = overloadRetryDelay(retryAttempt) else {
-                            throw CodexAppServerError.request(.init(
-                                requestID: attemptRequestID,
-                                method: method,
-                                purpose: requestPurpose,
-                                kind: .overloadRetryExhausted(
-                                    last: serverError,
-                                    attempts: retryAttempt + 1
-                                )
-                            ))
-                        }
-                        retryAttempt += 1
-                        logger.warning(
-                            "JSON-RPC request \(attemptRequestID, privacy: .public) overloaded for \(method, privacy: .public); retrying in \(String(describing: delay), privacy: .public)"
-                        )
-                        try await retrySleep(delay)
-                        requestID = await self.allocateRequestID()
-                        continue
-                    }
-                    let failure: CodexRequestFailure.Kind
-                    switch error {
-                    case .responseError(let serverError):
-                        failure = .server(serverError)
-                    case .closed:
-                        throw CodexAppServerError.connectionTerminated(
-                            .transportFailure(.closed)
-                        )
-                    case .invalidMessage(let message):
-                        throw CodexAppServerError.connectionTerminated(.transportFailure(
-                            .protocolViolation(message: message, rawData: nil)
-                        ))
-                    }
-                    let wrapped = CodexAppServerError.request(.init(
-                        requestID: attemptRequestID,
-                        method: method,
-                        purpose: requestPurpose,
-                        kind: failure
-                    ))
-                    logger.error(
-                        "JSON-RPC request \(attemptRequestID, privacy: .public) failed for \(method, privacy: .public): \(wrapped.localizedDescription, privacy: .public)"
-                    )
-                    throw wrapped
-                } catch let error as CodexAppServerError {
                     throw error
                 } catch {
                     throw CodexAppServerError.request(.init(
                         requestID: attemptRequestID,
                         method: method,
-                        purpose: requestPurpose,
+                        purpose: purpose,
                         kind: .transport(Self.transportFailure(from: error))
                     ))
                 }
+                let response: Response
+                do {
+                    response = try decoder.decode(responseType, from: rawResponse)
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    throw CodexAppServerError.request(.init(
+                        requestID: attemptRequestID,
+                        method: method,
+                        purpose: purpose,
+                        kind: .invalidResponse(
+                            expectedType: String(reflecting: responseType),
+                            message: error.localizedDescription,
+                            rawData: rawResponse
+                        )
+                    ))
+                }
+                do {
+                    try await afterResponse(response)
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    throw CodexAppServerError.request(.init(
+                        requestID: attemptRequestID,
+                        method: method,
+                        purpose: purpose,
+                        kind: .write(Self.transportFailure(from: error))
+                    ))
+                }
+                logger.debug(
+                    "JSON-RPC response \(attemptRequestID, privacy: .public) <- \(method, privacy: .public)"
+                )
+                return response
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch let error as JSONRPC.Error {
+                if case .responseError(let serverError) = error,
+                   serverError.code == Self.appServerOverloadedErrorCode {
+                    guard let delay = overloadRetryDelay(retryAttempt) else {
+                        throw CodexAppServerError.request(.init(
+                            requestID: attemptRequestID,
+                            method: method,
+                            purpose: purpose,
+                            kind: .overloadRetryExhausted(
+                                last: serverError,
+                                attempts: retryAttempt + 1
+                            )
+                        ))
+                    }
+                    retryAttempt += 1
+                    logger.warning(
+                        "JSON-RPC request \(attemptRequestID, privacy: .public) overloaded for \(method, privacy: .public); retrying in \(String(describing: delay), privacy: .public)"
+                    )
+                    try await retrySleep(delay)
+                    requestID = allocateRequestID()
+                    continue
+                }
+                switch error {
+                case .responseError(let serverError):
+                    throw CodexAppServerError.request(.init(
+                        requestID: attemptRequestID,
+                        method: method,
+                        purpose: purpose,
+                        kind: .server(serverError)
+                    ))
+                case .closed:
+                    throw CodexAppServerError.connectionTerminated(.transportFailure(.closed))
+                case .invalidMessage(let message):
+                    throw CodexAppServerError.connectionTerminated(.transportFailure(
+                        .protocolViolation(message: message, rawData: nil)
+                    ))
+                }
+            } catch let error as CodexAppServerError {
+                throw error
+            } catch {
+                throw CodexAppServerError.request(.init(
+                    requestID: attemptRequestID,
+                    method: method,
+                    purpose: purpose,
+                    kind: .transport(Self.transportFailure(from: error))
+                ))
             }
         }
     }

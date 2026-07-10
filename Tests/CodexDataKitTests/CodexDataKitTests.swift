@@ -4913,8 +4913,8 @@ struct CodexModelContextTests {
         #expect(params.includeTurns == false)
     }
 
-    @Test("metadata-only chat refresh derives phase from fresh thread status")
-    func metadataOnlyRefreshDerivesPhaseFromFreshThreadStatus() async throws {
+    @Test("metadata-only thread status never synthesizes a terminal turn state")
+    func metadataOnlyThreadStatusNeverSynthesizesTerminalTurnState() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         let context = CodexModelContainer(appServer: runtime.server).mainContext
 
@@ -4929,17 +4929,19 @@ struct CodexModelContextTests {
         try await context.refresh(chat)
         #expect(chat.phase == .loading)
 
-        try await runtime.transport.enqueueThreadResume(.init(id: "thread-metadata-phase"))
-        try await runtime.transport.enqueueThreadRead(.init(
-            id: "thread-metadata-phase",
-            status: .idle
-        ))
+        for status: CodexThreadStatus in [.idle, .notLoaded, .systemError] {
+            try await runtime.transport.enqueueThreadResume(.init(id: "thread-metadata-phase"))
+            try await runtime.transport.enqueueThreadRead(.init(
+                id: "thread-metadata-phase",
+                status: status
+            ))
 
-        try await context.refresh(chat, includeTurns: false)
+            try await context.refresh(chat, includeTurns: false)
 
-        #expect(chat.turn(id: "turn-stale")?.status == .completed)
-        #expect(chat.phase == .loaded)
-        #expect(chat.status == .idle)
+            #expect(chat.turn(id: "turn-stale")?.state == .inProgress)
+            #expect(chat.phase == .loaded)
+            #expect(chat.status == status)
+        }
     }
 
     @Test("turn snapshots without fresh thread status preserve app-server thread status")
@@ -4992,8 +4994,8 @@ struct CodexModelContextTests {
         #expect(chat.phase == .loading)
     }
 
-    @Test("fresh idle thread status wins over stale running turn snapshots")
-    func freshIdleThreadStatusWinsOverStaleRunningTurnSnapshots() async throws {
+    @Test("fresh idle thread status does not rewrite a running turn snapshot")
+    func freshIdleThreadStatusDoesNotRewriteRunningTurnSnapshot() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         let context = CodexModelContainer(appServer: runtime.server).mainContext
 
@@ -5024,8 +5026,8 @@ struct CodexModelContextTests {
         try await context.refresh(chat)
 
         #expect(chat.status == .idle)
-        #expect(chat.phase == .loaded)
-        #expect(chat.turn(id: "turn-stale-running")?.status == .completed)
+        #expect(chat.phase == .loading)
+        #expect(chat.turn(id: "turn-stale-running")?.state == .inProgress)
     }
 
     @Test("server-only chat refresh re-sorts current results")
@@ -5602,7 +5604,7 @@ struct CodexModelContextTests {
         #expect(betaItems.map(\.itemID) == ["message-beta"])
         #expect(alphaItems.first === alphaItem)
         #expect(alphaTurn.status == CodexTurnStatus.completed)
-        #expect(alphaTurn.errorDescription == nil)
+        #expect(alphaTurn.error == nil)
         #expect(alphaTurn.usage == nil)
         #expect(alphaThreadItems.map(\.id) == ["message-alpha-user", "message-alpha-agent"])
         #expect(CodexTranscript(items: alphaThreadItems).finalAnswer == "Alpha answer")
@@ -5635,7 +5637,11 @@ struct CodexModelContextTests {
                 ),
                 .init(
                     id: "turn-failed",
-                    state: .failed(.init(message: "Tool failed")),
+                    state: .failed(.init(
+                        message: "Tool failed",
+                        info: .httpConnectionFailed(httpStatusCode: 503),
+                        additionalDetails: "upstream detail"
+                    )),
                     items: [
                         .init(
                             id: "message-failed",
@@ -5660,7 +5666,11 @@ struct CodexModelContextTests {
 
         let failedTurn = try #require(chat.turn(id: "turn-failed"))
         #expect(failedTurn.status == CodexTurnStatus.failed)
-        #expect(failedTurn.errorDescription == "Tool failed")
+        #expect(failedTurn.error == .init(
+            message: "Tool failed",
+            info: .httpConnectionFailed(httpStatusCode: 503),
+            additionalDetails: "upstream detail"
+        ))
         #expect(failedTurn.usage == nil)
         #expect(chat.turn(id: "turn-missing") == nil)
         #expect(chat.items(in: "turn-missing").isEmpty)
@@ -8031,14 +8041,26 @@ struct CodexModelContextTests {
 
         try await runtime.transport.emitServerNotification(
             method: "turn/completed",
-            params: TurnCompletedParams(turn: .init(
-                id: "turn-failed",
-                status: "failed",
-                error: .init(message: "Tool failed")
-            ))
+            params: TurnCompletedParams(
+                threadID: "thread-failed",
+                turn: .init(
+                    id: "turn-failed",
+                    status: "failed",
+                    error: .init(
+                        message: "Tool failed",
+                        codexErrorInfo: "serverOverloaded",
+                        additionalDetails: "upstream detail"
+                    )
+                )
+            )
         )
 
         #expect(await eventually { chat.phase == .failed("Tool failed") })
+        #expect(chat.turn(id: "turn-failed")?.error == .init(
+            message: "Tool failed",
+            info: .serverOverloaded,
+            additionalDetails: "upstream detail"
+        ))
 
         try await runtime.transport.emitServerNotification(
             method: "thread/status/changed",
@@ -10340,7 +10362,18 @@ private struct ThreadClosedParams: Encodable, Sendable {
 }
 
 private struct TurnCompletedParams: Encodable, Sendable {
+    var threadID: String?
     var turn: Turn
+
+    init(threadID: String? = nil, turn: Turn) {
+        self.threadID = threadID
+        self.turn = turn
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case threadID = "threadId"
+        case turn
+    }
 
     struct Turn: Encodable, Sendable {
         var id: String
@@ -10363,6 +10396,18 @@ private struct TurnCompletedParams: Encodable, Sendable {
 
     struct Error: Encodable, Sendable {
         var message: String
+        var codexErrorInfo: String?
+        var additionalDetails: String?
+
+        init(
+            message: String,
+            codexErrorInfo: String? = nil,
+            additionalDetails: String? = nil
+        ) {
+            self.message = message
+            self.codexErrorInfo = codexErrorInfo
+            self.additionalDetails = additionalDetails
+        }
     }
 }
 

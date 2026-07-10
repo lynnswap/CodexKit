@@ -385,8 +385,7 @@ public final class CodexModelContext {
     package func turn(
         id: CodexTurnID,
         in chat: CodexChat,
-        status: CodexTurnStatus? = nil,
-        errorDescription: String? = nil,
+        state: CodexTurnSnapshot.State? = nil,
         itemsLoadState: CodexTurnItemsLoadState? = nil,
         usage: CodexTokenUsage? = nil
     ) -> CodexTurn {
@@ -398,8 +397,7 @@ public final class CodexModelContext {
             id: id,
             chat: chat,
             modelContext: self,
-            status: status,
-            errorDescription: errorDescription,
+            state: state,
             itemsLoadState: itemsLoadState,
             usage: usage
         )
@@ -609,10 +607,7 @@ public final class CodexModelContext {
         if includeTurns {
             refreshedChat.resetLiveMergeStateFromCurrentItems()
         }
-        refreshedChat.syncPhaseAfterRefresh(
-            includeTurns: includeTurns,
-            refreshedStatus: snapshot.hasField(.status)
-        )
+        refreshedChat.syncPhaseAfterRefresh(includeTurns: includeTurns)
         if emitsResynchronization {
             yield([
                 .resynchronized(reason: .refresh),
