@@ -711,9 +711,6 @@ public final class CodexChat: CodexPersistentModel {
                 }
             }
         }
-        if snapshot.hasField(.status) {
-            _ = terminalizeActiveItems(for: snapshot.status, completedAt: updatedAt)
-        }
     }
 
     package func applyContextArchived(_ isArchived: Bool) {
@@ -1250,18 +1247,10 @@ public final class CodexChat: CodexPersistentModel {
                 changes.appendIfPresent(markRunningIfNeeded())
             case .notLoaded, .idle, .systemError:
                 changes.appendIfPresent(setStatus(status))
-                changes.append(contentsOf: terminalizeActiveItems(
-                    for: status,
-                    completedAt: updatedAt
-                ))
                 markLoadedIfNotFailed()
             }
         case .closed:
             changes.appendIfPresent(setStatus(.notLoaded))
-            changes.append(contentsOf: terminalizeActiveItems(
-                status: .completed,
-                completedAt: updatedAt
-            ))
             markLoadedIfNotFailed()
         case .unknown:
             break
@@ -1655,42 +1644,6 @@ public final class CodexChat: CodexPersistentModel {
             changes.appendIfPresent(changeForUpdatedItem(item, previousItem: previousItem))
         }
         return changes
-    }
-
-    private func terminalizeActiveItems(
-        for threadStatus: CodexThreadStatus?,
-        completedAt: Date?
-    ) -> [CodexChatUpdate] {
-        guard let status = terminalItemStatus(for: threadStatus) else {
-            return []
-        }
-        return terminalizeActiveItems(status: status, completedAt: completedAt)
-    }
-
-    private func terminalizeActiveItems(
-        status: CodexTurnStatus,
-        completedAt: Date?
-    ) -> [CodexChatUpdate] {
-        turns
-            .filter { shouldTerminalizeLifecycleStatus($0.status) }
-            .flatMap {
-                terminalizeActiveItems(
-                    in: $0.id,
-                    status: status,
-                    completedAt: completedAt
-                )
-            }
-    }
-
-    private func terminalItemStatus(for threadStatus: CodexThreadStatus?) -> CodexTurnStatus? {
-        switch threadStatus {
-        case .active, .unknown, .none:
-            nil
-        case .systemError:
-            .failed
-        case .notLoaded, .idle:
-            .completed
-        }
     }
 
     private func itemByApplyingTerminalLifecycleStatus(
@@ -2379,7 +2332,6 @@ public final class CodexChat: CodexPersistentModel {
             phase = .loading
             lastErrorDescription = nil
         case .notLoaded, .idle, .systemError, .unknown, .none:
-            _ = terminalizeActiveItems(for: status, completedAt: updatedAt)
             phase = .loaded
             lastErrorDescription = nil
         }

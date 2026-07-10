@@ -5915,8 +5915,8 @@ struct CodexModelContextTests {
         #expect(completedCommand.completedAt != nil)
     }
 
-    @Test("thread inactive status terminalizes running command items when item completion is omitted")
-    func threadInactiveStatusTerminalizesRunningCommandItemsWhenItemCompletionIsOmitted() async throws {
+    @Test("thread inactive status never synthesizes turn or item completion")
+    func threadInactiveStatusNeverSynthesizesTurnOrItemCompletion() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         let context = CodexModelContainer(appServer: runtime.server).mainContext
 
@@ -5967,22 +5967,18 @@ struct CodexModelContextTests {
             )
         )
 
-        #expect(await eventually {
-            guard case .command(let command) = commandItem.content else {
-                return false
-            }
-            guard let startedAt = command.startedAt,
-                let completedAt = command.completedAt
-            else {
-                return false
-            }
-            return chat.turn(id: "turn-command-status-terminal")?.status == .completed
-                && command.status == .completed
-                && completedAt > startedAt
-        })
-        #expect(await changes.itemUpdated(id: "command-status-terminal") != nil)
+        #expect(await eventually { chat.status == .idle && chat.phase == .loaded })
+        guard case .command(let command) = commandItem.content else {
+            Issue.record("Expected command item")
+            return
+        }
+        #expect(chat.turn(id: "turn-command-status-terminal")?.state == .inProgress)
+        #expect(command.status == .inProgress)
+        #expect(command.startedAt != nil)
+        #expect(command.completedAt == nil)
         #expect(chat.phase == .loaded)
         #expect(chat.status == .idle)
+        withExtendedLifetime(changes) {}
     }
 
     @Test("existing later turn content terminalizes running command when item completion is omitted")
