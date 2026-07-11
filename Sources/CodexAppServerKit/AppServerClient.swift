@@ -148,6 +148,7 @@ package actor AppServerClient {
         _ request: Request,
         onWriteAccepted: @escaping @Sendable () -> Void = {},
         onResponseRejected: @escaping @Sendable () -> Void = {},
+        onResponseAccepted: @escaping @Sendable () -> Void = {},
         onPostWriteCancellation: @escaping @Sendable (Request.Response) async throws -> Void = { _ in }
     ) async throws -> Request.Response {
         try await send(
@@ -159,6 +160,7 @@ package actor AppServerClient {
             deadline: deadlines.request,
             onWriteAccepted: onWriteAccepted,
             onResponseRejected: onResponseRejected,
+            onResponseAccepted: onResponseAccepted,
             onPostWriteCancellation: onPostWriteCancellation
         )
     }
@@ -190,6 +192,7 @@ package actor AppServerClient {
         afterResponse: @escaping @Sendable (Response) async throws -> Void = { _ in },
         onWriteAccepted: @escaping @Sendable () -> Void = {},
         onResponseRejected: @escaping @Sendable () -> Void = {},
+        onResponseAccepted: @escaping @Sendable () -> Void = {},
         onPostWriteCancellation: @escaping @Sendable (Response) async throws -> Void = { _ in }
     ) async throws -> Response {
         try await serializer.run(scope: scope) { [encoder, self] laneToken in
@@ -220,6 +223,7 @@ package actor AppServerClient {
                     afterResponse: afterResponse,
                     onWriteAccepted: onWriteAccepted,
                     onResponseRejected: onResponseRejected,
+                    onResponseAccepted: onResponseAccepted,
                     operationState: state
                 )
                 state.markResponseBound()
@@ -281,6 +285,7 @@ package actor AppServerClient {
         afterResponse: @escaping @Sendable (Response) async throws -> Void,
         onWriteAccepted: @escaping @Sendable () -> Void,
         onResponseRejected: @escaping @Sendable () -> Void,
+        onResponseAccepted: @escaping @Sendable () -> Void,
         operationState: RequestOperationState
     ) async throws -> Response {
         var requestID = initialRequestID
@@ -356,6 +361,7 @@ package actor AppServerClient {
                         kind: .write(Self.transportFailure(from: error))
                     ))
                 }
+                onResponseAccepted()
                 logger.debug(
                     "JSON-RPC response \(attemptRequestID, privacy: .public) <- \(method, privacy: .public)"
                 )

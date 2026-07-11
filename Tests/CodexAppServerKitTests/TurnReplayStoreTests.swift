@@ -483,9 +483,11 @@ struct TurnReplayStoreTests {
             connectionCloseAction: closeAction
         )
         let turnReplayStore = TurnReplayStore()
+        let threadEventHub = ThreadEventHub()
         let router = CodexAppServerNotificationRouter(
             client: client,
-            turnReplayStore: turnReplayStore
+            turnReplayStore: turnReplayStore,
+            threadEventHub: threadEventHub
         )
         let connection = AppServerConnection(
             transport: transport,
@@ -554,9 +556,11 @@ private func makeTurnReplayExitTestState() -> TurnGenerationHandleState {
         connectionCloseAction: closeAction
     )
     let turnReplayStore = TurnReplayStore()
+    let threadEventHub = ThreadEventHub()
     let router = CodexAppServerNotificationRouter(
         client: client,
-        turnReplayStore: turnReplayStore
+        turnReplayStore: turnReplayStore,
+        threadEventHub: threadEventHub
     )
     let connection = AppServerConnection(
         transport: transport,

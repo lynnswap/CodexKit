@@ -147,7 +147,7 @@ public final class CodexModelContext {
 
     private final class ActiveChatObservation {
         var eventThread: CodexThread?
-        var eventStream: AsyncThrowingStream<CodexThreadEvent, Error>?
+        var eventStream: CodexThreadEventSequence?
         var includesTurns = false
         var isFinished = false
         var isBufferingEvents = false
@@ -215,7 +215,7 @@ public final class CodexModelContext {
             context: CodexModelContext,
             chatID: CodexThreadID,
             observation: ActiveChatObservation,
-            stream: AsyncThrowingStream<CodexThreadEvent, Error>,
+            stream: CodexThreadEventSequence,
             isolation: (any Actor)?
         ) {
             let target = ThreadEventPumpTarget(
@@ -879,7 +879,7 @@ public final class CodexModelContext {
             }
             if usesPreparedThread {
                 if shouldResetPreparedEventGenerationBeforeObserving(chat, includeTurns: includeTurns) {
-                    await thread.beginEventGeneration()
+                    thread.beginEventGeneration()
                 }
                 await startEventPump(observation, thread: thread)
             }
@@ -893,7 +893,7 @@ public final class CodexModelContext {
     }
 
     private func startEventPump(_ observation: ActiveChatObservation, thread: CodexThread) async {
-        observation.eventStream = await thread.makeCurrentGenerationEventStream()
+        observation.eventStream = thread.makeCurrentGenerationEventStream()
         if let eventStream = observation.eventStream {
             observation.eventPump = ThreadEventPump(
                 context: self,

@@ -5,7 +5,7 @@ import CodexAppServerKitTesting
 
 @Suite("Turn replay router integration")
 struct TurnReplayRouterTests {
-    @Test func duplicateAndConflictingExplicitThreadTerminalsPublishOnce() async throws {
+    @Test func duplicateExplicitThreadTerminalsPublishOnce() async throws {
         let transport = CodexAppServerTestTransport()
         let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
         await transport.waitForNotificationStreamCount(1)
@@ -13,11 +13,37 @@ struct TurnReplayRouterTests {
             threadID: "thread-1",
             turn: .init(id: "turn-external", status: "completed")
         )
-        let events = await harness.router.liveEvents(for: "thread-1")
+        let events = harness.router.events(for: "thread-1")
         var eventIterator = events.makeAsyncIterator()
 
         try await transport.emitServerNotification(method: "turn/completed", params: completed)
         try await transport.emitServerNotification(method: "turn/completed", params: completed)
+        try await transport.emitServerNotification(
+            method: "thread/closed",
+            params: ThreadClosedParams(threadID: "thread-1")
+        )
+
+        var terminals: [CodexTurnOutcome] = []
+        while let event = try await eventIterator.next() {
+            if case .terminal(let outcome) = event {
+                terminals.append(outcome)
+            }
+        }
+        await harness.close()
+        #expect(terminals == [.completed(.init(turnID: "turn-external"))])
+    }
+
+    @Test func conflictingExplicitThreadTerminalClosesConnectionWithContractViolation() async throws {
+        let transport = CodexAppServerTestTransport()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        await transport.waitForNotificationStreamCount(1)
+        try await transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(
+                threadID: "thread-1",
+                turn: .init(id: "turn-external", status: "completed")
+            )
+        )
         try await transport.emitServerNotification(
             method: "turn/completed",
             params: TurnCompletedParams(
@@ -26,16 +52,12 @@ struct TurnReplayRouterTests {
             )
         )
 
-        guard case .terminal(let outcome)? = try await eventIterator.next() else {
-            Issue.record("Expected the first explicit-thread terminal on its thread stream.")
-            await harness.close()
+        let termination = await harness.supervisor.waitForTerminationForTesting()
+        guard case .transportFailure(.contractViolation(let message)) = termination else {
+            Issue.record("Expected a typed thread-terminal contract violation, got \(termination).")
             return
         }
-        let eventCount = await harness.router.threadEventGenerationCursor("thread-1")
-        await harness.close()
-        #expect(outcome.response.turnID == "turn-external")
-        #expect(outcome == .completed(.init(turnID: "turn-external")))
-        #expect(eventCount == 1)
+        #expect(message.contains("turn-external"))
     }
 
     @Test func resumedReviewCapturesTerminalBeforeResumeResponse() async throws {
@@ -82,6 +104,14 @@ private struct TurnPayload: Encodable, Sendable {
     var id: String
     var status: String
     var items: [TurnItem] = []
+}
+
+private struct ThreadClosedParams: Encodable, Sendable {
+    var threadID: String
+
+    private enum CodingKeys: String, CodingKey {
+        case threadID = "threadId"
+    }
 }
 
 private struct TurnItem: Encodable, Sendable {}

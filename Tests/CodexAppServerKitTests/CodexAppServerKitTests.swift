@@ -2466,13 +2466,18 @@ struct CodexAppServerKitTests {
         let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
         let eventTask = Task { () -> CodexThreadEvent? in
             var iterator = thread.events.makeAsyncIterator()
-            return try await iterator.next()
+            while let event = try await iterator.next() {
+                if case .terminal = event {
+                    return event
+                }
+            }
+            return nil
         }
         defer {
             eventTask.cancel()
         }
         #expect(await eventually {
-            await router.threadSubscriberCountForTesting(for: "thread-1") == 1
+            router.threadSubscriberCountForTesting(for: "thread-1") == 1
         })
 
         _ = try await thread.streamResponse(to: "Run checks.")
@@ -3389,35 +3394,21 @@ struct CodexAppServerKitTests {
         }
 
         #expect(await eventually {
-            await router.threadSubscriberCountForTesting(for: "thread-1") == 1
+            router.threadSubscriberCountForTesting(for: "thread-1") == 1
         })
         consumer.cancel()
-        let removed = await eventually {
-            await router.threadSubscriberCountForTesting(for: "thread-1") == 0
-        }
-        #expect(removed)
-        if removed {
-            try await consumer.value
-        }
+        try await consumer.value
+        #expect(router.threadSubscriberCountForTesting(for: "thread-1") == 0)
     }
 
     @Test func directThreadEventStreamCancellationRemovesRouterSubscriber() async throws {
         let transport = CodexAppServerTestTransport()
         let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
         let router = harness.router
-        let stream = await router.events(for: CodexThreadID(rawValue: "thread-1"))
-        #expect(await router.threadSubscriberCountForTesting(for: "thread-1") == 1)
-
-        let consumer = Task {
-            var iterator = stream.makeAsyncIterator()
-            _ = try await iterator.next()
-        }
-
-        consumer.cancel()
-        let removed = await eventually {
-            await router.threadSubscriberCountForTesting(for: "thread-1") == 0
-        }
-        #expect(removed)
+        let stream = router.events(for: CodexThreadID(rawValue: "thread-1"))
+        #expect(router.threadSubscriberCountForTesting(for: "thread-1") == 1)
+        stream.cancel()
+        #expect(router.threadSubscriberCountForTesting(for: "thread-1") == 0)
     }
 
     @Test func liveThreadEventStreamFinishesWhenHistoryIsAlreadyTerminal() async throws {
@@ -3429,7 +3420,7 @@ struct CodexAppServerKitTests {
             method: "thread/closed",
             params: ThreadIDParams(threadID: "thread-1")
         )
-        let replayStream = await router.events(for: CodexThreadID(rawValue: "thread-1"))
+        let replayStream = router.events(for: CodexThreadID(rawValue: "thread-1"))
         let replayEvents = try await withTimeout {
             try await collect(replayStream)
         }
@@ -3440,13 +3431,7 @@ struct CodexAppServerKitTests {
             return false
         })
 
-        let stream = await router.liveEvents(for: CodexThreadID(rawValue: "thread-1"))
-        #expect(await router.threadSubscriberCountForTesting(for: "thread-1") == 0)
-
-        let events = try await withTimeout {
-            try await collect(stream)
-        }
-        #expect(events.isEmpty)
+        #expect(router.threadSubscriberCountForTesting(for: "thread-1") == 0)
     }
 
     @Test func threadEventStreamsReplayOnlyCurrentGenerationAfterNewGenerationStarts() async throws {
@@ -3459,7 +3444,7 @@ struct CodexAppServerKitTests {
             params: ThreadIDParams(threadID: "thread-1")
         )
         let firstGeneration = try await withTimeout {
-            try await collect(await router.events(for: CodexThreadID(rawValue: "thread-1")))
+            try await collect(router.events(for: CodexThreadID(rawValue: "thread-1")))
         }
         #expect(firstGeneration.contains { event in
             if case .closed = event {
@@ -3468,7 +3453,7 @@ struct CodexAppServerKitTests {
             return false
         })
 
-        await router.beginThreadEventGeneration("thread-1")
+        router.resetThreadEventGeneration("thread-1")
         try await emitItemStarted(
             on: transport,
             threadID: "thread-1",
@@ -3489,15 +3474,9 @@ struct CodexAppServerKitTests {
         )
 
         let currentGeneration = try await withTimeout {
-            try await collect(await router.observationEvents(for: "thread-1"))
+            try await collect(router.events(for: "thread-1"))
         }
-        #expect(currentGeneration.count == 3)
-        #expect(currentGeneration.contains { event in
-            if case .messageDelta(let delta, let turnID) = event {
-                return delta.text == "Current" && turnID == "turn-2"
-            }
-            return false
-        })
+        #expect(currentGeneration.containsThreadText("Current", turnID: "turn-2"))
         #expect(currentGeneration.last == .closed)
     }
 
@@ -3551,9 +3530,16 @@ struct CodexAppServerKitTests {
             params: ThreadIDParams(threadID: "thread-review")
         )
 
-        await router.beginThreadEventGeneration("thread-review", including: "turn-current")
+        let provisionalGeneration = try await withTimeout {
+            try await collect(router.events(for: "thread-review"))
+        }
+        #expect(provisionalGeneration.last == .closed)
+        await router.adoptDetachedThreadEventGeneration(
+            "thread-review",
+            including: "turn-current"
+        )
         let currentGeneration = try await withTimeout {
-            try await collect(await router.observationEvents(for: "thread-review"))
+            try await collect(router.events(for: "thread-review"))
         }
 
         #expect(currentGeneration.contains { event in
@@ -3563,17 +3549,12 @@ struct CodexAppServerKitTests {
             return false
         } == false)
         #expect(currentGeneration.contains { event in
-            if case .turnStarted(let turnID) = event {
-                return turnID == "turn-current"
+            if case .snapshot(let snapshot) = event {
+                return snapshot.id == "turn-current"
             }
             return false
         })
-        #expect(currentGeneration.contains { event in
-            if case .messageDelta(let delta, let turnID) = event {
-                return delta.text == "Current" && turnID == "turn-current"
-            }
-            return false
-        })
+        #expect(currentGeneration.containsThreadText("Current", turnID: "turn-current"))
         #expect(currentGeneration.last == .closed)
     }
 
@@ -3610,12 +3591,7 @@ struct CodexAppServerKitTests {
         )
 
         let events = try await collect(thread.events)
-        #expect(events.contains { event in
-            if case .messageDelta(let delta, let turnID) = event {
-                return delta.text == "During resume" && turnID == "turn-resume-events"
-            }
-            return false
-        })
+        #expect(events.containsThreadText("During resume", turnID: "turn-resume-events"))
     }
 
     @Test func streamResponseBeginsNewThreadEventGeneration() async throws {
@@ -3680,18 +3656,8 @@ struct CodexAppServerKitTests {
             try await collect(thread.events)
         }
         #expect(events.count == 3)
-        #expect(events.contains { event in
-            if case .messageDelta(let delta, let turnID) = event {
-                return delta.text == "During start" && turnID == "turn-2"
-            }
-            return false
-        })
-        #expect(events.contains { event in
-            if case .messageDelta(let delta, let turnID) = event {
-                return delta.text == "Previous generation" && turnID == "turn-1"
-            }
-            return false
-        } == false)
+        #expect(events.containsThreadText("During start", turnID: "turn-2"))
+        #expect(events.containsThreadText("Previous generation", turnID: "turn-1") == false)
         #expect(events.last == .closed)
         withExtendedLifetime(responseStream) {}
     }
@@ -3753,7 +3719,7 @@ struct CodexAppServerKitTests {
             try await collect(thread.events)
         }
         #expect(await eventually {
-            await router.threadSubscriberCountForTesting(for: "thread-1") == 1
+            router.threadSubscriberCountForTesting(for: "thread-1") == 1
         })
 
         try await transport.emitServerNotification(
@@ -3764,18 +3730,8 @@ struct CodexAppServerKitTests {
         let events = try await withTimeout {
             try await eventsTask.value
         }
-        #expect(events.contains { event in
-            if case .messageDelta(let delta, let turnID) = event {
-                return delta.text == "During review start" && turnID == "turn-review"
-            }
-            return false
-        })
-        #expect(events.contains { event in
-            if case .messageDelta(let delta, let turnID) = event {
-                return delta.text == "Previous generation" && turnID == "turn-previous"
-            }
-            return false
-        } == false)
+        #expect(events.containsThreadText("During review start", turnID: "turn-review"))
+        #expect(events.containsThreadText("Previous generation", turnID: "turn-previous") == false)
         #expect(events.last == .closed)
         withExtendedLifetime(review) {}
     }
@@ -3800,7 +3756,7 @@ struct CodexAppServerKitTests {
             try await collect(thread.events)
         }
         #expect(await eventually {
-            await router.threadSubscriberCountForTesting(for: "thread-source") == 1
+            router.threadSubscriberCountForTesting(for: "thread-source") == 1
         })
         try await transport.emitServerNotification(
             method: "thread/closed",
@@ -3863,7 +3819,7 @@ struct CodexAppServerKitTests {
             try await collect(reviewThread.events)
         }
         #expect(await eventually {
-            await router.threadSubscriberCountForTesting(for: "thread-review") == 1
+            router.threadSubscriberCountForTesting(for: "thread-review") == 1
         })
 
         try await transport.emitServerNotification(
@@ -3875,18 +3831,11 @@ struct CodexAppServerKitTests {
             try await eventsTask.value
         }
         #expect(events.contains(.statusChanged(.active(activeFlags: []))))
-        #expect(events.contains { event in
-            if case .messageDelta(let delta, let turnID) = event {
-                return delta.text == "During detached review start" && turnID == "turn-review"
-            }
-            return false
-        })
-        #expect(events.contains { event in
-            if case .messageDelta(let delta, let turnID) = event {
-                return delta.text == "Previous detached generation" && turnID == "turn-previous"
-            }
-            return false
-        } == false)
+        #expect(events.containsThreadText("During detached review start", turnID: "turn-review"))
+        #expect(
+            events.containsThreadText("Previous detached generation", turnID: "turn-previous")
+                == false
+        )
         #expect(events.last == .closed)
     }
 
@@ -3927,7 +3876,7 @@ struct CodexAppServerKitTests {
             try await collect(thread.events)
         }
         #expect(await eventually {
-            await router.threadSubscriberCountForTesting(for: "thread-1") == 1
+            router.threadSubscriberCountForTesting(for: "thread-1") == 1
         })
 
         try await emitItemStarted(
@@ -3952,18 +3901,8 @@ struct CodexAppServerKitTests {
         let events = try await withTimeout {
             try await eventsTask.value
         }
-        #expect(events.contains { event in
-            if case .messageDelta(let delta, let turnID) = event {
-                return delta.text == "Current compact generation" && turnID == "turn-compact"
-            }
-            return false
-        })
-        #expect(events.contains { event in
-            if case .messageDelta(let delta, let turnID) = event {
-                return delta.text == "Previous generation" && turnID == "turn-previous"
-            }
-            return false
-        } == false)
+        #expect(events.containsThreadText("Current compact generation", turnID: "turn-compact"))
+        #expect(events.containsThreadText("Previous generation", turnID: "turn-previous") == false)
         #expect(events.last == .closed)
     }
 
@@ -4020,18 +3959,8 @@ struct CodexAppServerKitTests {
         let events = try await withTimeout {
             try await collect(thread.events)
         }
-        #expect(events.contains { event in
-            if case .messageDelta(let delta, let turnID) = event {
-                return delta.text == "Previous generation" && turnID == "turn-previous"
-            }
-            return false
-        })
-        #expect(events.contains { event in
-            if case .messageDelta(let delta, let turnID) = event {
-                return delta.text == "Failed review start" && turnID == "turn-failed-review"
-            }
-            return false
-        } == false)
+        #expect(events.containsThreadText("Previous generation", turnID: "turn-previous"))
+        #expect(events.containsThreadText("Failed review start", turnID: "turn-failed-review") == false)
         #expect(events.last == .closed)
     }
 
@@ -4039,6 +3968,8 @@ struct CodexAppServerKitTests {
         let runtime = try await CodexAppServerTestRuntime.start()
         try await runtime.transport.enqueueThreadResume(.init(id: "thread-resume-failure"))
         let thread = try await runtime.server.resumeThread("thread-resume-failure")
+        let priorEvents = thread.events
+        var priorIterator = priorEvents.makeAsyncIterator()
         try await emitItemStarted(
             on: runtime.transport,
             threadID: "thread-resume-failure",
@@ -4053,6 +3984,18 @@ struct CodexAppServerKitTests {
                 delta: "Before failed resume"
             )
         )
+        var routedPriorGeneration = false
+        while let event = try await priorIterator.next() {
+            if [event].containsThreadText(
+                "Before failed resume",
+                turnID: "turn-resume-failure"
+            ) {
+                routedPriorGeneration = true
+                break
+            }
+        }
+        #expect(routedPriorGeneration)
+        priorEvents.cancel()
 
         await runtime.transport.enqueueFailure(
             code: -32_000,
@@ -4071,12 +4014,7 @@ struct CodexAppServerKitTests {
         )
 
         let events = try await collect(thread.events)
-        #expect(events.contains { event in
-            if case .messageDelta(let delta, let turnID) = event {
-                return delta.text == "Before failed resume" && turnID == "turn-resume-failure"
-            }
-            return false
-        })
+        #expect(events.containsThreadText("Before failed resume", turnID: "turn-resume-failure"))
     }
 
     @Test func threadStreamsReplayMessagesTranscriptLogsAndUsage() async throws {
@@ -4165,8 +4103,9 @@ struct CodexAppServerKitTests {
         let events = try await collect(thread.events)
         #expect(
             events.contains {
-                if case .tokenUsageUpdated(let usage, let turnID) = $0 {
-                    turnID == "turn-1" && usage.totalTokens == 3
+                if case .terminal(let outcome) = $0 {
+                    outcome.response.turnID == "turn-1"
+                        && outcome.response.usage?.totalTokens == 3
                 } else {
                     false
                 }
@@ -4202,19 +4141,35 @@ struct CodexAppServerKitTests {
             method: "thread/closed",
             params: ThreadIDParams(threadID: "thread-1")
         )
-        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
-
+        let thread = CodexThread(
+            id: "thread-1",
+            client: client,
+            router: router,
+            connectionLease: harness.lease
+        )
         let transcripts = try await collect(thread.transcriptUpdates)
 
         #expect(transcripts.last?.items.first?.text == "hello\nworld")
     }
 
-    @Test func threadTranscriptKeepsDistinctMessageDeltaItemIDs() async throws {
+    @Test func threadTranscriptSupersedesPriorTerminalGeneration() async throws {
         let transport = CodexAppServerTestTransport()
         let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
         let client = harness.client
         let router = harness.router
         await transport.waitForNotificationStreamCount(1)
+        let thread = CodexThread(
+            id: "thread-1",
+            client: client,
+            router: router,
+            connectionLease: harness.lease
+        )
+        let transcriptsTask = Task {
+            try await collect(thread.transcriptUpdates)
+        }
+        #expect(await eventually {
+            router.threadSubscriberCountForTesting(for: "thread-1") == 1
+        })
         try await transport.emitServerNotification(
             method: "turn/started",
             params: TurnStartedParams(threadID: "thread-1", turnID: "turn-1")
@@ -4255,11 +4210,9 @@ struct CodexAppServerKitTests {
             method: "thread/closed",
             params: ThreadIDParams(threadID: "thread-1")
         )
-        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
+        let transcripts = try await transcriptsTask.value
 
-        let transcripts = try await collect(thread.transcriptUpdates)
-
-        #expect(transcripts.last?.items.compactMap(\.text) == ["First", "Second"])
+        #expect(transcripts.last?.items.compactMap(\.text) == ["Second"])
     }
 
     @Test func responseStreamYieldsSnapshotsAndCollectsFinalResponse() async throws {
@@ -4594,6 +4547,13 @@ struct CodexAppServerKitTests {
         let client = harness.client
         let router = harness.router
         await transport.waitForNotificationStreamCount(1)
+        let thread = CodexThread(
+            id: "thread-1",
+            client: client,
+            router: router,
+            connectionLease: harness.lease
+        )
+        let logs = thread.logEntries
         try await emitItemStarted(
             on: transport,
             threadID: "thread-1",
@@ -4613,14 +4573,13 @@ struct CodexAppServerKitTests {
             params: ThreadIDParams(threadID: "thread-1")
         )
 
-        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
-        let logs = try await collect(thread.logEntries)
-        let deltas = logs.filter { $0.phase == .delta }
+        let collectedLogs = try await collect(logs)
+        let deltas = collectedLogs.filter { $0.phase == .delta }
         #expect(deltas.map(\.id) == ["message-1:0", "message-1:1"])
         #expect(deltas.compactMap(\.messageDelta).map(\.text) == ["First", "Second"])
     }
 
-    @Test func threadLogEntriesContinueAfterTurnCompletionUntilThreadClosed() async throws {
+    @Test func lateThreadLogEntriesReplayOnlyTheCurrentGeneration() async throws {
         let transport = CodexAppServerTestTransport()
         let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
         let client = harness.client
@@ -4654,12 +4613,15 @@ struct CodexAppServerKitTests {
             method: "thread/closed",
             params: ThreadIDParams(threadID: "thread-1")
         )
+        #expect(await eventually {
+            router.threadEventHub.snapshotForTesting(threadID: "thread-1").isClosed
+        })
 
         let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
         let logs = try await collect(thread.logEntries)
         let deltas = logs.filter { $0.phase == .delta }
-        #expect(deltas.map(\.id) == ["message-1:0", "message-1:1"])
-        #expect(deltas.compactMap(\.messageDelta).map(\.text) == ["First", "Second"])
+        #expect(deltas.map(\.id) == ["message-1:0"])
+        #expect(deltas.compactMap(\.messageDelta).map(\.text) == ["Second"])
     }
 
     @Test func messageDeltaWithoutItemIDFailsAsMalformedNotification() async throws {
@@ -4887,6 +4849,18 @@ struct CodexAppServerKitTests {
         let client = harness.client
         let router = harness.router
         await transport.waitForNotificationStreamCount(1)
+        let thread = CodexThread(
+            id: "thread-1",
+            client: client,
+            router: router,
+            connectionLease: harness.lease
+        )
+        let eventsTask = Task { try await collect(thread.events) }
+        let logsTask = Task { try await collect(thread.logEntries) }
+        let transcriptsTask = Task { try await collect(thread.transcriptUpdates) }
+        #expect(await eventually {
+            router.threadSubscriberCountForTesting(for: "thread-1") == 3
+        })
 
         try await emitItemStarted(
             on: transport,
@@ -4950,8 +4924,7 @@ struct CodexAppServerKitTests {
             params: ThreadIDParams(threadID: "thread-1")
         )
 
-        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
-        let events = try await collect(thread.events)
+        let events = try await eventsTask.value
         #expect(
             events.contains {
                 if case .reasoningSummaryPartAdded(let part, let turnID) = $0 {
@@ -4971,7 +4944,7 @@ struct CodexAppServerKitTests {
                 }
             })
 
-        let logs = try await collect(thread.logEntries)
+        let logs = try await logsTask.value
         #expect(logs.contains { $0.id == "reasoning-1:summary:0" && $0.phase == .started })
         #expect(
             logs.contains {
@@ -4984,7 +4957,7 @@ struct CodexAppServerKitTests {
                     && $0.reasoningDelta?.delta == "Raw trace"
             })
 
-        let transcripts = try await collect(thread.transcriptUpdates)
+        let transcripts = try await transcriptsTask.value
         let finalTranscript = try #require(transcripts.last)
         #expect(finalTranscript.items.map(\.id) == ["reasoning-1"])
         #expect(finalTranscript.items.first?.content == .reasoning(
@@ -6105,6 +6078,28 @@ private func emitItemStarted(
         method: "item/started",
         params: ThreadItemParams(threadID: threadID, turnID: turnID, item: item)
     )
+}
+
+private extension Array where Element == CodexThreadEvent {
+    func containsThreadText(_ text: String, turnID expectedTurnID: CodexTurnID) -> Bool {
+        contains { event in
+            switch event {
+            case .snapshot(let snapshot):
+                snapshot.id == expectedTurnID && snapshot.items.contains { $0.text == text }
+            case .itemStarted(let item, let turnID),
+                 .itemUpdated(let item, let turnID),
+                 .itemCompleted(let item, let turnID):
+                turnID == expectedTurnID && item.text == text
+            case .message(let message, let turnID):
+                turnID == expectedTurnID && message.text == text
+            case .messageDelta(let delta, let turnID):
+                turnID == expectedTurnID && delta.text == text
+            case .turnStarted, .terminal, .reasoningSummaryPartAdded, .reasoningDelta,
+                 .tokenUsageUpdated, .statusChanged, .closed, .unknown:
+                false
+            }
+        }
+    }
 }
 
 private func eventually(

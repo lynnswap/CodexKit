@@ -7,81 +7,28 @@ private let notificationRouterLogger = Logger(
 )
 
 package actor CodexAppServerNotificationRouter {
-    private struct ThreadSubscriber {
-        var continuation: AsyncThrowingStream<CodexThreadEvent, Error>.Continuation
-        var replayPolicy: ThreadEventReplayPolicy
-    }
-
     private typealias NotificationContext = AppServerNotificationDecoder.Context
 
     private var threadIDByTurnID: [CodexTurnID: CodexThreadID] = [:]
-    private var threadHistoryByThreadID: [CodexThreadID: [CodexThreadEvent]] = [:]
-    private var threadFailureByThreadID: [CodexThreadID: CodexAppServerError] = [:]
-    private var threadGenerationStartByThreadID: [CodexThreadID: ThreadGenerationStart] = [:]
-    private var threadSubscribersByThreadID: [CodexThreadID: [UUID: ThreadSubscriber]] = [:]
     private var itemReducer = CodexItemReducer()
-    // Removed with the general thread-history bridge when thread observation moves
-    // to its dedicated bounded owner. Per-turn replay never reads this state.
-    private var threadRoutingTermination: CodexAppServerError?
     private let accountEventHub: AccountEventHub
     package nonisolated let turnReplayStore: TurnReplayStore
-
-    private enum ThreadEventReplayPolicy {
-        case currentGeneration
-        case none
-    }
-
-    private enum ThreadGenerationStart {
-        case cursor(Int)
-        case includingTurn(CodexTurnID, fallbackCursor: Int)
-    }
+    package nonisolated let threadEventHub: ThreadEventHub
 
     package init(
         client: AppServerClient,
         turnReplayStore: TurnReplayStore,
+        threadEventHub: ThreadEventHub,
         accountEventHub: AccountEventHub = .init()
     ) {
         _ = client
         self.turnReplayStore = turnReplayStore
+        self.threadEventHub = threadEventHub
         self.accountEventHub = accountEventHub
     }
 
-    package func events(for threadID: CodexThreadID) -> AsyncThrowingStream<
-        CodexThreadEvent, Error
-    > {
-        threadEventStream(for: threadID, replayPolicy: .currentGeneration)
-    }
-
-    package func liveEvents(for threadID: CodexThreadID) -> AsyncThrowingStream<
-        CodexThreadEvent, Error
-    > {
-        threadEventStream(for: threadID, replayPolicy: .none)
-    }
-
-    package func observationEvents(for threadID: CodexThreadID) -> AsyncThrowingStream<
-        CodexThreadEvent, Error
-    > {
-        threadEventStream(for: threadID, replayPolicy: .currentGeneration)
-    }
-
-    private func threadEventStream(
-        for threadID: CodexThreadID,
-        replayPolicy: ThreadEventReplayPolicy
-    ) -> AsyncThrowingStream<CodexThreadEvent, Error> {
-        let (stream, continuation) = AsyncThrowingStream<CodexThreadEvent, Error>.makeStream(
-            bufferingPolicy: .unbounded
-        )
-        let subscriptionID = UUID()
-        continuation.onTermination = { _ in
-            Task { await self.removeThreadSubscriber(subscriptionID, threadID: threadID) }
-        }
-        addThreadSubscriber(
-            subscriptionID,
-            threadID: threadID,
-            continuation: continuation,
-            replayPolicy: replayPolicy
-        )
-        return stream
+    package nonisolated func events(for threadID: CodexThreadID) -> CodexThreadEventSequence {
+        threadEventHub.events(for: threadID)
     }
 
     package func seedTurn(_ turnID: CodexTurnID, threadID: CodexThreadID) {
@@ -127,8 +74,8 @@ package actor CodexAppServerNotificationRouter {
     ) async {
         await accountEventHub.replaceRateLimits(with: response)
     }
-    package func threadSubscriberCountForTesting(for threadID: CodexThreadID) -> Int {
-        threadSubscribersByThreadID[threadID]?.count ?? 0
+    package nonisolated func threadSubscriberCountForTesting(for threadID: CodexThreadID) -> Int {
+        threadEventHub.snapshotForTesting(threadID: threadID).subscriberCount
     }
 
     package func itemSnapshotForTesting(
@@ -138,49 +85,21 @@ package actor CodexAppServerNotificationRouter {
         itemReducer.item(turnID: turnID, itemID: itemID)
     }
 
-    package func beginThreadEventGeneration(_ threadID: CodexThreadID) {
-        threadFailureByThreadID.removeValue(forKey: threadID)
-        threadGenerationStartByThreadID[threadID] = .cursor(
-            threadHistoryByThreadID[threadID]?.count ?? 0
-        )
+    package nonisolated func resetThreadEventGeneration(_ threadID: CodexThreadID) {
+        threadEventHub.resetGeneration(for: threadID)
     }
 
-    package func threadEventGenerationCursor(_ threadID: CodexThreadID) -> Int {
-        threadHistoryByThreadID[threadID]?.count ?? 0
-    }
-
-    package func beginThreadEventGeneration(_ threadID: CodexThreadID, at cursor: Int) {
-        threadFailureByThreadID.removeValue(forKey: threadID)
-        let historyCount = threadHistoryByThreadID[threadID]?.count ?? 0
-        threadGenerationStartByThreadID[threadID] = .cursor(min(cursor, historyCount))
-    }
-
-    package func beginThreadEventGeneration(_ threadID: CodexThreadID, including turnID: CodexTurnID) {
-        threadFailureByThreadID.removeValue(forKey: threadID)
-        threadGenerationStartByThreadID[threadID] = .includingTurn(
-            turnID,
-            fallbackCursor: threadHistoryByThreadID[threadID]?.count ?? 0
-        )
-    }
-
-    package func beginDetachedThreadEventGeneration(
+    package func adoptDetachedThreadEventGeneration(
         _ threadID: CodexThreadID,
         including turnID: CodexTurnID
     ) {
-        threadFailureByThreadID.removeValue(forKey: threadID)
-        threadGenerationStartByThreadID[threadID] = .includingTurn(
-            turnID,
-            fallbackCursor: threadHistoryByThreadID[threadID]?.count ?? 0
-        )
+        threadEventHub.beginGeneration(for: threadID, including: turnID)
         seedTurn(turnID, threadID: threadID)
     }
 
     package func route(
         _ decoded: AppServerNotificationDecoder.DecodedNotification
     ) async throws {
-        guard threadRoutingTermination == nil else {
-            return
-        }
         guard decoded.disposition != .explicitIgnore else {
             return
         }
@@ -211,15 +130,9 @@ package actor CodexAppServerNotificationRouter {
             let outcome = try terminalOutcome(from: turn, context: context)
             let turnID = context.turnID ?? outcome.response.turnID
             releasedTurnID = turnID
-            let disposition = await turnReplayStore.finishIfTracked(outcome)
-            if let threadID = context.threadID ?? threadIDByTurnID[turnID],
-               shouldPublishThreadTerminal(
-                   disposition,
-                   outcome: outcome,
-                   threadID: threadID
-               )
-            {
-                appendThreadEvent(.terminal(outcome), threadID: threadID)
+            _ = await turnReplayStore.finishIfTracked(outcome)
+            if let threadID = context.threadID ?? threadIDByTurnID[turnID] {
+                try routeThreadEvent(.terminal(outcome), threadID: threadID)
             }
             threadIDByTurnID.removeValue(forKey: turnID)
 
@@ -229,7 +142,7 @@ package actor CodexAppServerNotificationRouter {
             }
             let event = try reduceItemEvent(mutation, turnID: turnID)
             if let threadID = context.threadID ?? threadIDByTurnID[turnID] {
-                appendThreadEvent(
+                try routeThreadEvent(
                     Self.threadEvent(from: event, turnID: turnID, threadID: threadID),
                     threadID: threadID
                 )
@@ -242,7 +155,7 @@ package actor CodexAppServerNotificationRouter {
         case .turnStarted(let payloadTurnID):
             let turnID = context.turnID ?? payloadTurnID
             if let threadID = context.threadID ?? threadIDByTurnID[turnID] {
-                appendThreadEvent(.turnStarted(turnID), threadID: threadID)
+                try routeThreadEvent(.turnStarted(turnID), threadID: threadID)
             }
             let event = CodexTurnEvent.started(turnID)
             recordReplayDisposition(
@@ -252,12 +165,12 @@ package actor CodexAppServerNotificationRouter {
 
         case .threadStatus(let status):
             if let threadID = context.threadID {
-                appendThreadEvent(.statusChanged(status), threadID: threadID)
+                try routeThreadEvent(.statusChanged(status), threadID: threadID)
             }
 
         case .tokenUsage(let usage):
             if let threadID = context.threadID {
-                appendThreadEvent(
+                try routeThreadEvent(
                     .tokenUsageUpdated(usage, turnID: context.turnID),
                     threadID: threadID
                 )
@@ -272,7 +185,7 @@ package actor CodexAppServerNotificationRouter {
 
         case .threadClosed:
             if let threadID = context.threadID {
-                appendThreadEvent(.closed, threadID: threadID)
+                try routeThreadEvent(.closed, threadID: threadID)
             }
 
         case .serverRequestResolved, .connectionDiagnostic:
@@ -296,7 +209,7 @@ package actor CodexAppServerNotificationRouter {
                 turnID: context.turnID
             )
             if let threadID = context.threadID {
-                appendThreadEvent(.unknown(raw), threadID: threadID)
+                try routeThreadEvent(.unknown(raw), threadID: threadID)
             }
             if let turnID = context.turnID {
                 let event = CodexTurnEvent.unknown(raw)
@@ -311,24 +224,12 @@ package actor CodexAppServerNotificationRouter {
         }
     }
 
-    private func appendThreadEvent(_ event: CodexThreadEvent, threadID: CodexThreadID) {
-        threadHistoryByThreadID[threadID, default: []].append(event)
-        let history = threadHistoryByThreadID[threadID] ?? []
-        let eventIndex = history.index(before: history.endIndex)
-        if let subscribers = threadSubscribersByThreadID[threadID] {
-            for subscriber in subscribers.values {
-                guard
-                    shouldYieldThreadEvent(
-                        at: eventIndex,
-                        in: history,
-                        threadID: threadID,
-                        replayPolicy: subscriber.replayPolicy
-                    )
-                else {
-                    continue
-                }
-                subscriber.continuation.yield(event)
-            }
+    private func routeThreadEvent(_ event: CodexThreadEvent, threadID: CodexThreadID) throws {
+        let overflowCount = try threadEventHub.route(event, for: threadID)
+        if overflowCount > 0 {
+            notificationRouterLogger.warning(
+                "Compacted \(overflowCount, privacy: .public) slow thread event subscriber(s) for \(threadID.rawValue, privacy: .public)"
+            )
         }
         if case .closed = event {
             let turnIDs = threadIDByTurnID.compactMap { entry in
@@ -338,257 +239,6 @@ package actor CodexAppServerNotificationRouter {
                 itemReducer.release(turnID: turnID)
                 threadIDByTurnID.removeValue(forKey: turnID)
             }
-            finishThreadSubscribers(threadID: threadID)
-        }
-    }
-
-    private func addThreadSubscriber(
-        _ subscriptionID: UUID,
-        threadID: CodexThreadID,
-        continuation: AsyncThrowingStream<CodexThreadEvent, Error>.Continuation,
-        replayPolicy: ThreadEventReplayPolicy = .currentGeneration
-    ) {
-        if let threadRoutingTermination {
-            continuation.finish(throwing: threadRoutingTermination)
-            return
-        }
-        let history = threadHistoryByThreadID[threadID] ?? []
-        let replayedHistory: [CodexThreadEvent]
-        switch replayPolicy {
-        case .currentGeneration:
-            replayedHistory = currentGenerationEvents(in: history, threadID: threadID)
-        case .none:
-            replayedHistory = []
-        }
-        for event in replayedHistory {
-            continuation.yield(event)
-        }
-        if isCurrentThreadEventGenerationFinished(threadID) {
-            continuation.finish()
-            return
-        }
-        if let failure = threadFailureByThreadID[threadID] {
-            continuation.finish(throwing: failure)
-            return
-        }
-        threadSubscribersByThreadID[threadID, default: [:]][subscriptionID] = .init(
-            continuation: continuation,
-            replayPolicy: replayPolicy
-        )
-    }
-
-    private func isCurrentThreadEventGenerationFinished(_ threadID: CodexThreadID) -> Bool {
-        let history = threadHistoryByThreadID[threadID] ?? []
-        return currentGenerationEvents(in: history, threadID: threadID)
-            .contains(where: Self.isTerminalThreadEvent)
-    }
-
-    private func currentGenerationEvents(
-        in history: [CodexThreadEvent],
-        threadID: CodexThreadID
-    ) -> [CodexThreadEvent] {
-        currentGenerationEventIndices(in: history, threadID: threadID).map { history[$0] }
-    }
-
-    private func currentGenerationEventIndices(
-        in history: [CodexThreadEvent],
-        threadID: CodexThreadID
-    ) -> [Array<CodexThreadEvent>.Index] {
-        guard let generationStart = threadGenerationStartByThreadID[threadID] else {
-            return Array(history.indices)
-        }
-
-        let startIndex = currentGenerationStartIndex(generationStart, in: history)
-        let eventIndices = Array(history.indices.filter { $0 >= startIndex })
-        if case .includingTurn(let turnID, _) = generationStart,
-            eventIndices.contains(where: { Self.threadEvent(history[$0], matches: turnID) }) == false
-        {
-            return eventIndices.filter {
-                Self.threadEventTurnID(history[$0]).map { $0 == turnID } ?? true
-            }
-        }
-        return eventIndices
-    }
-
-    private func shouldYieldThreadEvent(
-        at eventIndex: Int,
-        in history: [CodexThreadEvent],
-        threadID: CodexThreadID,
-        replayPolicy: ThreadEventReplayPolicy
-    ) -> Bool {
-        switch replayPolicy {
-        case .none:
-            return true
-        case .currentGeneration:
-            guard let generationStart = threadGenerationStartByThreadID[threadID] else {
-                return true
-            }
-            if case .includingTurn(let turnID, _) = generationStart,
-                history[...eventIndex].contains(where: { Self.threadEvent($0, matches: turnID) })
-                    == false,
-                Self.threadEventTurnID(history[eventIndex]).map({ $0 != turnID }) == true
-            {
-                return false
-            }
-            return eventIndex >= currentGenerationStartIndex(generationStart, in: history)
-        }
-    }
-
-    private nonisolated func currentGenerationStartIndex(
-        _ generationStart: ThreadGenerationStart,
-        in history: [CodexThreadEvent]
-    ) -> Int {
-        switch generationStart {
-        case .cursor(let cursor):
-            return min(cursor, history.count)
-        case .includingTurn(let turnID, let fallbackCursor):
-            return Self.generationStartIndex(
-                in: history,
-                including: turnID,
-                fallbackCursor: fallbackCursor
-            )
-        }
-    }
-
-    private nonisolated static func generationStartIndex(
-        in history: [CodexThreadEvent],
-        including turnID: CodexTurnID,
-        fallbackCursor: Int
-    ) -> Int {
-        if let firstTurnEventIndex = history.firstIndex(where: { threadEvent($0, matches: turnID) }) {
-            let precedingHistory = history[..<firstTurnEventIndex]
-            if let boundaryIndex = precedingHistory.lastIndex(where: isThreadEventGenerationBoundary) {
-                return history.index(after: boundaryIndex)
-            }
-            let clampedFallback = min(fallbackCursor, history.count)
-            return min(clampedFallback, firstTurnEventIndex)
-        }
-
-        let clampedFallback = min(fallbackCursor, history.count)
-        let fallbackHistory = history[clampedFallback...]
-        if let boundaryIndex = fallbackHistory.lastIndex(where: isPendingTurnGenerationBoundary) {
-            return history.index(after: boundaryIndex)
-        }
-        return clampedFallback
-    }
-
-    private nonisolated static func isPendingTurnGenerationBoundary(_ event: CodexThreadEvent) -> Bool {
-        switch event {
-        case .terminal:
-            true
-        case .closed, .turnStarted, .snapshot, .statusChanged, .itemStarted, .itemUpdated, .itemCompleted,
-             .message, .messageDelta, .reasoningSummaryPartAdded, .reasoningDelta,
-             .tokenUsageUpdated, .unknown:
-            false
-        }
-    }
-
-    private nonisolated static func threadEventTurnID(_ event: CodexThreadEvent) -> CodexTurnID? {
-        switch event {
-        case .turnStarted(let turnID):
-            turnID
-        case .snapshot(let snapshot):
-            snapshot.id
-        case .terminal(let outcome):
-            outcome.response.turnID
-        case .itemStarted(_, let turnID),
-             .itemUpdated(_, let turnID), .itemCompleted(_, let turnID), .message(_, let turnID),
-             .messageDelta(_, let turnID), .reasoningSummaryPartAdded(_, let turnID),
-             .reasoningDelta(_, let turnID), .tokenUsageUpdated(_, let turnID):
-            turnID
-        case .unknown(let raw):
-            raw.turnID
-        case .statusChanged, .closed:
-            nil
-        }
-    }
-
-    private nonisolated static func isTerminalThreadEvent(_ event: CodexThreadEvent) -> Bool {
-        switch event {
-        case .closed:
-            true
-        case .turnStarted, .snapshot, .terminal, .itemStarted, .itemUpdated, .itemCompleted, .message,
-             .messageDelta, .reasoningSummaryPartAdded, .reasoningDelta, .tokenUsageUpdated,
-             .statusChanged, .unknown:
-            false
-        }
-    }
-
-    private nonisolated static func isThreadEventGenerationBoundary(_ event: CodexThreadEvent) -> Bool {
-        switch event {
-        case .closed, .terminal:
-            true
-        case .turnStarted, .snapshot, .statusChanged, .itemStarted, .itemUpdated, .itemCompleted,
-            .message, .messageDelta, .reasoningSummaryPartAdded, .reasoningDelta,
-            .tokenUsageUpdated, .unknown:
-            false
-        }
-    }
-
-    private nonisolated static func isTerminalThreadEvent(
-        _ event: CodexThreadEvent,
-        for turnID: CodexTurnID
-    ) -> Bool {
-        switch event {
-        case .terminal(let outcome):
-            outcome.response.turnID == turnID
-        case .turnStarted, .snapshot, .statusChanged, .closed, .itemStarted, .itemUpdated, .itemCompleted,
-             .message, .messageDelta, .reasoningSummaryPartAdded, .reasoningDelta,
-             .tokenUsageUpdated, .unknown:
-            false
-        }
-    }
-
-    private func shouldPublishThreadTerminal(
-        _ disposition: TurnReplayStore.TerminalRoutingDisposition,
-        outcome: CodexTurnOutcome,
-        threadID: CodexThreadID
-    ) -> Bool {
-        guard disposition != .duplicate else {
-            return false
-        }
-        guard let existing = threadHistoryByThreadID[threadID]?.first(where: {
-            Self.isTerminalThreadEvent($0, for: outcome.response.turnID)
-        }) else {
-            return true
-        }
-        guard case .terminal(let existingOutcome) = existing else {
-            preconditionFailure("A matching terminal thread event must carry a turn outcome.")
-        }
-        if existingOutcome != outcome {
-            notificationRouterLogger.error(
-                "Ignoring conflicting terminal outcome for turn \(outcome.response.turnID.rawValue, privacy: .public)"
-            )
-        } else {
-            notificationRouterLogger.debug(
-                "Ignoring duplicate terminal outcome for turn \(outcome.response.turnID.rawValue, privacy: .public)"
-            )
-        }
-        return false
-    }
-
-    private nonisolated static func threadEvent(
-        _ event: CodexThreadEvent,
-        matches turnID: CodexTurnID
-    ) -> Bool {
-        switch event {
-        case .turnStarted(let eventTurnID):
-            eventTurnID == turnID
-        case .snapshot(let snapshot):
-            snapshot.id == turnID
-        case .terminal(let outcome):
-            outcome.response.turnID == turnID
-        case .itemStarted(_, let eventTurnID),
-             .itemUpdated(_, let eventTurnID), .itemCompleted(_, let eventTurnID),
-             .message(_, let eventTurnID), .messageDelta(_, let eventTurnID),
-             .reasoningSummaryPartAdded(_, let eventTurnID),
-             .reasoningDelta(_, let eventTurnID),
-             .tokenUsageUpdated(_, let eventTurnID):
-            eventTurnID == turnID
-        case .unknown(let raw):
-            raw.turnID == turnID
-        case .statusChanged, .closed:
-            false
         }
     }
 
@@ -666,40 +316,9 @@ package actor CodexAppServerNotificationRouter {
         }
     }
 
-    private func removeThreadSubscriber(_ subscriptionID: UUID, threadID: CodexThreadID) {
-        threadSubscribersByThreadID[threadID]?.removeValue(forKey: subscriptionID)
-        if threadSubscribersByThreadID[threadID]?.isEmpty == true {
-            threadSubscribersByThreadID.removeValue(forKey: threadID)
-        }
-    }
-
-    private func finishThreadSubscribers(threadID: CodexThreadID) {
-        let subscribers =
-            threadSubscribersByThreadID.removeValue(forKey: threadID).map {
-                Array($0.values)
-            } ?? []
-        for subscriber in subscribers {
-            subscriber.continuation.finish()
-        }
-    }
-
-    private func finishThreadSubscribers(threadID: CodexThreadID, throwing error: Error) {
-        let subscribers = threadSubscribersByThreadID.removeValue(forKey: threadID).map {
-            Array($0.values)
-        } ?? []
-        for subscriber in subscribers {
-            subscriber.continuation.finish(throwing: error)
-        }
-    }
-
     package func finishAll(throwing error: CodexAppServerError) async {
-        let threadSubscribers = threadSubscribersByThreadID.values.flatMap(\.values)
-        threadRoutingTermination = threadRoutingTermination ?? error
         itemReducer.releaseAll()
-        threadSubscribersByThreadID.removeAll()
-        for subscriber in threadSubscribers {
-            subscriber.continuation.finish(throwing: error)
-        }
+        threadEventHub.finish(throwing: error)
         await accountEventHub.finish(throwing: error)
     }
 

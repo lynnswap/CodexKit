@@ -359,13 +359,20 @@ struct CodexItemReducerTests {
             itemID: "command-1"
         )
 
-        let statusEvents = await router.liveEvents(for: CodexThreadID(rawValue: "thread-1"))
+        let statusEvents = router.events(for: CodexThreadID(rawValue: "thread-1"))
         var statusIterator = statusEvents.makeAsyncIterator()
         try await transport.emitServerNotification(
             method: "thread/status/changed",
             params: ThreadStatusParams(threadID: "thread-1", status: .init(type: "idle"))
         )
-        guard case .statusChanged? = try await statusIterator.next() else {
+        var receivedStatus = false
+        while let event = try await statusIterator.next() {
+            if case .statusChanged = event {
+                receivedStatus = true
+                break
+            }
+        }
+        guard receivedStatus else {
             Issue.record("Expected the thread/status/changed event.")
             return
         }

@@ -1,21 +1,5 @@
 import Foundation
 
-package struct CodexThreadEventSequence: AsyncSequence, Sendable {
-    package typealias Element = CodexThreadEvent
-
-    private let makeStream: @Sendable () -> AsyncThrowingStream<CodexThreadEvent, Error>
-
-    package init(
-        makeStream: @escaping @Sendable () -> AsyncThrowingStream<CodexThreadEvent, Error>
-    ) {
-        self.makeStream = makeStream
-    }
-
-    package func makeAsyncIterator() -> AsyncThrowingStream<CodexThreadEvent, Error>.Iterator {
-        makeStream().makeAsyncIterator()
-    }
-}
-
 package struct CodexThreadMessageSequence: AsyncSequence, Sendable {
     package typealias Element = CodexMessage
 
@@ -30,29 +14,81 @@ package struct CodexThreadMessageSequence: AsyncSequence, Sendable {
     }
 
     package struct Iterator: AsyncIteratorProtocol {
-        private var events: AsyncThrowingStream<CodexThreadEvent, Error>.Iterator
+        private var events: CodexThreadEventSequence.Iterator
+        private var pendingMessages: [CodexMessage] = []
+        private var pendingMessageIndex = 0
+        private var emittedMessagesByID: [String: CodexMessage] = [:]
+        private var currentTurnID: CodexTurnID?
 
-        fileprivate init(events: AsyncThrowingStream<CodexThreadEvent, Error>.Iterator) {
+        fileprivate init(events: CodexThreadEventSequence.Iterator) {
             self.events = events
         }
 
         package mutating func next() async throws -> CodexMessage? {
+            if let pending = nextPendingMessage() {
+                return pending
+            }
             while let event = try await events.next() {
                 switch event {
-                case .message(let message, _):
+                case .message(let message, let turnID):
+                    beginGenerationIfNeeded(turnID)
+                    emittedMessagesByID[message.id] = message
                     return message
-                case .itemCompleted(let item, _):
+                case .itemCompleted(let item, let turnID):
+                    beginGenerationIfNeeded(turnID)
                     if let message = item.message {
+                        emittedMessagesByID[message.id] = message
                         return message
                     }
-                case .itemStarted, .itemUpdated, .messageDelta:
-                    continue
-                case .turnStarted, .snapshot, .terminal, .reasoningSummaryPartAdded,
-                    .reasoningDelta, .tokenUsageUpdated, .statusChanged, .closed, .unknown:
-                    continue
+                case .snapshot(let snapshot):
+                    beginGenerationIfNeeded(snapshot.id)
+                    pendingMessages = snapshot.items.compactMap(\.message).filter {
+                        emittedMessagesByID[$0.id] != $0
+                    }
+                    for message in pendingMessages {
+                        emittedMessagesByID[message.id] = message
+                    }
+                    pendingMessageIndex = 0
+                    if let pending = nextPendingMessage() {
+                        return pending
+                    }
+                case .itemStarted(_, let turnID), .itemUpdated(_, let turnID),
+                     .messageDelta(_, let turnID),
+                     .reasoningSummaryPartAdded(_, let turnID),
+                     .reasoningDelta(_, let turnID),
+                     .tokenUsageUpdated(_, let turnID):
+                    beginGenerationIfNeeded(turnID)
+                case .turnStarted(let turnID):
+                    beginGenerationIfNeeded(turnID)
+                case .terminal(let outcome):
+                    beginGenerationIfNeeded(outcome.response.turnID)
+                case .unknown(let raw):
+                    beginGenerationIfNeeded(raw.turnID)
+                case .statusChanged, .closed:
+                    break
                 }
             }
             return nil
+        }
+
+        private mutating func nextPendingMessage() -> CodexMessage? {
+            guard pendingMessageIndex < pendingMessages.count else {
+                pendingMessages.removeAll(keepingCapacity: false)
+                pendingMessageIndex = 0
+                return nil
+            }
+            defer { pendingMessageIndex += 1 }
+            return pendingMessages[pendingMessageIndex]
+        }
+
+        private mutating func beginGenerationIfNeeded(_ turnID: CodexTurnID?) {
+            guard let turnID, currentTurnID != turnID else {
+                return
+            }
+            currentTurnID = turnID
+            pendingMessages.removeAll(keepingCapacity: false)
+            pendingMessageIndex = 0
+            emittedMessagesByID.removeAll(keepingCapacity: false)
         }
     }
 }
@@ -71,10 +107,10 @@ package struct CodexThreadTranscriptSequence: AsyncSequence, Sendable {
     }
 
     package struct Iterator: AsyncIteratorProtocol {
-        private var events: AsyncThrowingStream<CodexThreadEvent, Error>.Iterator
+        private var events: CodexThreadEventSequence.Iterator
         private var accumulator = CodexTranscriptAccumulator()
 
-        fileprivate init(events: AsyncThrowingStream<CodexThreadEvent, Error>.Iterator) {
+        fileprivate init(events: CodexThreadEventSequence.Iterator) {
             self.events = events
         }
 
@@ -105,13 +141,18 @@ package struct CodexThreadLogSequence: AsyncSequence, Sendable {
     }
 
     package struct Iterator: AsyncIteratorProtocol {
-        private var events: AsyncThrowingStream<CodexThreadEvent, Error>.Iterator
+        private var events: CodexThreadEventSequence.Iterator
         private let terminalTurnID: CodexTurnID?
         private var logEntryIndex = 0
         private var finished = false
+        private var pendingSnapshotItems: [CodexThreadItem] = []
+        private var pendingSnapshotIndex = 0
+        private var pendingSnapshotTurnID: CodexTurnID?
+        private var emittedItemsByID: [String: CodexThreadItem] = [:]
+        private var currentTurnID: CodexTurnID?
 
         fileprivate init(
-            events: AsyncThrowingStream<CodexThreadEvent, Error>.Iterator,
+            events: CodexThreadEventSequence.Iterator,
             terminalTurnID: CodexTurnID?
         ) {
             self.events = events
@@ -122,31 +163,59 @@ package struct CodexThreadLogSequence: AsyncSequence, Sendable {
             guard finished == false else {
                 return nil
             }
+            if let pending = nextPendingSnapshotEntry() {
+                return pending
+            }
             while let event = try await events.next() {
                 guard reviewEventMatches(event, terminalTurnID: terminalTurnID) else {
                     continue
                 }
                 switch event {
                 case .itemStarted(let item, let turnID):
+                    beginGenerationIfNeeded(turnID)
+                    emittedItemsByID[item.id] = item
                     return .itemStarted(item, turnID: turnID)
                 case .itemUpdated(let item, let turnID):
+                    beginGenerationIfNeeded(turnID)
+                    emittedItemsByID[item.id] = item
                     return .itemUpdated(item, turnID: turnID)
                 case .itemCompleted(let item, let turnID):
+                    beginGenerationIfNeeded(turnID)
+                    emittedItemsByID[item.id] = item
                     return .itemCompleted(item, turnID: turnID)
                 case .message(let message, let turnID):
+                    beginGenerationIfNeeded(turnID)
                     let item = CodexThreadItem(
                         id: message.id,
                         kind: message.role == .user ? .userMessage : .agentMessage,
                         content: .message(message)
                     )
+                    emittedItemsByID[item.id] = item
                     return .itemCompleted(item, turnID: turnID)
                 case .messageDelta(let delta, let turnID):
+                    beginGenerationIfNeeded(turnID)
                     return .messageDelta(delta, turnID: turnID, id: nextDeltaLogEntryID(for: delta))
                 case .reasoningSummaryPartAdded(let part, let turnID):
+                    beginGenerationIfNeeded(turnID)
                     return .reasoningPartStarted(part, turnID: turnID)
                 case .reasoningDelta(let delta, let turnID):
+                    beginGenerationIfNeeded(turnID)
                     return .reasoningDelta(delta, turnID: turnID)
-                case .terminal:
+                case .snapshot(let snapshot):
+                    beginGenerationIfNeeded(snapshot.id)
+                    pendingSnapshotItems = snapshot.items.filter {
+                        emittedItemsByID[$0.id] != $0
+                    }
+                    for item in pendingSnapshotItems {
+                        emittedItemsByID[item.id] = item
+                    }
+                    pendingSnapshotIndex = 0
+                    pendingSnapshotTurnID = snapshot.id
+                    if let pending = nextPendingSnapshotEntry() {
+                        return pending
+                    }
+                case .terminal(let outcome):
+                    beginGenerationIfNeeded(outcome.response.turnID)
                     guard terminalTurnID != nil else {
                         continue
                     }
@@ -155,12 +224,43 @@ package struct CodexThreadLogSequence: AsyncSequence, Sendable {
                 case .closed:
                     finished = true
                     return nil
-                case .turnStarted, .snapshot, .tokenUsageUpdated, .statusChanged, .unknown:
-                    continue
+                case .turnStarted(let turnID):
+                    beginGenerationIfNeeded(turnID)
+                case .tokenUsageUpdated(_, let turnID):
+                    beginGenerationIfNeeded(turnID)
+                case .unknown(let raw):
+                    beginGenerationIfNeeded(raw.turnID)
+                case .statusChanged:
+                    break
                 }
             }
             finished = true
             return nil
+        }
+
+        private mutating func nextPendingSnapshotEntry() -> CodexThreadLogEntry? {
+            guard pendingSnapshotIndex < pendingSnapshotItems.count else {
+                pendingSnapshotItems.removeAll(keepingCapacity: false)
+                pendingSnapshotIndex = 0
+                pendingSnapshotTurnID = nil
+                return nil
+            }
+            defer { pendingSnapshotIndex += 1 }
+            return .itemCompleted(
+                pendingSnapshotItems[pendingSnapshotIndex],
+                turnID: pendingSnapshotTurnID
+            )
+        }
+
+        private mutating func beginGenerationIfNeeded(_ turnID: CodexTurnID?) {
+            guard let turnID, currentTurnID != turnID else {
+                return
+            }
+            currentTurnID = turnID
+            pendingSnapshotItems.removeAll(keepingCapacity: false)
+            pendingSnapshotIndex = 0
+            pendingSnapshotTurnID = nil
+            emittedItemsByID.removeAll(keepingCapacity: false)
         }
 
         private mutating func nextDeltaLogEntryID(for delta: CodexMessageDelta) -> String {
@@ -750,6 +850,10 @@ private struct CodexTranscriptAccumulator {
 
     mutating func apply(_ event: CodexThreadEvent) -> Bool {
         switch event {
+        case .snapshot(let snapshot):
+            let previousItems = items
+            replace(with: snapshot.items)
+            return items != previousItems
         case .itemStarted(let item, _), .itemUpdated(let item, _), .itemCompleted(let item, _):
             upsert(item)
             return true
@@ -774,7 +878,7 @@ private struct CodexTranscriptAccumulator {
         case .reasoningDelta(let delta, _):
             upsert(Self.currentItem(from: delta))
             return true
-        case .turnStarted, .snapshot, .terminal, .tokenUsageUpdated, .statusChanged,
+        case .turnStarted, .terminal, .tokenUsageUpdated, .statusChanged,
             .closed, .unknown:
             return false
         }

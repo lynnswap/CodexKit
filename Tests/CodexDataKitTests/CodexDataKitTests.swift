@@ -6308,6 +6308,14 @@ struct CodexModelContextTests {
         #expect(chat.items.first === snapshotItem)
 
         try await runtime.transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(
+                threadID: "thread-live",
+                turn: .init(id: "turn-existing", status: "completed")
+            )
+        )
+
+        try await runtime.transport.emitServerNotification(
             method: "turn/started",
             params: TurnStartedParams(threadID: "thread-live", turnID: "turn-live")
         )
@@ -7009,6 +7017,13 @@ struct CodexModelContextTests {
 
         for turnID in ["turn-replay-a", "turn-replay-b"] {
             try await runtime.transport.emitServerNotification(
+                method: "turn/started",
+                params: TurnStartedParams(
+                    threadID: "thread-replay-live",
+                    turnID: turnID
+                )
+            )
+            try await runtime.transport.emitServerNotification(
                 method: "item/started",
                 params: ThreadItemParams(
                     lifecycle: .started,
@@ -7032,6 +7047,17 @@ struct CodexModelContextTests {
                         type: "agentMessage",
                         text: "Review was interrupted."
                     )
+                )
+            )
+            #expect(await eventually {
+                chat.items.contains { $0.itemID == "reasoning-\(turnID)" }
+                    && chat.items.contains { $0.itemID == "diagnostic-\(turnID)" }
+            })
+            try await runtime.transport.emitServerNotification(
+                method: "turn/completed",
+                params: TurnCompletedParams(
+                    threadID: "thread-replay-live",
+                    turn: .init(id: turnID, status: "completed")
                 )
             )
         }
@@ -7062,21 +7088,52 @@ struct CodexModelContextTests {
         }
         let changes = ChatUpdateRecorder(stream: observation.updates)
 
-        for turnID in ["turn-a", "turn-b"] {
-            try await runtime.transport.emitServerNotification(
-                method: "item/started",
-                params: ThreadItemParams(
-                    lifecycle: .started,
-                    threadID: "thread-reasoning-parts",
-                    turnID: turnID,
-                    item: .init(
-                        id: "reasoning-parent:summary:0",
-                        type: "reasoning",
-                        text: "Checking diff"
-                    )
+        try await runtime.transport.emitServerNotification(
+            method: "turn/started",
+            params: TurnStartedParams(threadID: "thread-reasoning-parts", turnID: "turn-a")
+        )
+        try await runtime.transport.emitServerNotification(
+            method: "item/started",
+            params: ThreadItemParams(
+                lifecycle: .started,
+                threadID: "thread-reasoning-parts",
+                turnID: "turn-a",
+                item: .init(
+                    id: "reasoning-parent:summary:0",
+                    type: "reasoning",
+                    text: "Checking diff"
                 )
             )
-        }
+        )
+        #expect(await eventually {
+            chat.items.contains {
+                $0.turnID == "turn-a" && $0.itemID == "reasoning-parent:summary:0"
+            }
+        })
+        try await runtime.transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(
+                threadID: "thread-reasoning-parts",
+                turn: .init(id: "turn-a", status: "completed")
+            )
+        )
+        try await runtime.transport.emitServerNotification(
+            method: "turn/started",
+            params: TurnStartedParams(threadID: "thread-reasoning-parts", turnID: "turn-b")
+        )
+        try await runtime.transport.emitServerNotification(
+            method: "item/started",
+            params: ThreadItemParams(
+                lifecycle: .started,
+                threadID: "thread-reasoning-parts",
+                turnID: "turn-b",
+                item: .init(
+                    id: "reasoning-parent:summary:0",
+                    type: "reasoning",
+                    text: "Checking diff"
+                )
+            )
+        )
         try await runtime.transport.emitServerNotification(
             method: "item/started",
             params: ThreadItemParams(

@@ -1,0 +1,596 @@
+import Foundation
+import Testing
+
+@testable import CodexAppServerKit
+
+@Suite("Thread event hub")
+struct ThreadEventHubTests {
+    @Test func laterPublicationCompactsAcrossAnOvertakenGenerationCommit() async throws {
+        let hub = ThreadEventHub()
+        let events = hub.events(for: "thread-1")
+        var iterator = events.makeAsyncIterator()
+        let checkpoint = try hub.registerCheckpoint(for: "thread-1")
+        hub.activate(checkpoint)
+        try hub.route(.turnStarted("turn-1"), for: "thread-1")
+        let gate = PublicationGate()
+
+        let commit = Task.detached {
+            hub.commitForTesting(checkpoint) {
+                gate.blockPublication()
+            }
+        }
+        #expect(gate.waitUntilBlocked())
+        try hub.route(.statusChanged(.active(activeFlags: [])), for: "thread-1")
+        gate.releasePublication()
+        await commit.value
+
+        #expect(try await iterator.next() == .snapshot(.init(
+            id: "turn-1",
+            state: .inProgress
+        )))
+        #expect(try await iterator.next() == .statusChanged(.active(activeFlags: [])))
+        #expect(hub.snapshotForTesting(threadID: "thread-1").overflowCount == 1)
+        events.cancel()
+    }
+
+    @Test func serializerSchedulingKeepsOnlyTheAcceptedAttempt() async throws {
+        let hub = ThreadEventHub()
+        let events = hub.events(for: "thread-1")
+        var iterator = events.makeAsyncIterator()
+        let first = try hub.registerCheckpoint(for: "thread-1")
+        let second = try hub.registerCheckpoint(for: "thread-1")
+
+        hub.activate(first)
+        hub.activate(first)
+        try hub.route(.turnStarted("turn-rejected"), for: "thread-1")
+        hub.reject(first)
+
+        #expect(hub.snapshotForTesting(threadID: "thread-1").hasActiveCheckpoint == false)
+        #expect(hub.snapshotForTesting(threadID: "thread-1").pendingCheckpointCount == 2)
+
+        hub.activate(first)
+        try hub.route(.turnStarted("turn-1"), for: "thread-1")
+        hub.commit(first)
+        hub.discard(first)
+
+        #expect(try await iterator.next() == .snapshot(.init(
+            id: "turn-1",
+            state: .inProgress
+        )))
+        #expect(hub.snapshotForTesting(threadID: "thread-1").pendingCheckpointCount == 1)
+
+        hub.activate(second)
+        try hub.route(.turnStarted("turn-2"), for: "thread-1")
+        hub.commit(second)
+        hub.discard(second)
+
+        #expect(try await iterator.next() == .snapshot(.init(
+            id: "turn-2",
+            state: .inProgress
+        )))
+        let snapshot = hub.snapshotForTesting(threadID: "thread-1")
+        #expect(snapshot.pendingCheckpointCount == 0)
+        #expect(snapshot.hasActiveCheckpoint == false)
+        #expect(snapshot.currentTurnID == "turn-2")
+        events.cancel()
+    }
+
+    @Test func terminalIsExactlyOnceNonDroppableAndDoesNotFinishTheThread() async throws {
+        let hub = ThreadEventHub()
+        hub.beginGeneration(for: "thread-1", including: "turn-1")
+        let events = hub.events(for: "thread-1")
+        var iterator = events.makeAsyncIterator()
+        let outcome = CodexTurnOutcome.completed(.init(turnID: "turn-1"))
+
+        #expect(try await iterator.next() == .snapshot(.init(
+            id: "turn-1",
+            state: .inProgress
+        )))
+        try hub.route(.terminal(outcome), for: "thread-1")
+        #expect(try hub.route(.terminal(outcome), for: "thread-1") == 0)
+
+        #expect(try await iterator.next() == .snapshot(.init(
+            id: "turn-1",
+            state: .completed
+        )))
+        #expect(try await iterator.next() == .terminal(outcome))
+
+        try hub.route(.statusChanged(.idle), for: "thread-1")
+        #expect(try await iterator.next() == .statusChanged(.idle))
+
+        do {
+            try hub.route(
+                .terminal(.interrupted(.init(turnID: "turn-1"))),
+                for: "thread-1"
+            )
+            Issue.record("Expected a conflicting terminal outcome to fail.")
+        } catch let error as CodexTransportFailure {
+            #expect(error == .contractViolation(
+                message: "Turn turn-1 reported conflicting terminal outcomes."
+            ))
+        }
+
+        try hub.route(.closed, for: "thread-1")
+        var remaining: [CodexThreadEvent] = []
+        while let event = try await iterator.next() {
+            remaining.append(event)
+        }
+        #expect(remaining.contains(.terminal(outcome)) == false)
+        #expect(remaining.last == .closed)
+
+        var late = hub.events(for: "thread-1").makeAsyncIterator()
+        var lateEvents: [CodexThreadEvent] = []
+        while let event = try await late.next() {
+            lateEvents.append(event)
+        }
+        #expect(lateEvents.first == .snapshot(.init(id: "turn-1", state: .completed)))
+        #expect(lateEvents.filter { $0 == .terminal(outcome) }.count == 1)
+        #expect(lateEvents.last == .closed)
+    }
+
+    @Test func terminalReplayHasExactCausalOrderForSlowAndLateSubscribers() async throws {
+        let hub = ThreadEventHub()
+        hub.beginGeneration(for: "thread-1", including: "turn-1")
+        let slow = hub.events(for: "thread-1")
+        let usage = CodexTokenUsage(inputTokens: 1, outputTokens: 2, totalTokens: 3)
+        let wireOutcome = CodexTurnOutcome.completed(.init(turnID: "turn-1"))
+        let outcome = CodexTurnOutcome.completed(.init(
+            turnID: "turn-1",
+            usage: usage
+        ))
+        let postStatus = CodexThreadStatus.idle
+        let postUnknown = CodexThreadEvent.unknown(.init(
+            method: "post-terminal",
+            params: Data(),
+            threadID: "thread-1",
+            turnID: "turn-1"
+        ))
+
+        try hub.route(.statusChanged(.active(activeFlags: [])), for: "thread-1")
+        try hub.route(.unknown(.init(
+            method: "pre-terminal",
+            params: Data(),
+            threadID: "thread-1",
+            turnID: "turn-1"
+        )), for: "thread-1")
+        try hub.route(.tokenUsageUpdated(usage, turnID: "turn-1"), for: "thread-1")
+        try hub.route(.terminal(wireOutcome), for: "thread-1")
+        try hub.route(.statusChanged(postStatus), for: "thread-1")
+        try hub.route(postUnknown, for: "thread-1")
+        try hub.route(.closed, for: "thread-1")
+
+        let expected: [CodexThreadEvent] = [
+            .snapshot(.init(id: "turn-1", state: .completed)),
+            .terminal(outcome),
+            .statusChanged(postStatus),
+            postUnknown,
+            .closed,
+        ]
+        #expect(try await collect(from: slow) == expected)
+        #expect(try await collect(from: hub.events(for: "thread-1")) == expected)
+    }
+
+    @Test func overflowCompactsToSnapshotBeforeTheBoundedNewestSuffix() async throws {
+        let hub = ThreadEventHub()
+        hub.beginGeneration(for: "thread-1", including: "turn-1")
+        let events = hub.events(for: "thread-1")
+        var iterator = events.makeAsyncIterator()
+
+        for index in 0...256 {
+            try hub.route(
+                .unknown(.init(
+                    method: "probe/\(index)",
+                    params: Data(),
+                    threadID: "thread-1",
+                    turnID: "turn-1"
+                )),
+                for: "thread-1"
+            )
+        }
+
+        let snapshot = hub.snapshotForTesting(threadID: "thread-1")
+        #expect(snapshot.overflowCount == 1)
+        #expect(try await iterator.next() == .snapshot(.init(
+            id: "turn-1",
+            state: .inProgress
+        )))
+
+        var methods: [String] = []
+        for _ in 0..<253 {
+            guard case .unknown(let raw) = try #require(try await iterator.next()) else {
+                Issue.record("Expected compacted unknown diagnostic suffix.")
+                break
+            }
+            methods.append(raw.method)
+        }
+        #expect(methods.first == "probe/4")
+        #expect(methods.last == "probe/256")
+        events.cancel()
+    }
+
+    @Test func detachedAdoptionUsesTheMatchingBoundedProvisionalGeneration() async throws {
+        let hub = ThreadEventHub()
+        let checkpoint = try hub.registerCheckpoint(for: "thread-1")
+        hub.activate(checkpoint)
+        try hub.route(.statusChanged(.active(activeFlags: [])), for: "thread-1")
+        try hub.route(.turnStarted("turn-1"), for: "thread-1")
+
+        hub.beginGeneration(for: "thread-1", including: "turn-1")
+        hub.commit(checkpoint)
+
+        var iterator = hub.events(for: "thread-1").makeAsyncIterator()
+        #expect(try await iterator.next() == .snapshot(.init(
+            id: "turn-1",
+            state: .inProgress
+        )))
+        #expect(try await iterator.next() == .statusChanged(.active(activeFlags: [])))
+        #expect(hub.snapshotForTesting(threadID: "thread-1").pendingCheckpointCount == 0)
+    }
+
+    @Test func lateSubscriberReplaysBoundedIncrementalsWithinTheCurrentGeneration() async throws {
+        let hub = ThreadEventHub()
+        hub.beginGeneration(for: "thread-1", including: "turn-1")
+        let item = CodexThreadItem(
+            id: "message-1",
+            kind: .agentMessage,
+            content: .message(.init(id: "message-1", role: .assistant, text: ""))
+        )
+        let first = CodexMessageDelta(text: "First", itemID: "message-1")
+        let second = CodexMessageDelta(text: "Second", itemID: "message-1")
+        try hub.route(.itemStarted(item, turnID: "turn-1"), for: "thread-1")
+        try hub.route(.messageDelta(first, turnID: "turn-1"), for: "thread-1")
+        try hub.route(.messageDelta(second, turnID: "turn-1"), for: "thread-1")
+
+        let events = hub.events(for: "thread-1")
+        var iterator = events.makeAsyncIterator()
+        #expect(try await iterator.next() == .snapshot(.init(
+            id: "turn-1",
+            state: .inProgress,
+            items: [item]
+        )))
+        #expect(try await iterator.next() == .messageDelta(first, turnID: "turn-1"))
+        #expect(try await iterator.next() == .messageDelta(second, turnID: "turn-1"))
+        events.cancel()
+    }
+
+    @Test func detachedStatusBeforeTurnRollsPastAClosedPriorGeneration() async throws {
+        let hub = ThreadEventHub()
+        let oldOutcome = CodexTurnOutcome.completed(.init(turnID: "turn-old"))
+        hub.beginGeneration(for: "thread-detached", including: "turn-old")
+        try hub.route(.terminal(oldOutcome), for: "thread-detached")
+        try hub.route(.closed, for: "thread-detached")
+
+        try hub.route(.statusChanged(.active(activeFlags: [])), for: "thread-detached")
+        try hub.route(.turnStarted("turn-new"), for: "thread-detached")
+        hub.beginGeneration(for: "thread-detached", including: "turn-new")
+
+        let events = hub.events(for: "thread-detached")
+        var iterator = events.makeAsyncIterator()
+        #expect(try await iterator.next() == .snapshot(.init(
+            id: "turn-new",
+            state: .inProgress
+        )))
+        #expect(try await iterator.next() == .statusChanged(.active(activeFlags: [])))
+        #expect(hub.snapshotForTesting(threadID: "thread-detached").currentTurnID == "turn-new")
+        events.cancel()
+    }
+
+    @Test func aSlowSubscriberCompactsIndependentlyAndNewSnapshotSupersedesItsOldSuffix() async throws {
+        let hub = ThreadEventHub()
+        hub.beginGeneration(for: "thread-1", including: "turn-1")
+        let fast = hub.events(for: "thread-1")
+        let slow = hub.events(for: "thread-1")
+        var fastIterator = fast.makeAsyncIterator()
+        var slowIterator = slow.makeAsyncIterator()
+
+        #expect(try await fastIterator.next() == .snapshot(.init(
+            id: "turn-1",
+            state: .inProgress
+        )))
+        for index in 0..<600 {
+            if index == 300 {
+                let snapshot = CodexTurnSnapshot(
+                    id: "turn-1",
+                    state: .inProgress,
+                    startedAt: Date(timeIntervalSince1970: 300)
+                )
+                try hub.route(.snapshot(snapshot), for: "thread-1")
+                #expect(try await fastIterator.next() == .snapshot(snapshot))
+            }
+            let event = CodexThreadEvent.unknown(.init(
+                method: "probe/\(index)",
+                params: Data(),
+                threadID: "thread-1",
+                turnID: "turn-1"
+            ))
+            try hub.route(event, for: "thread-1")
+            #expect(try await fastIterator.next() == event)
+        }
+
+        let snapshot = hub.snapshotForTesting(threadID: "thread-1")
+        #expect(snapshot.overflowCount >= 2)
+        guard case .snapshot(let compactSnapshot) = try #require(try await slowIterator.next()) else {
+            Issue.record("Expected the slow subscriber's compact baseline first.")
+            fast.cancel()
+            slow.cancel()
+            return
+        }
+        #expect(compactSnapshot.startedAt == Date(timeIntervalSince1970: 300))
+        #expect(snapshot.subscriberCount == 2)
+        fast.cancel()
+        slow.cancel()
+    }
+
+    @Test func discardingAFailedCheckpointPreservesThePriorCurrentGeneration() async throws {
+        let hub = ThreadEventHub()
+        hub.beginGeneration(for: "thread-1", including: "turn-current")
+        let checkpoint = try hub.registerCheckpoint(for: "thread-1")
+        hub.activate(checkpoint)
+        try hub.route(.turnStarted("turn-rejected"), for: "thread-1")
+
+        hub.discard(checkpoint)
+
+        let snapshot = hub.snapshotForTesting(threadID: "thread-1")
+        #expect(snapshot.currentTurnID == "turn-current")
+        #expect(snapshot.pendingCheckpointCount == 0)
+        var iterator = hub.events(for: "thread-1").makeAsyncIterator()
+        #expect(try await iterator.next() == .snapshot(.init(
+            id: "turn-current",
+            state: .inProgress
+        )))
+    }
+
+    @Test func threadProjectionsReleaseDedupeStateAcrossGenerations() async throws {
+        let hub = ThreadEventHub()
+        hub.beginGeneration(for: "thread-1", including: "turn-1")
+        let messages = CodexThreadMessageSequence(events: hub.events(for: "thread-1"))
+        let logs = CodexThreadLogSequence(events: hub.events(for: "thread-1"))
+        var messageIterator = messages.makeAsyncIterator()
+        var logIterator = logs.makeAsyncIterator()
+        let first = CodexThreadItem(
+            id: "shared-id",
+            kind: .agentMessage,
+            content: .message(.init(id: "shared-id", role: .assistant, text: "First"))
+        )
+
+        try hub.route(.itemCompleted(first, turnID: "turn-1"), for: "thread-1")
+        #expect(try await messageIterator.next()?.text == "First")
+        #expect(try await logIterator.next()?.item?.text == "First")
+        try hub.route(
+            .terminal(.completed(.init(turnID: "turn-1"))),
+            for: "thread-1"
+        )
+
+        try hub.route(.turnStarted("turn-2"), for: "thread-1")
+        let second = CodexThreadItem(
+            id: "shared-id",
+            kind: .agentMessage,
+            content: .message(.init(id: "shared-id", role: .assistant, text: "Second"))
+        )
+        try hub.route(.itemCompleted(second, turnID: "turn-2"), for: "thread-1")
+
+        #expect(try await messageIterator.next()?.text == "Second")
+        #expect(try await logIterator.next()?.item?.text == "Second")
+    }
+
+    @Test func discardedUniqueCheckpointsDoNotAccumulateEmptyThreadState() throws {
+        let hub = ThreadEventHub()
+
+        for index in 0..<100 {
+            let checkpoint = try hub.registerCheckpoint(for: .init(rawValue: "thread-\(index)"))
+            hub.discard(checkpoint)
+        }
+
+        let snapshot = hub.snapshotForTesting(threadID: "probe")
+        #expect(snapshot.pendingCheckpointCount == 0)
+        #expect(snapshot.threadStateCount == 0)
+    }
+
+    @Test func aDifferentTurnAtomicallySupersedesTheTerminalGeneration() async throws {
+        let hub = ThreadEventHub()
+        hub.beginGeneration(for: "thread-1", including: "turn-1")
+        let events = hub.events(for: "thread-1")
+        var iterator = events.makeAsyncIterator()
+        try hub.route(
+            .terminal(.completed(.init(turnID: "turn-1"))),
+            for: "thread-1"
+        )
+
+        try hub.route(.turnStarted("turn-2"), for: "thread-1")
+
+        #expect(try await iterator.next() == .snapshot(.init(
+            id: "turn-2",
+            state: .inProgress
+        )))
+        #expect(hub.snapshotForTesting(threadID: "thread-1").currentTurnID == "turn-2")
+        events.cancel()
+    }
+
+    @Test func closedGenerationCanBeReplacedByAnExplicitRequestCheckpoint() async throws {
+        let hub = ThreadEventHub()
+        hub.beginGeneration(for: "thread-1", including: "turn-old")
+        try hub.route(.closed, for: "thread-1")
+        let checkpoint = try hub.registerCheckpoint(for: "thread-1")
+        hub.activate(checkpoint)
+        try hub.route(.turnStarted("turn-new"), for: "thread-1")
+        hub.commit(checkpoint)
+
+        var iterator = hub.events(for: "thread-1").makeAsyncIterator()
+        #expect(try await iterator.next() == .snapshot(.init(
+            id: "turn-new",
+            state: .inProgress
+        )))
+        #expect(hub.snapshotForTesting(threadID: "thread-1").isClosed == false)
+    }
+
+    @Test func emptyCheckpointStillCreatesAnOpaqueGenerationBoundary() async throws {
+        let hub = ThreadEventHub()
+        hub.beginGeneration(for: "thread-1", including: "turn-old")
+        let oldOutcome = CodexTurnOutcome.completed(.init(turnID: "turn-old"))
+        try hub.route(.terminal(oldOutcome), for: "thread-1")
+        let events = hub.events(for: "thread-1")
+        var iterator = events.makeAsyncIterator()
+        #expect(try await iterator.next() == .snapshot(.init(
+            id: "turn-old",
+            state: .completed
+        )))
+        #expect(try await iterator.next() == .terminal(oldOutcome))
+
+        let checkpoint = try hub.registerCheckpoint(for: "thread-1")
+        hub.activate(checkpoint)
+        hub.commit(checkpoint)
+        try hub.route(.statusChanged(.active(activeFlags: [])), for: "thread-1")
+        try hub.route(.turnStarted("turn-new"), for: "thread-1")
+
+        #expect(try await iterator.next() == .snapshot(.init(
+            id: "turn-new",
+            state: .inProgress
+        )))
+        #expect(try await iterator.next() == .statusChanged(.active(activeFlags: [])))
+        events.cancel()
+    }
+
+    @Test func connectionFailureClearsGenerationsAndFailsCurrentAndLateSubscribersIdentically() async {
+        let hub = ThreadEventHub()
+        hub.beginGeneration(for: "thread-1", including: "turn-1")
+        let events = hub.events(for: "thread-1")
+        var current = events.makeAsyncIterator()
+        let error = CodexAppServerError.connectionTerminated(.processExited(status: 9))
+
+        hub.finish(throwing: error)
+
+        await expectFailure(error, from: &current)
+        var late = hub.events(for: "thread-1").makeAsyncIterator()
+        await expectFailure(error, from: &late)
+        let snapshot = hub.snapshotForTesting(threadID: "thread-1")
+        #expect(snapshot.hasCurrentGeneration == false)
+        #expect(snapshot.subscriberCount == 0)
+        #expect(snapshot.failure == error)
+    }
+
+    @Test func checkpointTransitionsAreHarmlessAfterConnectionTermination() throws {
+        let error = CodexAppServerError.connectionTerminated(.processExited(status: 9))
+
+        let activateHub = ThreadEventHub()
+        let inactive = try activateHub.registerCheckpoint(for: "thread-activate")
+        activateHub.finish(throwing: error)
+        activateHub.activate(inactive)
+
+        let rejectHub = ThreadEventHub()
+        let rejected = try rejectHub.registerCheckpoint(for: "thread-reject")
+        rejectHub.activate(rejected)
+        rejectHub.finish(throwing: error)
+        rejectHub.reject(rejected)
+
+        let commitHub = ThreadEventHub()
+        let committed = try commitHub.registerCheckpoint(for: "thread-commit")
+        commitHub.activate(committed)
+        commitHub.finish(throwing: error)
+        commitHub.commit(committed)
+
+        do {
+            _ = try commitHub.registerCheckpoint(for: "thread-late")
+            Issue.record("Expected registration after failure to throw.")
+        } catch let thrown as CodexAppServerError {
+            #expect(thrown == error)
+        }
+        commitHub.resetGeneration(for: "thread-commit")
+        commitHub.beginGeneration(for: "thread-commit", including: "turn-late")
+        do {
+            try commitHub.route(.statusChanged(.idle), for: "thread-commit")
+            Issue.record("Expected routing after failure to throw.")
+        } catch let thrown as CodexAppServerError {
+            #expect(thrown == error)
+        }
+    }
+
+    @Test func cancellationAfterHubRemovalDiscardsClosedAndFailedDelivery() async throws {
+        let closedHub = ThreadEventHub()
+        closedHub.beginGeneration(for: "thread-closed", including: "turn-1")
+        let closed = closedHub.events(for: "thread-closed")
+        try closedHub.route(.closed, for: "thread-closed")
+        #expect(closedHub.snapshotForTesting(threadID: "thread-closed").subscriberCount == 0)
+        closed.cancel()
+        var closedIterator = closed.makeAsyncIterator()
+        #expect(try await closedIterator.next() == nil)
+
+        let failedHub = ThreadEventHub()
+        let failed = failedHub.events(for: "thread-failed")
+        failedHub.finish(throwing: .connectionTerminated(.processExited(status: 9)))
+        failed.cancel()
+        var failedIterator = failed.makeAsyncIterator()
+        #expect(try await failedIterator.next() == nil)
+    }
+
+    @Test func explicitTaskAndLastCopyCancellationRemoveOnlyTheirSubscriber() async throws {
+        let hub = ThreadEventHub()
+        let retained = hub.events(for: "thread-1")
+        var explicit: CodexThreadEventSequence? = hub.events(for: "thread-1")
+        #expect(hub.snapshotForTesting(threadID: "thread-1").subscriberCount == 2)
+
+        explicit?.cancel()
+        explicit = nil
+        #expect(hub.snapshotForTesting(threadID: "thread-1").subscriberCount == 1)
+
+        do {
+            _ = hub.events(for: "thread-1")
+        }
+        #expect(hub.snapshotForTesting(threadID: "thread-1").subscriberCount == 1)
+
+        let waiting = hub.events(for: "thread-1")
+        let task = Task {
+            var iterator = waiting.makeAsyncIterator()
+            return try await iterator.next()
+        }
+        #expect(hub.snapshotForTesting(threadID: "thread-1").subscriberCount == 2)
+        task.cancel()
+        #expect(try await task.value == nil)
+        #expect(hub.snapshotForTesting(threadID: "thread-1").subscriberCount == 1)
+
+        retained.cancel()
+        #expect(hub.snapshotForTesting(threadID: "thread-1").subscriberCount == 0)
+    }
+}
+
+private final class PublicationGate: @unchecked Sendable {
+    private let blocked = DispatchSemaphore(value: 0)
+    private let released = DispatchSemaphore(value: 0)
+
+    func blockPublication() {
+        blocked.signal()
+        released.wait()
+    }
+
+    func waitUntilBlocked() -> Bool {
+        blocked.wait(timeout: .now() + 5) == .success
+    }
+
+    func releasePublication() {
+        released.signal()
+    }
+}
+
+private func collect(
+    from sequence: CodexThreadEventSequence
+) async throws -> [CodexThreadEvent] {
+    var iterator = sequence.makeAsyncIterator()
+    var events: [CodexThreadEvent] = []
+    while let event = try await iterator.next() {
+        events.append(event)
+    }
+    return events
+}
+
+private func expectFailure(
+    _ expected: CodexAppServerError,
+    from iterator: inout CodexThreadEventSequence.Iterator
+) async {
+    do {
+        _ = try await iterator.next()
+        Issue.record("Expected thread events to fail.")
+    } catch let error as CodexAppServerError {
+        #expect(error == expected)
+    } catch {
+        Issue.record("Unexpected thread event failure: \(error)")
+    }
+}

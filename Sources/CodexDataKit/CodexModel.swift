@@ -1154,6 +1154,16 @@ public final class CodexChat: CodexPersistentModel {
                 preservesExistingUsage: true
             ))
             changes.append(contentsOf: mergeItems(snapshot.items, turnID: snapshot.id))
+            switch snapshot.state {
+            case .inProgress:
+                changes.appendIfPresent(markRunningIfNeeded())
+            case .completed, .interrupted, .unknown:
+                changes.appendIfPresent(markIdleIfActive())
+                markLoadedIfNotFailed()
+            case .failed(let error):
+                changes.appendIfPresent(markIdleIfActive())
+                fail(with: error)
+            }
         case .terminal(let outcome):
             changes.append(contentsOf: apply(outcome))
             changes.appendIfPresent(markIdleIfActive())

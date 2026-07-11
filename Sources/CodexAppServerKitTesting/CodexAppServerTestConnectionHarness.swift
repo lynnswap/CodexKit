@@ -76,9 +76,11 @@ package struct CodexAppServerTestConnectionHarness: Sendable {
         connectionCloseAction: ConnectionCloseAction
     ) async -> Self {
         let turnReplayStore = TurnReplayStore()
+        let threadEventHub = ThreadEventHub()
         let router = CodexAppServerNotificationRouter(
             client: client,
-            turnReplayStore: turnReplayStore
+            turnReplayStore: turnReplayStore,
+            threadEventHub: threadEventHub
         )
         let connection = AppServerConnection(
             transport: transport,

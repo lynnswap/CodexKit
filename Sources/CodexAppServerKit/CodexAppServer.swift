@@ -216,9 +216,11 @@ public actor CodexAppServer {
             connectionCloseAction: connectionCloseAction
         )
         let turnReplayStore = TurnReplayStore()
+        let threadEventHub = ThreadEventHub()
         let router = CodexAppServerNotificationRouter(
             client: client,
-            turnReplayStore: turnReplayStore
+            turnReplayStore: turnReplayStore,
+            threadEventHub: threadEventHub
         )
         let connection = AppServerConnection(
             transport: transport,
@@ -261,9 +263,11 @@ public actor CodexAppServer {
         )
         let configuration = Configuration()
         let turnReplayStore = TurnReplayStore()
+        let threadEventHub = ThreadEventHub()
         let router = CodexAppServerNotificationRouter(
             client: client,
-            turnReplayStore: turnReplayStore
+            turnReplayStore: turnReplayStore,
+            threadEventHub: threadEventHub
         )
         let connection = AppServerConnection(
             transport: transport,
@@ -477,12 +481,16 @@ public actor CodexAppServer {
         let response: AppServerAPI.Thread.Resume.Response = try await withThreadEventGeneration(
             id,
             router: router
-        ) {
+        ) { generation in
             try await client.send(
                 AppServerAPI.Thread.Resume.Request(
                     threadID: id.rawValue,
                     params: threadStartParams(options: options)
-                ))
+                ),
+                onWriteAccepted: generation.acceptWrite,
+                onResponseRejected: generation.rejectResponse,
+                onResponseAccepted: generation.acceptResponse
+            )
         }
         return await thread(from: response.thread, model: response.model ?? options.model)
     }

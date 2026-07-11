@@ -7,34 +7,15 @@ extension CodexThread {
     /// live notifications. It finishes when the app-server reports the thread
     /// as closed or when the app-server connection closes.
     package var events: CodexThreadEventSequence {
-        .init {
-            AsyncThrowingStream { continuation in
-                let task = Task {
-                    let stream = await router.events(for: id)
-                    do {
-                        for try await event in stream {
-                            continuation.yield(event)
-                        }
-                        continuation.finish()
-                    } catch {
-                        continuation.finish(throwing: error)
-                    }
-                }
-                continuation.onTermination = { _ in
-                    task.cancel()
-                }
-            }
-        }
+        router.events(for: id)
     }
 
-    package func beginEventGeneration() async {
-        await router.beginThreadEventGeneration(id)
+    package func beginEventGeneration() {
+        router.resetThreadEventGeneration(id)
     }
 
-    package func makeCurrentGenerationEventStream() async -> AsyncThrowingStream<
-        CodexThreadEvent, Error
-    > {
-        await router.observationEvents(for: id)
+    package func makeCurrentGenerationEventStream() -> CodexThreadEventSequence {
+        router.events(for: id)
     }
 
     /// Agent messages emitted by this thread.
@@ -177,13 +158,20 @@ extension CodexThread {
             let response: AppServerAPI.Review.Start.Response = try await withThreadEventGeneration(
                 id,
                 router: router
-            ) {
+            ) { generation in
                 try await client.send(
                     AppServerAPI.Review.Start.Request(
                         params: .init(threadID: id.rawValue, target: target, delivery: delivery)
                     ),
-                    onWriteAccepted: pending.acceptWrite,
-                    onResponseRejected: pending.rejectAcceptedWrite,
+                    onWriteAccepted: {
+                        generation.acceptWrite()
+                        pending.acceptWrite()
+                    },
+                    onResponseRejected: {
+                        generation.rejectResponse()
+                        pending.rejectAcceptedWrite()
+                    },
+                    onResponseAccepted: generation.acceptResponse,
                     onPostWriteCancellation: { response in
                         let review = await reviewSession(
                             from: response,
@@ -220,7 +208,7 @@ extension CodexThread {
             initialSnapshot: initialTurn
         )
         if let detachedReviewThreadID {
-            await router.beginDetachedThreadEventGeneration(
+            await router.adoptDetachedThreadEventGeneration(
                 detachedReviewThreadID,
                 including: turnID
             )
@@ -389,11 +377,15 @@ extension CodexThread {
 
     /// Starts app-server context compaction for this thread.
     public func compact() async throws {
-        let _: EmptyResponse = try await withThreadEventGeneration(id, router: router) {
+        let _: EmptyResponse = try await withThreadEventGeneration(id, router: router) { generation in
             try await client.send(
                 AppServerAPI.Thread.Compact.Start.Request(
                     params: .init(threadID: id.rawValue)
-                ))
+                ),
+                onWriteAccepted: generation.acceptWrite,
+                onResponseRejected: generation.rejectResponse,
+                onResponseAccepted: generation.acceptResponse
+            )
         }
     }
 
@@ -467,7 +459,7 @@ package func startCodexTurn(
         let response: AppServerAPI.Turn.Start.Response = try await withThreadEventGeneration(
             threadID,
             router: router
-        ) {
+        ) { generation in
             try await client.send(
                 AppServerAPI.Turn.Start.Request(
                     params: .init(
@@ -486,8 +478,15 @@ package func startCodexTurn(
                         summary: options.summary?.rawValue
                     )
                 ),
-                onWriteAccepted: pending.acceptWrite,
-                onResponseRejected: pending.rejectAcceptedWrite,
+                onWriteAccepted: {
+                    generation.acceptWrite()
+                    pending.acceptWrite()
+                },
+                onResponseRejected: {
+                    generation.rejectResponse()
+                    pending.rejectAcceptedWrite()
+                },
+                onResponseAccepted: generation.acceptResponse,
                 onPostWriteCancellation: { response in
                     let turn = await bindTurn(
                         response,
@@ -562,12 +561,39 @@ private func finishPendingTurnOperation(
 package func withThreadEventGeneration<Response: Sendable>(
     _ threadID: CodexThreadID,
     router: CodexAppServerNotificationRouter,
-    operation: @Sendable () async throws -> Response
+    operation: @Sendable (ThreadEventGenerationAttempt) async throws -> Response
 ) async throws -> Response {
-    let generationCursor = await router.threadEventGenerationCursor(threadID)
-    let response = try await operation()
-    await router.beginThreadEventGeneration(threadID, at: generationCursor)
-    return response
+    let hub = router.threadEventHub
+    let checkpoint = try hub.registerCheckpoint(for: threadID)
+    let generation = ThreadEventGenerationAttempt(hub: hub, checkpoint: checkpoint)
+    do {
+        return try await operation(generation)
+    } catch {
+        hub.discard(checkpoint)
+        throw error
+    }
+}
+
+package struct ThreadEventGenerationAttempt: Sendable {
+    private let hub: ThreadEventHub
+    private let checkpoint: ThreadEventGenerationCheckpoint
+
+    fileprivate init(hub: ThreadEventHub, checkpoint: ThreadEventGenerationCheckpoint) {
+        self.hub = hub
+        self.checkpoint = checkpoint
+    }
+
+    package func acceptWrite() {
+        hub.activate(checkpoint)
+    }
+
+    package func rejectResponse() {
+        hub.reject(checkpoint)
+    }
+
+    package func acceptResponse() {
+        hub.commit(checkpoint)
+    }
 }
 
 extension CodexTurn {

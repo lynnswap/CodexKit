@@ -229,6 +229,17 @@ for try await event in thread.events {
 }
 ```
 
+The stream represents the thread's current generation, not an append-only
+connection history. A generation is registered before a scoped request is
+written and becomes current only after its response is accepted; attempts that
+fail or cancel before an accepted response leave the previous generation
+intact. Each subscriber has a
+bounded 256-event channel. A slow subscriber receives an authoritative turn
+snapshot plus the newest usage/status and bounded unknown diagnostics when its
+incremental queue overflows. Terminal and `thread/closed` events are never
+dropped, and cancelling one iterator synchronously removes only that
+subscriber.
+
 This lets review clients build logs from
 CodexAppServerKit domain events instead of parsing JSON-RPC notifications or
 string logs directly.
