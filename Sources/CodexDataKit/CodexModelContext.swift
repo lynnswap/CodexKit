@@ -153,6 +153,7 @@ public final class CodexModelContext {
         var thread: CodexThread
         var source: String
         var usesPreparedThread: Bool
+        var includesTurns: Bool
         var eventStream: CodexThreadEventSequence?
         var snapshot: ChatObservationStartSnapshot
     }
@@ -1149,6 +1150,7 @@ public final class CodexModelContext {
                     thread: thread,
                     source: source,
                     usesPreparedThread: usesPreparedThread,
+                    includesTurns: includeTurns,
                     eventStream: eventStream,
                     snapshot: snapshot
                 ))
@@ -1179,8 +1181,7 @@ public final class CodexModelContext {
             try await commitObservationStartIfNeeded(
                 outcome,
                 observation: observation,
-                chat: chat,
-                includeTurns: includeTurns
+                chat: chat
             )
             try Task.checkCancellation()
             if observation.isFinished {
@@ -1209,8 +1210,7 @@ public final class CodexModelContext {
     private func commitObservationStartIfNeeded(
         _ outcome: ChatObservationStartOutcome,
         observation: ActiveChatObservation,
-        chat: CodexChat,
-        includeTurns: Bool
+        chat: CodexChat
     ) async throws {
         if observation.isStarting == false {
             return
@@ -1231,7 +1231,7 @@ public final class CodexModelContext {
             )
         case .loaded(let load):
             logger.debug(
-                "Starting chat observation chatID=\(chat.id.rawValue, privacy: .public) includeTurns=\(includeTurns, privacy: .public) source=\(load.source, privacy: .public) turns=\(chat.turns.count, privacy: .public) items=\(chat.items.count, privacy: .public)"
+                "Starting chat observation chatID=\(chat.id.rawValue, privacy: .public) includeTurns=\(load.includesTurns, privacy: .public) source=\(load.source, privacy: .public) turns=\(chat.turns.count, privacy: .public) items=\(chat.items.count, privacy: .public)"
             )
             observation.eventThread = load.thread
             switch load.snapshot {
@@ -1239,16 +1239,16 @@ public final class CodexModelContext {
                 await applyRefreshedThreadSnapshot(
                     refreshedSnapshot,
                     to: chat,
-                    includeTurns: includeTurns,
+                    includeTurns: load.includesTurns,
                     observation: observation,
-                    replaysBufferedEvents: false,
+                    replaysBufferedEvents: true,
                     emitsResynchronization: false
                 )
             case .failed(let error):
                 guard canObserveSeededSnapshotAfterInitialRefreshFailure(
                     chat,
                     usesPreparedThread: load.usesPreparedThread,
-                    includeTurns: includeTurns
+                    includeTurns: load.includesTurns
                 ) else {
                     finishObservationStartWithFailure(
                         error,
@@ -1257,12 +1257,12 @@ public final class CodexModelContext {
                     )
                     return
                 }
-                chat.syncPhaseAfterRefresh(includeTurns: includeTurns)
+                chat.syncPhaseAfterRefresh(includeTurns: load.includesTurns)
             }
             if load.usesPreparedThread,
                shouldResetPreparedEventGenerationBeforeObserving(
                    chat,
-                   includeTurns: includeTurns
+                   includeTurns: load.includesTurns
                ) {
                 load.thread.beginEventGeneration()
             }
@@ -1273,7 +1273,7 @@ public final class CodexModelContext {
                 thread: load.thread,
                 eventStream: eventStream
             )
-            observation.includesTurns = includeTurns
+            observation.includesTurns = load.includesTurns
             observation.finishStarting()
         }
     }
