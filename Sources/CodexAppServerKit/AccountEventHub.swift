@@ -5,7 +5,6 @@ package actor AccountEventHub {
     package enum Mutation: Equatable, Sendable {
         case updated(AppServerNotificationDecoder.AccountUpdate)
         case rateLimitsUpdated(AppServerAPI.Account.RateLimits.Snapshot)
-        case loginCompleted(CodexLoginCompletion)
     }
 
     private var rateLimitsResponse: AppServerAPI.Account.RateLimits.Response?
@@ -42,8 +41,6 @@ package actor AccountEventHub {
                 return
             }
             yield(.rateLimitsUpdated(.init(appServer: merged)))
-        case .loginCompleted(let completion):
-            yield(.loginCompleted(completion))
         }
     }
 
@@ -115,9 +112,6 @@ private final class AccountEventSubscriberChannel: Sendable {
         var nextSequence: UInt64 = 0
         var accountChanged: PendingEvent?
         var rateLimits: PendingEvent?
-        // Transitional W2 compatibility only. W3 replaces this bounded FIFO with
-        // ID-correlated LoginRegistry ownership and removes broad login events.
-        var loginCompletions: [PendingEvent] = []
         var waiter: CheckedContinuation<
             Result<CodexAccountEvent?, CodexAppServerError>, Never
         >?
@@ -145,14 +139,6 @@ private final class AccountEventSubscriberChannel: Sendable {
             case .rateLimitsUpdated:
                 let sequence = state.rateLimits?.sequence ?? state.nextSequence
                 state.rateLimits = .init(sequence: sequence, event: event)
-            case .loginCompleted:
-                if state.loginCompletions.count == 3 {
-                    state.loginCompletions.removeFirst()
-                }
-                state.loginCompletions.append(.init(
-                    sequence: state.nextSequence,
-                    event: event
-                ))
             case .malformed, .unknown:
                 preconditionFailure("AccountEventHub received an event outside its owned kinds.")
             }
@@ -230,7 +216,6 @@ private final class AccountEventSubscriberChannel: Sendable {
             state.terminal = .finished(error)
             state.accountChanged = nil
             state.rateLimits = nil
-            state.loginCompletions.removeAll()
             let waiter = state.waiter
             state.waiter = nil
             let observers = state.suspensionObservers
@@ -251,12 +236,10 @@ private final class AccountEventSubscriberChannel: Sendable {
         enum Kind {
             case accountChanged
             case rateLimits
-            case loginCompleted
         }
         let candidates: [(Kind, PendingEvent)] = [
             state.accountChanged.map { (.accountChanged, $0) },
             state.rateLimits.map { (.rateLimits, $0) },
-            state.loginCompletions.first.map { (.loginCompleted, $0) },
         ].compactMap(\.self)
         guard let (kind, pending) = candidates.min(by: { $0.1.sequence < $1.1.sequence }) else {
             return nil
@@ -266,8 +249,6 @@ private final class AccountEventSubscriberChannel: Sendable {
             state.accountChanged = nil
         case .rateLimits:
             state.rateLimits = nil
-        case .loginCompleted:
-            state.loginCompletions.removeFirst()
         }
         return pending.event
     }

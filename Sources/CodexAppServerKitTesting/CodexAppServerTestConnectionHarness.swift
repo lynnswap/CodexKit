@@ -31,7 +31,8 @@ package struct CodexAppServerTestConnectionHarness: Sendable {
             handler: handler,
             diagnosticHandler: diagnosticHandler,
             client: client,
-            connectionCloseAction: connectionCloseAction
+            connectionCloseAction: connectionCloseAction,
+            deadlineClock: deadlineClock
         )
     }
 
@@ -62,7 +63,8 @@ package struct CodexAppServerTestConnectionHarness: Sendable {
             handler: handler,
             diagnosticHandler: diagnosticHandler,
             client: client,
-            connectionCloseAction: connectionCloseAction
+            connectionCloseAction: connectionCloseAction,
+            deadlineClock: deadlineClock
         )
     }
 
@@ -73,14 +75,16 @@ package struct CodexAppServerTestConnectionHarness: Sendable {
         handler: CodexAppServerRequestHandler?,
         diagnosticHandler: @escaping ServerRequestRegistry.DiagnosticHandler,
         client: AppServerClient,
-        connectionCloseAction: ConnectionCloseAction
+        connectionCloseAction: ConnectionCloseAction,
+        deadlineClock: CodexDeadlineClock
     ) async -> Self {
         let turnReplayStore = TurnReplayStore()
         let threadEventHub = ThreadEventHub()
         let router = CodexAppServerNotificationRouter(
             client: client,
             turnReplayStore: turnReplayStore,
-            threadEventHub: threadEventHub
+            threadEventHub: threadEventHub,
+            loginRegistry: LoginRegistry(sleep: deadlineClock.sleep)
         )
         let connection = AppServerConnection(
             transport: transport,

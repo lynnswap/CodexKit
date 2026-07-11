@@ -420,33 +420,9 @@ try await appServer.updateConfiguration(patch)
 Login flows return typed handles:
 
 ```swift
-let accountEvents = await appServer.accountEvents()
 let handle = try await appServer.loginChatGPT()
-
-for try await event in accountEvents {
-    if case .loginCompleted(let completion) = event, completion.loginID == handle.id {
-        break
-    }
-}
-```
-
-Native apps can ask the app-server to shape the ChatGPT login URL for an
-`ASWebAuthenticationSession`, then complete the login with the returned callback
-URL:
-
-```swift
-let login = try await appServer.loginChatGPT(
-    nativeWebAuthentication: .init(callbackURLScheme: "com.example.app.auth")
-)
-let callbackURL = try await webAuthenticationSession(login.authenticationURL)
-try await appServer.completeLogin(id: login.id, callbackURL: callbackURL)
-```
-
-API key and device-code login are also available:
-
-```swift
-try await appServer.loginAPIKey(apiKey)
-let deviceCode = try await appServer.loginChatGPTDeviceCode()
+openInBrowser(handle.authenticationURL)
+let outcome = try await handle.result()
 ```
 
 ## Testing

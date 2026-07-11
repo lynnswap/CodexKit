@@ -913,16 +913,12 @@ public actor CodexAppServerTestTransport {
     /// Enqueues a ChatGPT browser login response.
     public func enqueueChatGPTLogin(
         loginID: String,
-        authenticationURL: URL,
-        nativeWebAuthentication: CodexNativeWebAuthentication? = nil
+        authenticationURL: URL
     ) throws {
         try enqueue(
             AppServerAPI.Account.Login.Response.chatgpt(
                 loginID: loginID,
-                authURL: authenticationURL.absoluteString,
-                nativeWebAuthentication: nativeWebAuthentication.map {
-                    .init(callbackURLScheme: $0.callbackURLScheme)
-                }
+                authURL: authenticationURL.absoluteString
             ),
             for: "account/login/start"
         )

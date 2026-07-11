@@ -52,7 +52,6 @@ package enum AppServerAPI {
         }
         package enum Login {
             package enum Start {}
-            package enum Complete {}
             package enum Cancel {}
         }
     }
@@ -2311,36 +2310,19 @@ extension AppServerAPI.Account {
 }
 
 extension AppServerAPI.Account.Login {
-    package struct NativeWebAuthentication: Codable, Equatable, Sendable {
-        package var callbackURLScheme: String
-
-        enum CodingKeys: String, CodingKey {
-            case callbackURLScheme = "callbackUrlScheme"
-        }
-
-        package init(callbackURLScheme: String) {
-            self.callbackURLScheme = callbackURLScheme
-        }
-    }
-}
-
-extension AppServerAPI.Account.Login {
     package struct Params: Codable, Equatable, Sendable {
         package var type: String
         package var apiKey: String?
         package var codexStreamlinedLogin: Bool
-        package var nativeWebAuthentication: AppServerAPI.Account.Login.NativeWebAuthentication?
 
         package init(
             type: String = "chatgpt",
             apiKey: String? = nil,
-            codexStreamlinedLogin: Bool = true,
-            nativeWebAuthentication: AppServerAPI.Account.Login.NativeWebAuthentication? = nil
+            codexStreamlinedLogin: Bool = true
         ) {
             self.type = type
             self.apiKey = apiKey
             self.codexStreamlinedLogin = codexStreamlinedLogin
-            self.nativeWebAuthentication = nativeWebAuthentication
         }
     }
 }
@@ -2348,11 +2330,7 @@ extension AppServerAPI.Account.Login {
 extension AppServerAPI.Account.Login {
     package enum Response: Codable, Equatable, Sendable {
         case apiKey
-        case chatgpt(
-            loginID: String,
-            authURL: String,
-            nativeWebAuthentication: AppServerAPI.Account.Login.NativeWebAuthentication? = nil
-        )
+        case chatgpt(loginID: String, authURL: String)
         case chatgptDeviceCode(loginID: String, verificationURL: String, userCode: String)
         case chatgptAuthTokens
 
@@ -2360,7 +2338,6 @@ extension AppServerAPI.Account.Login {
             case type
             case loginID = "loginId"
             case authURL = "authUrl"
-            case nativeWebAuthentication
             case verificationURL = "verificationUrl"
             case userCode
         }
@@ -2373,11 +2350,7 @@ extension AppServerAPI.Account.Login {
             case "chatgpt":
                 self = .chatgpt(
                     loginID: try container.decode(String.self, forKey: .loginID),
-                    authURL: try container.decode(String.self, forKey: .authURL),
-                    nativeWebAuthentication: try container.decodeIfPresent(
-                        AppServerAPI.Account.Login.NativeWebAuthentication.self,
-                        forKey: .nativeWebAuthentication
-                    )
+                    authURL: try container.decode(String.self, forKey: .authURL)
                 )
             case "chatgptDeviceCode":
                 self = .chatgptDeviceCode(
@@ -2401,11 +2374,10 @@ extension AppServerAPI.Account.Login {
             switch self {
             case .apiKey:
                 try container.encode("apiKey", forKey: .type)
-            case .chatgpt(let loginID, let authURL, let nativeWebAuthentication):
+            case .chatgpt(let loginID, let authURL):
                 try container.encode("chatgpt", forKey: .type)
                 try container.encode(loginID, forKey: .loginID)
                 try container.encode(authURL, forKey: .authURL)
-                try container.encodeIfPresent(nativeWebAuthentication, forKey: .nativeWebAuthentication)
             case .chatgptDeviceCode(let loginID, let verificationURL, let userCode):
                 try container.encode("chatgptDeviceCode", forKey: .type)
                 try container.encode(loginID, forKey: .loginID)
@@ -2421,7 +2393,7 @@ extension AppServerAPI.Account.Login {
 extension AppServerAPI.Account.Login.Response {
     package var pendingLoginID: String? {
         switch self {
-        case .chatgpt(let loginID, _, _), .chatgptDeviceCode(let loginID, _, _):
+        case .chatgpt(let loginID, _), .chatgptDeviceCode(let loginID, _, _):
             loginID
         case .apiKey, .chatgptAuthTokens:
             nil
@@ -2437,36 +2409,6 @@ extension AppServerAPI.Account.Login.Start {
         package var params: AppServerAPI.Account.Login.Params
 
         package init(params: AppServerAPI.Account.Login.Params) {
-            self.params = params
-        }
-    }
-}
-
-extension AppServerAPI.Account.Login.Complete {
-    package struct Params: Codable, Equatable, Sendable {
-        package var loginID: String
-        package var callbackURL: String
-
-        enum CodingKeys: String, CodingKey {
-            case loginID = "loginId"
-            case callbackURL = "callbackUrl"
-        }
-
-        package init(loginID: String, callbackURL: String) {
-            self.loginID = loginID
-            self.callbackURL = callbackURL
-        }
-    }
-}
-
-extension AppServerAPI.Account.Login.Complete {
-    package struct Request: AppServerAPI.Request {
-        package typealias Response = EmptyResponse
-
-        package static let method = "account/login/complete"
-        package var params: AppServerAPI.Account.Login.Complete.Params
-
-        package init(params: AppServerAPI.Account.Login.Complete.Params) {
             self.params = params
         }
     }

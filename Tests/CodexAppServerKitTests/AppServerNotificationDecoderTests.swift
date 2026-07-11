@@ -341,32 +341,21 @@ struct AccountEventHubTests {
         #expect(merged.planType == "plus")
     }
 
-    @Test func replacedLoginCompletionsKeepTheTransitionalThreeEventFIFO() async throws {
-        let hub = AccountEventHub()
-        let events = await hub.events()
-        await hub.apply(.loginCompleted(.init(
-            loginID: .init(rawValue: "login-old"),
-            success: false,
-            error: "Login was not completed"
-        )))
-        await hub.apply(.loginCompleted(.init(
-            loginID: .init(rawValue: "login-new"),
-            success: true
-        )))
-        await hub.apply(.updated(.init(authMode: .chatGPT, planType: .plus)))
-
-        var iterator = events.makeAsyncIterator()
-        #expect(try await iterator.next() == .loginCompleted(.init(
-            loginID: .init(rawValue: "login-old"),
-            success: false,
-            error: "Login was not completed"
-        )))
-        #expect(try await iterator.next() == .loginCompleted(.init(
-            loginID: .init(rawValue: "login-new"),
-            success: true
-        )))
-        #expect(try await iterator.next() == .accountUpdated)
-        await events.cancel()
+    @Test func loginReplaysCompletionAndAccountUpdateReceivedBeforeBinding() async throws {
+        let registry = LoginRegistry()
+        let state = try await registry.reserve(
+            readinessTimeout: nil,
+            cancel: { _, _ in .cancelled },
+            closeConnection: {}
+        )
+        await registry.apply(.init(loginID: "login-new", success: true))
+        await registry.applyAccountUpdate(.init(authMode: .chatGPT, planType: .plus))
+        let handle = try await registry.bind(
+            state,
+            id: "login-new",
+            authenticationURL: try #require(URL(string: "https://example.com/login"))
+        )
+        #expect(try await handle.result() == .succeeded)
     }
 }
 

@@ -5148,18 +5148,15 @@ struct CodexAppServerKitTests {
         let server = harness.server
         let handle = try await server.loginChatGPT()
 
-        #expect(handle == .chatGPT(
-            id: "login-1",
-            authenticationURL: URL(string: "https://chatgpt.com/auth")!
-        ))
+        #expect(handle.id == "login-1")
+        #expect(handle.authenticationURL == URL(string: "https://chatgpt.com/auth")!)
         let loginRequest = try #require(await transport.recordedRequests().first)
         #expect(loginRequest.method == "account/login/start")
         let loginParams = try loginRequest.decodeParams(AppServerAPI.Account.Login.Params.self)
         #expect(loginParams.type == "chatgpt")
         #expect(loginParams.codexStreamlinedLogin == true)
-        #expect(loginParams.nativeWebAuthentication == nil)
 
-        try await server.cancelLogin(handle)
+        #expect(try await handle.cancel() == .cancelled)
         let cancelRequest = try #require(await transport.recordedRequests().last)
         #expect(cancelRequest.method == "account/login/cancel")
         let cancelParams = try cancelRequest.decodeParams(
@@ -5173,50 +5170,236 @@ struct CodexAppServerKitTests {
         ])
     }
 
-    @Test func nativeChatGPTLoginSendsCallbackSchemeAndCompletesWithCallbackURL() async throws {
+    @Test func stockChatGPTLoginResolvesAfterPostSuccessAccountUpdate() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueueChatGPTLogin(
             loginID: "login-1",
-            authenticationURL: URL(string: "https://chatgpt.com/auth")!,
-            nativeWebAuthentication: .init(callbackURLScheme: "lynnpd.CodexReviewMonitor.auth")
+            authenticationURL: URL(string: "https://chatgpt.com/auth")!
         )
-        try await transport.enqueue(EmptyResponse(), for: "account/login/complete")
         let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
         let server = harness.server
 
-        let login = try await server.loginChatGPT(
-            nativeWebAuthentication: .init(callbackURLScheme: "lynnpd.CodexReviewMonitor.auth")
-        )
+        let login = try await server.loginChatGPT()
 
-        #expect(login == CodexChatGPTLogin(
-            id: "login-1",
-            authenticationURL: URL(string: "https://chatgpt.com/auth")!,
-            nativeWebAuthentication: .init(callbackURLScheme: "lynnpd.CodexReviewMonitor.auth")
-        ))
+        #expect(login.id == "login-1")
+        #expect(login.authenticationURL == URL(string: "https://chatgpt.com/auth")!)
         let loginRequest = try #require(await transport.recordedRequests().first)
         #expect(loginRequest.method == "account/login/start")
         let loginParams = try loginRequest.decodeParams(AppServerAPI.Account.Login.Params.self)
         #expect(loginParams.type == "chatgpt")
         #expect(loginParams.codexStreamlinedLogin == true)
-        #expect(loginParams.nativeWebAuthentication == .init(
-            callbackURLScheme: "lynnpd.CodexReviewMonitor.auth"
-        ))
+        try await transport.emitServerNotificationJSON(
+            method: "account/login/completed",
+            json: #"{"loginId":"login-1","success":true,"error":null}"#
+        )
+        try await transport.emitServerNotificationJSON(
+            method: "account/updated",
+            json: #"{"authMode":"chatgpt","planType":"plus"}"#
+        )
+        #expect(try await login.result() == .succeeded)
+        #expect(try await login.result() == .succeeded)
+        #expect(await transport.recordedRequests().map(\.method) == ["account/login/start"])
+    }
 
-        try await server.completeLogin(
-            id: login.id,
-            callbackURL: URL(string: "lynnpd.CodexReviewMonitor.auth://callback?code=abc")!
+    @Test func stockChatGPTLoginDropsMismatchedCompletionID() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueChatGPTLogin(
+            loginID: "login-1",
+            authenticationURL: URL(string: "https://chatgpt.com/auth")!
         )
-        let completeRequest = try #require(await transport.recordedRequests().last)
-        #expect(completeRequest.method == "account/login/complete")
-        let completeParams = try completeRequest.decodeParams(
-            AppServerAPI.Account.Login.Complete.Params.self
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let handle = try await harness.server.loginChatGPT()
+
+        try await transport.emitServerNotificationJSON(
+            method: "account/login/completed",
+            json: #"{"loginId":"other-login","success":false,"error":"stale"}"#
         )
-        #expect(completeParams.loginID == "login-1")
-        #expect(completeParams.callbackURL == "lynnpd.CodexReviewMonitor.auth://callback?code=abc")
-        #expect(await transport.recordedRequests().map(\.method) == [
-            "account/login/start",
-            "account/login/complete",
-        ])
+        try await transport.emitServerNotificationJSON(
+            method: "account/login/completed",
+            json: #"{"loginId":"login-1","success":true,"error":null}"#
+        )
+        try await transport.emitServerNotificationJSON(
+            method: "account/updated",
+            json: #"{"authMode":"chatgpt","planType":"plus"}"#
+        )
+
+        #expect(try await handle.result() == .succeeded)
+    }
+
+    @Test func stockChatGPTLoginReleasesReservationAfterStartFailure() async throws {
+        let transport = CodexAppServerTestTransport()
+        await transport.enqueueFailure(
+            code: -32_000,
+            message: "login unavailable",
+            for: "account/login/start"
+        )
+        try await transport.enqueueChatGPTLogin(
+            loginID: "login-2",
+            authenticationURL: URL(string: "https://chatgpt.com/auth/2")!
+        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+
+        await #expect(throws: CodexAppServerError.self) {
+            _ = try await harness.server.loginChatGPT()
+        }
+        let handle = try await harness.server.loginChatGPT()
+
+        #expect(handle.id == "login-2")
+        #expect(await transport.recordedRequests(method: "account/login/start").count == 2)
+    }
+
+    @Test func stockChatGPTLoginRejectsConcurrentStartBeforeSendingASecondRequest() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueChatGPTLogin(
+            loginID: "login-1",
+            authenticationURL: URL(string: "https://chatgpt.com/auth")!
+        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let activeHandle = try await harness.server.loginChatGPT()
+
+        do {
+            _ = try await harness.server.loginChatGPT()
+            Issue.record("Expected the active login reservation to reject a second start.")
+        } catch let error as CodexAppServerError {
+            #expect(error == .loginAlreadyInProgress)
+        }
+        #expect(await transport.recordedRequests(method: "account/login/start").count == 1)
+        _ = activeHandle
+    }
+
+    @Test func stockChatGPTLoginCancellationIsSharedAcrossConcurrentCallers() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueChatGPTLogin(
+            loginID: "login-1",
+            authenticationURL: URL(string: "https://chatgpt.com/auth")!
+        )
+        try await transport.enqueue(
+            AppServerAPI.Account.Login.Cancel.Response(),
+            for: "account/login/cancel"
+        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let handle = try await harness.server.loginChatGPT()
+
+        async let first = handle.cancel()
+        async let second = handle.cancel()
+
+        #expect(try await first == .cancelled)
+        #expect(try await second == .cancelled)
+        #expect(await transport.recordedRequests(method: "account/login/cancel").count == 1)
+    }
+
+    @Test func cancellingLoginResultWaiterDoesNotCancelSharedLogin() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueChatGPTLogin(
+            loginID: "login-1",
+            authenticationURL: URL(string: "https://chatgpt.com/auth")!
+        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let handle = try await harness.server.loginChatGPT()
+        let cancelledWaiter = Task { try await handle.result() }
+
+        cancelledWaiter.cancel()
+        await #expect(throws: CancellationError.self) {
+            try await cancelledWaiter.value
+        }
+        try await transport.emitServerNotificationJSON(
+            method: "account/login/completed",
+            json: #"{"loginId":"login-1","success":true,"error":null}"#
+        )
+        try await transport.emitServerNotificationJSON(
+            method: "account/updated",
+            json: #"{"authMode":"chatgpt","planType":"plus"}"#
+        )
+
+        #expect(try await handle.result() == .succeeded)
+        #expect(await transport.recordedRequests(method: "account/login/cancel").isEmpty)
+    }
+
+    @Test func stockChatGPTLoginReadinessDeadlineStartsAfterSuccess() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueChatGPTLogin(
+            loginID: "login-1",
+            authenticationURL: URL(string: "https://chatgpt.com/auth")!
+        )
+        let deadlineGate = CodexAppServerTestGate()
+        let deadlineStarted = TestSignal()
+        let harness = await CodexAppServerTestConnectionHarness.start(
+            transport: transport,
+            deadlineClock: .init { duration in
+                #expect(duration == .seconds(5))
+                deadlineStarted.signal()
+                await deadlineGate.waitIgnoringCancellation()
+            }
+        )
+        let handle = try await harness.server.loginChatGPT(accountReadinessTimeout: .seconds(5))
+        let result = Task { try await handle.result() }
+
+        try await transport.emitServerNotificationJSON(
+            method: "account/login/completed",
+            json: #"{"loginId":"login-1","success":true,"error":null}"#
+        )
+        await deadlineStarted.wait()
+        await deadlineGate.open()
+
+        #expect(
+            try await result.value == .authenticationCommittedNeedsConnectionReconciliation(
+                .accountReadinessDeadlineExceeded(.seconds(5))
+            )
+        )
+    }
+
+    @Test func malformedAccountUpdateAfterLoginSuccessRequiresReconciliation() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueChatGPTLogin(
+            loginID: "login-1",
+            authenticationURL: URL(string: "https://chatgpt.com/auth")!
+        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let handle = try await harness.server.loginChatGPT()
+
+        try await transport.emitServerNotificationJSON(
+            method: "account/login/completed",
+            json: #"{"loginId":"login-1","success":true,"error":null}"#
+        )
+        try await transport.emitServerNotificationJSON(
+            method: "account/updated",
+            json: #"{"authMode":42}"#
+        )
+
+        guard case .authenticationCommittedNeedsConnectionReconciliation(
+            .malformedAccountUpdateAfterSuccess(let malformed)
+        ) = try await handle.result() else {
+            Issue.record("Expected malformed post-success account update reconciliation.")
+            return
+        }
+        #expect(malformed.method == "account/updated")
+    }
+
+    @Test func unknownCancelOutcomeAfterLoginSuccessRequiresReconciliation() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueChatGPTLogin(
+            loginID: "login-1",
+            authenticationURL: URL(string: "https://chatgpt.com/auth")!
+        )
+        await transport.enqueueFailure(
+            code: -32_000,
+            message: "cancel response lost",
+            for: "account/login/cancel"
+        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let handle = try await harness.server.loginChatGPT()
+        try await transport.emitServerNotificationJSON(
+            method: "account/login/completed",
+            json: #"{"loginId":"login-1","success":true,"error":null}"#
+        )
+
+        guard case .authenticationCommittedNeedsConnectionReconciliation(
+            .cancelOutcomeUnknown(let failure)
+        ) = try await handle.cancel(acknowledgementTimeout: .seconds(5)) else {
+            Issue.record("Expected unknown post-success cancel reconciliation.")
+            return
+        }
+        #expect(failure?.method == "account/login/cancel")
     }
 
     @Test func responseStreamCancelSendsTurnInterrupt() async throws {

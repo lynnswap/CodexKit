@@ -2800,9 +2800,6 @@ public struct CodexLoginCompletion: Equatable, Sendable {
 
 /// A typed account-related notification emitted by Codex app-server.
 public enum CodexAccountEvent: Equatable, Sendable {
-    /// A login flow reached a terminal state.
-    case loginCompleted(CodexLoginCompletion)
-
     /// The active account changed or was refreshed.
     case accountUpdated
 
@@ -2816,43 +2813,22 @@ public enum CodexAccountEvent: Equatable, Sendable {
     case unknown(CodexRawNotification)
 }
 
-/// Native web-authentication options for a ChatGPT login flow.
-public struct CodexNativeWebAuthentication: Equatable, Sendable {
-    /// The custom URL scheme the native host expects in the authentication callback.
-    public var callbackURLScheme: String
-
-    public init(callbackURLScheme: String) {
-        self.callbackURLScheme = callbackURLScheme
-    }
+public enum CodexLoginOutcome: Equatable, Sendable {
+    case succeeded
+    case authenticationCommittedNeedsConnectionReconciliation(CodexLoginReconciliationReason)
+    case failed(message: String?)
+    case cancelled
 }
 
-/// A ChatGPT browser login flow started by the app-server.
-public struct CodexChatGPTLogin: Equatable, Sendable {
-    /// The app-server login identifier.
-    public var id: CodexLoginHandle.ID
-
-    /// The URL the host should open in a browser or native web-authentication session.
-    public var authenticationURL: URL
-
-    /// Native web-authentication information returned by the app-server, when available.
-    public var nativeWebAuthentication: CodexNativeWebAuthentication?
-
-    public init(
-        id: CodexLoginHandle.ID,
-        authenticationURL: URL,
-        nativeWebAuthentication: CodexNativeWebAuthentication? = nil
-    ) {
-        self.id = id
-        self.authenticationURL = authenticationURL
-        self.nativeWebAuthentication = nativeWebAuthentication
-    }
-
-    public var handle: CodexLoginHandle {
-        .chatGPT(id: id, authenticationURL: authenticationURL)
-    }
+public enum CodexLoginReconciliationReason: Equatable, Sendable {
+    case connectionTerminated(CodexConnectionTermination)
+    case accountReadinessDeadlineExceeded(Duration)
+    case chatGPTAccountUnavailableAfterSuccess
+    case malformedAccountUpdateAfterSuccess(CodexMalformedNotification)
+    case cancelOutcomeUnknown(CodexRequestFailure?)
 }
 
-public enum CodexLoginHandle: Equatable, Sendable {
+public struct CodexLoginHandle: Identifiable, Equatable, Sendable {
     public struct ID: RawRepresentable, Hashable, Codable, Sendable, ExpressibleByStringLiteral {
         public var rawValue: String
 
@@ -2865,17 +2841,31 @@ public enum CodexLoginHandle: Equatable, Sendable {
         }
     }
 
-    case apiKey
-    case chatGPT(id: ID, authenticationURL: URL)
-    case chatGPTDeviceCode(id: ID, verificationURL: URL, userCode: String)
+    public let id: ID
+    public let authenticationURL: URL
+    private let state: LoginState
 
-    public var id: ID? {
-        switch self {
-        case .apiKey:
-            nil
-        case .chatGPT(let id, _), .chatGPTDeviceCode(let id, _, _):
-            id
-        }
+    package init(state: LoginState, id: ID, authenticationURL: URL) {
+        self.state = state
+        self.id = id
+        self.authenticationURL = authenticationURL
+    }
+
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.id == rhs.id && lhs.authenticationURL == rhs.authenticationURL
+    }
+
+    public func result() async throws -> CodexLoginOutcome {
+        try await state.result()
+    }
+
+    @discardableResult
+    public func cancel(acknowledgementTimeout: Duration? = nil) async throws -> CodexLoginOutcome {
+        try await state.cancel(acknowledgementTimeout: acknowledgementTimeout)
+    }
+
+    public func closeConnection() async {
+        await state.closeConnection()
     }
 }
 

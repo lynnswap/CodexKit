@@ -102,6 +102,7 @@ package actor AppServerConnection {
                     method: method
                 )
             ))
+            await router.finishLogin(throwing: error)
             await onExit(.transport(Self.transportFailure(for: error)))
             await drainResponsesOnly()
         } catch {

@@ -12,6 +12,7 @@ package actor CodexAppServerNotificationRouter {
     private var threadIDByTurnID: [CodexTurnID: CodexThreadID] = [:]
     private var itemReducer = CodexItemReducer()
     private let accountEventHub: AccountEventHub
+    package nonisolated let loginRegistry: LoginRegistry
     package nonisolated let turnReplayStore: TurnReplayStore
     package nonisolated let threadEventHub: ThreadEventHub
 
@@ -19,12 +20,14 @@ package actor CodexAppServerNotificationRouter {
         client: AppServerClient,
         turnReplayStore: TurnReplayStore,
         threadEventHub: ThreadEventHub,
-        accountEventHub: AccountEventHub = .init()
+        accountEventHub: AccountEventHub = .init(),
+        loginRegistry: LoginRegistry = .init()
     ) {
         _ = client
         self.turnReplayStore = turnReplayStore
         self.threadEventHub = threadEventHub
         self.accountEventHub = accountEventHub
+        self.loginRegistry = loginRegistry
     }
 
     package nonisolated func events(for threadID: CodexThreadID) -> CodexThreadEventSequence {
@@ -194,11 +197,12 @@ package actor CodexAppServerNotificationRouter {
         case .account(let mutation):
             switch mutation {
             case .updated(let update):
+                await loginRegistry.applyAccountUpdate(update)
                 await accountEventHub.apply(.updated(update))
             case .rateLimitsUpdated(let update):
                 await accountEventHub.apply(.rateLimitsUpdated(update))
             case .loginCompleted(let completion):
-                await accountEventHub.apply(.loginCompleted(completion))
+                await loginRegistry.apply(completion)
             }
 
         case .raw:
@@ -320,6 +324,11 @@ package actor CodexAppServerNotificationRouter {
         itemReducer.releaseAll()
         threadEventHub.finish(throwing: error)
         await accountEventHub.finish(throwing: error)
+        await loginRegistry.finish(throwing: error)
+    }
+
+    package func finishLogin(throwing error: CodexAppServerError) async {
+        await loginRegistry.finish(throwing: error)
     }
 
     private nonisolated func recordReplayDisposition(
