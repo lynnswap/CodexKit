@@ -428,6 +428,21 @@ struct TurnReplayStoreTests {
         }
     }
 
+    @Test func pendingCleanupAfterTerminationReportsTokenAlreadyRemoved() async {
+        let store = TurnReplayStore()
+        let state = makeState()
+        let pending = await store.registerPendingOperation(
+            kind: .turn(threadID: "thread-1"),
+            state: state
+        )
+        pending.acceptWrite()
+
+        await store.terminateAll(with: .closedByCaller)
+
+        #expect(await store.cancelPendingOperation(pending) == .notRegistered)
+        #expect(await state.snapshot() == .terminated(.closedByCaller))
+    }
+
     @Test func concurrentTerminationAndSubscriptionJoinOneFullCleanup() async throws {
         let store = TurnReplayStore()
         let state = makeState()

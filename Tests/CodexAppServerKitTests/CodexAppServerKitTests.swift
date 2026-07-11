@@ -5267,6 +5267,39 @@ struct CodexAppServerKitTests {
         _ = activeHandle
     }
 
+    @Test func stockChatGPTLoginRegistryRetainsPendingStateAfterHandleIsDropped() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueChatGPTLogin(
+            loginID: "login-1",
+            authenticationURL: URL(string: "https://chatgpt.com/auth/1")!
+        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let server = harness.server
+
+        let authenticationURL = try await server.loginChatGPT().authenticationURL
+        #expect(authenticationURL == URL(string: "https://chatgpt.com/auth/1")!)
+        await #expect(throws: CodexAppServerError.loginAlreadyInProgress) {
+            _ = try await server.loginChatGPT()
+        }
+        #expect(await transport.recordedRequests(method: "account/login/start").count == 1)
+
+        await harness.router.loginRegistry.apply(
+            .init(loginID: "login-1", success: true)
+        )
+        await harness.router.loginRegistry.applyAccountUpdate(
+            .init(authMode: .chatGPT, planType: .plus)
+        )
+        try await transport.enqueueChatGPTLogin(
+            loginID: "login-2",
+            authenticationURL: URL(string: "https://chatgpt.com/auth/2")!
+        )
+
+        let nextHandle = try await server.loginChatGPT()
+
+        #expect(nextHandle.id == "login-2")
+        #expect(await transport.recordedRequests(method: "account/login/start").count == 2)
+    }
+
     @Test func stockChatGPTLoginCancellationIsSharedAcrossConcurrentCallers() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueueChatGPTLogin(

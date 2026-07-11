@@ -238,7 +238,6 @@ package actor TurnReplayStore {
     package func cancelPendingOperation(
         _ token: TurnReplayPendingToken
     ) -> PendingCancellationDisposition {
-        requireOpen()
         guard let operation = pendingOperations[token] else {
             return .notRegistered
         }

@@ -1,7 +1,7 @@
 import Foundation
 
 package actor LoginRegistry {
-    private weak var activeState: LoginState?
+    private var activeState: LoginState?
     private var pendingReservation: UUID?
     private let sleep: @Sendable (Duration) async throws -> Void
 
@@ -36,7 +36,10 @@ package actor LoginRegistry {
             readinessTimeout: readinessTimeout,
             cancel: cancel,
             closeConnection: closeConnection,
-            sleep: sleep
+            sleep: sleep,
+            didTerminate: { [weak self] reservation in
+                await self?.releaseTerminatedState(reservation: reservation)
+            }
         )
         activeState = state
         return state
@@ -87,6 +90,19 @@ package actor LoginRegistry {
         await state.abandon()
     }
 
+    private func releaseTerminatedState(reservation: UUID) async {
+        guard let state = activeState,
+              state.reservation == reservation,
+              await state.isTerminal else {
+            return
+        }
+        guard activeState === state else {
+            return
+        }
+        pendingReservation = nil
+        activeState = nil
+    }
+
 }
 
 package actor LoginState {
@@ -115,6 +131,7 @@ package actor LoginState {
             -> CodexLoginOutcome
     private let closeConnectionOperation: @Sendable () async -> Void
     private let sleep: @Sendable (Duration) async throws -> Void
+    private let didTerminate: @Sendable (UUID) async -> Void
 
     package init(
         reservation: UUID,
@@ -123,13 +140,15 @@ package actor LoginState {
             @escaping @Sendable (CodexLoginHandle.ID, Duration?) async throws
             -> CodexLoginOutcome,
         closeConnection: @escaping @Sendable () async -> Void,
-        sleep: @escaping @Sendable (Duration) async throws -> Void
+        sleep: @escaping @Sendable (Duration) async throws -> Void,
+        didTerminate: @escaping @Sendable (UUID) async -> Void
     ) {
         self.reservation = reservation
         self.readinessTimeout = readinessTimeout
         self.cancelOperation = cancel
         self.closeConnectionOperation = closeConnection
         self.sleep = sleep
+        self.didTerminate = didTerminate
     }
 
     package var isTerminal: Bool {
@@ -376,6 +395,11 @@ package actor LoginState {
         cancelTask = nil
         preBindEvents.removeAll(keepingCapacity: false)
         phase = .terminal(result)
+        let reservation = reservation
+        let didTerminate = didTerminate
+        Task {
+            await didTerminate(reservation)
+        }
         let continuations = waiters.values
         waiters.removeAll()
         for continuation in continuations {
