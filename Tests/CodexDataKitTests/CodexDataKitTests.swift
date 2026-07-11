@@ -7881,6 +7881,11 @@ struct CodexModelContextTests {
 
         let insertedChange = await changes.itemInserted(id: "message-live")
         #expect(insertedChange != nil)
+        let initialTextChange = await changes.itemTextAppended(
+            id: "message-live",
+            delta: "Hel"
+        )
+        #expect(initialTextChange != nil)
         #expect(chat.items.first { $0.itemID == "message-live" }?.text == "Hel")
 
         try await runtime.transport.emitServerNotification(
