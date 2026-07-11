@@ -6971,6 +6971,58 @@ struct CodexModelContextTests {
             == [false, true])
     }
 
+    @Test("cancelling one observation start waiter preserves the shared start")
+    func cancellingObservationStartWaiterPreservesSharedStart() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let readGate = CodexAppServerTestGate()
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-join-cancel"))
+
+        try await runtime.transport.enqueueThreadResume(.init(id: chat.id))
+        try await runtime.transport.enqueueThreadRead(.init(id: chat.id, status: .idle))
+        await runtime.transport.holdNextIgnoringCancellation(
+            method: "thread/read",
+            gate: readGate
+        )
+
+        var firstWasCancelled = false
+        var secondObservation: CodexChatObservation?
+        let firstStart = Task { @MainActor in
+            do {
+                _ = try await chat.observe(includeTurns: false)
+                Issue.record("Expected the first observation waiter to be cancelled")
+            } catch is CancellationError {
+                firstWasCancelled = true
+            } catch {
+                Issue.record("Unexpected first observation failure: \(error)")
+            }
+        }
+        await runtime.transport.waitForRequest(method: "thread/read")
+        let secondStart = Task { @MainActor in
+            do {
+                secondObservation = try await chat.observe(includeTurns: false)
+            } catch {
+                Issue.record("Unexpected second observation failure: \(error)")
+            }
+        }
+        await Task.yield()
+
+        firstStart.cancel()
+        await firstStart.value
+
+        #expect(firstWasCancelled)
+        #expect(await runtime.transport.recordedRequests(method: "thread/resume").count == 1)
+        await readGate.open()
+        await secondStart.value
+        let observation = try #require(secondObservation)
+        defer { observation.cancel() }
+
+        #expect(observation.chat === chat)
+        #expect(chat.phase == .idle)
+        #expect(await runtime.transport.recordedRequests(method: "thread/resume").count == 1)
+        #expect(await runtime.transport.recordedRequests(method: "thread/read").count == 1)
+    }
+
     @Test("finished chat observations are not reused")
     func finishedChatObservationsAreNotReused() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()

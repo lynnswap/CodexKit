@@ -207,6 +207,185 @@ package final class ChatObservationReleaseAcknowledgement: Sendable {
     }
 }
 
+package final class ChatObservationStartWaiter: Sendable {
+    private enum State {
+        case pending(CheckedContinuation<Void, any Error>?)
+        case resolved(cancelled: Bool)
+    }
+
+    private let state = Mutex<State>(.pending(nil))
+
+    package init() {}
+
+    package func wait() async throws {
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let result = state.withLock { state -> Bool? in
+                    switch state {
+                    case .pending(nil):
+                        state = .pending(continuation)
+                        return nil
+                    case .pending(.some):
+                        preconditionFailure("Observation start waiter supports one caller.")
+                    case .resolved(let cancelled):
+                        return cancelled
+                    }
+                }
+                if let cancelled = result {
+                    if cancelled {
+                        continuation.resume(throwing: CancellationError())
+                    } else {
+                        continuation.resume()
+                    }
+                }
+            }
+        } onCancel: {
+            resolve(cancelled: true)
+        }
+    }
+
+    package func resolve(cancelled: Bool) {
+        let continuation = state.withLock {
+            state -> CheckedContinuation<Void, any Error>? in
+            switch state {
+            case .pending(let continuation):
+                state = .resolved(cancelled: cancelled)
+                return continuation
+            case .resolved:
+                return nil
+            }
+        }
+        if cancelled {
+            continuation?.resume(throwing: CancellationError())
+        } else {
+            continuation?.resume()
+        }
+    }
+}
+
+package final class ChatObservationStartOperation<Output: Sendable>: Sendable {
+    private let task: Task<Output, any Error>
+    private let completion: ChatObservationStartCompletion<Output>
+    private let completionTask: Task<Void, Never>
+
+    package init(
+        operation: sending @escaping @isolated(any) @Sendable () async throws -> Output
+    ) {
+        let task = Task(operation: operation)
+        let completion = ChatObservationStartCompletion<Output>()
+        self.task = task
+        self.completion = completion
+        completionTask = Task { [task, completion] in
+            do {
+                completion.resolve(.success(try await task.value))
+            } catch {
+                completion.resolve(.failure(error))
+            }
+        }
+    }
+
+    package func value() async throws -> Output {
+        try await completion.value()
+    }
+
+    package func cancel() {
+        task.cancel()
+    }
+
+    package func cancelAndWait() async {
+        task.cancel()
+        await completionTask.value
+    }
+}
+
+private final class ChatObservationStartCompletion<Output: Sendable>: Sendable {
+    private enum State: Sendable {
+        case pending([ChatObservationStartValueWaiter<Output>])
+        case completed(Result<Output, any Error>)
+    }
+
+    private let state = Mutex<State>(.pending([]))
+
+    func value() async throws -> Output {
+        let waiter = ChatObservationStartValueWaiter<Output>()
+        let result = state.withLock { state -> Result<Output, any Error>? in
+            switch state {
+            case .pending(var waiters):
+                waiters.append(waiter)
+                state = .pending(waiters)
+                return nil
+            case .completed(let result):
+                return result
+            }
+        }
+        if let result {
+            waiter.resolve(result)
+        }
+        return try await waiter.value()
+    }
+
+    func resolve(_ result: Result<Output, any Error>) {
+        let waiters = state.withLock { state -> [ChatObservationStartValueWaiter<Output>] in
+            switch state {
+            case .pending(let waiters):
+                state = .completed(result)
+                return waiters
+            case .completed:
+                return []
+            }
+        }
+        for waiter in waiters {
+            waiter.resolve(result)
+        }
+    }
+}
+
+private final class ChatObservationStartValueWaiter<Output: Sendable>: Sendable {
+    private enum State: Sendable {
+        case pending(CheckedContinuation<Output, any Error>?)
+        case resolved(Result<Output, any Error>)
+    }
+
+    private let state = Mutex<State>(.pending(nil))
+
+    func value() async throws -> Output {
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let result = state.withLock { state -> Result<Output, any Error>? in
+                    switch state {
+                    case .pending(nil):
+                        state = .pending(continuation)
+                        return nil
+                    case .pending(.some):
+                        preconditionFailure("Observation start value supports one waiter.")
+                    case .resolved(let result):
+                        return result
+                    }
+                }
+                if let result {
+                    continuation.resume(with: result)
+                }
+            }
+        } onCancel: {
+            resolve(.failure(CancellationError()))
+        }
+    }
+
+    func resolve(_ result: Result<Output, any Error>) {
+        let continuation = state.withLock {
+            state -> CheckedContinuation<Output, any Error>? in
+            switch state {
+            case .pending(let continuation):
+                state = .resolved(result)
+                return continuation
+            case .resolved:
+                return nil
+            }
+        }
+        continuation?.resume(with: result)
+    }
+}
+
 package struct ChatObservationRelease: Sendable {
     package let leaseID: UUID
 }
