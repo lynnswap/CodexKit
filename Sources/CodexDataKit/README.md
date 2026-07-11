@@ -16,7 +16,7 @@ Use this package when app or UI code needs workspace group, workspace, and chat 
 - `CodexPersistentModel`: SwiftData-style model protocol. The protocol itself is not main-actor isolated; concrete context ownership decides the isolation domain.
 - `CodexWorkspaceGroup`, `CodexWorkspace`, `CodexChat`, `CodexTurn`, `CodexItem`: Observable model objects attached to a model context.
 - `CodexQuery`: A SwiftUI `DynamicProperty` wrapper around `CodexFetchedResults`.
-- `CodexDataPhase`: A small data-loading state enum with `idle`, `loading`, `loaded`, and `failed`.
+- `CodexFetchPhase`: The typed fetch state. Validation and app-server failures are carried by `CodexFetchFailure`.
 
 ## Quick Start
 
@@ -46,7 +46,7 @@ let descriptor = CodexFetchDescriptor<CodexChat>(
             && chat.workspaceID == workspaceID
             && chat.searchableText.localizedStandardContains("review")
     },
-    sortBy: [SortDescriptor(\.recencyAt, order: .reverse)],
+    sortBy: [CodexSortDescriptor(\.recencyAt, order: .reverse)],
     fetchLimit: 50
 )
 
@@ -63,9 +63,9 @@ Use `CodexFetchRequest` when request construction reads better as a mutable Core
 let request = CodexFetchRequest<CodexChat>()
 let workspaceID = CodexWorkspaceID(rawValue: workspaceURL.standardizedFileURL.resolvingSymlinksInPath().path)
 request.predicate = #Predicate<CodexChat> { chat in
-    chat.workspaceID == workspaceID
+    chat.isArchived == false && chat.workspaceID == workspaceID
 }
-request.sortDescriptors = [SortDescriptor(\.updatedAt, order: .reverse)]
+request.sortDescriptors = [CodexSortDescriptor(\.updatedAt, order: .reverse)]
 request.fetchLimit = 100
 
 let results = context.fetchedResults(for: request)
@@ -76,7 +76,14 @@ Sort descriptors use the known key-path contract directly. A key path must map t
 supported CodexDataKit model field; arbitrary key paths are not silently treated as
 app-server sorts. Section descriptors support the same key-path style, plus
 relationship aliases such as `.workspaceGroup` and `.workspace` for the common
-sidebar groupings.
+sidebar groupings. Unsupported predicate, sort, section, model, limit, and offset
+values fail through `CodexFetchFailure.validation` instead of trapping during query
+construction or SwiftUI updates.
+
+A nil chat predicate is the active-only convenience scope. An explicit predicate is
+evaluated literally: if it does not mention `isArchived`, CodexDataKit fetches and
+merges both active and archived server scopes. Add `chat.isArchived == false` when a
+consumer wants active chats only.
 
 Chat fetches include pending/live context changes by default, matching SwiftData's
 `includePendingChanges` shape. A `CodexChat` created or actively observed by the
@@ -94,6 +101,13 @@ if results.nextCursor != nil {
     try await results.loadNextPage()
 }
 ```
+
+Each `CodexFetchedResults` serializes fetch, refresh, pagination, and mutation-driven
+reloads. A refresh rebuilds the currently loaded window in staging and commits items,
+cursors, sections, and phase together. Cancelling a queued load removes it from the
+queue; cancelling an in-flight load preserves the prior stable result and phase.
+Queries stay live for mutations performed through the same model context. Changes
+made by another process or app-server client require an explicit `refresh()`.
 
 Use `registeredModel(for:)` when code needs only models that are already registered in
 the context. This lookup does not create placeholder chats and does not issue an
@@ -122,7 +136,7 @@ let workspaces = context.fetchedResults(
 
 let chats = context.fetchedResults(
     for: CodexFetchDescriptor<CodexChat>(
-        sortBy: [SortDescriptor(\.updatedAt, order: .reverse)]
+        sortBy: [CodexSortDescriptor(\.updatedAt, order: .reverse)]
     ),
     sectionedBy: .workspace
 )
@@ -154,7 +168,7 @@ Task {
 try await controller.performFetch()
 ```
 
-The controller does not fetch or store a second copy of the model graph. Its `items`, `sections`, `snapshot`, cursors, phase, and errors are forwarded from the underlying `CodexFetchedResults`, and transactions are emitted from the same state updates that mutate those current values. Snapshots contain section IDs, optional titles, and item IDs only; section and item changes are ordered and include insert, delete, move, and update cases.
+The controller does not fetch or store a second copy of the model graph. Its `items`, `sections`, `snapshot`, cursors, and phase are forwarded from the underlying `CodexFetchedResults`, and transactions are emitted from the same state updates that mutate those current values. Snapshots contain section IDs, optional titles, and item IDs only; section and item changes are ordered and include insert, delete, move, and update cases. The transaction stream buffers only the newest transaction. Every transaction carries complete old and new identity snapshots, so a consumer whose current snapshot no longer equals `oldSnapshot` replaces it with `newSnapshot` instead of replaying stale granular changes.
 
 CodexDataKit does not import AppKit, UIKit, or SwiftUI for this API. Convert `CodexFetchedResultsTransaction` into `NSCollectionView`, `UICollectionView`, diffable data source, or `NSOutlineView` updates in the UI layer. Detail transcript streams remain the responsibility of `CodexChat.observe()`.
 

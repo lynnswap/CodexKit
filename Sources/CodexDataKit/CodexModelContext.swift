@@ -310,10 +310,19 @@ public final class CodexModelContext {
     public nonisolated(nonsending) func fetch<Model: CodexPersistentModel>(
         _ descriptor: CodexFetchDescriptor<Model>
     ) async throws -> [Model] {
-        let page = try await fetchPage(descriptor)
-        let items = fetchedItemsIncludingPendingChanges(from: page, descriptor: descriptor)
-        await syncLoadedRelationships(from: page, descriptor: descriptor, loadedItems: items)
-        return items
+        do {
+            try descriptor.validate()
+            let page = try await fetchPage(descriptor)
+            let items = fetchedItemsIncludingPendingChanges(from: page, descriptor: descriptor)
+            await syncLoadedRelationships(from: page, descriptor: descriptor, loadedItems: items)
+            return items
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let failure as CodexFetchValidationError {
+            throw CodexFetchFailure.validation(failure)
+        } catch let failure as CodexAppServerError {
+            throw CodexFetchFailure.appServer(failure)
+        }
     }
 
     public nonisolated(nonsending) func fetch<Model: CodexPersistentModel>(
@@ -454,7 +463,7 @@ public final class CodexModelContext {
         }
 
         let descriptor = CodexFetchDescriptor<CodexWorkspace>(
-            sortBy: [SortDescriptor(\.name)]
+            sortBy: [CodexSortDescriptor(\.name)]
         )
         let previousWorkspaces = group.workspaces
         let previousChats = group.workspaces.flatMap(\.chats)
@@ -1289,6 +1298,7 @@ public final class CodexModelContext {
         cursor: String? = nil,
         excluding excludedRegistration: (any CodexFetchedResultsRegistration)? = nil
     ) async throws -> CodexFetchPage<Model> {
+        try descriptor.validate()
         if Model.self == CodexChat.self {
             let page = try await fetchChatPage(
                 descriptor as! CodexFetchDescriptor<CodexChat>,
@@ -1461,7 +1471,8 @@ public final class CodexModelContext {
         guard let sortDescriptor = descriptor.sortBy.first else {
             return compare(lhs.recencyAt, rhs.recencyAt, order: .reverse)
         }
-        return sortDescriptor.compare(lhs, rhs) == .orderedAscending
+        let plan = CodexSortPlan.afterValidation(sortDescriptor)
+        return plan.compare(lhs, rhs) == .orderedAscending
     }
 
     private func compare<Value: Comparable>(
@@ -1495,7 +1506,7 @@ public final class CodexModelContext {
     ) async throws
         -> CodexFetchPage<CodexChat>
     {
-        let plan = CodexThreadQueryPlan(descriptor: descriptor)
+        let plan = try CodexThreadQueryPlan(descriptor: descriptor)
         if canUseServerOrderedPages(for: descriptor, cursor: cursor) == false {
             let fetchedChats = filter(
                 try await fetchAllChats(
@@ -1787,7 +1798,7 @@ public final class CodexModelContext {
         if group.workspaces.contains(where: { $0 === workspace }) == false {
             group.replaceContextWorkspaces(sort(
                 group.workspaces + [workspace],
-                using: [SortDescriptor(\.name)]
+                using: [CodexSortDescriptor(\.name)]
             ))
         }
         return workspace
@@ -1973,7 +1984,7 @@ public final class CodexModelContext {
                 }
                 group.replaceContextWorkspaces(sort(
                     fetchedWorkspaces + remainingWorkspaces,
-                    using: [SortDescriptor(\.name)]
+                    using: [CodexSortDescriptor(\.name)]
                 ))
             } else {
                 let fetchedIDs = Set(fetchedWorkspaces.map(\.id))
@@ -1983,7 +1994,7 @@ public final class CodexModelContext {
                 }
                 group.replaceContextWorkspaces(sort(
                     fetchedWorkspaces + preservedWorkspaces,
-                    using: [SortDescriptor(\.name)]
+                    using: [CodexSortDescriptor(\.name)]
                 ))
             }
         }
@@ -2277,7 +2288,9 @@ public final class CodexModelContext {
         guard Model.self == CodexChat.self else {
             return nil
         }
-        return CodexThreadQueryPlan(descriptor: descriptor as! CodexFetchDescriptor<CodexChat>)
+        return try? CodexThreadQueryPlan(
+            descriptor: descriptor as! CodexFetchDescriptor<CodexChat>
+        )
     }
 
     private func archivedScope<Model: CodexPersistentModel>(
@@ -2345,6 +2358,9 @@ public final class CodexModelContext {
         guard let plan = chatQueryPlan(for: descriptor) else {
             return true
         }
+        guard plan.archived != nil else {
+            return false
+        }
         guard plan.serverPredicateIsComplete else {
             return false
         }
@@ -2390,7 +2406,7 @@ public final class CodexModelContext {
                 archived: archiveScope
             )
         }
-        let sortPlans = descriptor.sortPlans
+        let sortPlans = descriptor.sortBy.map(CodexSortPlan.afterValidation)
         let serverSort = sortPlans.first { sortDescriptor in
             switch sortDescriptor.key {
             case .createdAt, .updatedAt, .recencyAt:
@@ -2411,7 +2427,15 @@ public final class CodexModelContext {
         for item: Model,
         descriptor: CodexSectionDescriptor<Model>
     ) -> (id: CodexFetchSectionID, title: String) {
-        switch descriptor.key {
+        let sectionKey: CodexSectionKey
+        do {
+            sectionKey = try descriptor.resolveKey()
+        } catch {
+            preconditionFailure(
+                "CodexSectionDescriptor was used before successful validation: \(error)"
+            )
+        }
+        switch sectionKey {
         case .workspace:
             if let chat = item as? CodexChat, let workspace = chat.workspace {
                 return (.workspace(workspace.id), workspace.name)
@@ -2427,10 +2451,13 @@ public final class CodexModelContext {
         return (.unknown("unknown"), "Unknown")
     }
 
-    private func sort(_ chats: [CodexChat], using descriptors: [SortDescriptor<CodexChat>])
+    private func sort(
+        _ chats: [CodexChat],
+        using descriptors: [CodexSortDescriptor<CodexChat>]
+    )
         -> [CodexChat]
     {
-        let sortPlans = descriptors.map(CodexSortPlan<CodexChat>.init(descriptor:))
+        let sortPlans = descriptors.map(CodexSortPlan.afterValidation)
         guard sortPlans.first?.key != .recencyAt else {
             return chats
         }
@@ -2438,31 +2465,28 @@ public final class CodexModelContext {
         guard localSortPlans.isEmpty == false else {
             return chats
         }
-        let localDescriptors = zip(descriptors, sortPlans).compactMap { descriptor, sortPlan in
-            sortPlan.key == .recencyAt ? nil : descriptor
-        }
-        return sortModels(chats, using: localDescriptors) { descriptor, lhs, rhs in
-            descriptor.compare(lhs, rhs)
+        return sortModels(chats, using: localSortPlans) { plan, lhs, rhs in
+            plan.compare(lhs, rhs)
         }
     }
 
     private func sort(
         _ workspaces: [CodexWorkspace],
-        using descriptors: [SortDescriptor<CodexWorkspace>]
+        using descriptors: [CodexSortDescriptor<CodexWorkspace>]
     ) -> [CodexWorkspace] {
-        _ = descriptors.map(CodexSortPlan<CodexWorkspace>.init(descriptor:))
-        return sortModels(workspaces, using: descriptors) { descriptor, lhs, rhs in
-            descriptor.compare(lhs, rhs)
+        let plans = descriptors.map(CodexSortPlan.afterValidation)
+        return sortModels(workspaces, using: plans) { plan, lhs, rhs in
+            plan.compare(lhs, rhs)
         }
     }
 
     private func sort(
         _ groups: [CodexWorkspaceGroup],
-        using descriptors: [SortDescriptor<CodexWorkspaceGroup>]
+        using descriptors: [CodexSortDescriptor<CodexWorkspaceGroup>]
     ) -> [CodexWorkspaceGroup] {
-        _ = descriptors.map(CodexSortPlan<CodexWorkspaceGroup>.init(descriptor:))
-        return sortModels(groups, using: descriptors) { descriptor, lhs, rhs in
-            descriptor.compare(lhs, rhs)
+        let plans = descriptors.map(CodexSortPlan.afterValidation)
+        return sortModels(groups, using: plans) { plan, lhs, rhs in
+            plan.compare(lhs, rhs)
         }
     }
 

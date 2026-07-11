@@ -452,12 +452,8 @@ public final class CodexFetchedResultsController<Model: CodexPersistentModel> {
         fetchedResults.backwardsCursor
     }
 
-    public var phase: CodexDataPhase {
+    public var phase: CodexFetchPhase {
         fetchedResults.phase
-    }
-
-    public var lastErrorDescription: String? {
-        fetchedResults.lastErrorDescription
     }
 
     public var transactions: AsyncStream<CodexFetchedResultsTransaction<Model>> {
