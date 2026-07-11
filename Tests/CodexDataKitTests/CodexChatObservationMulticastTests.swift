@@ -30,21 +30,341 @@ struct CodexChatObservationMulticastTests {
         await firstRecorder.waitUntilStarted()
         await secondRecorder.waitUntilStarted()
 
-        try await runtime.transport.emitServerNotification(
-            method: "item/started",
-            params: ObservationTestThreadItemParams(
-                threadID: "thread-multicast",
-                turnID: "turn-multicast",
-                item: .init(
-                    id: "message-multicast",
-                    type: "agentMessage",
-                    text: "Multicast update"
-                )
+        try await runtime.notificationEmitter.emitItemStarted(
+            threadID: .init(rawValue: "thread-multicast"),
+            turnID: .init(rawValue: "turn-multicast"),
+            item: .agentMessage(
+                id: "message-multicast",
+                text: "Multicast update"
             )
         )
 
         #expect(await firstRecorder.itemInserted(id: "message-multicast") != nil)
         #expect(await secondRecorder.itemInserted(id: "message-multicast") != nil)
+    }
+
+    @Test("typed notification emitter drives item lifecycle and text deltas")
+    func typedNotificationEmitterDrivesItemLifecycleAndTextDeltas() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let threadID = CodexThreadID(rawValue: "thread-typed-emitter")
+        let turnID = CodexTurnID(rawValue: "turn-typed-emitter")
+
+        try await runtime.transport.enqueueThreadResume(.init(id: threadID))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: threadID,
+            status: .idle,
+            turns: []
+        ))
+
+        let chat = context.model(for: threadID)
+        let observation = try await chat.observe()
+        defer { observation.cancel() }
+        let recorder = ObservationUpdateRecorder(stream: observation.updates)
+        await recorder.waitUntilStarted()
+
+        try await runtime.notificationEmitter.emitItemStarted(
+            threadID: threadID,
+            turnID: turnID,
+            item: .agentMessage(
+                id: "message-typed-emitter",
+                text: "Hel",
+                phase: .finalAnswer
+            )
+        )
+        #expect(await observationEventually {
+            guard let content = chat.items.first?.content,
+                  case .message(let message) = content else {
+                return false
+            }
+            return message.text == "Hel" && message.phase == .finalAnswer
+        })
+
+        try await runtime.notificationEmitter.emitAgentMessageDelta(
+            threadID: threadID,
+            turnID: turnID,
+            itemID: "message-typed-emitter",
+            delta: "lo"
+        )
+        #expect(await observationEventually {
+            chat.items.first?.text == "Hello"
+        })
+
+        try await runtime.notificationEmitter.emitItemCompleted(
+            threadID: threadID,
+            turnID: turnID,
+            item: .agentMessage(id: "message-typed-emitter", text: "Hello")
+        )
+        #expect(await observationEventually {
+            chat.items.first?.text == "Hello"
+        })
+
+        try await runtime.notificationEmitter.emitItemStarted(
+            threadID: threadID,
+            turnID: turnID,
+            item: .commandExecution(
+                id: "command-typed-emitter",
+                command: "swift test",
+                cwd: URL(fileURLWithPath: "/tmp/workspace", isDirectory: true),
+                status: .inProgress
+            )
+        )
+        #expect(await observationEventually {
+            guard let content = chat.items
+                .first(where: { $0.itemID == "command-typed-emitter" })?.content,
+                case .command(let command) = content else {
+                return false
+            }
+            return command.status == .inProgress
+        })
+        #expect(await recorder.itemInserted(id: "command-typed-emitter") != nil)
+        try await runtime.notificationEmitter.emitItemCompleted(
+            threadID: threadID,
+            turnID: turnID,
+            item: .commandExecution(
+                id: "command-typed-emitter",
+                command: "swift test",
+                cwd: URL(fileURLWithPath: "/tmp/workspace", isDirectory: true),
+                status: .completed,
+                aggregatedOutput: "passed",
+                exitCode: 0
+            )
+        )
+        #expect(await recorder.itemUpdated(id: "command-typed-emitter") != nil)
+        #expect(await observationEventually {
+            guard let content = chat.items
+                .first(where: { $0.itemID == "command-typed-emitter" })?.content,
+                case .command(let command) = content else {
+                return false
+            }
+            return command.status == .completed && command.output == "passed"
+        })
+    }
+
+    @Test("typed notification fixtures reject invalid required values")
+    func typedNotificationFixturesRejectInvalidRequiredValues() async throws {
+        #expect(throws: CodexAppServerTestError.self) {
+            try CodexAppServerTestItem.agentMessage(id: "  ", text: "invalid")
+        }
+        #expect(throws: CodexAppServerTestError.self) {
+            try CodexAppServerTestItem.commandExecution(
+                id: "command-invalid",
+                command: "swift test",
+                cwd: try #require(URL(string: "https://example.com/workspace")),
+                status: .inProgress
+            )
+        }
+        let item = try CodexAppServerTestItem.agentMessage(id: "message-valid", text: "Valid")
+        #expect(throws: CodexAppServerTestError.self) {
+            try CodexAppServerTestTurn(
+                snapshot: .init(id: "turn-mismatch", state: .completed, items: []),
+                items: [item]
+            )
+        }
+        #expect(throws: CodexAppServerTestError.self) {
+            try CodexAppServerTestTurn(
+                snapshot: .init(
+                    id: "turn-in-progress-with-completion",
+                    state: .inProgress,
+                    items: [],
+                    completedAt: Date(timeIntervalSince1970: 20)
+                ),
+                items: []
+            )
+        }
+        let summaryTurn = try CodexAppServerTestTurn(
+            snapshot: .init(
+                id: "turn-summary",
+                state: .completed,
+                itemsLoadState: .summary,
+                items: [item.domainProjection]
+            ),
+            items: [item]
+        )
+        guard case .object(let turnFields) = summaryTurn.wireValue else {
+            Issue.record("Expected a canonical turn fixture payload.")
+            return
+        }
+        #expect(turnFields["itemsView"] == .string("summary"))
+    }
+
+    @Test("typed notification emitter routes specialized current-v2 updates")
+    func typedNotificationEmitterRoutesSpecializedCurrentV2Updates() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let threadID = CodexThreadID(rawValue: "thread-specialized-emitter")
+        let turnID = CodexTurnID(rawValue: "turn-specialized-emitter")
+        try await runtime.transport.enqueueThreadResume(.init(id: threadID))
+        try await runtime.transport.enqueueThreadRead(.init(id: threadID, turns: []))
+
+        let chat = context.model(for: threadID)
+        let observation = try await chat.observe()
+        defer { observation.cancel() }
+        let recorder = ObservationUpdateRecorder(stream: observation.updates)
+        await recorder.waitUntilStarted()
+
+        try await runtime.notificationEmitter.emitItemStarted(
+            threadID: threadID,
+            turnID: turnID,
+            item: .reasoning(id: "reasoning-specialized", summary: ["First"])
+        )
+        try await runtime.notificationEmitter.emitReasoningSummaryPartAdded(
+            threadID: threadID,
+            turnID: turnID,
+            itemID: "reasoning-specialized",
+            summaryIndex: 1
+        )
+        try await runtime.notificationEmitter.emitReasoningSummaryTextDelta(
+            threadID: threadID,
+            turnID: turnID,
+            itemID: "reasoning-specialized",
+            summaryIndex: 1,
+            delta: "Second"
+        )
+        #expect(
+            await recorder.itemTextAppended(
+                id: "reasoning-specialized",
+                delta: "\n\nSecond"
+            ) != nil
+        )
+
+        let fileChange = CodexFileUpdateChange(
+            path: "/tmp/workspace/File.swift",
+            kind: .update(movePath: "/tmp/workspace/Moved.swift"),
+            diff: "@@ -1 +1 @@"
+        )
+        let movedFileFixture = try CodexAppServerTestItem.fileChange(
+            id: "file-move-wire",
+            changes: [fileChange],
+            status: .inProgress
+        )
+        guard case .object(let fileFields) = movedFileFixture.wireValue,
+              let changesValue = fileFields["changes"],
+              case .array(let fileChanges) = changesValue,
+              let firstValue = fileChanges.first,
+              case .object(let firstChange) = firstValue,
+              let kindValue = firstChange["kind"],
+              case .object(let kindFields) = kindValue else {
+            Issue.record("Expected a canonical moved-file fixture payload.")
+            return
+        }
+        #expect(kindFields["move_path"] == .string("/tmp/workspace/Moved.swift"))
+        #expect(kindFields["movePath"] == nil)
+        try await runtime.notificationEmitter.emitItemStarted(
+            threadID: threadID,
+            turnID: turnID,
+            item: .fileChange(
+                id: "file-specialized",
+                changes: [.init(
+                    path: fileChange.path,
+                    kind: fileChange.kind,
+                    diff: ""
+                )],
+                status: .inProgress
+            )
+        )
+        try await runtime.notificationEmitter.emitFileChangePatchUpdated(
+            threadID: threadID,
+            turnID: turnID,
+            itemID: "file-specialized",
+            changes: [fileChange]
+        )
+
+        try await runtime.notificationEmitter.emitItemStarted(
+            threadID: threadID,
+            turnID: turnID,
+            item: .mcpToolCall(
+                id: "mcp-specialized",
+                server: "review",
+                tool: "inspect",
+                status: .inProgress
+            )
+        )
+        try await runtime.notificationEmitter.emitMCPToolCallProgress(
+            threadID: threadID,
+            turnID: turnID,
+            itemID: "mcp-specialized",
+            message: "Reviewing"
+        )
+
+        #expect(await observationEventually {
+            chat.items.first(where: { $0.itemID == "reasoning-specialized" })?.text == "First\n\nSecond"
+                && chat.items.first(where: { $0.itemID == "file-specialized" })?.text == "@@ -1 +1 @@"
+                && chat.items.first(where: { $0.itemID == "mcp-specialized" })?.text == "Reviewing"
+        })
+        let completedMCP = try CodexAppServerTestItem.mcpToolCall(
+            id: "mcp-specialized",
+            server: "review",
+            tool: "inspect",
+            status: .completed,
+            resultContent: [.string("Done")],
+            structuredContent: .object(["count": .int(1)]),
+            resultMetadata: .object(["source": .string("fixture")])
+        )
+        try await runtime.notificationEmitter.emitItemCompleted(
+            threadID: threadID,
+            turnID: turnID,
+            item: completedMCP
+        )
+        #expect(await observationEventually {
+            guard let content = chat.items
+                .first(where: { $0.itemID == "mcp-specialized" })?.content,
+                case .toolCall(let actual) = content,
+                case .toolCall(let expected) = completedMCP.domainProjection.content else {
+                return false
+            }
+            return actual.result == expected.result && actual.status == .completed
+        })
+        try await runtime.notificationEmitter.emitThreadStatusChanged(
+            threadID: threadID,
+            status: .idle
+        )
+        #expect(await observationEventually { chat.status == .idle })
+    }
+
+    @Test("typed turn fixture emits terminal current-v2 snapshots")
+    func typedTurnFixtureEmitsTerminalCurrentV2Snapshots() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let threadID = CodexThreadID(rawValue: "thread-terminal-emitter")
+        let turnID = CodexTurnID(rawValue: "turn-terminal-emitter")
+        try await runtime.transport.enqueueThreadResume(.init(id: threadID))
+        try await runtime.transport.enqueueThreadRead(.init(id: threadID, turns: []))
+
+        let chat = context.model(for: threadID)
+        let observation = try await chat.observe()
+        defer { observation.cancel() }
+        let item = try CodexAppServerTestItem.agentMessage(
+            id: "message-terminal-emitter",
+            text: "Done",
+            phase: .finalAnswer
+        )
+        try await runtime.notificationEmitter.emitItemCompleted(
+            threadID: threadID,
+            turnID: turnID,
+            item: item
+        )
+        let turn = try CodexAppServerTestTurn(
+            snapshot: .init(
+                id: turnID,
+                state: .completed,
+                items: [item.domainProjection]
+            ),
+            items: [item]
+        )
+        try await runtime.notificationEmitter.emitTurnCompleted(
+            threadID: threadID,
+            turn: turn
+        )
+
+        #expect(await observationEventually {
+            guard let content = chat.items.first?.content,
+                  case .message(let message) = content else {
+                return false
+            }
+            return chat.phase == .terminal(turnID: turnID, disposition: .completed)
+                && message.phase == .finalAnswer
+        })
     }
 
     @Test("observed chat advances without update consumers")
@@ -365,6 +685,24 @@ private final class ObservationUpdateRecorder {
             }
             if case .turnInserted(let turn, _) = change {
                 return turn.items.contains { $0.id == id }
+            }
+            return false
+        }
+    }
+
+    func itemUpdated(id: String) async -> CodexChatUpdate? {
+        await next { change in
+            if case .itemUpdated(let item, _, _) = change {
+                return item.id == id
+            }
+            return false
+        }
+    }
+
+    func itemTextAppended(id: String, delta: String) async -> CodexChatUpdate? {
+        await next { change in
+            if case .itemTextAppended(let locator, let appendedDelta) = change {
+                return locator.id == id && appendedDelta == delta
             }
             return false
         }

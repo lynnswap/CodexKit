@@ -214,10 +214,14 @@ public struct CodexAppServerTestRuntime: Sendable {
     /// The in-memory transport used by ``server``.
     public var transport: CodexAppServerTestTransport
 
+    /// Typed current-v2 notification controls for the in-memory server.
+    public var notificationEmitter: CodexAppServerTestNotificationEmitter
+
     /// Creates a runtime from an already initialized app-server container and transport.
     public init(server: CodexAppServer, transport: CodexAppServerTestTransport) {
         self.server = server
         self.transport = transport
+        self.notificationEmitter = CodexAppServerTestNotificationEmitter(transport: transport)
     }
 
     /// Creates a test runtime without launching a real app-server process.

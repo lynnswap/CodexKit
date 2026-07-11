@@ -746,11 +746,18 @@ extension AppServerJSONValue {
         case .object(let value):
             value["displayText"]?.displayText
                 ?? value["text"]?.displayText
-                ?? (try? JSONEncoder().encode(self)).flatMap { String(data: $0, encoding: .utf8) }
+                ?? value["message"]?.displayText
+                ?? canonicalJSONString
         case .array:
-            (try? JSONEncoder().encode(self)).flatMap { String(data: $0, encoding: .utf8) }
+            canonicalJSONString
         case .null:
             nil
         }
+    }
+
+    private var canonicalJSONString: String? {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return (try? encoder.encode(self)).flatMap { String(data: $0, encoding: .utf8) }
     }
 }

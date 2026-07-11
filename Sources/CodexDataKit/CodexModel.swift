@@ -1985,6 +1985,9 @@ public final class CodexChat: CodexPersistentModel {
 
     private func merge(_ delta: CodexReasoningDelta, turnID: CodexTurnID?) -> [CodexChatMutation] {
         let key = reasoningMergeKey(for: delta, turnID: turnID)
+        if let currentItem = delta.currentItem {
+            return mergeItems([currentItem], turnID: turnID)
+        }
         let previousAccumulatedText = liveMergeState.reasoningDeltaTextByItemKey[key] ?? ""
         let accumulatedText = previousAccumulatedText + delta.delta
 
@@ -2076,7 +2079,10 @@ public final class CodexChat: CodexPersistentModel {
         guard currentItem != previousItem else {
             return nil
         }
-        if let delta = appendedText(previousText: previousItem.text, currentText: item.text) {
+        if let delta = appendedText(
+            from: previousItem,
+            to: currentItem
+        ) {
             return .itemTextAppended(
                 id: item.id,
                 turnID: item.turnID,
@@ -2084,6 +2090,81 @@ public final class CodexChat: CodexPersistentModel {
             )
         }
         return .itemUpdated(id: item.id, turnID: item.turnID)
+    }
+
+    private func appendedText(
+        from previousItem: CodexThreadItem,
+        to currentItem: CodexThreadItem
+    ) -> String? {
+        guard previousItem.id == currentItem.id,
+              previousItem.kind == currentItem.kind else {
+            return nil
+        }
+        switch (previousItem.content, currentItem.content) {
+        case (.message(let previous), .message(var current)):
+            current.text = previous.text
+            guard current == previous else { return nil }
+        case (.plan, .plan):
+            break
+        case (.reasoning(let previous), .reasoning(let current)):
+            guard reasoningHasOnlyAppendedText(from: previous, to: current) else {
+                return nil
+            }
+        case (.command(let previous), .command(var current)):
+            current.output = previous.output
+            guard current == previous else { return nil }
+        case (.fileChange(let previous), .fileChange(var current)):
+            current.output = previous.output
+            guard current == previous else { return nil }
+        case (.toolCall(let previous), .toolCall(var current)):
+            current.result = previous.result
+            guard current == previous else { return nil }
+        case (.contextCompaction, .contextCompaction),
+            (.diagnostic, .diagnostic),
+            (.log, .log):
+            break
+        case (.unknown(let previous), .unknown(var current)):
+            current.text = previous.text
+            guard current == previous else { return nil }
+        default:
+            return nil
+        }
+        return appendedText(
+            previousText: previousItem.text,
+            currentText: currentItem.text
+        )
+    }
+
+    private func reasoningHasOnlyAppendedText(
+        from previous: CodexReasoning,
+        to current: CodexReasoning
+    ) -> Bool {
+        if previous.summary.isEmpty == false || current.summary.isEmpty == false {
+            return previous.content == current.content
+                && fragmentsHaveOnlyAppendedText(from: previous.summary, to: current.summary)
+        }
+        return fragmentsHaveOnlyAppendedText(from: previous.content, to: current.content)
+    }
+
+    private func fragmentsHaveOnlyAppendedText(
+        from previous: [String],
+        to current: [String]
+    ) -> Bool {
+        if previous.isEmpty {
+            return current.count == 1 && current[0].isEmpty == false
+        }
+        if current.count == previous.count + 1,
+           current.dropLast().elementsEqual(previous),
+           current.last?.isEmpty == false {
+            return true
+        }
+        guard previous.count == current.count,
+              previous.dropLast().elementsEqual(current.dropLast()),
+              let previousLast = previous.last,
+              let currentLast = current.last else {
+            return false
+        }
+        return currentLast.hasPrefix(previousLast) && currentLast.count > previousLast.count
     }
 
     private func appendedText(previousText: String?, currentText: String?) -> String? {

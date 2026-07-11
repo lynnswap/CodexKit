@@ -1827,6 +1827,24 @@ public struct CodexFileChange: Equatable, Sendable {
     }
 }
 
+public struct CodexFileUpdateChange: Equatable, Sendable {
+    public enum Kind: Equatable, Sendable {
+        case add
+        case delete
+        case update(movePath: String?)
+    }
+
+    public var path: String
+    public var kind: Kind
+    public var diff: String
+
+    public init(path: String, kind: Kind, diff: String) {
+        self.path = path
+        self.kind = kind
+        self.diff = diff
+    }
+}
+
 public struct CodexToolCall: Equatable, Sendable {
     public var namespace: String?
     public var server: String?
