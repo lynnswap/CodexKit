@@ -14,7 +14,7 @@ public enum CodexChatUpdate: Equatable, Sendable {
     case itemRemoved(id: String, turnID: CodexTurnID?)
     case itemTextAppended(id: String, turnID: CodexTurnID?, delta: String)
     case statusChanged(CodexThreadStatus?)
-    case phaseChanged(CodexDataPhase)
+    case phaseChanged(CodexChatPhase)
 
     public var affectedTurnID: CodexTurnID? {
         switch self {

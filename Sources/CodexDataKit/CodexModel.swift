@@ -551,8 +551,7 @@ public final class CodexChat: CodexPersistentModel {
     public private(set) var ephemeral: Bool?
     public private(set) var turns: [CodexTurn]
     public private(set) var items: [CodexItem]
-    public var phase: CodexDataPhase = .idle
-    public var lastErrorDescription: String?
+    public private(set) var phase: CodexChatPhase = .idle
 
     public private(set) weak var workspace: CodexWorkspace?
 
@@ -759,12 +758,15 @@ public final class CodexChat: CodexPersistentModel {
         guard let modelContext else {
             throw CodexModelContextError.modelIsDetached
         }
+        let stablePhase = phase
         phase = .loading
-        lastErrorDescription = nil
         do {
             let response = try await modelContext.send(input, in: self)
             await modelContext.syncPhaseAfterSend(in: self)
             return response
+        } catch is CancellationError {
+            restorePhaseIfLoading(stablePhase)
+            throw CancellationError()
         } catch {
             fail(with: error)
             throw error
@@ -1127,6 +1129,10 @@ public final class CodexChat: CodexPersistentModel {
             ))
         }
         changes.appendIfPresent(markIdleIfActive())
+        phase = .terminal(
+            turnID: response.turnID,
+            disposition: outcome.chatTerminalDisposition
+        )
         appendPhaseChange(to: &changes, previousPhase: previousPhase)
         markAppliedLiveTurnItemUpdatesIfNeeded(changes)
         return changes
@@ -1144,8 +1150,7 @@ public final class CodexChat: CodexPersistentModel {
                 state: .inProgress,
                 preservesExistingUsage: true
             ))
-            changes.appendIfPresent(markRunningIfNeeded())
-            lastErrorDescription = nil
+            changes.appendIfPresent(markRunningIfNeeded(turnID: turnID))
         case .snapshot(let snapshot):
             changes.appendIfPresent(upsertTurn(
                 id: snapshot.id,
@@ -1156,23 +1161,26 @@ public final class CodexChat: CodexPersistentModel {
             changes.append(contentsOf: mergeItems(snapshot.items, turnID: snapshot.id))
             switch snapshot.state {
             case .inProgress:
-                changes.appendIfPresent(markRunningIfNeeded())
-            case .completed, .interrupted, .unknown:
+                changes.appendIfPresent(markRunningIfNeeded(turnID: snapshot.id))
+            case .completed:
                 changes.appendIfPresent(markIdleIfActive())
-                markLoadedIfNotFailed()
-            case .failed(let error):
+                phase = .terminal(turnID: snapshot.id, disposition: .completed)
+            case .interrupted:
                 changes.appendIfPresent(markIdleIfActive())
-                fail(with: error)
+                phase = .terminal(turnID: snapshot.id, disposition: .interrupted)
+            case .failed:
+                changes.appendIfPresent(markIdleIfActive())
+                phase = .terminal(turnID: snapshot.id, disposition: .failed)
+            case .unknown(let rawValue, _):
+                changes.appendIfPresent(markIdleIfActive())
+                phase = .terminal(
+                    turnID: snapshot.id,
+                    disposition: .invalid(rawStatus: rawValue)
+                )
             }
         case .terminal(let outcome):
             changes.append(contentsOf: apply(outcome))
             changes.appendIfPresent(markIdleIfActive())
-            if case .failed(let failedTurn) = outcome {
-                fail(with: failedTurn.error.message)
-            } else {
-                phase = .loaded
-                lastErrorDescription = nil
-            }
         case .itemStarted(let item, let turnID):
             insertRunningTurnIfMissing(turnID, into: &changes)
             changes.append(contentsOf: terminalizeActiveItemsBeforeAppending(
@@ -1182,7 +1190,7 @@ public final class CodexChat: CodexPersistentModel {
             changes.append(contentsOf: mergeItems([
                 itemByApplyingLifecycleStatus(.inProgress, to: item),
             ], turnID: turnID))
-            changes.appendIfPresent(markRunningIfNeeded())
+            changes.appendIfPresent(markRunningIfNeeded(turnID: turnID))
         case .itemCompleted(let item, let turnID):
             insertRunningTurnIfMissing(turnID, into: &changes)
             changes.append(contentsOf: terminalizeActiveItemsBeforeAppending(
@@ -1203,7 +1211,7 @@ public final class CodexChat: CodexPersistentModel {
                 turnID: turnID,
                 accumulatesOutputDeltas: isOutputDeltaUpdate(item)
             ))
-            changes.appendIfPresent(markRunningIfNeeded())
+            changes.appendIfPresent(markRunningIfNeeded(turnID: turnID))
         case .message(let message, let turnID):
             insertRunningTurnIfMissing(turnID, into: &changes)
             let item = CodexThreadItem(
@@ -1216,7 +1224,7 @@ public final class CodexChat: CodexPersistentModel {
                 turnID: turnID
             ))
             changes.append(contentsOf: mergeItems([item], turnID: turnID))
-            changes.appendIfPresent(markRunningIfNeeded())
+            changes.appendIfPresent(markRunningIfNeeded(turnID: turnID))
         case .messageDelta(let delta, let turnID):
             insertRunningTurnIfMissing(turnID, into: &changes)
             changes.append(contentsOf: terminalizeActiveItemsBeforeAppending(
@@ -1228,7 +1236,7 @@ public final class CodexChat: CodexPersistentModel {
                 turnID: turnID
             ))
             changes.append(contentsOf: merge(delta, turnID: turnID))
-            changes.appendIfPresent(markRunningIfNeeded())
+            changes.appendIfPresent(markRunningIfNeeded(turnID: turnID))
         case .reasoningSummaryPartAdded(let part, let turnID):
             insertRunningTurnIfMissing(turnID, into: &changes)
             let item = CodexThreadItem(id: part.id, kind: .reasoning, content: .reasoning(.empty))
@@ -1237,7 +1245,7 @@ public final class CodexChat: CodexPersistentModel {
                 turnID: turnID
             ))
             changes.append(contentsOf: start(part, turnID: turnID))
-            changes.appendIfPresent(markRunningIfNeeded())
+            changes.appendIfPresent(markRunningIfNeeded(turnID: turnID))
         case .reasoningDelta(let delta, let turnID):
             insertRunningTurnIfMissing(turnID, into: &changes)
             changes.append(contentsOf: terminalizeActiveItemsBeforeAppending(
@@ -1245,7 +1253,7 @@ public final class CodexChat: CodexPersistentModel {
                 turnID: turnID
             ))
             changes.append(contentsOf: merge(delta, turnID: turnID))
-            changes.appendIfPresent(markRunningIfNeeded())
+            changes.appendIfPresent(markRunningIfNeeded(turnID: turnID))
         case .tokenUsageUpdated(let usage, let turnID):
             if let turnID {
                 changes.appendIfPresent(setUsage(usage, for: turnID))
@@ -1254,14 +1262,14 @@ public final class CodexChat: CodexPersistentModel {
             switch status {
             case .active, .unknown:
                 changes.appendIfPresent(setStatus(status))
-                changes.appendIfPresent(markRunningIfNeeded())
+                changes.appendIfPresent(markRunningIfNeeded(turnID: nil))
             case .notLoaded, .idle, .systemError:
                 changes.appendIfPresent(setStatus(status))
-                markLoadedIfNotFailed()
+                markInactiveWithoutTerminalizingTurn()
             }
         case .closed:
             changes.appendIfPresent(setStatus(.notLoaded))
-            markLoadedIfNotFailed()
+            markInactiveWithoutTerminalizingTurn()
         case .unknown:
             break
         }
@@ -2281,14 +2289,18 @@ public final class CodexChat: CodexPersistentModel {
         return removedChanges
     }
 
-    private func markRunningIfNeeded() -> CodexChatUpdate? {
+    private func markRunningIfNeeded(turnID: CodexTurnID?) -> CodexChatUpdate? {
         let statusChange: CodexChatUpdate?
         if status?.isActive != true {
             statusChange = setStatus(.active(activeFlags: []))
         } else {
             statusChange = nil
         }
-        if phase != .loading {
+        if let turnID {
+            phase = .running(turnID: turnID)
+        } else if case .running = phase {
+            // A thread-scoped status update cannot replace known turn identity.
+        } else {
             phase = .loading
         }
         return statusChange
@@ -2298,6 +2310,15 @@ public final class CodexChat: CodexPersistentModel {
         let previousStatus = self.status
         self.status = status
         return previousStatus == status ? nil : .statusChanged(status)
+    }
+
+    private func markInactiveWithoutTerminalizingTurn() {
+        switch phase {
+        case .idle, .loading:
+            phase = .idle
+        case .running, .terminal, .failed:
+            break
+        }
     }
 
     private func markIdleIfActive() -> CodexChatUpdate? {
@@ -2315,23 +2336,40 @@ public final class CodexChat: CodexPersistentModel {
         }
     }
 
+    package func beginLoading() {
+        phase = .loading
+    }
+
+    package func restorePhaseIfLoading(_ phase: CodexChatPhase) {
+        guard self.phase == .loading else {
+            return
+        }
+        self.phase = phase
+    }
+
     @discardableResult
     package func syncPhaseWithTurnsAfterRefresh() -> CodexChatUpdate? {
         let previousPhase = phase
         guard let latestTurn = turns.last else {
-            phase = status?.isActive == true ? .loading : .loaded
-            lastErrorDescription = nil
+            phase = status?.isActive == true ? .loading : .idle
             return phase == previousPhase ? nil : .phaseChanged(phase)
         }
-        switch latestTurn.status {
+        switch latestTurn.state {
         case .inProgress:
-            phase = .loading
-            lastErrorDescription = nil
+            phase = .running(turnID: latestTurn.id)
+        case .completed:
+            phase = .terminal(turnID: latestTurn.id, disposition: .completed)
+        case .interrupted:
+            phase = .terminal(turnID: latestTurn.id, disposition: .interrupted)
         case .failed:
-            fail(with: latestTurn.error?.message ?? latestTurn.status?.rawValue ?? "Turn failed")
-        case .completed, .interrupted, .unknown, .none:
-            phase = status?.isActive == true ? .loading : .loaded
-            lastErrorDescription = nil
+            phase = .terminal(turnID: latestTurn.id, disposition: .failed)
+        case .unknown(let rawValue, _):
+            phase = .terminal(
+                turnID: latestTurn.id,
+                disposition: .invalid(rawStatus: rawValue)
+            )
+        case nil:
+            phase = status?.isActive == true ? .loading : .idle
         }
         return phase == previousPhase ? nil : .phaseChanged(phase)
     }
@@ -2339,24 +2377,23 @@ public final class CodexChat: CodexPersistentModel {
     private func syncPhaseWithStatusAfterMetadataRefresh() {
         switch status {
         case .active:
+            if case .running = phase {
+                return
+            }
             phase = .loading
-            lastErrorDescription = nil
         case .notLoaded, .idle, .systemError, .unknown, .none:
-            phase = .loaded
-            lastErrorDescription = nil
+            switch phase {
+            case .terminal, .failed:
+                break
+            case .idle, .loading, .running:
+                phase = .idle
+            }
         }
-    }
-
-    private func markLoadedIfNotFailed() {
-        if case .failed = phase {
-            return
-        }
-        phase = .loaded
     }
 
     private func appendPhaseChange(
         to changes: inout [CodexChatUpdate],
-        previousPhase: CodexDataPhase
+        previousPhase: CodexChatPhase
     ) {
         if phase != previousPhase {
             changes.append(.phaseChanged(phase))
@@ -2364,8 +2401,15 @@ public final class CodexChat: CodexPersistentModel {
     }
 
     package func fail(with error: any Error) {
-        let message = error.localizedDescription
-        fail(with: message)
+        if let failure = error as? CodexFetchFailure {
+            phase = .failed(failure)
+            return
+        }
+        if let appServerError = error as? CodexAppServerError {
+            phase = .failed(.appServer(appServerError))
+            return
+        }
+        preconditionFailure("Unexpected CodexChat load failure: \(error)")
     }
 
     package func resetLiveMergeStateFromCurrentItems() {
@@ -2510,11 +2554,6 @@ public final class CodexChat: CodexPersistentModel {
             modelContext.unregisterContextItem(item)
             item.detachFromContext()
         }
-    }
-
-    private func fail(with message: String) {
-        lastErrorDescription = message
-        phase = .failed(message)
     }
 
     private struct LiveMergeState {

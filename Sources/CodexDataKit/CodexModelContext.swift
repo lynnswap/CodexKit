@@ -563,11 +563,14 @@ public final class CodexModelContext {
             throw CodexModelContextError.modelIsDetached
         }
 
-        chat.phase = .loading
-        chat.lastErrorDescription = nil
+        let stablePhase = chat.phase
+        chat.beginLoading()
         do {
             let thread = try await eventThread(for: chat)
             try await refresh(chat, using: thread, includeTurns: includeTurns)
+        } catch is CancellationError {
+            chat.restorePhaseIfLoading(stablePhase)
+            throw CancellationError()
         } catch {
             chat.fail(with: error)
             throw error
@@ -842,8 +845,8 @@ public final class CodexModelContext {
         includeTurns: Bool,
         resumedThread: CodexThread? = nil
     ) async throws {
-        chat.phase = .loading
-        chat.lastErrorDescription = nil
+        let stablePhase = chat.phase
+        chat.beginLoading()
         let thread: CodexThread
         let usesPreparedThread: Bool
         do {
@@ -894,6 +897,10 @@ public final class CodexModelContext {
             }
             try Task.checkCancellation()
             observation.includesTurns = includeTurns
+        } catch is CancellationError {
+            chat.restorePhaseIfLoading(stablePhase)
+            discardChatObservation(chat.id, observation: observation)
+            throw CancellationError()
         } catch {
             chat.fail(with: error)
             discardChatObservation(chat.id, observation: observation)
@@ -922,6 +929,9 @@ public final class CodexModelContext {
             return false
         }
         if chat.phase == .loading || chat.status?.isActive == true {
+            return false
+        }
+        if case .running = chat.phase {
             return false
         }
         return true

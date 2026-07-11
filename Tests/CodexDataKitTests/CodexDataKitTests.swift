@@ -5276,7 +5276,7 @@ struct CodexModelContextTests {
 
         let chat = context.model(for: CodexThreadID(rawValue: "thread-metadata-phase"))
         try await context.refresh(chat)
-        #expect(chat.phase == .loading)
+        #expect(chat.phase == .running(turnID: "turn-stale"))
 
         for status: CodexThreadStatus in [.idle, .notLoaded, .systemError] {
             try await runtime.transport.enqueueThreadResume(.init(id: "thread-metadata-phase"))
@@ -5288,7 +5288,7 @@ struct CodexModelContextTests {
             try await context.refresh(chat, includeTurns: false)
 
             #expect(chat.turn(id: "turn-stale")?.state == .inProgress)
-            #expect(chat.phase == .loaded)
+            #expect(chat.phase == .idle)
             #expect(chat.status == status)
         }
     }
@@ -5340,7 +5340,87 @@ struct CodexModelContextTests {
         #expect(command.status == .inProgress)
         #expect(command.completedAt == nil)
         #expect(chat.status == .idle)
-        #expect(chat.phase == .loading)
+        #expect(chat.phase == .running(turnID: "turn-running-after-idle"))
+    }
+
+    @Test("chat refresh cancellation restores its stable typed phase")
+    func chatRefreshCancellationRestoresStablePhase() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let readGate = CodexAppServerTestGate()
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-cancel-refresh"))
+
+        try await runtime.transport.enqueueThreadResume(.init(id: chat.id))
+        try await runtime.transport.enqueueThreadRead(.init(id: chat.id, status: .idle))
+        await runtime.transport.holdNextIgnoringCancellation(
+            method: "thread/read",
+            gate: readGate
+        )
+        let refresh = Task { @MainActor in
+            try await context.refresh(chat, includeTurns: false)
+        }
+        await runtime.transport.waitForRequest(method: "thread/read")
+
+        refresh.cancel()
+        await readGate.open()
+        do {
+            try await refresh.value
+            Issue.record("Expected chat refresh cancellation")
+        } catch is CancellationError {
+        }
+
+        #expect(chat.phase == .idle)
+    }
+
+    @Test("cancelled chat operations do not overwrite a newer live terminal phase")
+    func cancelledChatOperationPreservesNewerTerminalPhase() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-cancel-live-terminal"))
+
+        chat.beginLoading()
+        _ = chat.apply(.completed(CodexResponse(turnID: "turn-live-terminal")))
+        chat.restorePhaseIfLoading(.idle)
+
+        #expect(chat.phase == .terminal(
+            turnID: "turn-live-terminal",
+            disposition: .completed
+        ))
+    }
+
+    @Test("chat observation setup cancellation releases its slot and restores phase")
+    func chatObservationSetupCancellationReleasesSlot() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let readGate = CodexAppServerTestGate()
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-cancel-observe"))
+
+        try await runtime.transport.enqueueThreadResume(.init(id: chat.id))
+        try await runtime.transport.enqueueThreadRead(.init(id: chat.id, status: .idle))
+        await runtime.transport.holdNextIgnoringCancellation(
+            method: "thread/read",
+            gate: readGate
+        )
+        let setup = Task { @MainActor in
+            do {
+                _ = try await chat.observe(includeTurns: false)
+                Issue.record("Expected chat observation setup cancellation")
+            } catch is CancellationError {
+            } catch {
+                Issue.record("Unexpected chat observation setup error: \(error)")
+            }
+        }
+        await runtime.transport.waitForRequest(method: "thread/read")
+
+        setup.cancel()
+        await readGate.open()
+        await setup.value
+        #expect(chat.phase == .idle)
+
+        try await runtime.transport.enqueueThreadResume(.init(id: chat.id))
+        try await runtime.transport.enqueueThreadRead(.init(id: chat.id, status: .idle))
+        let observation = try await chat.observe(includeTurns: false)
+        observation.cancel()
     }
 
     @Test("fresh idle thread status does not rewrite a running turn snapshot")
@@ -5375,7 +5455,7 @@ struct CodexModelContextTests {
         try await context.refresh(chat)
 
         #expect(chat.status == .idle)
-        #expect(chat.phase == .loading)
+        #expect(chat.phase == .running(turnID: "turn-stale-running"))
         #expect(chat.turn(id: "turn-stale-running")?.state == .inProgress)
     }
 
@@ -6109,7 +6189,7 @@ struct CodexModelContextTests {
             observation.cancel()
         }
         let updateRecorder = ChatUpdateRecorder(stream: observation.updates)
-        #expect(chat.phase == .loading)
+        #expect(chat.phase == .running(turnID: "turn-existing"))
 
         try await runtime.transport.enqueueThreadResume(.init(id: "thread-send-phase"))
         try await runtime.transport.enqueueTurnStart(turnID: "turn-send-phase", status: "running")
@@ -6128,9 +6208,15 @@ struct CodexModelContextTests {
 
         _ = try await sendTask.value
 
-        let phaseChange = await updateRecorder.phaseChanged(.loaded)
+        let phaseChange = await updateRecorder.phaseChanged(.terminal(
+            turnID: "turn-send-phase",
+            disposition: .completed
+        ))
         #expect(phaseChange != nil)
-        #expect(chat.phase == .loaded)
+        #expect(chat.phase == .terminal(
+            turnID: "turn-send-phase",
+            disposition: .completed
+        ))
     }
 
     @Test("thread event lifecycle updates observable chat status")
@@ -6153,7 +6239,7 @@ struct CodexModelContextTests {
         let updateRecorder = ChatUpdateRecorder(stream: observation.updates)
 
         #expect(chat.status == .idle)
-        #expect(chat.phase == .loaded)
+        #expect(chat.phase == .idle)
 
         try await runtime.transport.emitServerNotification(
             method: "turn/started",
@@ -6165,7 +6251,7 @@ struct CodexModelContextTests {
 
         #expect(await updateRecorder.statusChanged(.active(activeFlags: [])) != nil)
         #expect(chat.status == .active(activeFlags: []))
-        #expect(chat.phase == .loading)
+        #expect(chat.phase == .running(turnID: "turn-status-lifecycle"))
 
         try await runtime.transport.emitServerNotification(
             method: "turn/completed",
@@ -6177,7 +6263,10 @@ struct CodexModelContextTests {
 
         #expect(await updateRecorder.statusChanged(.idle) != nil)
         #expect(chat.status == .idle)
-        #expect(chat.phase == .loaded)
+        #expect(chat.phase == .terminal(
+            turnID: "turn-status-lifecycle",
+            disposition: .completed
+        ))
     }
 
     @Test("item lifecycle updates observable command status")
@@ -6325,7 +6414,10 @@ struct CodexModelContextTests {
             )
         )
 
-        #expect(await eventually { chat.status == .idle && chat.phase == .loaded })
+        #expect(await eventually {
+            chat.status == .idle
+                && chat.phase == .running(turnID: "turn-command-status-terminal")
+        })
         guard case .command(let command) = commandItem.content else {
             Issue.record("Expected command item")
             return
@@ -6334,7 +6426,7 @@ struct CodexModelContextTests {
         #expect(command.status == .inProgress)
         #expect(command.startedAt != nil)
         #expect(command.completedAt == nil)
-        #expect(chat.phase == .loaded)
+        #expect(chat.phase == .running(turnID: "turn-command-status-terminal"))
         #expect(chat.status == .idle)
         withExtendedLifetime(changes) {}
     }
@@ -6635,7 +6727,10 @@ struct CodexModelContextTests {
 
         let snapshotItem = try #require(chat.items.first)
         #expect(observation.chat === chat)
-        #expect(chat.phase == .loaded)
+        #expect(chat.phase == .terminal(
+            turnID: "turn-existing",
+            disposition: .completed
+        ))
         #expect(snapshotItem.text == "Snapshot")
 
         try await runtime.transport.emitServerNotification(
@@ -6722,7 +6817,10 @@ struct CodexModelContextTests {
         #expect(await eventually {
             chat.turns.contains { $0.id == "turn-live" && $0.status == .completed }
                 && liveItem.text == "Hello"
-                && chat.phase == .loaded
+                && chat.phase == .terminal(
+                    turnID: "turn-live",
+                    disposition: .completed
+                )
         })
         let liveTurn = try #require(chat.turns.first { $0.id == "turn-live" })
         #expect(chat.items.first { $0.itemID == "message-live" } === liveItem)
@@ -6853,7 +6951,7 @@ struct CodexModelContextTests {
             method: "thread/closed",
             params: ThreadClosedParams(threadID: "thread-finished")
         )
-        #expect(await eventually { chat.status == .notLoaded && chat.phase == .loaded })
+        #expect(await eventually { chat.status == .notLoaded && chat.phase == .idle })
         #expect(await eventually { firstChanges.isFinished })
 
         try await runtime.transport.enqueueThreadResume(.init(id: "thread-finished"))
@@ -7858,7 +7956,7 @@ struct CodexModelContextTests {
             observation.cancel()
         }
         let changes = ChatUpdateRecorder(stream: observation.updates)
-        #expect(chat.phase == .loading)
+        #expect(chat.phase == .running(turnID: "turn-running"))
 
         try await runtime.transport.enqueueThreadResume(.init(id: "thread-refresh-stream"))
         try await runtime.transport.enqueueThreadRead(.init(
@@ -7870,7 +7968,7 @@ struct CodexModelContextTests {
         try await context.refresh(chat)
 
         #expect(await changes.resynchronized(reason: .refresh) != nil)
-        #expect(chat.phase == .loaded)
+        #expect(chat.phase == .idle)
     }
 
     @Test("active chat refresh preserves live-streamed items omitted by lagging snapshots")
@@ -8485,7 +8583,7 @@ struct CodexModelContextTests {
             observation.cancel()
         }
 
-        #expect(chat.phase == .loading)
+        #expect(chat.phase == .running(turnID: "turn-running"))
         #expect(chat.turn(id: "turn-running")?.status == .inProgress)
     }
 
@@ -8520,7 +8618,9 @@ struct CodexModelContextTests {
             )
         )
 
-        #expect(await eventually { chat.phase == .failed("Tool failed") })
+        #expect(await eventually {
+            chat.phase == .terminal(turnID: "turn-failed", disposition: .failed)
+        })
         #expect(chat.turn(id: "turn-failed")?.error == .init(
             message: "Tool failed",
             info: .serverOverloaded,
@@ -8536,7 +8636,9 @@ struct CodexModelContextTests {
             params: ThreadClosedParams(threadID: "thread-failed")
         )
 
-        #expect(await eventually { chat.phase == .failed("Tool failed") })
+        #expect(await eventually {
+            chat.phase == .terminal(turnID: "turn-failed", disposition: .failed)
+        })
         withExtendedLifetime(changes) {}
     }
 
@@ -8571,7 +8673,7 @@ struct CodexModelContextTests {
             params: ThreadClosedParams(threadID: "thread-closed-status")
         )
 
-        #expect(await eventually { chat.status == .notLoaded && chat.phase == .loaded })
+        #expect(await eventually { chat.status == .notLoaded && chat.phase == .idle })
         withExtendedLifetime(changes) {}
     }
 
@@ -9524,7 +9626,10 @@ struct CodexModelContextTests {
         try? await Task.sleep(for: .milliseconds(100))
 
         #expect(started.chat.turn(id: "turn-review")?.status == .completed)
-        #expect(started.chat.phase == .loaded)
+        #expect(started.chat.phase == .terminal(
+            turnID: "turn-review",
+            disposition: .completed
+        ))
         #expect(started.chat.items.map(\.itemID) == ["final-message"])
         withExtendedLifetime(changes) {}
     }
@@ -11166,7 +11271,7 @@ private final class ChatUpdateRecorder {
         }
     }
 
-    func phaseChanged(_ phase: CodexDataPhase) async -> CodexChatUpdate? {
+    func phaseChanged(_ phase: CodexChatPhase) async -> CodexChatUpdate? {
         await next { change in
             if case .phaseChanged(let candidate) = change {
                 return candidate == phase
