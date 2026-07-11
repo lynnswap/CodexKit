@@ -6867,8 +6867,8 @@ struct CodexModelContextTests {
         #expect(await runtime.transport.recordedRequests(method: "thread/resume").count == 2)
     }
 
-    @Test("chat observation rejects concurrent include-turn upgrade")
-    func chatObservationRejectsConcurrentIncludeTurnUpgrade() async throws {
+    @Test("chat observation shares its pump and upgrades include-turn hydration")
+    func chatObservationSharesPumpAndUpgradesIncludeTurns() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         let context = CodexModelContainer(appServer: runtime.server).mainContext
 
@@ -6883,16 +6883,6 @@ struct CodexModelContextTests {
 
         #expect(chat.turn(id: "turn-history") == nil)
 
-        do {
-            _ = try await chat.observe(includeTurns: true)
-            Issue.record("Expected concurrent observation to throw.")
-        } catch CodexModelContextError.chatObservationAlreadyActive(let id) {
-            #expect(id == chat.id)
-        }
-
-        metadataObservation.cancel()
-
-        try await runtime.transport.enqueueThreadResume(.init(id: "thread-upgrade"))
         try await runtime.transport.enqueueThreadRead(.init(
             id: "thread-upgrade",
             turns: [
@@ -6923,13 +6913,62 @@ struct CodexModelContextTests {
         let turn = try #require(chat.turn(id: "turn-history"))
         #expect(turn.status == .completed)
         #expect(chat.items(in: "turn-history").map(\.text) == ["Loaded from upgrade"])
-        #expect(await runtime.transport.recordedRequests(method: "thread/resume").count == 2)
+        #expect(await runtime.transport.recordedRequests(method: "thread/resume").count == 1)
         let readRequests = await runtime.transport.recordedRequests(method: "thread/read")
         #expect(readRequests.count == 2)
         let firstParams = try readRequests[0].decodeParams(ThreadReadParams.self)
         let secondParams = try readRequests[1].decodeParams(ThreadReadParams.self)
         #expect(firstParams.includeTurns == false)
         #expect(secondParams.includeTurns == true)
+    }
+
+    @Test("include-turn join waits for in-flight observation start then upgrades once")
+    func includeTurnJoinWaitsForStartThenUpgradesOnce() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let readGate = CodexAppServerTestGate()
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-join-upgrade"))
+        var metadataObservation: CodexChatObservation?
+        var turnsObservation: CodexChatObservation?
+
+        try await runtime.transport.enqueueThreadResume(.init(id: chat.id))
+        try await runtime.transport.enqueueThreadRead(.init(id: chat.id, status: .idle))
+        await runtime.transport.holdNextIgnoringCancellation(
+            method: "thread/read",
+            gate: readGate
+        )
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: chat.id,
+            status: .idle,
+            turns: [.init(id: "turn-joined", state: .completed)]
+        ))
+
+        let metadataStart = Task { @MainActor in
+            do { metadataObservation = try await chat.observe(includeTurns: false) }
+            catch { Issue.record("Metadata observation failed: \(error)") }
+        }
+        await runtime.transport.waitForRequest(method: "thread/read", count: 1)
+        let turnsJoin = Task { @MainActor in
+            do { turnsObservation = try await chat.observe(includeTurns: true) }
+            catch { Issue.record("Turns observation failed: \(error)") }
+        }
+
+        await readGate.open()
+        await metadataStart.value
+        await turnsJoin.value
+        defer {
+            metadataObservation?.cancel()
+            turnsObservation?.cancel()
+        }
+
+        #expect(metadataObservation != nil)
+        #expect(turnsObservation != nil)
+        #expect(chat.turn(id: "turn-joined")?.status == .completed)
+        #expect(await runtime.transport.recordedRequests(method: "thread/resume").count == 1)
+        let reads = await runtime.transport.recordedRequests(method: "thread/read")
+        #expect(reads.count == 2)
+        #expect(try reads.map { try $0.decodeParams(ThreadReadParams.self).includeTurns }
+            == [false, true])
     }
 
     @Test("finished chat observations are not reused")
@@ -7184,8 +7223,8 @@ struct CodexModelContextTests {
         withExtendedLifetime(changes) {}
     }
 
-    @Test("duplicate chat observations are rejected")
-    func duplicateChatObservationsAreRejected() async throws {
+    @Test("duplicate chat observations create independent subscriber leases")
+    func duplicateChatObservationsCreateIndependentLeases() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         let context = CodexModelContainer(appServer: runtime.server).mainContext
 
@@ -7198,12 +7237,10 @@ struct CodexModelContextTests {
             firstObservation.cancel()
         }
 
-        do {
-            _ = try await chat.observe()
-            Issue.record("Expected duplicate observation to throw.")
-        } catch CodexModelContextError.chatObservationAlreadyActive(let id) {
-            #expect(id == chat.id)
-        }
+        let secondObservation = try await chat.observe()
+        defer { secondObservation.cancel() }
+        #expect(secondObservation !== firstObservation)
+        #expect(secondObservation.chat === chat)
         #expect(await runtime.transport.recordedRequests(method: "thread/resume").count == 1)
     }
 
@@ -7600,14 +7637,15 @@ struct CodexModelContextTests {
                 "turn-b:reasoning-parent",
             ]
         })
-        guard case .itemRemoved(let removedID, let removedTurnID) =
+        guard case .itemRemoved(let removedItem) =
             await changes.itemRemoved(id: "reasoning-parent:summary:0")
         else {
             Issue.record("Expected reasoning part removal.")
             return
         }
-        #expect(removedID == "reasoning-parent:summary:0")
-        #expect(removedTurnID == "turn-b")
+        #expect(removedItem.id == "reasoning-parent:summary:0")
+        #expect(removedItem.kind == .reasoning)
+        #expect(removedItem.turnID == "turn-b")
     }
 
     @Test("chat observation preserves distinct repeated narrative live items")
@@ -7804,14 +7842,15 @@ struct CodexModelContextTests {
             )
         )
 
-        guard case .itemTextAppended(let id, let turnID, let delta) =
+        guard case .itemTextAppended(let item, let delta) =
             await changes.itemTextAppended(id: "message-live", delta: "lo")
         else {
             Issue.record("Expected appended text change.")
             return
         }
-        #expect(id == "message-live")
-        #expect(turnID == "turn-live")
+        #expect(item.id == "message-live")
+        #expect(item.kind == .agentMessage)
+        #expect(item.turnID == "turn-live")
         #expect(delta == "lo")
         #expect(chat.items.first { $0.itemID == "message-live" }?.text == "Hello")
 
@@ -7871,7 +7910,6 @@ struct CodexModelContextTests {
             turnID: "turn-kind-change"
         ))
 
-        #expect(changes.contains(.itemInserted(id: "item-kind-change", turnID: "turn-kind-change")))
         #expect(chat.items.count == 2)
         let originalItems = chat.items.filter {
             $0.kind == .unknown("progress") && $0.text == "Initial"
@@ -7882,6 +7920,11 @@ struct CodexModelContextTests {
         #expect(originalItems.count == 1)
         #expect(originalItems.first === originalItem)
         #expect(diagnosticItems.count == 1)
+        let diagnosticItem = try #require(diagnosticItems.first)
+        #expect(changes.contains(.itemInserted(
+            id: diagnosticItem.id,
+            turnID: "turn-kind-change"
+        )))
     }
 
     @Test("tool call progress updates preserve existing metadata")
@@ -7925,7 +7968,10 @@ struct CodexModelContextTests {
             turnID: "turn-tool-progress"
         ))
 
-        #expect(changes.contains(.itemUpdated(id: "tool-progress", turnID: "turn-tool-progress")))
+        #expect(changes.contains(.itemUpdated(
+            id: toolItem.id,
+            turnID: "turn-tool-progress"
+        )))
         guard case .toolCall(let toolCall) = toolItem.content else {
             Issue.record("Expected tool call item")
             return
@@ -7967,7 +8013,7 @@ struct CodexModelContextTests {
 
         try await context.refresh(chat)
 
-        #expect(await changes.resynchronized(reason: .refresh) != nil)
+        #expect(await changes.snapshot(reason: .refresh) != nil)
         #expect(chat.phase == .idle)
     }
 
@@ -8541,8 +8587,8 @@ struct CodexModelContextTests {
         #expect(chat.items.first { $0.itemID == "message-buffered" }?.text == "Buffered")
     }
 
-    @Test("active chat observation owns the update stream")
-    func activeChatObservationOwnsTheUpdateStream() async throws {
+    @Test("active chat observation owns one pump with independent streams")
+    func activeChatObservationOwnsOnePumpWithIndependentStreams() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         let context = CodexModelContainer(appServer: runtime.server).mainContext
 
@@ -8556,12 +8602,10 @@ struct CodexModelContextTests {
         }
         #expect(firstObservation.chat === chat)
 
-        do {
-            _ = try await chat.observe()
-            Issue.record("Expected duplicate observation to throw.")
-        } catch CodexModelContextError.chatObservationAlreadyActive(let id) {
-            #expect(id == chat.id)
-        }
+        let secondObservation = try await chat.observe()
+        defer { secondObservation.cancel() }
+        #expect(secondObservation !== firstObservation)
+        #expect(secondObservation.chat === chat)
         #expect(await runtime.transport.recordedRequests(method: "thread/resume").count == 1)
     }
 
@@ -11215,13 +11259,14 @@ private final class FetchedResultsTransactionRecorder<Model: CodexPersistentMode
 @MainActor
 private final class ChatUpdateRecorder {
     private var changes: [CodexChatUpdate] = []
+    private var snapshots: [(CodexChatObservationSnapshot, CodexChatSnapshotReason)] = []
     private var streamFinished = false
     private var task: Task<Void, Never>?
 
     init(stream: CodexChatUpdates) {
         task = Task { @MainActor [weak self] in
-            for await change in stream {
-                self?.append(change)
+            for await event in stream {
+                self?.append(event)
             }
             self?.markFinished()
         }
@@ -11237,8 +11282,11 @@ private final class ChatUpdateRecorder {
 
     func itemInserted(id: String) async -> CodexChatUpdate? {
         await next { change in
-            if case .itemInserted(let changeID, _) = change {
-                return changeID == id
+            if case .itemInserted(let item, _, _) = change {
+                return item.id == id
+            }
+            if case .turnInserted(let turn, _) = change {
+                return turn.items.contains { $0.id == id }
             }
             return false
         }
@@ -11246,8 +11294,11 @@ private final class ChatUpdateRecorder {
 
     func itemUpdated(id: String) async -> CodexChatUpdate? {
         await next { change in
-            if case .itemUpdated(let changeID, _) = change {
-                return changeID == id
+            if case .itemUpdated(let item, _, _) = change {
+                return item.id == id
+            }
+            if case .turnUpdated(let turn, _) = change {
+                return turn.items.contains { $0.id == id }
             }
             return false
         }
@@ -11255,8 +11306,8 @@ private final class ChatUpdateRecorder {
 
     func itemRemoved(id: String) async -> CodexChatUpdate? {
         await next { change in
-            if case .itemRemoved(let changeID, _) = change {
-                return changeID == id
+            if case .itemRemoved(let locator) = change {
+                return locator.id == id
             }
             return false
         }
@@ -11264,8 +11315,8 @@ private final class ChatUpdateRecorder {
 
     func itemTextAppended(id: String, delta: String) async -> CodexChatUpdate? {
         await next { change in
-            if case .itemTextAppended(let changeID, _, let changeDelta) = change {
-                return changeID == id && changeDelta == delta
+            if case .itemTextAppended(let locator, let changeDelta) = change {
+                return locator.id == id && changeDelta == delta
             }
             return false
         }
@@ -11289,21 +11340,27 @@ private final class ChatUpdateRecorder {
         }
     }
 
-    func resynchronized(reason: CodexChatResynchronizationReason) async -> CodexChatUpdate? {
-        await next { change in
-            if case .resynchronized(let candidate) = change {
-                return candidate == reason
+    func snapshot(reason: CodexChatSnapshotReason) async -> CodexChatObservationSnapshot? {
+        for _ in 0..<50 {
+            if let index = snapshots.firstIndex(where: { $0.1 == reason }) {
+                return snapshots.remove(at: index).0
             }
-            return false
+            try? await Task.sleep(for: .milliseconds(10))
         }
+        return nil
     }
 
     var isFinished: Bool {
         streamFinished
     }
 
-    private func append(_ change: CodexChatUpdate) {
-        changes.append(change)
+    private func append(_ event: CodexChatObservationEvent) {
+        switch event.payload {
+        case .update(let change):
+            changes.append(change)
+        case .snapshot(let snapshot, let reason):
+            snapshots.append((snapshot, reason))
+        }
     }
 
     private func markFinished() {

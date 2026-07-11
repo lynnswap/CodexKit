@@ -8,7 +8,6 @@ private let logger = Logger(subsystem: "CodexDataKit", category: "model-context"
 public enum CodexModelContextError: Error, Equatable, Sendable {
     case unsupportedModelType(String)
     case modelIsDetached
-    case chatObservationAlreadyActive(CodexThreadID)
 }
 
 package struct CodexModelContextID: Hashable, Sendable {
@@ -146,21 +145,108 @@ public final class CodexModelContext {
     }
 
     private final class ActiveChatObservation {
+        let generation: UInt64
+        let releaseSignal = ChatObservationReleaseSignal()
         var eventThread: CodexThread?
         var eventStream: CodexThreadEventSequence?
         var includesTurns = false
         var isFinished = false
+        var isClosing = false
+        var finishSnapshotReason: CodexChatSnapshotReason?
         var isBufferingEvents = false
         var bufferedEvents: [CodexThreadEvent] = []
-        let updateRelay = CodexAsyncStreamRelay<CodexChatUpdate>()
+        var subscribers: [UUID: CodexChatObservationChannel] = [:]
+        var sequence: UInt64 = 0
         var hasAppliedLiveUpdates = false
+        var isStarting = true
+        var startFailure: (any Error)?
+        var startWaiters: [CheckedContinuation<Void, any Error>] = []
+        var isUpgrading = false
+        var upgradeWaiters: [CheckedContinuation<Void, any Error>] = []
+        var closeWaiters: [CheckedContinuation<Void, Never>] = []
+
+        init(generation: UInt64) {
+            self.generation = generation
+        }
 
         func cancel() {
             isFinished = true
+            releaseSignal.terminate()
             eventPump?.cancel()
             discardBufferedEvents()
-            updateRelay.finish()
+            for channel in subscribers.values {
+                channel.finish()
+            }
+            subscribers.removeAll(keepingCapacity: false)
             eventStream = nil
+            finishClosing()
+        }
+
+        func waitUntilStarted() async throws {
+            if let startFailure { throw startFailure }
+            guard isStarting else { return }
+            try await withCheckedThrowingContinuation {
+                (continuation: CheckedContinuation<Void, any Error>) in
+                if let startFailure {
+                    continuation.resume(throwing: startFailure)
+                } else if isStarting {
+                    startWaiters.append(continuation)
+                } else {
+                    continuation.resume()
+                }
+            }
+        }
+
+        func finishStarting(with error: (any Error)? = nil) {
+            precondition(isStarting)
+            isStarting = false
+            startFailure = error
+            let waiters = startWaiters
+            startWaiters.removeAll(keepingCapacity: false)
+            for waiter in waiters {
+                if let error { waiter.resume(throwing: error) }
+                else { waiter.resume() }
+            }
+        }
+
+        func waitUntilUpgradeFinishes() async throws {
+            guard isUpgrading else { return }
+            try await withCheckedThrowingContinuation {
+                (continuation: CheckedContinuation<Void, any Error>) in
+                if isUpgrading { upgradeWaiters.append(continuation) }
+                else { continuation.resume() }
+            }
+        }
+
+        func finishUpgrade(with error: (any Error)? = nil) {
+            precondition(isUpgrading)
+            isUpgrading = false
+            let waiters = upgradeWaiters
+            upgradeWaiters.removeAll(keepingCapacity: false)
+            for waiter in waiters {
+                if let error { waiter.resume(throwing: error) }
+                else { waiter.resume() }
+            }
+        }
+
+        func waitUntilClosed() async {
+            guard isFinished == false else { return }
+            await withCheckedContinuation { continuation in
+                if isFinished {
+                    continuation.resume()
+                } else {
+                    closeWaiters.append(continuation)
+                }
+            }
+        }
+
+        func finishClosing() {
+            isClosing = false
+            let waiters = closeWaiters
+            closeWaiters.removeAll(keepingCapacity: false)
+            for waiter in waiters {
+                waiter.resume()
+            }
         }
 
         var eventPump: ThreadEventPump?
@@ -198,47 +284,175 @@ public final class CodexModelContext {
             bufferedEvents.removeAll(keepingCapacity: true)
         }
 
-        func yield(_ updates: [CodexChatUpdate]) {
+        func yield(_ mutations: [CodexChatMutation], chat: CodexChat) {
+            let updates = chat.observationUpdates(for: mutations)
             guard updates.isEmpty == false else {
                 return
             }
-            for update in updates {
-                updateRelay.yield(update)
+            let firstSequence = sequence &+ 1
+            sequence &+= UInt64(updates.count)
+            let events = updates.enumerated().map { offset, update in
+                CodexChatObservationEvent(
+                    generation: generation,
+                    sequence: firstSequence &+ UInt64(offset),
+                    payload: .update(update)
+                )
             }
+            let overflow = snapshotEvent(chat: chat, reason: .bufferOverflow)
+            for channel in subscribers.values {
+                channel.yield(events, overflowSnapshot: overflow)
+            }
+        }
+
+        func makeSubscriber(chat: CodexChat) -> (UUID, CodexChatUpdates) {
+            let id = UUID()
+            let channel = CodexChatObservationChannel(
+                releaseSignal: releaseSignal,
+                leaseID: id
+            )
+            channel.seed(snapshotEvent(
+                chat: chat,
+                reason: finishSnapshotReason
+                    ?? (generation == 1 ? .initial : .generationRestart)
+            ))
+            if isFinished {
+                channel.finish()
+            } else {
+                subscribers[id] = channel
+            }
+            return (id, CodexChatUpdates(channel: channel))
+        }
+
+        func removeSubscriber(_ id: UUID) {
+            subscribers.removeValue(forKey: id)?.finish()
+        }
+
+        func broadcastSnapshot(
+            chat: CodexChat,
+            reason: CodexChatSnapshotReason,
+            advancesSequence: Bool = true
+        ) {
+            if advancesSequence {
+                sequence &+= 1
+            }
+            let event = snapshotEvent(chat: chat, reason: reason)
+            for channel in subscribers.values {
+                channel.yield(event, overflowSnapshot: event)
+            }
+        }
+
+        func finishSubscribers() {
+            for channel in subscribers.values {
+                channel.finish()
+            }
+            subscribers.removeAll(keepingCapacity: false)
+        }
+
+        private func snapshotEvent(
+            chat: CodexChat,
+            reason: CodexChatSnapshotReason
+        ) -> CodexChatObservationEvent {
+            CodexChatObservationEvent(
+                generation: generation,
+                sequence: sequence,
+                payload: .snapshot(
+                    .init(thread: chat.observationSnapshot(), phase: chat.phase),
+                    reason: reason
+                )
+            )
         }
     }
 
     private final class ThreadEventPump {
+        private enum ChildResult: Sendable {
+            case upstreamFinished
+            case upstreamCancelled
+            case releaseReceiverFinished
+            case lastLeaseReleased(UUID)
+        }
+
         private let task: Task<Void, Never>
+        private let releaseSignal: ChatObservationReleaseSignal
 
         init(
             context: CodexModelContext,
             chatID: CodexThreadID,
             observation: ActiveChatObservation,
             stream: CodexThreadEventSequence,
+            releaseSignal: ChatObservationReleaseSignal,
             isolation: (any Actor)?
         ) {
+            self.releaseSignal = releaseSignal
             let target = ThreadEventPumpTarget(
                 context: context,
                 chatID: chatID,
                 observation: observation
             )
             task = Task {
-                do {
-                    for try await event in stream {
-                        await target.process(event, isolation: isolation)
+                var lastReleasedLeaseID: UUID?
+                await withTaskGroup(of: ChildResult.self) { group in
+                    group.addTask {
+                        do {
+                            for try await event in stream {
+                                await target.process(event, isolation: isolation)
+                            }
+                            await target.finish(isolation: isolation)
+                            releaseSignal.terminate()
+                            return .upstreamFinished
+                        } catch is CancellationError {
+                            return .upstreamCancelled
+                        } catch {
+                            await target.fail(with: error, isolation: isolation)
+                            releaseSignal.terminate()
+                            return .upstreamFinished
+                        }
                     }
-                    await target.finish(isolation: isolation)
-                } catch is CancellationError {
-                    await target.discard(isolation: isolation)
-                } catch {
-                    await target.fail(with: error, isolation: isolation)
+                    group.addTask {
+                        while let release = await releaseSignal.next() {
+                            let isLast = await target.release(
+                                leaseID: release.leaseID,
+                                isolation: isolation
+                            )
+                            if isLast {
+                                return .lastLeaseReleased(release.leaseID)
+                            }
+                            releaseSignal.acknowledge(release.leaseID)
+                        }
+                        return .releaseReceiverFinished
+                    }
+                    while let result = await group.next() {
+                        switch result {
+                        case .lastLeaseReleased(let leaseID):
+                            lastReleasedLeaseID = leaseID
+                            releaseSignal.terminate()
+                            group.cancelAll()
+                        case .upstreamFinished, .upstreamCancelled:
+                            releaseSignal.terminate()
+                            group.cancelAll()
+                        case .releaseReceiverFinished:
+                            if Task.isCancelled {
+                                group.cancelAll()
+                            }
+                        }
+                    }
                 }
+                if let lastReleasedLeaseID {
+                    await target.completeLastRelease(isolation: isolation)
+                    releaseSignal.acknowledge(lastReleasedLeaseID)
+                }
+                releaseSignal.completeAllAcknowledgements()
             }
         }
 
         func cancel() {
+            releaseSignal.terminate()
             task.cancel()
+        }
+
+        func cancelAndWait() async {
+            releaseSignal.terminate()
+            task.cancel()
+            await task.value
         }
     }
 
@@ -269,23 +483,24 @@ public final class CodexModelContext {
             context?.finishChatObservationIfIdle(chatID, observation: observation)
         }
 
-        func discard(isolation: isolated (any Actor)?) {
-            context?.discardChatObservation(chatID, observation: observation)
-        }
-
         func fail(with error: Error, isolation: isolated (any Actor)?) async {
             await context?.failChatObservation(chatID, observation: observation, error: error)
         }
-    }
 
-    private struct ObservationUpdates: AsyncSequence, Sendable {
-        typealias Element = CodexChatUpdate
-        typealias Failure = Never
+        func release(
+            leaseID: UUID,
+            isolation: isolated (any Actor)?
+        ) -> Bool {
+            guard let context else { return true }
+            return context.releaseChatObservationLease(
+                chatID,
+                observation: observation,
+                subscriberID: leaseID
+            )
+        }
 
-        let relay: CodexAsyncStreamRelay<CodexChatUpdate>
-
-        func makeAsyncIterator() -> AsyncStream<CodexChatUpdate>.Iterator {
-            relay.makeStream().makeAsyncIterator()
+        func completeLastRelease(isolation: isolated (any Actor)?) {
+            context?.completeChatObservationClose(chatID, observation: observation)
         }
     }
 
@@ -300,6 +515,7 @@ public final class CodexModelContext {
     private var itemsByID: [CodexChatItemID: CodexItem] = [:]
     private var fetchedResults: [WeakFetchedResultsRegistration] = []
     private var activeChatObservationsByID: [CodexThreadID: ActiveChatObservation] = [:]
+    private var chatObservationGenerationByID: [CodexThreadID: UInt64] = [:]
     private var preparedEventThreadsByID: [CodexThreadID: CodexThread] = [:]
 
     public init(_ container: CodexModelContainer) {
@@ -621,9 +837,7 @@ public final class CodexModelContext {
         }
         refreshedChat.syncPhaseAfterRefresh(includeTurns: includeTurns)
         if emitsResynchronization {
-            yield([
-                .resynchronized(reason: .refresh),
-            ], to: observation)
+            observation?.broadcastSnapshot(chat: refreshedChat, reason: .refresh)
         }
         if replaysBufferedEvents {
             await flushBufferedEvents(from: observation, to: refreshedChat)
@@ -779,18 +993,19 @@ public final class CodexModelContext {
         for event in bufferedEvents {
             let changes = await apply(event, to: chat)
             observation?.markAppliedLiveUpdates()
-            yield(changes, to: observation)
+            yield(changes, from: chat, to: observation)
         }
     }
 
     private func yield(
-        _ updates: [CodexChatUpdate],
+        _ updates: [CodexChatMutation],
+        from chat: CodexChat,
         to observation: ActiveChatObservation?
     ) {
         guard let observation else {
             return
         }
-        observation.yield(updates)
+        observation.yield(updates, chat: chat)
     }
 
     public nonisolated(nonsending) func observe(
@@ -817,13 +1032,26 @@ public final class CodexModelContext {
         if let observation = activeChatObservationsByID[chat.id] {
             if observation.isFinished {
                 activeChatObservationsByID.removeValue(forKey: chat.id)
+            } else if observation.isClosing {
+                await observation.waitUntilClosed()
+                return try await activeObservation(
+                    for: chat,
+                    includeTurns: includeTurns,
+                    resumedThread: resumedThread
+                )
             } else {
-                throw CodexModelContextError.chatObservationAlreadyActive(chat.id)
+                try await observation.waitUntilStarted()
+                if includeTurns, observation.includesTurns == false {
+                    try await upgradeObservation(observation, for: chat)
+                }
+                return observation
             }
         }
 
         let chatID = chat.id
-        let observation = ActiveChatObservation()
+        let generation = (chatObservationGenerationByID[chatID] ?? 0) &+ 1
+        chatObservationGenerationByID[chatID] = generation
+        let observation = ActiveChatObservation(generation: generation)
         activeChatObservationsByID[chatID] = observation
         do {
             try await self.startObservation(
@@ -832,9 +1060,53 @@ public final class CodexModelContext {
                 includeTurns: includeTurns,
                 resumedThread: resumedThread
             )
+            observation.finishStarting()
             return observation
         } catch {
-            discardChatObservation(chatID, observation: observation)
+            if error is CancellationError {
+                if observation.isStarting {
+                    observation.finishStarting(with: error)
+                }
+                discardChatObservation(chatID, observation: observation)
+                throw error
+            }
+            observation.finishSnapshotReason = .upstreamFailure
+            observation.isFinished = true
+            if observation.isStarting {
+                observation.finishStarting()
+            }
+            observation.releaseSignal.terminate()
+            await observation.eventPump?.cancelAndWait()
+            activeChatObservationsByID.removeValue(forKey: chatID)
+            return observation
+        }
+    }
+
+    private func upgradeObservation(
+        _ observation: ActiveChatObservation,
+        for chat: CodexChat
+    ) async throws {
+        if observation.includesTurns { return }
+        if observation.isUpgrading {
+            try await observation.waitUntilUpgradeFinishes()
+            return
+        }
+        guard let thread = observation.eventThread else {
+            preconditionFailure("An active chat observation must own its event thread.")
+        }
+        observation.isUpgrading = true
+        do {
+            try await refresh(
+                chat,
+                using: thread,
+                includeTurns: true,
+                emitsResynchronization: false
+            )
+            observation.includesTurns = true
+            observation.broadcastSnapshot(chat: chat, reason: .includeTurnsUpgrade)
+            observation.finishUpgrade()
+        } catch {
+            observation.finishUpgrade(with: error)
             throw error
         }
     }
@@ -903,7 +1175,6 @@ public final class CodexModelContext {
             throw CancellationError()
         } catch {
             chat.fail(with: error)
-            discardChatObservation(chat.id, observation: observation)
             throw error
         }
     }
@@ -916,6 +1187,7 @@ public final class CodexModelContext {
                 chatID: thread.id,
                 observation: observation,
                 stream: eventStream,
+                releaseSignal: observation.releaseSignal,
                 isolation: #isolation
             )
         }
@@ -941,7 +1213,7 @@ public final class CodexModelContext {
         _ event: CodexThreadEvent,
         to chat: CodexChat,
         observation: ActiveChatObservation
-    ) async -> [CodexChatUpdate] {
+    ) async -> [CodexChatMutation] {
         if observation.isBufferingEvents {
             observation.appendBufferedEvent(event)
             return []
@@ -964,7 +1236,7 @@ public final class CodexModelContext {
             return
         }
         let changes = await applyObservedEvent(event, to: chat, observation: observation)
-        yield(changes, to: observation)
+        yield(changes, from: chat, to: observation)
     }
 
     private func failChatObservation(
@@ -974,7 +1246,11 @@ public final class CodexModelContext {
     ) async {
         if let chat = registeredModel(for: chatID) {
             chat.fail(with: error)
-            yield([.phaseChanged(chat.phase)], to: observation)
+            observation.finishSnapshotReason = .upstreamFailure
+            observation.broadcastSnapshot(
+                chat: chat,
+                reason: .upstreamFailure
+            )
         }
         finishChatObservationIfIdle(chatID, observation: observation)
     }
@@ -989,15 +1265,32 @@ public final class CodexModelContext {
             && chat.turns.isEmpty == false
     }
 
-    private func releaseChatObservation(
+    private func releaseChatObservationLease(
+        _ chatID: CodexThreadID,
+        observation: ActiveChatObservation,
+        subscriberID: UUID
+    ) -> Bool {
+        guard activeChatObservationsByID[chatID] === observation else {
+            observation.removeSubscriber(subscriberID)
+            return observation.subscribers.isEmpty
+        }
+        observation.removeSubscriber(subscriberID)
+        if observation.subscribers.isEmpty == false {
+            return false
+        }
+        observation.isClosing = true
+        return true
+    }
+
+    private func completeChatObservationClose(
         _ chatID: CodexThreadID,
         observation: ActiveChatObservation
     ) {
-        guard activeChatObservationsByID[chatID] === observation else {
-            return
+        observation.isFinished = true
+        observation.finishClosing()
+        if activeChatObservationsByID[chatID] === observation {
+            activeChatObservationsByID.removeValue(forKey: chatID)
         }
-        observation.cancel()
-        activeChatObservationsByID.removeValue(forKey: chatID)
     }
 
     private func finishChatObservationIfIdle(
@@ -1008,7 +1301,9 @@ public final class CodexModelContext {
             return
         }
         observation.isFinished = true
-        observation.updateRelay.finish()
+        observation.finishSubscribers()
+        observation.releaseSignal.terminate()
+        observation.finishClosing()
         activeChatObservationsByID.removeValue(forKey: chatID)
     }
 
@@ -1027,15 +1322,13 @@ public final class CodexModelContext {
         chat: CodexChat,
         activeObservation: ActiveChatObservation
     ) -> CodexChatObservation {
-        let chatID = chat.id
-        let updates: CodexChatUpdates = ObservationUpdates(relay: activeObservation.updateRelay)
-        return CodexChatObservation(chat: chat, updates: updates) {
-            [weak self, weak activeObservation] in
-            guard let activeObservation else {
-                return
-            }
-            self?.releaseChatObservation(chatID, observation: activeObservation)
-        }
+        let (subscriberID, updates) = activeObservation.makeSubscriber(chat: chat)
+        return CodexChatObservation(
+            chat: chat,
+            updates: updates,
+            leaseID: subscriberID,
+            releaseSignal: activeObservation.releaseSignal
+        )
     }
 
     private func prepareEventThread(_ thread: CodexThread, for chatID: CodexThreadID) {
@@ -1209,7 +1502,7 @@ public final class CodexModelContext {
     }
 
     @discardableResult
-    package func apply(_ outcome: CodexTurnOutcome, to chat: CodexChat) async -> [CodexChatUpdate] {
+    package func apply(_ outcome: CodexTurnOutcome, to chat: CodexChat) async -> [CodexChatMutation] {
         let previousWorkspace = chat.workspace
         let previousGroup = previousWorkspace?.workspaceGroup
         let previousUpdatedAt = chat.updatedAt
@@ -1228,7 +1521,7 @@ public final class CodexModelContext {
         )
         let observation = activeChatObservationsByID[chat.id]
         observation?.markAppliedLiveUpdates()
-        yield(changes, to: observation)
+        yield(changes, from: chat, to: observation)
         return changes
     }
 
@@ -1236,11 +1529,11 @@ public final class CodexModelContext {
         guard let change = chat.syncPhaseWithTurnsAfterRefresh() else {
             return
         }
-        yield([change], to: activeChatObservationsByID[chat.id])
+        yield([change], from: chat, to: activeChatObservationsByID[chat.id])
     }
 
     @discardableResult
-    package func apply(_ event: CodexThreadEvent, to chat: CodexChat) async -> [CodexChatUpdate] {
+    package func apply(_ event: CodexThreadEvent, to chat: CodexChat) async -> [CodexChatMutation] {
         let previousWorkspace = chat.workspace
         let previousGroup = previousWorkspace?.workspaceGroup
         let previousState = fetchedResultState(for: chat)

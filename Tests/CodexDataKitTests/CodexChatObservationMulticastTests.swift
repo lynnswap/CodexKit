@@ -20,11 +20,13 @@ struct CodexChatObservationMulticastTests {
 
         let chat = context.model(for: CodexThreadID(rawValue: "thread-multicast"))
         let observation = try await chat.observe()
+        let secondObservation = try await chat.observe()
         defer {
             observation.cancel()
+            secondObservation.cancel()
         }
         let firstRecorder = ObservationUpdateRecorder(stream: observation.updates)
-        let secondRecorder = ObservationUpdateRecorder(stream: observation.updates)
+        let secondRecorder = ObservationUpdateRecorder(stream: secondObservation.updates)
         await firstRecorder.waitUntilStarted()
         await secondRecorder.waitUntilStarted()
 
@@ -96,11 +98,13 @@ struct CodexChatObservationMulticastTests {
 
         let chat = context.model(for: CodexThreadID(rawValue: "thread-no-duplicate"))
         let observation = try await chat.observe()
+        let secondObservation = try await chat.observe()
         defer {
             observation.cancel()
+            secondObservation.cancel()
         }
         let firstRecorder = ObservationUpdateRecorder(stream: observation.updates)
-        let secondRecorder = ObservationUpdateRecorder(stream: observation.updates)
+        let secondRecorder = ObservationUpdateRecorder(stream: secondObservation.updates)
         await firstRecorder.waitUntilStarted()
         await secondRecorder.waitUntilStarted()
 
@@ -136,11 +140,13 @@ struct CodexChatObservationMulticastTests {
 
         let chat = context.model(for: CodexThreadID(rawValue: "thread-finish-multicast"))
         let observation = try await chat.observe()
+        let secondObservation = try await chat.observe()
         defer {
             observation.cancel()
+            secondObservation.cancel()
         }
         let firstRecorder = ObservationUpdateRecorder(stream: observation.updates)
-        let secondRecorder = ObservationUpdateRecorder(stream: observation.updates)
+        let secondRecorder = ObservationUpdateRecorder(stream: secondObservation.updates)
         await firstRecorder.waitUntilStarted()
         await secondRecorder.waitUntilStarted()
 
@@ -151,6 +157,125 @@ struct CodexChatObservationMulticastTests {
 
         #expect(await firstRecorder.waitUntilFinished())
         #expect(await secondRecorder.waitUntilFinished())
+    }
+
+    @Test("non-last close releases one lease and last close joins the pump")
+    func observationCloseHonorsLeaseOwnership() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-close-leases"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-close-leases",
+            status: .idle,
+            turns: []
+        ))
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-close-leases"))
+        let first = try await chat.observe()
+        let second = try await chat.observe()
+        let firstRecorder = ObservationUpdateRecorder(stream: first.updates)
+        let secondRecorder = ObservationUpdateRecorder(stream: second.updates)
+        await firstRecorder.waitUntilStarted()
+        await secondRecorder.waitUntilStarted()
+
+        await first.close()
+        #expect(await firstRecorder.waitUntilFinished())
+        #expect(await secondRecorder.waitUntilFinished(attempts: 1) == false)
+
+        try await runtime.transport.emitServerNotification(
+            method: "item/started",
+            params: ObservationTestThreadItemParams(
+                threadID: "thread-close-leases",
+                turnID: "turn-close-leases",
+                item: .init(id: "message-after-close", type: "agentMessage", text: "still live")
+            )
+        )
+        #expect(await secondRecorder.itemInserted(id: "message-after-close") != nil)
+
+        await second.close()
+        #expect(await secondRecorder.waitUntilFinished())
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-close-leases"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-close-leases",
+            status: .idle,
+            turns: []
+        ))
+        let restarted = try await chat.observe()
+        var restartedEvents = restarted.updates.makeAsyncIterator()
+        let initial = try #require(await restartedEvents.next())
+        #expect(initial.generation == 2)
+        guard case .snapshot(_, let reason) = initial.payload else {
+            Issue.record("Expected restarted generation snapshot")
+            return
+        }
+        #expect(reason == .generationRestart)
+        await restarted.close()
+    }
+
+    @Test("failure before first render yields one complete failure snapshot then finishes")
+    func setupFailureYieldsSnapshotThenFinishes() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        await runtime.transport.enqueueFailure(
+            code: -32_000,
+            message: "offline",
+            for: "thread/resume"
+        )
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-setup-failure"))
+
+        let observation = try await chat.observe()
+        var events = observation.updates.makeAsyncIterator()
+        let failureEvent = try #require(await events.next())
+        guard case .snapshot(let snapshot, let reason) = failureEvent.payload else {
+            Issue.record("Expected failure snapshot")
+            return
+        }
+        #expect(reason == .upstreamFailure)
+        guard case .failed(.appServer) = snapshot.phase else {
+            Issue.record("Expected typed app-server failure phase")
+            return
+        }
+        #expect(await events.next() == nil)
+        await observation.close()
+    }
+
+    @Test("iterator cancellation releases its lease before a new generation starts")
+    func iteratorCancellationReleasesLease() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-iterator-cancel"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-iterator-cancel",
+            status: .idle,
+            turns: []
+        ))
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-iterator-cancel"))
+        let observation = try await chat.observe()
+        let consumer = Task { @MainActor in
+            for await _ in observation.updates {}
+        }
+        await Task.yield()
+        consumer.cancel()
+        await consumer.value
+        await observation.close()
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-iterator-cancel"))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-iterator-cancel",
+            status: .idle,
+            turns: []
+        ))
+        let restarted = try await chat.observe()
+        var events = restarted.updates.makeAsyncIterator()
+        let initial = try #require(await events.next())
+        #expect(initial.generation == 2)
+        guard case .snapshot(_, let reason) = initial.payload else {
+            Issue.record("Expected generation restart snapshot")
+            return
+        }
+        #expect(reason == .generationRestart)
+        await restarted.close()
     }
 }
 
@@ -207,8 +332,10 @@ private final class ObservationUpdateRecorder {
     init(stream: CodexChatUpdates) {
         task = Task { @MainActor [weak self] in
             self?.markStarted()
-            for await change in stream {
-                self?.append(change)
+            for await event in stream {
+                if case .update(let change) = event.payload {
+                    self?.append(change)
+                }
             }
             self?.markFinished()
         }
@@ -233,8 +360,11 @@ private final class ObservationUpdateRecorder {
 
     func itemInserted(id: String) async -> CodexChatUpdate? {
         await next { change in
-            if case .itemInserted(let changeID, _) = change {
-                return changeID == id
+            if case .itemInserted(let item, _, _) = change {
+                return item.id == id
+            }
+            if case .turnInserted(let turn, _) = change {
+                return turn.items.contains { $0.id == id }
             }
             return false
         }

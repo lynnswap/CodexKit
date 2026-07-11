@@ -329,6 +329,14 @@ struct CodexItemIdentityPromotionTests {
         #expect(chat.items.map(\.kind) == [.enteredReviewMode, .exitedReviewMode])
         #expect(Set(chat.items.map(\.id)).count == 2)
         #expect(chat.items.map(\.itemID) == ["review-marker", "review-marker"])
+        let locators = chat.items.map {
+            CodexChatItemLocator(
+                id: $0.itemID,
+                kind: $0.kind,
+                turnID: turnID
+            )
+        }
+        #expect(Set(locators).count == 2)
     }
 
     private func agentMessageItem(

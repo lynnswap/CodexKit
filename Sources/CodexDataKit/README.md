@@ -205,40 +205,33 @@ Keep review-specific state, parsed findings, and review timelines outside CodexD
 
 ## Live Chat Observation
 
-Use `CodexChat.observe()` or `CodexModelContext.observe(_:)` when a detail view needs the current accumulated transcript plus live app-server events applied to the same observable chat object.
+Use `CodexChat.observe()` or `CodexModelContext.observe(_:)` when a detail view needs an immutable transcript projection followed by live app-server updates.
 
 ```swift
 let chat = context.model(for: CodexThreadID(rawValue: "thread-1"))
 let observation = try await context.observe(chat)
 
-render(observation.chat.items)
-
-Task {
-    for await update in observation.updates {
-        apply(update, to: observation.chat)
+for await event in observation.updates {
+    switch event.payload {
+    case .snapshot(let snapshot, _):
+        projection.replace(with: snapshot)
+    case .update(let update):
+        projection.apply(update)
     }
 }
 
-observation.cancel()
+await observation.close()
 ```
 
-Observation first refreshes or seeds the chat with `includeTurns: true`, then consumes `CodexThread.events`. Turn, item, message, delta, usage, completion, and failure events mutate the existing context-owned `CodexChat`, `CodexTurn`, and `CodexItem` instances in place. `CodexItem.id` is the stable model identity; `CodexItem.itemID` keeps the raw app-server item ID.
+Observation first refreshes or seeds the chat with `includeTurns: true`, then consumes `CodexThread.events`. Turn, item, message, delta, usage, completion, and failure events still mutate the context-owned model graph, but that graph is not the presentation baseline. `CodexItem.id` is the stable model identity; `CodexItem.itemID` keeps the raw app-server item ID.
 
-`CodexChatObservation.chat` is the current value at observation creation and stays identical to the context-owned `CodexChat` instance. `updates` is a multicast async sequence of subsequent `CodexChatUpdate` values. The stream does not replay the current value. Consumers render the current value once, then use `updates` as invalidation or incremental hints while reading the same observable model.
+Each observation owns one subscriber lease and one iterator. The first event is a complete immutable snapshot. Later events carry a `(generation, sequence)` cursor and either a self-contained update or another complete snapshot barrier. Apply updates only to the immediately preceding projection; a snapshot replaces the projection and covers every event through its cursor. A second consumer must call `observe()` again instead of creating a second iterator from the same `updates` value.
 
-Do not keep UI-owned transcript mirrors in sync with the stream. Keep selection state as semantic IDs, read `CodexChat.turns` and `CodexChat.items` from the observed model, and build app-specific display projections in the UI package:
+Item removal and text-append updates use `CodexChatItemLocator`, whose turn ID, item kind, and raw item ID match DataKit's semantic merge key. Do not locate those targets by raw item ID alone because distinct item kinds can legally share that wire ID.
 
-```swift
-var selectedTurnID: CodexTurnID?
-render(selectedTurnID.map { chat.items(in: $0) } ?? chat.items)
+`CodexChatObservation.chat` remains the context-owned semantic action and identity handle. Do not reread it to apply an update: the graph may already contain later mutations. Keep selection state as semantic IDs and build app-specific presentation state only from event payloads. `CodexChatUpdate.affectedTurnID` can scope update handling after the projection has validated and applied the event cursor.
 
-for await update in observation.updates {
-    guard selectedTurnID == nil || update.affectedTurnID == selectedTurnID else {
-        continue
-    }
-    render(selectedTurnID.map { chat.items(in: $0) } ?? chat.items)
-}
-```
+Subscriber queues are bounded. A slow subscriber receives a complete `.bufferOverflow` snapshot instead of an unbounded delta backlog. Explicit `close()` finishes that subscriber and waits for its release; closing the last lease also cancels and joins the shared upstream pump. Iterator task cancellation releases the same lease. Dropping the observation sends a synchronous best-effort release, but normal teardown should always await `close()`.
 
 CodexDataKit may read app-server thread snapshots internally to establish or reconcile the current value. Those reads are not part of the observation stream. Once live events have advanced an observed chat, later thread reads are merged into the existing model and must not rewind already-applied live turns or items unless an explicit model operation such as rollback requests replacement.
 
