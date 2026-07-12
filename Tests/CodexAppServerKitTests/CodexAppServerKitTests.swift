@@ -2077,9 +2077,14 @@ struct CodexAppServerKitTests {
                 item: .init(
                     id: "file-1",
                     type: "fileChange",
-                    text: "updated",
                     status: "completed",
-                    path: "Sources/File.swift"
+                    changes: .array([
+                        .object([
+                            "path": .string("Sources/File.swift"),
+                            "kind": .object(["type": .string("update")]),
+                            "diff": .string("updated"),
+                        ]),
+                    ])
                 )
             )
         )
@@ -6134,8 +6139,12 @@ struct CodexAppServerKitTests {
 
         let logs = try await collect(thread.logEntries)
 
-        #expect(logs.first?.item?.kind == .fileChange)
-        #expect(logs.first?.item?.text?.contains("File.swift") == true)
+        guard case .fileChange(let fileChange) = logs.first?.item?.content else {
+            Issue.record("Expected a structured file-change item.")
+            return
+        }
+        #expect(fileChange.path == "Sources/File.swift")
+        #expect(fileChange.output == "@@ -1 +1 @@")
     }
 
     @Test func reasoningNotificationsRouteAsTypedEventsLogsAndTranscript() async throws {

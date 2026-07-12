@@ -2,9 +2,62 @@ import Foundation
 import Testing
 
 @testable import CodexAppServerKit
+import CodexAppServerKitTesting
 
 @Suite("AppServerNotificationDecoder")
 struct AppServerNotificationDecoderTests {
+    @Test func currentV2MapperPreservesCanonicalFileChangePathsAndDiffs() throws {
+        let fixture = try CodexAppServerTestItem.fileChange(
+            id: "file-change-1",
+            changes: [
+                .init(
+                    path: "Sources/First.swift",
+                    kind: .update(movePath: "Sources/Renamed.swift"),
+                    diff: "@@ -1 +1 @@\n-old\n+new"
+                ),
+                .init(
+                    path: "Sources/Second.swift",
+                    kind: .add,
+                    diff: "@@ -0,0 +1 @@\n+second"
+                ),
+            ],
+            status: .completed
+        )
+        let wireData = try JSONEncoder().encode(fixture.wireValue)
+        let wireValue = try JSONDecoder().decode(AppServerJSONValue.self, from: wireData)
+
+        let mapped = try #require(AppServerThreadItemMapping.threadItem(from: wireValue))
+
+        #expect(mapped.id == fixture.domainProjection.id)
+        #expect(mapped.kind == fixture.domainProjection.kind)
+        #expect(mapped.content == fixture.domainProjection.content)
+    }
+
+    @Test func currentV2MapperDoesNotSynthesizeOutputForEmptyFileChanges() throws {
+        let mapped = try #require(AppServerThreadItemMapping.threadItem(from: .object([
+            "id": .string("file-change-empty"),
+            "type": .string("fileChange"),
+            "changes": .array([]),
+            "status": .string("inProgress"),
+        ])))
+
+        guard case .fileChange(let fileChange) = mapped.content else {
+            Issue.record("Expected a file-change item.")
+            return
+        }
+        #expect(fileChange.path == nil)
+        #expect(fileChange.output == nil)
+        #expect(fileChange.status == .inProgress)
+    }
+
+    @Test func currentV2MapperRejectsFileChangeWithoutRequiredChanges() {
+        #expect(AppServerThreadItemMapping.threadItem(from: .object([
+            "id": .string("file-change-missing"),
+            "type": .string("fileChange"),
+            "status": .string("inProgress"),
+        ])) == nil)
+    }
+
     @Test func currentV2MapperAssignsReviewRolloutCompanionMetadataOnlyToFixedAgentItem() throws {
         let reviewAssistant = try #require(AppServerThreadItemMapping.threadItem(from: .object([
             "id": .string("review_rollout_assistant"),

@@ -895,6 +895,54 @@ struct RawCommandAction: Decodable {
     }
 }
 
+private struct RawFileUpdateChange: Decodable {
+    var path: String
+    var kind: CodexFileUpdateChange.Kind
+    var diff: String
+
+    private enum CodingKeys: String, CodingKey {
+        case path
+        case kind
+        case diff
+    }
+
+    private enum KindCodingKeys: String, CodingKey {
+        case type
+        case movePath = "move_path"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        path = try container.decode(String.self, forKey: .path)
+        diff = try container.decode(String.self, forKey: .diff)
+
+        let kindContainer = try container.nestedContainer(
+            keyedBy: KindCodingKeys.self,
+            forKey: .kind
+        )
+        switch try kindContainer.decode(String.self, forKey: .type) {
+        case "add":
+            kind = .add
+        case "delete":
+            kind = .delete
+        case "update":
+            kind = .update(
+                movePath: try kindContainer.decodeIfPresent(String.self, forKey: .movePath)
+            )
+        case let type:
+            throw DecodingError.dataCorruptedError(
+                forKey: .type,
+                in: kindContainer,
+                debugDescription: "Unsupported file update change kind: \(type)"
+            )
+        }
+    }
+
+    var domainValue: CodexFileUpdateChange {
+        .init(path: path, kind: kind, diff: diff)
+    }
+}
+
 struct RawThreadItem: Decodable {
     var id: String?
     var type: String?
@@ -925,7 +973,7 @@ struct RawThreadItem: Decodable {
     var input: AppServerJSONValue?
     var result: AppServerJSONValue?
     var error: AppServerJSONValue?
-    var changes: AppServerJSONValue?
+    private var changes: [RawFileUpdateChange]?
     var rawValue: AppServerJSONValue?
 
     enum CodingKeys: String, CodingKey {
@@ -993,7 +1041,7 @@ struct RawThreadItem: Decodable {
         input = try? container.decodeIfPresent(AppServerJSONValue.self, forKey: .input)
         result = try? container.decodeIfPresent(AppServerJSONValue.self, forKey: .result)
         error = try? container.decodeIfPresent(AppServerJSONValue.self, forKey: .error)
-        changes = try? container.decodeIfPresent(AppServerJSONValue.self, forKey: .changes)
+        changes = try container.decodeIfPresent([RawFileUpdateChange].self, forKey: .changes)
     }
 
     var threadItem: CodexThreadItem? {
@@ -1010,16 +1058,19 @@ struct RawThreadItem: Decodable {
         guard let itemID = id ?? fallbackItemID(rawType: rawType, allowed: allowsFallbackID) else {
             return nil
         }
+        guard let content = content(
+            kind: kind,
+            id: itemID,
+            rawType: rawType,
+            startedAt: startedAt,
+            completedAt: completedAt
+        ) else {
+            return nil
+        }
         return .init(
             id: itemID,
             kind: kind,
-            content: content(
-                kind: kind,
-                id: itemID,
-                rawType: rawType,
-                startedAt: startedAt,
-                completedAt: completedAt
-            ),
+            content: content,
             rawPayload: rawPayload
         )
     }
@@ -1037,7 +1088,7 @@ struct RawThreadItem: Decodable {
         rawType: String,
         startedAt: Date?,
         completedAt: Date?
-    ) -> CodexThreadItem.Content {
+    ) -> CodexThreadItem.Content? {
         switch kind {
         case .userMessage:
             return .message(.init(id: id, role: .user, text: messageText))
@@ -1076,10 +1127,13 @@ struct RawThreadItem: Decodable {
                     commandActions: commandActions.map(\.codexCommandAction)
                 ))
         case .fileChange:
+            guard let changes = changes?.map(\.domainValue) else {
+                return nil
+            }
             return .fileChange(
                 .init(
-                    path: path,
-                    output: aggregatedOutput ?? output ?? changes?.displayText ?? text,
+                    path: changes.first?.path,
+                    output: changes.isEmpty ? nil : changes.map(\.diff).joined(separator: "\n"),
                     status: status.map(CodexTurnStatus.init(rawValue:))
                 ))
         case .mcpToolCall, .dynamicToolCall, .collabAgentToolCall, .subAgentActivity,
