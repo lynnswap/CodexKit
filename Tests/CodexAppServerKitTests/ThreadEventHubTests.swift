@@ -146,6 +146,88 @@ struct ThreadEventHubTests {
         events.cancel()
     }
 
+    @Test func snapshotDoesNotWaitForBlockedSubscriptionPreparation() async throws {
+        let hub = ThreadEventHub()
+        let gate = PublicationGate()
+        let snapshotCompleted = DispatchSemaphore(value: 0)
+        let subscription = Task.detached {
+            hub.eventsForTesting(for: "thread-1") {
+                gate.blockPublication()
+            }
+        }
+        defer { gate.releasePublication() }
+        try #require(gate.waitUntilBlocked())
+
+        let snapshotTask = Task.detached {
+            let snapshot = hub.snapshotForTesting(threadID: "thread-1")
+            snapshotCompleted.signal()
+            return snapshot
+        }
+        let completedWhilePreparationWasBlocked = await withCheckedContinuation { continuation in
+            DispatchQueue.global().async {
+                continuation.resume(
+                    returning: snapshotCompleted.wait(timeout: .now() + 5) == .success
+                )
+            }
+        }
+        gate.releasePublication()
+
+        let events = await subscription.value
+        let snapshot = await snapshotTask.value
+        #expect(completedWhilePreparationWasBlocked)
+        #expect(snapshot.subscriberCount == 0)
+        #expect(snapshot.threadStateCount == 0)
+        events.cancel()
+    }
+
+    @Test func blockedSubscriptionPreparationDoesNotDelayConcurrentPublication() async throws {
+        let hub = ThreadEventHub()
+        hub.beginGeneration(for: "thread-1", including: "turn-1")
+        let existing = CodexThreadEvent.unknown(.init(
+            method: "thread/existing",
+            params: Data()
+        ))
+        let concurrent = CodexThreadEvent.unknown(.init(
+            method: "thread/concurrent",
+            params: Data()
+        ))
+        try hub.route(existing, for: "thread-1")
+        let gate = PublicationGate()
+        let publicationCompleted = DispatchSemaphore(value: 0)
+        let subscription = Task.detached {
+            hub.eventsForTesting(for: "thread-1") {
+                gate.blockPublication()
+            }
+        }
+        defer { gate.releasePublication() }
+        try #require(gate.waitUntilBlocked())
+
+        let publication = Task.detached {
+            defer { publicationCompleted.signal() }
+            return try hub.route(concurrent, for: "thread-1")
+        }
+        let completedWhilePreparationWasBlocked = await withCheckedContinuation { continuation in
+            DispatchQueue.global().async {
+                continuation.resume(
+                    returning: publicationCompleted.wait(timeout: .now() + 5) == .success
+                )
+            }
+        }
+        gate.releasePublication()
+
+        let events = await subscription.value
+        _ = try await publication.value
+        #expect(completedWhilePreparationWasBlocked)
+        var iterator = events.makeAsyncIterator()
+        #expect(try await iterator.next() == .snapshot(.init(
+            id: "turn-1",
+            state: .inProgress
+        )))
+        #expect(try await iterator.next() == existing)
+        #expect(try await iterator.next() == concurrent)
+        events.cancel()
+    }
+
     @Test func serializerSchedulingKeepsOnlyTheAcceptedAttempt() async throws {
         let hub = ThreadEventHub()
         let events = hub.events(for: "thread-1")

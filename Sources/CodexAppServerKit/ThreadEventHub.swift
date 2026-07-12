@@ -97,6 +97,9 @@ package final class ThreadEventHub: Sendable {
     }
 
     private let state = Mutex(State())
+    // `removeSubscriber` and deinit cancellation must never acquire `delivery`: channel
+    // completion can wait on a task-status lock while its cancellation handler removes here.
+    private let delivery = Mutex(())
 
     package init() {}
 
@@ -304,7 +307,7 @@ package final class ThreadEventHub: Sendable {
             }
             state.threads[eventThreadID] = eventThread
         }
-        _ = publication?.deliver()
+        _ = deliver(publication)
     }
 
     package func reject(_ checkpoint: ThreadEventGenerationCheckpoint) {
@@ -393,7 +396,7 @@ package final class ThreadEventHub: Sendable {
             state.threads[record.threadID] = thread
         }
         beforeDelivery()
-        _ = publication?.deliver()
+        _ = deliver(publication)
     }
 
     package func discard(_ checkpoint: ThreadEventGenerationCheckpoint) {
@@ -440,7 +443,7 @@ package final class ThreadEventHub: Sendable {
             )
             state.threads[threadID] = thread
         }
-        _ = publication?.deliver()
+        _ = deliver(publication)
     }
 
     package func beginGeneration(
@@ -489,7 +492,7 @@ package final class ThreadEventHub: Sendable {
             )
             state.threads[threadID] = thread
         }
-        _ = publication?.deliver()
+        _ = deliver(publication)
     }
 
     package func events(for threadID: CodexThreadID) -> CodexThreadEventSequence {
@@ -515,28 +518,31 @@ package final class ThreadEventHub: Sendable {
             hub: self,
             channel: channel
         )
-        state.withLock { state in
-            beforePublication()
-            switch state.phase {
-            case .failed(let error):
-                channel.fail(error)
-            case .open:
-                var thread = state.threads[threadID] ?? .init()
-                if thread.isClosed {
-                    channel.finish(
-                        with: thread.current?.replayEvents ?? [.closed],
-                        revision: thread.publicationRevision
-                    )
-                } else {
-                    channel.supersede(
-                        with: thread.current?.replayEvents ?? [],
-                        revision: thread.publicationRevision,
-                        resetsGeneration: true
-                    )
-                    thread.subscribers[subscriptionID] = channel
-                    state.threads[threadID] = thread
+        beforePublication()
+        delivery.withLock { _ in
+            let publication = state.withLock { state -> ThreadEventInitialPublication in
+                switch state.phase {
+                case .failed(let error):
+                    return .fail(error)
+                case .open:
+                    var thread = state.threads[threadID] ?? .init()
+                    if thread.isClosed {
+                        return .finish(
+                            thread.current?.replayEvents ?? [.closed],
+                            thread.publicationRevision
+                        )
+                    } else {
+                        let publication = ThreadEventInitialPublication.supersede(
+                            thread.current?.replayEvents ?? [],
+                            thread.publicationRevision
+                        )
+                        thread.subscribers[subscriptionID] = channel
+                        state.threads[threadID] = thread
+                        return publication
+                    }
                 }
             }
+            publication.deliver(to: channel)
         }
         return .init(channel: channel, cancellation: cancellation)
     }
@@ -628,7 +634,7 @@ package final class ThreadEventHub: Sendable {
             state.threads[threadID] = thread
             return publication
         }
-        return publication?.deliver() ?? 0
+        return deliver(publication)
     }
 
     package func finish(throwing error: CodexAppServerError) {
@@ -648,13 +654,18 @@ package final class ThreadEventHub: Sendable {
             state.threads.removeAll(keepingCapacity: false)
             return channels
         }
-        for channel in channels {
-            channel.fail(error)
+        delivery.withLock { _ in
+            for channel in channels {
+                channel.fail(error)
+            }
         }
     }
 
     package func snapshotForTesting(threadID: CodexThreadID) -> Snapshot {
-        state.withLock { state in
+        let captured = state.withLock { state -> (
+            snapshot: Snapshot,
+            subscribers: [ThreadEventSubscriberChannel]
+        ) in
             let thread = state.threads[threadID]
             let failure: CodexAppServerError?
             switch state.phase {
@@ -664,23 +675,29 @@ package final class ThreadEventHub: Sendable {
                 failure = error
             }
             let subscribers = thread.map { Array($0.subscribers.values) } ?? []
-            return .init(
-                subscriberCount: subscribers.count,
-                pendingCheckpointCount: state.checkpoints.values.filter {
-                    $0.threadID == threadID
-                }.count,
-                hasActiveCheckpoint: thread?.activeCheckpointID != nil,
-                hasCurrentGeneration: thread?.current != nil,
-                currentTurnID: thread?.current?.turnID,
-                currentEventCount: thread?.current?.replayEvents.count ?? 0,
-                overflowCount: subscribers.reduce(0) {
-                    $0 + $1.overflowCountForTesting()
-                },
-                isClosed: thread?.isClosed ?? false,
-                failure: failure,
-                threadStateCount: state.threads.count
+            return (
+                snapshot: .init(
+                    subscriberCount: subscribers.count,
+                    pendingCheckpointCount: state.checkpoints.values.filter {
+                        $0.threadID == threadID
+                    }.count,
+                    hasActiveCheckpoint: thread?.activeCheckpointID != nil,
+                    hasCurrentGeneration: thread?.current != nil,
+                    currentTurnID: thread?.current?.turnID,
+                    currentEventCount: thread?.current?.replayEvents.count ?? 0,
+                    overflowCount: 0,
+                    isClosed: thread?.isClosed ?? false,
+                    failure: failure,
+                    threadStateCount: state.threads.count
+                ),
+                subscribers: subscribers
             )
         }
+        var snapshot = captured.snapshot
+        snapshot.overflowCount = captured.subscribers.reduce(0) {
+            $0 + $1.overflowCountForTesting()
+        }
+        return snapshot
     }
 
     fileprivate func removeSubscriber(_ id: UUID, threadID: CodexThreadID) {
@@ -696,6 +713,15 @@ package final class ThreadEventHub: Sendable {
     private func nextPublicationRevision(for thread: inout ThreadState) -> UInt64 {
         thread.publicationRevision &+= 1
         return thread.publicationRevision
+    }
+
+    private func deliver(_ publication: ThreadEventPublication?) -> Int {
+        guard let publication else {
+            return 0
+        }
+        return delivery.withLock { _ in
+            publication.deliver()
+        }
     }
 
     private func store(
@@ -1191,6 +1217,23 @@ private enum ThreadEventPublication {
                 channel.finish(with: events, revision: revision)
             }
             return 0
+        }
+    }
+}
+
+private enum ThreadEventInitialPublication {
+    case supersede([CodexThreadEvent], UInt64)
+    case finish([CodexThreadEvent], UInt64)
+    case fail(CodexAppServerError)
+
+    func deliver(to channel: ThreadEventSubscriberChannel) {
+        switch self {
+        case .supersede(let events, let revision):
+            channel.supersede(with: events, revision: revision, resetsGeneration: true)
+        case .finish(let events, let revision):
+            channel.finish(with: events, revision: revision)
+        case .fail(let error):
+            channel.fail(error)
         }
     }
 }

@@ -174,6 +174,43 @@ struct TurnReplayCoreTests {
         events.cancel()
     }
 
+    @Test func snapshotDoesNotWaitForBlockedInitialPublication() async throws {
+        let relay = TurnReplayRelay()
+        let publicationEntered = DispatchSemaphore(value: 0)
+        let releasePublication = DispatchSemaphore(value: 0)
+        let snapshotCompleted = DispatchSemaphore(value: 0)
+        let snapshot = CodexTurnSnapshot(id: "turn-1", state: .inProgress)
+        let subscription = Task {
+            await performOnGlobalQueue {
+                relay.eventsForTesting(initialSnapshot: snapshot) {
+                    publicationEntered.signal()
+                    releasePublication.wait()
+                }
+            }
+        }
+        defer { releasePublication.signal() }
+        let publicationDidEnter = await performOnGlobalQueue {
+            publicationEntered.wait(timeout: .now() + 5) == .success
+        }
+        try #require(publicationDidEnter)
+
+        let snapshotTask = Task.detached {
+            let captured = relay.snapshotForTesting()
+            snapshotCompleted.signal()
+            return captured
+        }
+        let completedWhilePublicationWasBlocked = await performOnGlobalQueue {
+            snapshotCompleted.wait(timeout: .now() + 5) == .success
+        }
+        releasePublication.signal()
+
+        let events = await subscription.value
+        let captured = await snapshotTask.value
+        #expect(completedWhilePublicationWasBlocked)
+        #expect(captured == .init(subscriberCount: 0, overflowCount: 0, isFinished: false))
+        events.cancel()
+    }
+
     @Test func progressKeepsNewestRunningValueAndReservedTerminal() async throws {
         let relay = TurnReplayRelay()
         let events = relay.progressEvents()

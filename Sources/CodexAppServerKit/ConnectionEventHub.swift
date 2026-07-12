@@ -487,64 +487,77 @@ private final class ConnectionEventSubscriptionRegistry: Sendable {
     }
 
     private let state = Mutex(State())
+    // `remove` and `cancelAll` must never acquire `delivery`: channel completion can wait on a
+    // subscriber task-status lock while that lock runs its cancellation handler back into remove.
+    private let delivery = Mutex(())
 
     func makeEvents() -> CodexConnectionEvents {
         let id = UUID()
         let channel = ConnectionEventSubscriberChannel()
         let cancellation = ConnectionEventSubscriptionCancellation(id: id, registry: self)
-        let terminal = state.withLock { state -> CodexConnectionTermination? in
-            guard let terminal = state.terminal else {
-                state.channels[id] = channel
-                return nil
+        delivery.withLock { _ in
+            let terminal = state.withLock { state -> CodexConnectionTermination? in
+                guard let terminal = state.terminal else {
+                    state.channels[id] = channel
+                    return nil
+                }
+                return terminal
             }
-            return terminal
-        }
-        if let terminal {
-            channel.finish(with: terminal)
+            if let terminal {
+                channel.finish(with: terminal)
+            }
         }
         return .init(channel: channel, cancellation: cancellation)
     }
 
     func yield(_ event: CodexConnectionEvent) {
-        state.withLock { state in
-            guard state.terminal == nil else {
-                return
+        delivery.withLock { _ in
+            let channels = state.withLock { state -> [ConnectionEventSubscriberChannel] in
+                guard state.terminal == nil else {
+                    return []
+                }
+                return Array(state.channels.values)
             }
-            for channel in state.channels.values {
+            for channel in channels {
                 channel.yield(event)
             }
         }
     }
 
     func remove(_ id: UUID) {
-        state.withLock { state in
-            state.channels.removeValue(forKey: id)?.cancel()
-        }
+        let channel = state.withLock { $0.channels.removeValue(forKey: id) }
+        channel?.cancel()
     }
 
     func finish(with termination: CodexConnectionTermination) {
-        state.withLock { state in
-            if let existing = state.terminal {
-                precondition(
-                    existing == termination,
-                    "ConnectionEventHub cannot replace its derived terminal replay."
-                )
-                return
+        delivery.withLock { _ in
+            let channels = state.withLock { state -> [ConnectionEventSubscriberChannel] in
+                if let existing = state.terminal {
+                    precondition(
+                        existing == termination,
+                        "ConnectionEventHub cannot replace its derived terminal replay."
+                    )
+                    return []
+                }
+                state.terminal = termination
+                let channels = Array(state.channels.values)
+                state.channels.removeAll(keepingCapacity: false)
+                return channels
             }
-            state.terminal = termination
-            for channel in state.channels.values {
+            for channel in channels {
                 channel.finish(with: termination)
             }
-            state.channels.removeAll(keepingCapacity: false)
         }
     }
 
     func cancelAll() {
-        state.withLock { state in
-            for channel in state.channels.values {
-                channel.cancel()
-            }
+        let channels = state.withLock { state -> [ConnectionEventSubscriberChannel] in
+            let channels = Array(state.channels.values)
             state.channels.removeAll(keepingCapacity: false)
+            return channels
+        }
+        for channel in channels {
+            channel.cancel()
         }
     }
 

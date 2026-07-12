@@ -749,6 +749,9 @@ private final class TurnReplaySubscriptionRegistry<Channel: TurnReplaySubscriber
     }
 
     private let state = Mutex(State())
+    // `remove` and `cancelAll` must never acquire `delivery`: channel completion can wait on a
+    // subscriber task-status lock while that lock runs its cancellation handler back into remove.
+    private let delivery = Mutex(())
 
     func makeSubscription(
         makeChannel: () -> Channel,
@@ -757,10 +760,19 @@ private final class TurnReplaySubscriptionRegistry<Channel: TurnReplaySubscriber
         let id = UUID()
         let channel = makeChannel()
         let cancellation = TurnReplaySubscriptionCancellation(id: id, registry: self)
-        state.withLock { state in
-            precondition(state.isFinished == false, "Late replay must come from handle state.")
+        delivery.withLock { _ in
+            precondition(
+                state.withLock { $0.isFinished == false },
+                "Late replay must come from handle state."
+            )
             prepareForPublication(channel)
-            state.channels[id] = channel
+            state.withLock { state in
+                precondition(
+                    state.isFinished == false,
+                    "A serialized replay publication cannot overtake finish."
+                )
+                state.channels[id] = channel
+            }
         }
         return .init(channel: channel, cancellation: cancellation)
     }
@@ -769,12 +781,15 @@ private final class TurnReplaySubscriptionRegistry<Channel: TurnReplaySubscriber
     func yield(
         _ body: (Channel) -> Void
     ) -> Int {
-        state.withLock { state in
-            guard state.isFinished == false else {
-                return 0
+        delivery.withLock { _ in
+            let channels = state.withLock { state -> [Channel] in
+                guard state.isFinished == false else {
+                    return []
+                }
+                return Array(state.channels.values)
             }
             var overflows = 0
-            for channel in state.channels.values {
+            for channel in channels {
                 let before = channel.overflowCountForTesting()
                 body(channel)
                 overflows += channel.overflowCountForTesting() - before
@@ -784,45 +799,51 @@ private final class TurnReplaySubscriptionRegistry<Channel: TurnReplaySubscriber
     }
 
     func remove(_ id: UUID) {
-        state.withLock { state in
-            state.channels.removeValue(forKey: id)?.cancel()
-        }
+        let channel = state.withLock { $0.channels.removeValue(forKey: id) }
+        channel?.cancel()
     }
 
     func finish(
         _ body: (Channel) -> Void
     ) {
-        state.withLock { state in
-            guard state.isFinished == false else {
-                return
+        delivery.withLock { _ in
+            let channels = state.withLock { state -> [Channel] in
+                guard state.isFinished == false else {
+                    return []
+                }
+                state.isFinished = true
+                let channels = Array(state.channels.values)
+                state.channels.removeAll(keepingCapacity: false)
+                return channels
             }
-            state.isFinished = true
-            for channel in state.channels.values {
+            for channel in channels {
                 body(channel)
             }
-            state.channels.removeAll(keepingCapacity: false)
         }
     }
 
     func cancelAll() {
-        state.withLock { state in
-            for channel in state.channels.values {
-                channel.cancel()
-            }
+        let channels = state.withLock { state -> [Channel] in
+            let channels = Array(state.channels.values)
             state.channels.removeAll(keepingCapacity: false)
+            return channels
+        }
+        for channel in channels {
+            channel.cancel()
         }
     }
 
     func snapshot() -> Snapshot {
-        state.withLock { state in
-            .init(
-                subscriberCount: state.channels.count,
-                overflowCount: state.channels.values.reduce(0) {
-                    $0 + $1.overflowCountForTesting()
-                },
-                isFinished: state.isFinished
-            )
+        let captured = state.withLock { state in
+            (channels: Array(state.channels.values), isFinished: state.isFinished)
         }
+        return .init(
+            subscriberCount: captured.channels.count,
+            overflowCount: captured.channels.reduce(0) {
+                $0 + $1.overflowCountForTesting()
+            },
+            isFinished: captured.isFinished
+        )
     }
 }
 
