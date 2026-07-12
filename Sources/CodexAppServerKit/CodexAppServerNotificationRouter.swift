@@ -61,6 +61,7 @@ package actor CodexAppServerNotificationRouter {
     ] = [:]
     private var notificationDrainsByThreadID: [CodexThreadID: NotificationDrain] = [:]
     private var notificationDrainPauseForTesting: (@Sendable () async -> Void)?
+    private var terminalReplayPublicationPauseForTesting: (@Sendable () async -> Void)?
     private var phase = Phase.open
     private var itemReducer = CodexItemReducer()
     private let accountEventHub: AccountEventHub
@@ -87,13 +88,39 @@ package actor CodexAppServerNotificationRouter {
     }
 
     package func seedTurn(_ turnID: CodexTurnID, threadID: CodexThreadID) {
-        if let existingThreadID = threadIDByTurnID[turnID] {
+        if let existingThreadID = installTurnAssociation(turnID, threadID: threadID) {
             precondition(
                 existingThreadID == threadID,
                 "A turn cannot move between thread associations."
             )
         }
+    }
+
+    private func installTurnAssociation(
+        _ turnID: CodexTurnID,
+        threadID: CodexThreadID
+    ) -> CodexThreadID? {
+        if let existingThreadID = threadIDByTurnID[turnID] {
+            return existingThreadID
+        }
         threadIDByTurnID[turnID] = threadID
+        return nil
+    }
+
+    private func associateNotificationTurn(
+        _ turnID: CodexTurnID,
+        threadID: CodexThreadID
+    ) throws {
+        guard let existingThreadID = installTurnAssociation(turnID, threadID: threadID) else {
+            return
+        }
+        guard existingThreadID == threadID else {
+            throw CodexTransportFailure.contractViolation(
+                message: "Turn \(turnID.rawValue) is already associated with thread "
+                    + "\(existingThreadID.rawValue) and cannot move to thread "
+                    + "\(threadID.rawValue)."
+            )
+        }
     }
 
     package func discardTurnAssociation(
@@ -390,7 +417,7 @@ package actor CodexAppServerNotificationRouter {
         }
         if let threadID = notification.context.threadID,
            let turnID = notification.context.turnID {
-            threadIDByTurnID[turnID] = threadID
+            try associateNotificationTurn(turnID, threadID: threadID)
         }
         let replayRouting: ReplayRouting
         switch mode {
@@ -476,7 +503,7 @@ package actor CodexAppServerNotificationRouter {
             replayRouting = .boundOnly
         }
         if let threadID = context.threadID, let turnID = context.turnID {
-            threadIDByTurnID[turnID] = threadID
+            try associateNotificationTurn(turnID, threadID: threadID)
         }
         try await routeNotification(routed, replayRouting: replayRouting)
     }
@@ -529,23 +556,20 @@ package actor CodexAppServerNotificationRouter {
         let context = notification.context
         switch notification.payload {
         case .turnCompleted(let turn):
-            var releasedTurnID = context.turnID
-            defer {
-                if let releasedTurnID {
-                    itemReducer.release(turnID: releasedTurnID)
-                }
-            }
             let outcome = try terminalOutcome(from: turn, context: context)
             let turnID = context.turnID ?? outcome.response.turnID
-            releasedTurnID = turnID
-            await finishReplay(
-                outcome,
-                replayRouting: replayRouting
-            )
             if let threadID = context.threadID ?? threadIDByTurnID[turnID] {
                 try routeThreadEvent(.terminal(outcome), threadID: threadID)
             }
             threadIDByTurnID.removeValue(forKey: turnID)
+            itemReducer.release(turnID: turnID)
+            if let terminalReplayPublicationPauseForTesting {
+                await terminalReplayPublicationPauseForTesting()
+            }
+            await finishReplay(
+                outcome,
+                replayRouting: replayRouting
+            )
 
         case .item(let mutation):
             guard let turnID = context.turnID else {
@@ -742,6 +766,7 @@ package actor CodexAppServerNotificationRouter {
         phase = .terminating(error)
         detachedReviewAttempts.removeAll(keepingCapacity: false)
         detachedReviewCandidatesByThreadID.removeAll(keepingCapacity: false)
+        threadIDByTurnID.removeAll(keepingCapacity: false)
         itemReducer.releaseAll()
         threadEventHub.finish(throwing: error)
         await turnReplayStore.terminateAll(with: termination)
@@ -759,6 +784,18 @@ package actor CodexAppServerNotificationRouter {
         _ pause: (@Sendable () async -> Void)?
     ) {
         notificationDrainPauseForTesting = pause
+    }
+
+    package func setTerminalReplayPublicationPauseForTesting(
+        _ pause: (@Sendable () async -> Void)?
+    ) {
+        terminalReplayPublicationPauseForTesting = pause
+    }
+
+    package func turnAssociationForTesting(
+        _ turnID: CodexTurnID
+    ) -> CodexThreadID? {
+        threadIDByTurnID[turnID]
     }
 
     private nonisolated func recordReplayDisposition(

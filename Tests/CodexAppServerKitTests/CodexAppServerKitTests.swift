@@ -920,7 +920,10 @@ struct CodexAppServerKitTests {
         await runtime.transport.waitForRequest(method: "turn/interrupt")
         try await runtime.transport.emitServerNotification(
             method: "turn/completed",
-            params: TurnCompletedParams(turn: .init(id: "turn-review", status: "interrupted"))
+            params: TurnCompletedParams(
+                threadID: "thread-review",
+                turn: .init(id: "turn-review", status: "interrupted")
+            )
         )
 
         do {
@@ -945,6 +948,7 @@ struct CodexAppServerKitTests {
         } catch {
             Issue.record("Expected CancellationError, got \(error).")
         }
+        await runtime.close()
     }
 
     @Test func standaloneStartThreadDeletesLateIdentityBeforeCancellationReturns() async throws {
@@ -2461,6 +2465,7 @@ struct CodexAppServerKitTests {
         #expect(reviewStartParams.threadID == "thread-source")
         #expect(reviewStartParams.target == .baseBranch("main"))
         #expect(reviewStartParams.delivery == .detached)
+        await runtime.close()
     }
 
     @Test func prepareReviewRestartRejectsConcurrentPreparationForTheSameSource() async throws {
@@ -2499,6 +2504,7 @@ struct CodexAppServerKitTests {
         )
         #expect(try await firstPreparation.value.interruptedIdentity == identity)
         #expect(await runtime.transport.recordedRequests(method: "turn/interrupt").count == 1)
+        await runtime.close()
     }
 
     @Test func cleanupReviewKeepsCancellationRetryCleanupForPreparedRestart() async throws {
@@ -2552,6 +2558,7 @@ struct CodexAppServerKitTests {
             "thread-review-restarted",
             "thread-source",
         ])
+        await runtime.close()
     }
 
     @Test func cleanupReviewDeletesDetachedThreadsBeforeSourceAndDedupes() async throws {
@@ -2592,6 +2599,7 @@ struct CodexAppServerKitTests {
             "thread-extra-2",
             "thread-source",
         ])
+        await runtime.close()
     }
 
     @Test func cleanupReviewRestoresRetainedIdentitiesAfterDeletionFailure() async throws {
@@ -2650,6 +2658,7 @@ struct CodexAppServerKitTests {
             "thread-review",
             "thread-source",
         ])
+        await runtime.close()
     }
 
     @Test func restartPreparedReviewRejectsStaleTokenWithMeaningfulError() async throws {
@@ -2668,6 +2677,7 @@ struct CodexAppServerKitTests {
         } catch {
             Issue.record("Expected CodexAppServerError, got \(error).")
         }
+        await runtime.close()
     }
 
     @Test func discardPreparedReviewRestartRequiresTheFullTokenAndTransfersOnce() async throws {
@@ -2706,6 +2716,7 @@ struct CodexAppServerKitTests {
             restarted.identity,
         ])
         #expect(await runtime.server.discardPreparedReviewRestart(token).isEmpty)
+        await runtime.close()
     }
 
     @Test func discardAllPreparedReviewRestartsReturnsOrderedSourceGroups() async throws {
@@ -2758,6 +2769,7 @@ struct CodexAppServerKitTests {
             ))
         }
         #expect(await runtime.transport.recordedRequests(method: "thread/resume").count == resumeCount)
+        await runtime.close()
     }
 
     @Test func restartPreparedReviewKeepsTokenForRetryAfterPartialFailure() async throws {
@@ -7876,7 +7888,10 @@ private func prepareRestartToken(
     await runtime.transport.waitForRequest(method: "turn/interrupt")
     try await runtime.transport.emitServerNotification(
         method: "turn/completed",
-        params: TurnCompletedParams(turn: .init(id: identity.turnID.rawValue, status: "interrupted"))
+        params: TurnCompletedParams(
+            threadID: identity.activeTurnThreadID.rawValue,
+            turn: .init(id: identity.turnID.rawValue, status: "interrupted")
+        )
     )
     return try await prepareTask.value
 }

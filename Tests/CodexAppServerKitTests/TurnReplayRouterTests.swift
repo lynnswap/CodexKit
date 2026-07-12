@@ -53,11 +53,12 @@ struct TurnReplayRouterTests {
         )
 
         let termination = await harness.supervisor.waitForTerminationForTesting()
-        guard case .transportFailure(.contractViolation(let message)) = termination else {
+        if case .transportFailure(.contractViolation(let message)) = termination {
+            #expect(message.contains("turn-external"))
+        } else {
             Issue.record("Expected a typed thread-terminal contract violation, got \(termination).")
-            return
         }
-        #expect(message.contains("turn-external"))
+        await harness.close()
     }
 
     @Test func resumedReviewCapturesTerminalBeforeResumeResponse() async throws {
@@ -87,6 +88,80 @@ struct TurnReplayRouterTests {
         let review = try await resume.value
         let outcome = try await review.collect(timeout: .seconds(1))
         #expect(outcome == .completed(.init(turnID: "turn-review")))
+        await runtime.close()
+    }
+
+    @Test func terminalCommitsRouterStateBeforeReplayPublication() async throws {
+        let transport = CodexAppServerTestTransport()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        await transport.waitForNotificationStreamCount(1)
+        let publicationGate = CodexAppServerTestGate()
+        await harness.router.setTerminalReplayPublicationPauseForTesting {
+            await publicationGate.waitIgnoringCancellation()
+        }
+        await harness.router.seedTurns(
+            [
+                .init(
+                    id: "turn-terminal-order",
+                    state: .inProgress,
+                    items: [
+                        .init(
+                            id: "message-terminal-order",
+                            kind: .agentMessage,
+                            content: .message(.init(
+                                id: "message-terminal-order",
+                                role: .assistant,
+                                text: "Pending"
+                            ))
+                        ),
+                    ]
+                ),
+            ],
+            threadID: "thread-terminal-order"
+        )
+
+        try await transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(
+                threadID: "thread-terminal-order",
+                turn: .init(id: "turn-terminal-order", status: "completed")
+            )
+        )
+        await publicationGate.waitUntilBlocked()
+
+        #expect(await harness.router.turnAssociationForTesting("turn-terminal-order") == nil)
+        #expect(await harness.router.itemSnapshotForTesting(
+            turnID: "turn-terminal-order",
+            itemID: "message-terminal-order"
+        ) == nil)
+
+        await publicationGate.open()
+        await harness.close()
+    }
+
+    @Test func conflictingNotificationTurnAssociationTerminatesConnection() async throws {
+        let transport = CodexAppServerTestTransport()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        await transport.waitForNotificationStreamCount(1)
+        await harness.router.seedTurn("turn-associated", threadID: "thread-owner")
+
+        try await transport.emitServerNotification(
+            method: "turn/started",
+            params: TurnStartedParams(
+                threadID: "thread-other",
+                turnID: "turn-associated"
+            )
+        )
+
+        let termination = await harness.supervisor.waitForTerminationForTesting()
+        if case .transportFailure(.contractViolation(let message)) = termination {
+            #expect(message.contains("turn-associated"))
+            #expect(message.contains("thread-owner"))
+            #expect(message.contains("thread-other"))
+        } else {
+            Issue.record("Expected a typed turn-association contract violation, got \(termination).")
+        }
+        await harness.close()
     }
 }
 
@@ -104,6 +179,27 @@ private struct TurnPayload: Encodable, Sendable {
     var id: String
     var status: String
     var items: [TurnItem] = []
+}
+
+private struct TurnStartedParams: Encodable, Sendable {
+    var threadID: String
+    var turn: Turn
+
+    enum CodingKeys: String, CodingKey {
+        case threadID = "threadId"
+        case turn
+    }
+
+    init(threadID: String, turnID: String) {
+        self.threadID = threadID
+        self.turn = .init(id: turnID)
+    }
+
+    struct Turn: Encodable, Sendable {
+        var id: String
+        var status = "inProgress"
+        var items: [String] = []
+    }
 }
 
 private struct ThreadClosedParams: Encodable, Sendable {
