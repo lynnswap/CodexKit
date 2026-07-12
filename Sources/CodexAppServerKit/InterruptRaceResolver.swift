@@ -29,6 +29,9 @@ package struct InterruptRaceResolver: Sendable {
             activationRetryCount += 1
             return .retry(after: Self.activationRetryDelay)
         }
+        // The pinned app-server treats an empty turn ID as a startup interrupt
+        // and bypasses its expected-turn mismatch check. Only a nonempty ID we
+        // actually sent can authenticate the exact mismatch prefix below.
         guard redirected == false,
               let expectedTurnID,
               let activeTurnID = Self.activeTurnID(

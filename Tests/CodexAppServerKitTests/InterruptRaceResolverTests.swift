@@ -66,6 +66,18 @@ struct InterruptRaceResolverTests {
         }
     }
 
+    @Test func startupInterruptNeverParsesAnExpectedTurnMismatch() {
+        var resolver = InterruptRaceResolver(expectedTurnID: nil)
+        let impossibleForPinnedAppServer = serverFailure(
+            "expected active turn id  but found turn-new"
+        )
+
+        guard case .fail = resolver.decision(for: impossibleForPinnedAppServer) else {
+            Issue.record("An unguarded startup interrupt must not infer a turn identity.")
+            return
+        }
+    }
+
     @Test func interruptRetryUsesTheInjectedMonotonicClock() async throws {
         let recorder = InterruptSleepRecorder()
         let transport = CodexAppServerTestTransport()

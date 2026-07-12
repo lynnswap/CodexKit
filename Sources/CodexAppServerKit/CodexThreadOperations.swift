@@ -323,10 +323,13 @@ extension CodexThread {
     /// - Parameters:
     ///   - expectedTurnID: The turn the caller expects to cancel. When the
     ///     app-server reports a newer active turn, the returned cancellation
-    ///     identifies the actual cancelled turn.
+    ///     identifies the actual cancelled turn. Pass `nil` to submit an
+    ///     unguarded startup interrupt; that response does not reveal the
+    ///     active turn identity.
     ///   - willCancelActiveTurn: Optional hook invoked before retrying an
     ///     cancellation for a newer active turn reported by app-server.
-    /// - Returns: The turn that app-server cancelled.
+    /// - Returns: The expected or redirected turn when known, or a cancellation
+    ///   with no turn identity for an unguarded startup interrupt.
     @discardableResult
     public func cancelActiveTurn(
         expectedTurnID: CodexTurnID? = nil,
