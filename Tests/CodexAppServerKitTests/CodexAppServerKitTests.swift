@@ -6782,6 +6782,53 @@ struct CodexAppServerKitTests {
         #expect(try await handle.result() == outcome)
     }
 
+    @Test func pendingLoginConnectionFailureWhileCancellationIsInFlightRequiresReconciliation() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueChatGPTLogin(
+            loginID: "login-1",
+            authenticationURL: URL(string: "https://chatgpt.com/auth")!
+        )
+        await transport.enqueueFailure(
+            code: -32_000,
+            message: "cancel response lost",
+            for: "account/login/cancel"
+        )
+        let cancelGate = CodexAppServerTestGate()
+        await transport.holdNextIgnoringCancellation(
+            method: "account/login/cancel",
+            gate: cancelGate
+        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let handle = try await harness.server.loginChatGPT()
+        let cancellation = Task {
+            try await handle.cancel(acknowledgementTimeout: .seconds(5))
+        }
+        await transport.waitForRequest(method: "account/login/cancel")
+        let result = Task { try await handle.result() }
+
+        await transport.failConnection(.closed)
+        let terminalResult = await result.result
+        await cancelGate.open()
+        let cancellationResult = await cancellation.result
+
+        let expected = CodexLoginOutcome.authenticationCommittedNeedsConnectionReconciliation(
+            .cancelOutcomeUnknown(nil)
+        )
+        switch terminalResult {
+        case .success(let outcome):
+            #expect(outcome == expected)
+        case .failure(let error):
+            Issue.record("Expected connection reconciliation, got terminal failure: \(error)")
+        }
+        switch cancellationResult {
+        case .success(let outcome):
+            #expect(outcome == expected)
+        case .failure(let error):
+            Issue.record("Expected shared cancellation reconciliation, got failure: \(error)")
+        }
+        await harness.close()
+    }
+
     @Test func loginSuccessTerminalWinsOverLateCancelResponse() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueueChatGPTLogin(

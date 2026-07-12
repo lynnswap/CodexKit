@@ -250,6 +250,8 @@ package actor LoginState {
                     .authenticationCommittedNeedsConnectionReconciliation(
                         .connectionTerminated(termination)
                     )))
+        case .pending where cancelTask != nil:
+            resolve(.success(cancelOutcomeRequiringReconciliation(requestFailure: nil)))
         case .starting, .pending:
             resolve(.failure(error))
         case .terminal:
@@ -317,11 +319,9 @@ package actor LoginState {
                     } else {
                         requestFailure = nil
                     }
-                    let reconciliation =
-                        CodexLoginOutcome
-                        .authenticationCommittedNeedsConnectionReconciliation(
-                            .cancelOutcomeUnknown(requestFailure)
-                        )
+                    let reconciliation = cancelOutcomeRequiringReconciliation(
+                        requestFailure: requestFailure
+                    )
                     resolve(.success(reconciliation))
                     return reconciliation
                 case .terminal(let result):
@@ -352,6 +352,14 @@ package actor LoginState {
 
     private func cancelWaiter(_ token: UUID) {
         waiters.removeValue(forKey: token)?.resume(returning: .failure(CancellationError()))
+    }
+
+    private func cancelOutcomeRequiringReconciliation(
+        requestFailure: CodexRequestFailure?
+    ) -> CodexLoginOutcome {
+        .authenticationCommittedNeedsConnectionReconciliation(
+            .cancelOutcomeUnknown(requestFailure)
+        )
     }
 
     private func bufferPreBindEvent(_ event: PreBindEvent) {
