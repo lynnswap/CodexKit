@@ -1381,6 +1381,8 @@ public final class CodexChat: CodexPersistentModel {
             ))
             changes.append(contentsOf: merge(delta, turnID: turnID))
             changes.appendIfPresent(markRunningIfNeeded(turnID: turnID))
+        case .diagnostic:
+            break
         case .tokenUsageUpdated(let usage, let turnID):
             if let turnID {
                 changes.appendIfPresent(setUsage(usage, for: turnID))

@@ -27,6 +27,7 @@ Add the products your target needs:
 ```swift
 .product(name: "CodexAppServerKit", package: "CodexKit"),
 .product(name: "CodexDataKit", package: "CodexKit"),
+.product(name: "CodexAppServerKitTesting", package: "CodexKit"),
 ```
 
 ## CodexAppServerKit
@@ -40,25 +41,58 @@ import Foundation
 let server = try await CodexAppServer()
 let thread = try await server.startThread(in: workspaceURL)
 
-let response = try await thread.respond(to: "Review this workspace.")
-print(response.finalAnswer ?? "")
+let outcome = try await thread.respond(to: "Review this workspace.")
+if case .completed(let response) = outcome {
+    print(response.transcript.finalAnswer ?? "")
+}
 
 await server.close()
 ```
 
-Use `streamResponse` when your UI or tool needs incremental response snapshots:
+For thread management, typed terminal outcomes, review sessions, model/account
+APIs, login flows, and testing utilities, see
+[Sources/CodexAppServerKit/README.md](Sources/CodexAppServerKit/README.md). Native
+UI code that needs live model updates uses CodexDataKit's context-owned
+observation APIs.
+
+## CodexAppServerKitTesting
+
+Use `CodexAppServerKitTesting` from an external test target when production
+behavior must run through an in-memory app-server connection. Queue opaque typed
+fixtures on the transport, exercise the normal `CodexAppServer` API, and close
+the runtime explicitly.
 
 ```swift
-let stream = try await thread.streamResponse(to: "Summarize the changes.")
+import CodexAppServerKit
+import CodexAppServerKitTesting
 
-for try await snapshot in stream {
-    render(snapshot.transcript.items)
-}
+let clock = CodexAppServerTestDeadlineClock()
+let runtime = try await CodexAppServerTestRuntime.start(deadlineClock: clock)
+let layer = try CodexAppServerTestConfigurationLayerMetadata(
+    source: .sessionFlags,
+    version: "test-config-v1"
+)
+let fixture = try CodexAppServerTestConfigurationReadResult(
+    configuration: .init(model: "gpt-5-codex"),
+    origins: ["model": layer],
+    layers: [try .init(
+        metadata: layer,
+        configuration: .object(["model": .string("gpt-5-codex")])
+    )]
+)
 
-let response = try await stream.collect()
+try await runtime.transport.enqueueConfiguration(fixture)
+let configuration = try await runtime.server.configuration()
+precondition(configuration == fixture.configuration)
+await runtime.close()
 ```
 
-For thread management, streaming, review sessions, model/account APIs, login flows, and testing utilities, see [Sources/CodexAppServerKit/README.md](Sources/CodexAppServerKit/README.md).
+The public testing surface accepts domain-typed fixtures and closed operations;
+raw JSON and method-string seams remain package-internal malformed-protocol test
+tools. `CodexAppServerTestDeadlineClock` lets deadline tests wait for sleeper
+registration and advance time without wall-clock sleeps. The standalone
+[`CodexKitProductConsumer`](Fixtures/CodexKitProductConsumer) fixture compiles and
+runs all three products without `@testable import`.
 
 ## CodexDataKit
 
@@ -69,12 +103,13 @@ import CodexAppServerKit
 import CodexDataKit
 import Foundation
 
-let container = try await CodexModelContainer()
+let appServer = try await CodexAppServer()
+let container = CodexModelContainer(appServer: appServer)
 let context = container.mainContext
 
 let results = context.fetchedResults(
     for: CodexFetchDescriptor<CodexChat>(
-        sortBy: [SortDescriptor(\.updatedAt, order: .reverse)]
+        sortBy: [CodexSortDescriptor(\.updatedAt, order: .reverse)]
     )
 )
 try await results.performFetch()
@@ -86,8 +121,9 @@ for chat in results.items {
 let workspace = try await context.fetch(CodexFetchDescriptor<CodexWorkspace>.workspaces).first
 let chat = try await workspace?.startChat()
 try await chat?.send("Summarize this project.")
+await appServer.close()
 ```
 
-Render from `CodexWorkspaceGroup`, `CodexWorkspace`, and `CodexChat` observable model objects. Use `CodexFetchDescriptor` for SwiftData-style value fetches, `CodexFetchRequest` for CoreData-like mutable requests, or `@CodexQuery` for SwiftUI views.
+Render from `CodexWorkspaceGroup`, `CodexWorkspace`, and `CodexChat` observable model objects. Use the value-typed `CodexFetchDescriptor` for explicit fetches or `@CodexQuery` for SwiftUI views.
 
 For model containers, fetch requests, sectioning, SwiftUI queries, and ownership guidance, see [Sources/CodexDataKit/README.md](Sources/CodexDataKit/README.md).

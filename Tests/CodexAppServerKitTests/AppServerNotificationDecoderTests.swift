@@ -184,6 +184,24 @@ struct AppServerNotificationDecoderTests {
         #expect(started.context == .init(threadID: "thread-1", turnID: "turn-1"))
         #expect(item.id == "command-1")
 
+        let error = try decoder.decode(notification(
+            method: "error",
+            json: #"{"threadId":"thread-1","turnId":"turn-1","error":{"message":"retrying","codexErrorInfo":"serverOverloaded","additionalDetails":"retry scheduled"},"willRetry":true}"#
+        ))
+        guard case .item(.turnDiagnostic(let diagnostic)) = error.payload else {
+            Issue.record("Expected a typed turn diagnostic mutation.")
+            return
+        }
+        #expect(error.context == .init(threadID: "thread-1", turnID: "turn-1"))
+        #expect(diagnostic == .init(
+            error: .init(
+                message: "retrying",
+                info: .serverOverloaded,
+                additionalDetails: "retry scheduled"
+            ),
+            willRetry: true
+        ))
+
         let futureTerminal = try decoder.decode(notification(
             method: "turn/completed",
             json: #"{"threadId":"thread-1","turn":{"id":"turn-1","status":"futureStatus","items":[]}}"#

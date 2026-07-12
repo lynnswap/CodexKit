@@ -10077,8 +10077,8 @@ struct CodexModelContextTests {
         withExtendedLifetime(changes) {}
     }
 
-    @Test("started review live turn replaces provisional seed after empty history read")
-    func startedReviewLiveTurnReplacesProvisionalSeedAfterEmptyHistoryRead() async throws {
+    @Test("started review ignores advisory subturn start after empty history read")
+    func startedReviewIgnoresAdvisorySubturnStartAfterEmptyHistoryRead() async throws {
         let workspaceURL = temporaryDirectory()
         let runtime = try await CodexAppServerTestRuntime.start()
         let context = CodexModelContainer(appServer: runtime.server).mainContext
@@ -10138,7 +10138,7 @@ struct CodexModelContextTests {
             params: ThreadItemParams(
                 lifecycle: .started,
                 threadID: "thread-review",
-                turnID: "turn-live",
+                turnID: "turn-seed",
                 item: .init(
                     id: "review-mode",
                     type: "enteredReviewMode",
@@ -10148,9 +10148,9 @@ struct CodexModelContextTests {
         )
 
         #expect(await eventually {
-            started.chat.turns.map(\.id.rawValue) == ["turn-live"]
-                && started.chat.items.map(\.itemID) == ["review-mode"]
-                && started.chat.items.map(\.text) == ["current changes"]
+            started.chat.turns.map(\.id.rawValue) == ["turn-seed"]
+                && started.chat.items.map(\.itemID) == ["turn-seed", "review-mode"]
+                && started.chat.items.map(\.text) == ["current changes", "current changes"]
         })
         withExtendedLifetime(changes) {}
     }

@@ -216,6 +216,28 @@ struct TurnReplayStoreTests {
         #expect(snapshot.orphanGenerationCount == 0)
     }
 
+    @Test func pendingReviewDoesNotBindLeakedChildTurnStart() async {
+        let store = TurnReplayStore()
+        let state = makeState()
+        let pending = await store.registerPendingOperation(
+            kind: .review(sourceThreadID: "thread-1", delivery: .inline),
+            state: state
+        )
+        pending.acceptWrite()
+
+        #expect(
+            await store.routeIfTracked(.started("turn-child"), for: "turn-child") == .untracked
+        )
+        #expect(await store.snapshotForTesting().orphanGenerationCount == 0)
+
+        await store.bind(
+            pending,
+            to: "turn-review",
+            initialSnapshot: .init(id: "turn-review", state: .inProgress)
+        )
+        #expect(await store.snapshotForTesting().activeGenerationCount == 1)
+    }
+
     @Test func terminalHandoffTransitionsStateBeforeDeletingRawGeneration() async throws {
         let store = TurnReplayStore()
         let state = makeState()
@@ -329,8 +351,8 @@ struct TurnReplayStoreTests {
         first.acceptWrite()
         second.acceptWrite()
 
-        _ = await store.yield(.started("early-1"), for: "early-1")
-        _ = await store.yield(.started("early-2"), for: "early-2")
+        _ = await store.yield(.itemCompleted(makeItem(id: "early-item-1")), for: "early-1")
+        _ = await store.yield(.itemCompleted(makeItem(id: "early-item-2")), for: "early-2")
         let snapshot = await store.snapshotForTesting()
         #expect(snapshot.postWritePendingOperationCount == 2)
         #expect(snapshot.orphanGenerationCount == 2)
@@ -347,8 +369,14 @@ struct TurnReplayStoreTests {
                 state: state
             )
             pending.acceptWrite()
-            _ = await store.yield(.started("early-1"), for: "early-1")
-            _ = await store.yield(.started("early-2"), for: "early-2")
+            _ = await store.yield(
+                .unknown(.init(method: "early-1", params: Data(), turnID: "early-1")),
+                for: "early-1"
+            )
+            _ = await store.yield(
+                .unknown(.init(method: "early-2", params: Data(), turnID: "early-2")),
+                for: "early-2"
+            )
         }
     }
 

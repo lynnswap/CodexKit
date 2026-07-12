@@ -144,9 +144,7 @@ package actor AppServerConnection {
     }
 
     package func finishDomains(with termination: CodexConnectionTermination) async {
-        let error = CodexAppServerError.connectionTerminated(termination)
-        await turnReplayStore.terminateAll(with: termination)
-        await router.finishAll(throwing: error)
+        await router.finishAll(with: termination)
         connectionEventHub.finish(with: termination)
     }
 

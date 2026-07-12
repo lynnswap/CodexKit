@@ -720,6 +720,7 @@ package enum CodexReviewEvent: Equatable, Sendable {
     case messageDelta(CodexMessageDelta, turnID: CodexTurnID?)
     case reasoningSummaryPartAdded(CodexReasoningPart, turnID: CodexTurnID?)
     case reasoningDelta(CodexReasoningDelta, turnID: CodexTurnID?)
+    case diagnostic(CodexTurnDiagnostic, turnID: CodexTurnID)
     case tokenUsageUpdated(CodexTokenUsage, turnID: CodexTurnID?)
     case statusChanged(CodexThreadStatus)
     case closed
@@ -747,6 +748,8 @@ package enum CodexReviewEvent: Equatable, Sendable {
             self = .reasoningSummaryPartAdded(part, turnID: turnID)
         case .reasoningDelta(let delta, let turnID):
             self = .reasoningDelta(delta, turnID: turnID)
+        case .diagnostic(let diagnostic, let turnID):
+            self = .diagnostic(diagnostic, turnID: turnID)
         case .tokenUsageUpdated(let usage, let turnID):
             self = .tokenUsageUpdated(usage, turnID: turnID)
         case .statusChanged(let status):
@@ -780,6 +783,8 @@ package enum CodexReviewEvent: Equatable, Sendable {
             self = .reasoningSummaryPartAdded(part, turnID: turnID)
         case .reasoningDelta(let delta):
             self = .reasoningDelta(delta, turnID: turnID)
+        case .diagnostic(let diagnostic):
+            self = .diagnostic(diagnostic, turnID: turnID)
         case .tokenUsageUpdated(let usage):
             self = .tokenUsageUpdated(usage, turnID: turnID)
         case .unknown(let raw):
@@ -911,6 +916,15 @@ public struct CodexReviewSession: Identifiable, Sendable {
     /// Collects the review response until the turn finishes.
     public func collect(timeout: Duration? = nil) async throws -> CodexTurnOutcome {
         try await response.collect(timeout: timeout)
+    }
+
+    /// Returns the terminal outcome already committed for this review generation.
+    ///
+    /// This operation never waits for a live turn and never sends a request. A
+    /// connection termination committed before a turn outcome is surfaced as an
+    /// error instead of being synthesized into a turn result.
+    public func terminalOutcomeIfKnown() async throws -> CodexTurnOutcome? {
+        try await response.turn.state.cachedOutcome()
     }
 
     /// Cancels the running review turn.
@@ -2069,6 +2083,20 @@ public struct CodexTurnError: Error, Equatable, LocalizedError, Sendable {
     public var errorDescription: String? { message }
 }
 
+/// A nonterminal error notification emitted while a turn is running.
+public struct CodexTurnDiagnostic: Equatable, Sendable {
+    /// The app-server error payload.
+    public var error: CodexTurnError
+
+    /// Whether the app-server will retry the operation that produced this diagnostic.
+    public var willRetry: Bool
+
+    public init(error: CodexTurnError, willRetry: Bool) {
+        self.error = error
+        self.willRetry = willRetry
+    }
+}
+
 public enum CodexTurnOutcome: Equatable, Sendable {
     case completed(CodexResponse)
     case interrupted(CodexResponse)
@@ -2216,7 +2244,8 @@ package struct CodexResponseStream: AsyncSequence, Sendable {
                     throw failedTurn.error
                 }
             case .started, .snapshot, .itemStarted, .itemUpdated, .itemCompleted, .message, .messageDelta,
-                .reasoningSummaryPartAdded, .reasoningDelta, .tokenUsageUpdated, .unknown:
+                .reasoningSummaryPartAdded, .reasoningDelta, .diagnostic,
+                .tokenUsageUpdated, .unknown:
                 continue
             }
         }
@@ -2463,6 +2492,7 @@ package enum CodexTurnEvent: Equatable, Sendable {
     case messageDelta(CodexMessageDelta)
     case reasoningSummaryPartAdded(CodexReasoningPart)
     case reasoningDelta(CodexReasoningDelta)
+    case diagnostic(CodexTurnDiagnostic)
     case tokenUsageUpdated(CodexTokenUsage)
     case terminal(CodexTurnOutcome)
     case unknown(CodexRawNotification)
@@ -2479,6 +2509,7 @@ package enum CodexThreadEvent: Equatable, Sendable {
     case messageDelta(CodexMessageDelta, turnID: CodexTurnID?)
     case reasoningSummaryPartAdded(CodexReasoningPart, turnID: CodexTurnID?)
     case reasoningDelta(CodexReasoningDelta, turnID: CodexTurnID?)
+    case diagnostic(CodexTurnDiagnostic, turnID: CodexTurnID)
     case tokenUsageUpdated(CodexTokenUsage, turnID: CodexTurnID?)
     case statusChanged(CodexThreadStatus)
     case closed
@@ -2491,6 +2522,7 @@ public enum CodexThreadLogEntry: Identifiable, Equatable, Sendable {
         case updated
         case completed
         case delta
+        case diagnostic
     }
 
     case itemStarted(CodexThreadItem, turnID: CodexTurnID?)
@@ -2499,6 +2531,7 @@ public enum CodexThreadLogEntry: Identifiable, Equatable, Sendable {
     case messageDelta(CodexMessageDelta, turnID: CodexTurnID?, id: String)
     case reasoningPartStarted(CodexReasoningPart, turnID: CodexTurnID?)
     case reasoningDelta(CodexReasoningDelta, turnID: CodexTurnID?)
+    case diagnostic(CodexTurnDiagnostic, turnID: CodexTurnID, id: String)
 
     public var id: String {
         switch self {
@@ -2510,6 +2543,8 @@ public enum CodexThreadLogEntry: Identifiable, Equatable, Sendable {
             part.id
         case .reasoningDelta(let delta, _):
             delta.id
+        case .diagnostic(_, _, let id):
+            id
         }
     }
 
@@ -2518,6 +2553,8 @@ public enum CodexThreadLogEntry: Identifiable, Equatable, Sendable {
         case .itemStarted(_, let turnID), .itemUpdated(_, let turnID),
              .itemCompleted(_, let turnID), .messageDelta(_, let turnID, _),
              .reasoningPartStarted(_, let turnID), .reasoningDelta(_, let turnID):
+            turnID
+        case .diagnostic(_, let turnID, _):
             turnID
         }
     }
@@ -2532,6 +2569,8 @@ public enum CodexThreadLogEntry: Identifiable, Equatable, Sendable {
             .completed
         case .messageDelta, .reasoningDelta:
             .delta
+        case .diagnostic:
+            .diagnostic
         }
     }
 
@@ -2542,6 +2581,8 @@ public enum CodexThreadLogEntry: Identifiable, Equatable, Sendable {
         case .reasoningPartStarted(let part, _):
             .init(id: part.id, kind: .reasoning, content: .reasoning(.empty))
         case .messageDelta, .reasoningDelta:
+            nil
+        case .diagnostic:
             nil
         }
     }
@@ -2556,6 +2597,13 @@ public enum CodexThreadLogEntry: Identifiable, Equatable, Sendable {
     public var reasoningDelta: CodexReasoningDelta? {
         if case .reasoningDelta(let delta, _) = self {
             return delta
+        }
+        return nil
+    }
+
+    public var diagnostic: CodexTurnDiagnostic? {
+        if case .diagnostic(let diagnostic, _, _) = self {
+            return diagnostic
         }
         return nil
     }

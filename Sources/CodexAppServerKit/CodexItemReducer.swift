@@ -12,6 +12,7 @@ package struct CodexItemReducer {
         case commandOutputDelta(itemID: String, delta: String)
         case filePatchSnapshot(itemID: String, output: String?)
         case mcpProgress(itemID: String, message: String)
+        case turnDiagnostic(CodexTurnDiagnostic)
     }
 
     package enum ContractError: Error, Equatable, Sendable, LocalizedError {
@@ -80,6 +81,47 @@ package struct CodexItemReducer {
     private var stateByItemKey: [ItemKey: ItemState] = [:]
 
     package init() {}
+
+    package mutating func reduce(
+        _ mutation: Mutation,
+        turnID: CodexTurnID
+    ) throws -> CodexTurnEvent {
+        if case .turnDiagnostic(let diagnostic) = mutation {
+            return .diagnostic(diagnostic)
+        }
+
+        let item = try apply(mutation, turnID: turnID)
+        switch mutation {
+        case .started:
+            return .itemStarted(item)
+        case .completed:
+            return .itemCompleted(item)
+        case .agentMessageDelta(let itemID, let delta):
+            return .messageDelta(.init(
+                text: delta,
+                itemID: itemID,
+                phase: item.message?.phase,
+                currentItem: item
+            ))
+        case .reasoningSummaryPartAdded(let itemID, let index):
+            return .reasoningSummaryPartAdded(.init(
+                itemID: itemID,
+                kind: .summary,
+                index: index,
+                currentItem: item
+            ))
+        case .reasoningSummaryDelta(let itemID, let index, let delta):
+            let part = CodexReasoningPart(itemID: itemID, kind: .summary, index: index)
+            return .reasoningDelta(.init(part: part, delta: delta, currentItem: item))
+        case .reasoningTextDelta(let itemID, let index, let delta):
+            let part = CodexReasoningPart(itemID: itemID, kind: .text, index: index)
+            return .reasoningDelta(.init(part: part, delta: delta, currentItem: item))
+        case .planDelta, .commandOutputDelta, .filePatchSnapshot, .mcpProgress:
+            return .itemUpdated(item)
+        case .turnDiagnostic:
+            preconditionFailure("A turn diagnostic must return before item reduction.")
+        }
+    }
 
     package mutating func seed(_ turns: [CodexTurnSnapshot]?) {
         for turn in turns ?? [] {
@@ -215,6 +257,9 @@ package struct CodexItemReducer {
                 $0.item.content = .toolCall(toolCall)
                 return true
             }
+
+        case .turnDiagnostic:
+            preconditionFailure("Use reduce(_:turnID:) for turn diagnostics.")
         }
     }
 

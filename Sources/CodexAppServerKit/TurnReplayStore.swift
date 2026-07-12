@@ -537,13 +537,26 @@ package actor TurnReplayStore {
 
     package func routeIfTracked(
         _ event: CodexTurnEvent,
-        for turnID: CodexTurnID
+        for turnID: CodexTurnID,
+        allowsOrphanGeneration: Bool = true
     ) -> RoutingDisposition {
-        requireOpen()
+        guard case .open = phase else {
+            return .untracked
+        }
         if case .terminal = event {
             preconditionFailure("Turn replay terminal delivery must use finish(_:).")
         }
-        guard let generation = generationForRoutingIfTracked(turnID) else {
+        let existingGeneration = generations[turnID] ?? orphanGenerations[turnID]
+        // Do not use turn/started as an unbound response identity. Reviews can expose an
+        // internal reviewer turn here while their response and substantive events use the
+        // canonical outer turn; the response snapshot or a substantive event owns binding.
+        if existingGeneration == nil, case .started = event {
+            return .untracked
+        }
+        guard let generation = existingGeneration ?? generationForRoutingIfTracked(
+            turnID,
+            allowsOrphanGeneration: allowsOrphanGeneration
+        ) else {
             return .untracked
         }
         guard case .active = generation.phase else {
@@ -558,6 +571,31 @@ package actor TurnReplayStore {
         return .routed(overflowCount: overflowCount)
     }
 
+    package func isActiveReviewGeneration(_ turnID: CodexTurnID) -> Bool {
+        guard let generation = generations[turnID],
+              case .active = generation.phase,
+              case .review = generation.operationKind else {
+            return false
+        }
+        return true
+    }
+
+    package func hasWriteAcceptedNonDetachedOperation(for threadID: CodexThreadID) -> Bool {
+        pendingOperations.values.contains { operation in
+            guard operation.token.isWriteAccepted else {
+                return false
+            }
+            switch operation.kind {
+            case .turn(let operationThreadID):
+                return operationThreadID == threadID
+            case .review(let sourceThreadID, delivery: .inline):
+                return sourceThreadID == threadID
+            case .review(_, delivery: .detached):
+                return false
+            }
+        }
+    }
+
     package func finish(_ outcome: CodexTurnOutcome) async {
         guard await finishIfTracked(outcome) != .untracked else {
             preconditionFailure("A strict turn replay finish requires a tracked generation.")
@@ -565,11 +603,17 @@ package actor TurnReplayStore {
     }
 
     package func finishIfTracked(
-        _ outcome: CodexTurnOutcome
+        _ outcome: CodexTurnOutcome,
+        allowsOrphanGeneration: Bool = true
     ) async -> TerminalRoutingDisposition {
-        requireOpen()
+        guard case .open = phase else {
+            return .untracked
+        }
         let turnID = outcome.response.turnID
-        guard let generation = generationForRoutingIfTracked(turnID) else {
+        guard let generation = generationForRoutingIfTracked(
+            turnID,
+            allowsOrphanGeneration: allowsOrphanGeneration
+        ) else {
             return .untracked
         }
         switch generation.phase {
@@ -722,9 +766,15 @@ package actor TurnReplayStore {
             .relay.snapshotForTesting().subscriberCount ?? 0
     }
 
-    private func generationForRoutingIfTracked(_ turnID: CodexTurnID) -> Generation? {
+    private func generationForRoutingIfTracked(
+        _ turnID: CodexTurnID,
+        allowsOrphanGeneration: Bool = true
+    ) -> Generation? {
         if let generation = generations[turnID] ?? orphanGenerations[turnID] {
             return generation
+        }
+        guard allowsOrphanGeneration else {
+            return nil
         }
         let unboundPostWriteCount = pendingOperations.values.reduce(into: 0) {
             count, operation in
@@ -894,6 +944,8 @@ private struct TurnReplayAccumulator {
             upsert(requiredCurrentItem(delta.currentItem, eventName: "reasoning delta"))
         case .tokenUsageUpdated(let newUsage):
             usage = newUsage
+        case .diagnostic:
+            break
         case .unknown:
             break
         case .terminal:

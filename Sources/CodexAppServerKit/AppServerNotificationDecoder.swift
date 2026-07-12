@@ -284,6 +284,8 @@ package struct AppServerNotificationDecoder {
         data: Data
     ) throws -> Payload {
         switch method {
+        case .error:
+            return .item(.turnDiagnostic(try decodeTurnDiagnostic(from: object)))
         case .turnCompleted:
             return .turnCompleted(try decodeTurn(from: object, data: data, lifecycle: .completed))
         case .turnStarted:
@@ -391,8 +393,7 @@ package struct AppServerNotificationDecoder {
                 message: method.rawValue,
                 method: method.rawValue
             )))
-        case .error,
-             .threadStarted,
+        case .threadStarted,
              .threadArchived,
              .threadDeleted,
              .threadUnarchived,
@@ -915,6 +916,15 @@ package struct AppServerNotificationDecoder {
         try validateTurn(turnObject, lifecycle: lifecycle)
         let turnData = try JSONEncoder().encode(try object.requireValue("turn"))
         return try decoder.decode(AppServerAPI.Turn.Payload.self, from: turnData)
+    }
+
+    private func decodeTurnDiagnostic(from object: PayloadObject) throws -> CodexTurnDiagnostic {
+        let errorData = try JSONEncoder().encode(try object.requireValue("error"))
+        let error = try decoder.decode(AppServerAPI.Turn.Error.self, from: errorData)
+        return .init(
+            error: CodexAppServer.turnError(from: error),
+            willRetry: try object.requireBool("willRetry")
+        )
     }
 
     private enum TurnLifecycle {

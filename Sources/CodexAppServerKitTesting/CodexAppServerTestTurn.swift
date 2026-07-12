@@ -86,6 +86,15 @@ public struct CodexAppServerTestTurn: Equatable, Sendable {
     }
 }
 
+public enum CodexAppServerTestTurnOutcome {
+    public static func failed(
+        response: CodexResponse,
+        error: CodexTurnError
+    ) -> CodexTurnOutcome {
+        .failed(.init(response: response, error: error))
+    }
+}
+
 private extension Duration {
     var millisecondsForTestTurn: Int {
         let components = self.components

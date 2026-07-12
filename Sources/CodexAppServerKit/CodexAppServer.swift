@@ -498,6 +498,14 @@ public actor CodexAppServer {
                     threadID: id.rawValue,
                     params: threadStartParams(options: options)
                 ),
+                reconcileResponse: { response in
+                    if let latestTurn = response.thread.turns?.last {
+                        let snapshot = Self.turnSnapshots(from: [latestTurn])[0]
+                        if snapshot.state == .inProgress {
+                            generation.seedProvisionalResumeSnapshot(snapshot)
+                        }
+                    }
+                },
                 onWriteAccepted: generation.acceptWrite,
                 onResponseRejected: generation.rejectResponse,
                 onResponseAccepted: generation.acceptResponse

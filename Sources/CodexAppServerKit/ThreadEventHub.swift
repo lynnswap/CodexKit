@@ -5,6 +5,17 @@ package struct ThreadEventGenerationCheckpoint: Sendable {
     fileprivate let identity: ThreadEventGenerationCheckpointIdentity
 }
 
+package enum ThreadEventGenerationOperation: Equatable, Sendable {
+    case standard
+    case reviewStart(delivery: CodexReviewDelivery)
+}
+
+package enum ThreadEventTurnStartDisposition: Equatable, Sendable {
+    case route
+    case suppress
+    case deferUntilOwned
+}
+
 package struct CodexThreadEventSequence: AsyncSequence, Sendable {
     package typealias Element = CodexThreadEvent
 
@@ -75,6 +86,7 @@ package final class ThreadEventHub: Sendable {
     private struct CheckpointRecord: Sendable {
         var identity: ThreadEventGenerationCheckpointIdentity
         var threadID: CodexThreadID
+        var operation: ThreadEventGenerationOperation
         var generation: ThreadEventGeneration?
     }
 
@@ -101,7 +113,8 @@ package final class ThreadEventHub: Sendable {
     }
 
     package func registerCheckpoint(
-        for threadID: CodexThreadID
+        for threadID: CodexThreadID,
+        operation: ThreadEventGenerationOperation = .standard
     ) throws -> ThreadEventGenerationCheckpoint {
         let identity = ThreadEventGenerationCheckpointIdentity()
         try state.withLock { state in
@@ -111,10 +124,24 @@ package final class ThreadEventHub: Sendable {
             state.checkpoints[identity.id] = .init(
                 identity: identity,
                 threadID: threadID,
+                operation: operation,
                 generation: nil
             )
         }
         return .init(identity: identity)
+    }
+
+    package func turnStartDisposition(for threadID: CodexThreadID) -> ThreadEventTurnStartDisposition {
+        state.withLock { state in
+            if let checkpointID = state.threads[threadID]?.activeCheckpointID,
+               let checkpoint = state.checkpoints[checkpointID] {
+                if case .reviewStart(let delivery) = checkpoint.operation {
+                    return delivery == .inline ? .suppress : .route
+                }
+                return .route
+            }
+            return .deferUntilOwned
+        }
     }
 
     package func activate(_ checkpoint: ThreadEventGenerationCheckpoint) {
@@ -153,6 +180,131 @@ package final class ThreadEventHub: Sendable {
                 preconditionFailure("A discarded generation checkpoint cannot be activated.")
             }
         }
+    }
+
+    package func seed(
+        _ snapshot: CodexTurnSnapshot,
+        at checkpoint: ThreadEventGenerationCheckpoint
+    ) throws {
+        try state.withLock { state in
+            guard var record = state.checkpoints[checkpoint.identity.id] else {
+                if checkpoint.identity.phase == .connectionTerminated {
+                    return
+                }
+                preconditionFailure("Only a registered generation checkpoint can be seeded.")
+            }
+            precondition(record.identity === checkpoint.identity)
+            precondition(
+                checkpoint.identity.phase == .active,
+                "A generation checkpoint must be active when its response snapshot is seeded."
+            )
+            var generation = record.generation ?? .init()
+            try generation.mergeResponseSnapshot(snapshot)
+            record.generation = generation
+            state.checkpoints[checkpoint.identity.id] = record
+        }
+    }
+
+    package func seedProvisionalResumeSnapshot(
+        _ snapshot: CodexTurnSnapshot,
+        at checkpoint: ThreadEventGenerationCheckpoint
+    ) {
+        state.withLock { state in
+            guard var record = state.checkpoints[checkpoint.identity.id] else {
+                if checkpoint.identity.phase == .connectionTerminated {
+                    return
+                }
+                preconditionFailure("Only a registered generation checkpoint can be seeded.")
+            }
+            precondition(record.identity === checkpoint.identity)
+            precondition(
+                checkpoint.identity.phase == .active,
+                "A generation checkpoint must be active when its response snapshot is seeded."
+            )
+            var generation = record.generation ?? .init()
+            generation.mergeProvisionalResumeSnapshot(snapshot)
+            record.generation = generation
+            state.checkpoints[checkpoint.identity.id] = record
+        }
+    }
+
+    package func resolveReviewStart(
+        _ checkpoint: ThreadEventGenerationCheckpoint,
+        eventThreadID: CodexThreadID,
+        responseSnapshot: CodexTurnSnapshot
+    ) throws {
+        var publication: ThreadEventPublication?
+        try state.withLock { state in
+            guard let record = state.checkpoints[checkpoint.identity.id] else {
+                preconditionFailure("Only an active review checkpoint can resolve a response.")
+            }
+            precondition(record.identity === checkpoint.identity)
+            precondition(
+                checkpoint.identity.phase == .active,
+                "A review checkpoint must remain active until its response identity resolves."
+            )
+            guard case .reviewStart(let delivery) = record.operation else {
+                preconditionFailure("Only review/start may move its event generation.")
+            }
+
+            switch delivery {
+            case .inline:
+                guard eventThreadID == record.threadID else {
+                    throw CodexTransportFailure.contractViolation(
+                        message: "An inline review cannot move to another event thread."
+                    )
+                }
+            case .detached:
+                guard eventThreadID != record.threadID else {
+                    throw CodexTransportFailure.contractViolation(
+                        message: "A detached review must use a different event thread."
+                    )
+                }
+                guard state.threads[eventThreadID] == nil else {
+                    throw CodexTransportFailure.contractViolation(
+                        message: "A detached review must use a previously unseen event thread."
+                    )
+                }
+            }
+
+            var sourceThread = state.threads[record.threadID] ?? .init()
+            precondition(sourceThread.activeCheckpointID == checkpoint.identity.id)
+            sourceThread.activeCheckpointID = nil
+
+            var generation = record.generation ?? .init()
+            try generation.mergeResponseSnapshot(responseSnapshot)
+            checkpoint.identity.phase = .committed
+            state.checkpoints.removeValue(forKey: checkpoint.identity.id)
+
+            var eventThread: ThreadState
+            if eventThreadID == record.threadID {
+                eventThread = sourceThread
+            } else {
+                store(sourceThread, for: record.threadID, in: &state)
+                eventThread = state.threads[eventThreadID] ?? .init()
+                precondition(
+                    eventThread.activeCheckpointID == nil,
+                    "A detached review cannot replace an active event-thread request."
+                )
+            }
+            eventThread.current = generation
+            eventThread.isClosed = generation.isClosed
+            let revision = nextPublicationRevision(for: &eventThread)
+            if generation.isClosed {
+                let channels = Array(eventThread.subscribers.values)
+                eventThread.subscribers.removeAll(keepingCapacity: false)
+                publication = .finish(channels, generation.replayEvents, revision)
+            } else {
+                publication = .supersede(
+                    Array(eventThread.subscribers.values),
+                    generation.replayEvents,
+                    revision,
+                    resetsGeneration: true
+                )
+            }
+            state.threads[eventThreadID] = eventThread
+        }
+        _ = publication?.deliver()
     }
 
     package func reject(_ checkpoint: ThreadEventGenerationCheckpoint) {
@@ -320,6 +472,10 @@ package final class ThreadEventHub: Sendable {
                     thread.activeCheckpointID = nil
                 }
                 thread.current = match.generation
+            } else if var current = thread.current,
+                      current.hasProvisionalResumeSnapshot {
+                current.adoptProvisionalResumeIdentity(turnID)
+                thread.current = current
             } else {
                 thread.current = .init(expectedTurnID: turnID)
             }
@@ -405,12 +561,17 @@ package final class ThreadEventHub: Sendable {
                 guard var record = state.checkpoints[activeID] else {
                     preconditionFailure("An active thread checkpoint lost its registration.")
                 }
-                var generation = record.generation ?? .init()
-                _ = try generation.apply(event)
-                record.generation = generation
-                state.checkpoints[activeID] = record
-                state.threads[threadID] = thread
-                return nil
+                // A detached review is required to run on a fresh response-identified thread.
+                // Explicit source-thread notifications therefore stay on the source generation;
+                // moving them with the request checkpoint would corrupt both thread histories.
+                if record.operation != .reviewStart(delivery: .detached) {
+                    var generation = record.generation ?? .init()
+                    _ = try generation.apply(event)
+                    record.generation = generation
+                    state.checkpoints[activeID] = record
+                    state.threads[threadID] = thread
+                    return nil
+                }
             }
 
             let eventTurnID = Self.turnID(of: event)
@@ -447,7 +608,7 @@ package final class ThreadEventHub: Sendable {
                 publication = .finish(channels, generation.replayEvents, revision)
             case .turnStarted, .snapshot, .itemStarted, .itemUpdated, .itemCompleted,
                 .message, .messageDelta, .reasoningSummaryPartAdded, .reasoningDelta,
-                .tokenUsageUpdated, .statusChanged, .unknown:
+                .diagnostic, .tokenUsageUpdated, .statusChanged, .unknown:
                 if shouldRollGeneration || didEstablishTurn {
                     publication = .supersede(
                         channels,
@@ -566,6 +727,8 @@ package final class ThreadEventHub: Sendable {
              .messageDelta(_, let turnID), .reasoningSummaryPartAdded(_, let turnID),
              .reasoningDelta(_, let turnID), .tokenUsageUpdated(_, let turnID):
             turnID
+        case .diagnostic(_, let turnID):
+            turnID
         case .unknown(let raw):
             raw.turnID
         case .statusChanged, .closed:
@@ -609,6 +772,7 @@ private struct ThreadEventGeneration: Equatable, Sendable {
     private var compactTail: [CodexThreadEvent] = []
     private var postTerminalTail: [CodexThreadEvent] = []
     private var terminal: CodexTurnOutcome?
+    private var provisionalResumeSnapshot: CodexTurnSnapshot?
     private(set) var isClosed = false
 
     init(expectedTurnID: CodexTurnID? = nil) {
@@ -619,6 +783,9 @@ private struct ThreadEventGeneration: Equatable, Sendable {
     }
 
     var hasTerminal: Bool { terminal != nil }
+    var hasProvisionalResumeSnapshot: Bool {
+        turnID == nil && provisionalResumeSnapshot != nil
+    }
 
     var compactEvents: [CodexThreadEvent] {
         if let terminal {
@@ -746,6 +913,11 @@ private struct ThreadEventGeneration: Equatable, Sendable {
             try requireNonterminalTurnEvent("token usage")
             latestUsage = usage
 
+        case .diagnostic(_, let eventTurnID):
+            try establishTurn(eventTurnID)
+            try requireNonterminalTurnEvent("turn diagnostic")
+            appendCompactTail(event)
+
         case .statusChanged(let status):
             if terminal == nil {
                 latestStatus = status
@@ -781,8 +953,54 @@ private struct ThreadEventGeneration: Equatable, Sendable {
             }
             return
         }
-        turnID = eventTurnID
-        snapshot = .init(id: eventTurnID, state: .inProgress)
+        if hasProvisionalResumeSnapshot {
+            adoptProvisionalResumeIdentity(eventTurnID)
+        } else {
+            turnID = eventTurnID
+            snapshot = .init(id: eventTurnID, state: .inProgress)
+        }
+    }
+
+    mutating func mergeResponseSnapshot(_ responseSnapshot: CodexTurnSnapshot) throws {
+        try establishTurn(responseSnapshot.id)
+        seed(responseSnapshot)
+        if let terminal {
+            finalizeSnapshot(with: terminal)
+        }
+    }
+
+    mutating func mergeProvisionalResumeSnapshot(_ responseSnapshot: CodexTurnSnapshot) {
+        precondition(
+            responseSnapshot.state == .inProgress,
+            "Only an in-progress resume response can provisionally seed a live generation."
+        )
+        guard let turnID else {
+            precondition(
+                provisionalResumeSnapshot == nil,
+                "A generation can receive one provisional response snapshot."
+            )
+            // thread/resume reconstructs review turn IDs from rollout history. Keep that
+            // baseline private until a notification supplies the canonical live identity.
+            provisionalResumeSnapshot = responseSnapshot
+            return
+        }
+        var adoptedSnapshot = responseSnapshot
+        adoptedSnapshot.id = turnID
+        seed(adoptedSnapshot)
+        if let terminal {
+            finalizeSnapshot(with: terminal)
+        }
+    }
+
+    mutating func adoptProvisionalResumeIdentity(_ canonicalTurnID: CodexTurnID) {
+        precondition(
+            hasProvisionalResumeSnapshot,
+            "Only an identity-unbound resume snapshot can adopt a persisted live turn identity."
+        )
+        turnID = canonicalTurnID
+        provisionalResumeSnapshot?.id = canonicalTurnID
+        snapshot = provisionalResumeSnapshot
+        provisionalResumeSnapshot = nil
     }
 
     private func requireNonterminalTurnEvent(_ name: StaticString) throws {
@@ -1354,6 +1572,8 @@ private extension CodexThreadEvent {
              .messageDelta(_, let turnID), .reasoningSummaryPartAdded(_, let turnID),
              .reasoningDelta(_, let turnID), .tokenUsageUpdated(_, let turnID):
             turnID
+        case .diagnostic(_, let turnID):
+            turnID
         case .unknown(let raw):
             raw.turnID
         case .statusChanged, .closed:
@@ -1367,7 +1587,7 @@ private extension CodexThreadEvent {
             true
         case .turnStarted, .snapshot, .itemStarted, .itemUpdated, .itemCompleted,
              .message, .messageDelta, .reasoningSummaryPartAdded, .reasoningDelta,
-             .tokenUsageUpdated, .statusChanged, .unknown:
+             .diagnostic, .tokenUsageUpdated, .statusChanged, .unknown:
             false
         }
     }
@@ -1376,7 +1596,7 @@ private extension CodexThreadEvent {
         switch self {
         case .turnStarted, .itemStarted, .itemUpdated, .itemCompleted, .message,
              .messageDelta, .reasoningSummaryPartAdded, .reasoningDelta,
-             .tokenUsageUpdated, .statusChanged, .unknown:
+             .diagnostic, .tokenUsageUpdated, .statusChanged, .unknown:
             true
         case .snapshot, .terminal, .closed:
             false

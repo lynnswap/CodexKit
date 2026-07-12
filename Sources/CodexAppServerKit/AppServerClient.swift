@@ -98,6 +98,10 @@ package actor AppServerClient {
         }
     }
 
+    package func sleepForInterruptRace(_ duration: Duration) async throws {
+        try await deadlineClock.sleep(duration)
+    }
+
     package func initializationWaiterCountForTesting() -> Int {
         guard case .inFlight(_, let waiters) = initializationState else {
             return 0
@@ -146,8 +150,9 @@ package actor AppServerClient {
 
     package func send<Request: AppServerAPI.Request>(
         _ request: Request,
+        reconcileResponse: @escaping @Sendable (Request.Response) async throws -> Void = { _ in },
         onWriteAccepted: @escaping @Sendable () -> Void = {},
-        onResponseRejected: @escaping @Sendable () -> Void = {},
+        onResponseRejected: @escaping @Sendable () async throws -> Void = {},
         onResponseAccepted: @escaping @Sendable () -> Void = {},
         onPostWriteCancellation: @escaping @Sendable (Request.Response) async throws -> Void = { _ in }
     ) async throws -> Request.Response {
@@ -158,6 +163,7 @@ package actor AppServerClient {
             scope: request.scope,
             purpose: .operation(Request.method),
             deadline: deadlines.request,
+            reconcileResponse: reconcileResponse,
             onWriteAccepted: onWriteAccepted,
             onResponseRejected: onResponseRejected,
             onResponseAccepted: onResponseAccepted,
@@ -189,9 +195,10 @@ package actor AppServerClient {
         scope: AppServerAPI.RequestScope? = nil,
         purpose: CodexRequestPurpose? = nil,
         deadline: Duration? = nil,
+        reconcileResponse: @escaping @Sendable (Response) async throws -> Void = { _ in },
         afterResponse: @escaping @Sendable (Response) async throws -> Void = { _ in },
         onWriteAccepted: @escaping @Sendable () -> Void = {},
-        onResponseRejected: @escaping @Sendable () -> Void = {},
+        onResponseRejected: @escaping @Sendable () async throws -> Void = {},
         onResponseAccepted: @escaping @Sendable () -> Void = {},
         onPostWriteCancellation: @escaping @Sendable (Response) async throws -> Void = { _ in }
     ) async throws -> Response {
@@ -220,6 +227,7 @@ package actor AppServerClient {
                     encodedParams: encodedParams,
                     responseType: responseType,
                     purpose: requestPurpose,
+                    reconcileResponse: reconcileResponse,
                     afterResponse: afterResponse,
                     onWriteAccepted: onWriteAccepted,
                     onResponseRejected: onResponseRejected,
@@ -282,9 +290,10 @@ package actor AppServerClient {
         encodedParams: Data,
         responseType: Response.Type,
         purpose: CodexRequestPurpose,
+        reconcileResponse: @escaping @Sendable (Response) async throws -> Void,
         afterResponse: @escaping @Sendable (Response) async throws -> Void,
         onWriteAccepted: @escaping @Sendable () -> Void,
-        onResponseRejected: @escaping @Sendable () -> Void,
+        onResponseRejected: @escaping @Sendable () async throws -> Void,
         onResponseAccepted: @escaping @Sendable () -> Void,
         operationState: RequestOperationState
     ) async throws -> Response {
@@ -336,7 +345,7 @@ package actor AppServerClient {
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch {
-                    onResponseRejected()
+                    try await reconcileRejectedResponse(using: onResponseRejected)
                     throw CodexAppServerError.request(.init(
                         requestID: attemptRequestID,
                         method: method,
@@ -349,11 +358,33 @@ package actor AppServerClient {
                     ))
                 }
                 do {
+                    try await reconcileResponse(response)
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch let error as CodexAppServerError {
+                    if case .connectionTerminated = error {
+                        throw error
+                    }
+                    let failure = CodexTransportFailure.protocolViolation(
+                        message: "Response reconciliation failed: \(error.localizedDescription)",
+                        rawData: rawResponse
+                    )
+                    await connectionCloseAction.failConnection(with: failure)
+                    throw CodexAppServerError.connectionTerminated(.transportFailure(failure))
+                } catch {
+                    let failure = (error as? CodexTransportFailure) ?? .protocolViolation(
+                        message: "Response reconciliation failed: \(error.localizedDescription)",
+                        rawData: rawResponse
+                    )
+                    await connectionCloseAction.failConnection(with: failure)
+                    throw CodexAppServerError.connectionTerminated(.transportFailure(failure))
+                }
+                do {
                     try await afterResponse(response)
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch {
-                    onResponseRejected()
+                    try await reconcileRejectedResponse(using: onResponseRejected)
                     throw CodexAppServerError.request(.init(
                         requestID: attemptRequestID,
                         method: method,
@@ -372,7 +403,7 @@ package actor AppServerClient {
                 throw abandonment
             } catch let error as JSONRPC.Error {
                 if case .responseError = error {
-                    onResponseRejected()
+                    try await reconcileRejectedResponse(using: onResponseRejected)
                 }
                 if case .responseError(let serverError) = error,
                    serverError.code == Self.appServerOverloadedErrorCode {
@@ -430,6 +461,31 @@ package actor AppServerClient {
                     kind: .transport(Self.transportFailure(from: error))
                 ))
             }
+        }
+    }
+
+    private func reconcileRejectedResponse(
+        using action: @escaping @Sendable () async throws -> Void
+    ) async throws {
+        do {
+            try await action()
+        } catch let error as CodexAppServerError {
+            if case .connectionTerminated = error {
+                throw error
+            }
+            let failure = CodexTransportFailure.protocolViolation(
+                message: "Response rejection reconciliation failed: \(error.localizedDescription)",
+                rawData: nil
+            )
+            await connectionCloseAction.failConnection(with: failure)
+            throw CodexAppServerError.connectionTerminated(.transportFailure(failure))
+        } catch {
+            let failure = CodexTransportFailure.protocolViolation(
+                message: "Response rejection reconciliation failed: \(error.localizedDescription)",
+                rawData: nil
+            )
+            await connectionCloseAction.failConnection(with: failure)
+            throw CodexAppServerError.connectionTerminated(.transportFailure(failure))
         }
     }
 

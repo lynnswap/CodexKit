@@ -5,6 +5,119 @@ import Testing
 
 @Suite("Thread event hub")
 struct ThreadEventHubTests {
+    @Test func reviewStartDispositionKeepsDetachedSourceEventsOnTheirSource() throws {
+        let hub = ThreadEventHub()
+        let review = try hub.registerCheckpoint(
+            for: "thread-source",
+            operation: .reviewStart(delivery: .detached)
+        )
+        let resume = try hub.registerCheckpoint(for: "thread-resume")
+
+        hub.activate(review)
+        hub.activate(resume)
+
+        #expect(hub.turnStartDisposition(for: "thread-source") == .route)
+        #expect(hub.turnStartDisposition(for: "thread-detached") == .deferUntilOwned)
+        #expect(hub.turnStartDisposition(for: "thread-resume") == .route)
+
+        hub.discard(review)
+        hub.discard(resume)
+    }
+
+    @Test func detachedReviewResponseMovesTheCheckpointWithoutResettingItsSourceThread() async throws {
+        let hub = ThreadEventHub()
+        hub.beginGeneration(for: "thread-source", including: "turn-source")
+        let sourceEvents = hub.events(for: "thread-source")
+        var sourceIterator = sourceEvents.makeAsyncIterator()
+        let checkpoint = try hub.registerCheckpoint(
+            for: "thread-source",
+            operation: .reviewStart(delivery: .detached)
+        )
+        hub.activate(checkpoint)
+        try hub.route(
+            .statusChanged(.active(activeFlags: [.waitingOnApproval])),
+            for: "thread-source"
+        )
+
+        try hub.resolveReviewStart(
+            checkpoint,
+            eventThreadID: "thread-review",
+            responseSnapshot: .init(id: "turn-review", state: .inProgress)
+        )
+
+        let source = hub.snapshotForTesting(threadID: "thread-source")
+        #expect(source.currentTurnID == "turn-source")
+        #expect(source.hasActiveCheckpoint == false)
+        let review = hub.snapshotForTesting(threadID: "thread-review")
+        #expect(review.currentTurnID == "turn-review")
+        #expect(review.hasActiveCheckpoint == false)
+        #expect(review.pendingCheckpointCount == 0)
+        #expect(try await sourceIterator.next() == .snapshot(.init(
+            id: "turn-source",
+            state: .inProgress
+        )))
+        #expect(try await sourceIterator.next() == .statusChanged(
+            .active(activeFlags: [.waitingOnApproval])
+        ))
+        sourceEvents.cancel()
+    }
+
+    @Test func detachedReviewResponseRequiresAPreviouslyUnseenEventThread() throws {
+        let hub = ThreadEventHub()
+        hub.beginGeneration(for: "thread-review", including: "turn-existing")
+        let checkpoint = try hub.registerCheckpoint(
+            for: "thread-source",
+            operation: .reviewStart(delivery: .detached)
+        )
+        hub.activate(checkpoint)
+
+        #expect(throws: CodexTransportFailure.contractViolation(
+            message: "A detached review must use a previously unseen event thread."
+        )) {
+            try hub.resolveReviewStart(
+                checkpoint,
+                eventThreadID: "thread-review",
+                responseSnapshot: .init(id: "turn-review", state: .inProgress)
+            )
+        }
+        #expect(hub.snapshotForTesting(threadID: "thread-review").currentTurnID == "turn-existing")
+        #expect(hub.snapshotForTesting(threadID: "thread-source").hasActiveCheckpoint)
+
+        hub.discard(checkpoint)
+    }
+
+    @Test func concurrentDetachedReviewResponsesCannotClaimTheSameEventThread() throws {
+        let hub = ThreadEventHub()
+        let first = try hub.registerCheckpoint(
+            for: "thread-source-first",
+            operation: .reviewStart(delivery: .detached)
+        )
+        let second = try hub.registerCheckpoint(
+            for: "thread-source-second",
+            operation: .reviewStart(delivery: .detached)
+        )
+        hub.activate(first)
+        hub.activate(second)
+
+        try hub.resolveReviewStart(
+            second,
+            eventThreadID: "thread-review",
+            responseSnapshot: .init(id: "turn-second", state: .inProgress)
+        )
+        #expect(throws: CodexTransportFailure.contractViolation(
+            message: "A detached review must use a previously unseen event thread."
+        )) {
+            try hub.resolveReviewStart(
+                first,
+                eventThreadID: "thread-review",
+                responseSnapshot: .init(id: "turn-first", state: .inProgress)
+            )
+        }
+        #expect(hub.snapshotForTesting(threadID: "thread-review").currentTurnID == "turn-second")
+
+        hub.discard(first)
+    }
+
     @Test func laterPublicationCompactsAcrossAnOvertakenGenerationCommit() async throws {
         let hub = ThreadEventHub()
         let events = hub.events(for: "thread-1")
@@ -72,6 +185,122 @@ struct ThreadEventHubTests {
         #expect(snapshot.pendingCheckpointCount == 0)
         #expect(snapshot.hasActiveCheckpoint == false)
         #expect(snapshot.currentTurnID == "turn-2")
+        events.cancel()
+    }
+
+    @Test func responseSnapshotMergesAfterAnEarlyTerminal() async throws {
+        let hub = ThreadEventHub()
+        let checkpoint = try hub.registerCheckpoint(for: "thread-1")
+        hub.activate(checkpoint)
+        let outcome = CodexTurnOutcome.completed(.init(turnID: "turn-1"))
+        try hub.route(.terminal(outcome), for: "thread-1")
+
+        try hub.seed(
+            .init(id: "turn-1", state: .inProgress),
+            at: checkpoint
+        )
+        hub.commit(checkpoint)
+
+        let events = hub.events(for: "thread-1")
+        var iterator = events.makeAsyncIterator()
+        #expect(try await iterator.next() == .snapshot(.init(id: "turn-1", state: .completed)))
+        #expect(try await iterator.next() == .terminal(outcome))
+        events.cancel()
+    }
+
+    @Test func provisionalResumeSnapshotAdoptsAnEarlierCanonicalEventIdentity() async throws {
+        let hub = ThreadEventHub()
+        let checkpoint = try hub.registerCheckpoint(for: "thread-1")
+        hub.activate(checkpoint)
+        try hub.route(
+            .itemStarted(messageItem(id: "live-item", text: "Live"), turnID: "turn-live"),
+            for: "thread-1"
+        )
+
+        hub.seedProvisionalResumeSnapshot(
+            .init(
+                id: "rollout-synthesized-turn",
+                state: .inProgress,
+                items: [messageItem(id: "response-item", text: "Response")]
+            ),
+            at: checkpoint
+        )
+        hub.commit(checkpoint)
+
+        let events = hub.events(for: "thread-1")
+        var iterator = events.makeAsyncIterator()
+        let event = try #require(try await iterator.next())
+        guard case .snapshot(let snapshot) = event else {
+            Issue.record("Expected a compact snapshot.")
+            return
+        }
+        #expect(snapshot.id == "turn-live")
+        #expect(snapshot.items.map(\.id) == ["response-item", "live-item"])
+        events.cancel()
+    }
+
+    @Test func provisionalResumeSnapshotWaitsForALaterCanonicalEventIdentity() async throws {
+        let hub = ThreadEventHub()
+        let checkpoint = try hub.registerCheckpoint(for: "thread-1")
+        hub.activate(checkpoint)
+        hub.seedProvisionalResumeSnapshot(
+            .init(
+                id: "rollout-synthesized-turn",
+                state: .inProgress,
+                items: [messageItem(id: "response-item", text: "Response")]
+            ),
+            at: checkpoint
+        )
+        hub.commit(checkpoint)
+
+        let committed = hub.snapshotForTesting(threadID: "thread-1")
+        #expect(committed.currentTurnID == nil)
+        #expect(committed.currentEventCount == 0)
+
+        let events = hub.events(for: "thread-1")
+        var iterator = events.makeAsyncIterator()
+        try hub.route(
+            .itemStarted(messageItem(id: "live-item", text: "Live"), turnID: "turn-live"),
+            for: "thread-1"
+        )
+
+        let event = try #require(try await iterator.next())
+        guard case .snapshot(let snapshot) = event else {
+            Issue.record("Expected a compact snapshot.")
+            return
+        }
+        #expect(snapshot.id == "turn-live")
+        #expect(snapshot.items.map(\.id) == ["response-item", "live-item"])
+        events.cancel()
+    }
+
+    @Test func persistedReviewIdentityPromotesACommittedProvisionalResumeSnapshot() async throws {
+        let hub = ThreadEventHub()
+        let checkpoint = try hub.registerCheckpoint(for: "thread-1")
+        hub.activate(checkpoint)
+        hub.seedProvisionalResumeSnapshot(
+            .init(
+                id: "rollout-synthesized-turn",
+                state: .inProgress,
+                items: [messageItem(id: "response-item", text: "Response")]
+            ),
+            at: checkpoint
+        )
+        hub.commit(checkpoint)
+
+        hub.beginGeneration(for: "thread-1", including: "turn-persisted")
+
+        let committed = hub.snapshotForTesting(threadID: "thread-1")
+        #expect(committed.currentTurnID == "turn-persisted")
+        let events = hub.events(for: "thread-1")
+        var iterator = events.makeAsyncIterator()
+        let event = try #require(try await iterator.next())
+        guard case .snapshot(let snapshot) = event else {
+            Issue.record("Expected a compact snapshot.")
+            return
+        }
+        #expect(snapshot.id == "turn-persisted")
+        #expect(snapshot.items.map(\.id) == ["response-item"])
         events.cancel()
     }
 
@@ -579,6 +808,14 @@ private func collect(
         events.append(event)
     }
     return events
+}
+
+private func messageItem(id: String, text: String) -> CodexThreadItem {
+    .init(
+        id: id,
+        kind: .agentMessage,
+        content: .message(.init(id: id, role: .assistant, text: text))
+    )
 }
 
 private func expectFailure(

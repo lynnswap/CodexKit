@@ -67,6 +67,20 @@ struct CodexItemReducerTests {
             ))
     }
 
+    @Test func turnDiagnosticsReduceToTypedNonterminalEventsWithoutCreatingItems() throws {
+        var reducer = CodexItemReducer()
+        let diagnostic = CodexTurnDiagnostic(
+            error: .init(message: "retrying", info: .serverOverloaded),
+            willRetry: true
+        )
+
+        #expect(try reducer.reduce(
+            .turnDiagnostic(diagnostic),
+            turnID: "turn-1"
+        ) == .diagnostic(diagnostic))
+        #expect(reducer.item(turnID: "turn-1", itemID: "diagnostic") == nil)
+    }
+
     @Test func commandDeltasAppendAndCompletionPreservesStartedMetadata() throws {
         var reducer = CodexItemReducer()
         let startedAt = Date(timeIntervalSince1970: 100)

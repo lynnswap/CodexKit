@@ -8,22 +8,38 @@ private let supervisorLogger = Logger(
 )
 
 package final class ConnectionCloseAction: Sendable {
-    private let action: Mutex<(@Sendable () async -> Void)?>
+    private enum Request: Sendable {
+        case close
+        case fail(CodexTransportFailure)
+    }
+
+    private let action: Mutex<(@Sendable (Request) async -> Void)?>
 
     package init(action: (@Sendable () async -> Void)? = nil) {
-        self.action = Mutex(action)
+        let wrappedAction: (@Sendable (Request) async -> Void)?
+        if let action {
+            wrappedAction = { _ in await action() }
+        } else {
+            wrappedAction = nil
+        }
+        self.action = Mutex(wrappedAction)
     }
 
     package func bind(to supervisor: ConnectionSupervisor) {
         action.withLock { action in
             precondition(action == nil, "Connection close action may be bound exactly once.")
-            action = { [weak supervisor] in
+            action = { [weak supervisor] request in
                 guard let supervisor else {
                     preconditionFailure(
                         "Connection supervisor must outlive every client operation."
                     )
                 }
-                await supervisor.closeConnection()
+                switch request {
+                case .close:
+                    await supervisor.closeConnection()
+                case .fail(let failure):
+                    await supervisor.failConnection(with: failure)
+                }
             }
         }
     }
@@ -32,7 +48,14 @@ package final class ConnectionCloseAction: Sendable {
         guard let action = action.withLock({ $0 }) else {
             preconditionFailure("Connection close action is not bound.")
         }
-        await action()
+        await action(.close)
+    }
+
+    package func failConnection(with failure: CodexTransportFailure) async {
+        guard let action = action.withLock({ $0 }) else {
+            preconditionFailure("Connection close action is not bound.")
+        }
+        await action(.fail(failure))
     }
 }
 
@@ -98,6 +121,15 @@ package actor ConnectionSupervisor {
 
     package func closeConnection() async {
         let completion = recordTermination(.init(.closedByCaller))
+        if let context = ServerRequestTaskContext.value,
+           await connection.signalCloseIfOwned(by: context) {
+            return
+        }
+        await completion.value
+    }
+
+    package func failConnection(with failure: CodexTransportFailure) async {
+        let completion = recordTermination(.init(.transportFailure(failure)))
         if let context = ServerRequestTaskContext.value,
            await connection.signalCloseIfOwned(by: context) {
             return

@@ -58,6 +58,8 @@ package struct CodexThreadMessageSequence: AsyncSequence, Sendable {
                      .reasoningDelta(_, let turnID),
                      .tokenUsageUpdated(_, let turnID):
                     beginGenerationIfNeeded(turnID)
+                case .diagnostic(_, let turnID):
+                    beginGenerationIfNeeded(turnID)
                 case .turnStarted(let turnID):
                     beginGenerationIfNeeded(turnID)
                 case .terminal(let outcome):
@@ -201,6 +203,13 @@ package struct CodexThreadLogSequence: AsyncSequence, Sendable {
                 case .reasoningDelta(let delta, let turnID):
                     beginGenerationIfNeeded(turnID)
                     return .reasoningDelta(delta, turnID: turnID)
+                case .diagnostic(let diagnostic, let turnID):
+                    beginGenerationIfNeeded(turnID)
+                    return .diagnostic(
+                        diagnostic,
+                        turnID: turnID,
+                        id: nextDiagnosticLogEntryID(turnID: turnID)
+                    )
                 case .snapshot(let snapshot):
                     beginGenerationIfNeeded(snapshot.id)
                     pendingSnapshotItems = snapshot.items.filter {
@@ -269,6 +278,13 @@ package struct CodexThreadLogSequence: AsyncSequence, Sendable {
             }
             return "\(delta.itemID ?? "agent-message-delta"):\(logEntryIndex)"
         }
+
+        private mutating func nextDiagnosticLogEntryID(turnID: CodexTurnID) -> String {
+            defer {
+                logEntryIndex += 1
+            }
+            return "\(turnID.rawValue):diagnostic:\(logEntryIndex)"
+        }
     }
 }
 
@@ -315,7 +331,7 @@ package struct CodexReviewEventSequence: AsyncSequence, Sendable {
                 return .terminal(outcome)
             case .started, .snapshot, .itemStarted, .itemUpdated, .itemCompleted, .message,
                  .messageDelta, .reasoningSummaryPartAdded, .reasoningDelta,
-                 .tokenUsageUpdated, .unknown:
+                 .diagnostic, .tokenUsageUpdated, .unknown:
                 return CodexReviewEvent(event, turnID: turnID)
             }
         }
@@ -393,6 +409,8 @@ private func reviewEventMatches(
          .itemCompleted(_, let turnID), .message(_, let turnID), .messageDelta(_, let turnID),
          .reasoningSummaryPartAdded(_, let turnID), .reasoningDelta(_, let turnID),
          .tokenUsageUpdated(_, let turnID):
+        return turnID == terminalTurnID
+    case .diagnostic(_, let turnID):
         return turnID == terminalTurnID
     case .unknown(let raw):
         return raw.turnID.map { $0 == terminalTurnID } ?? true
@@ -545,7 +563,7 @@ package struct CodexTurnMessageSequence: AsyncSequence, Sendable {
                     }
                 case .started, .terminal, .itemStarted, .itemUpdated,
                      .messageDelta, .reasoningSummaryPartAdded, .reasoningDelta,
-                     .tokenUsageUpdated, .unknown:
+                     .diagnostic, .tokenUsageUpdated, .unknown:
                     continue
                 }
             }
@@ -653,6 +671,13 @@ package struct CodexTurnLogSequence: AsyncSequence, Sendable {
                     return .reasoningPartStarted(part, turnID: turnID)
                 case .reasoningDelta(let delta):
                     return .reasoningDelta(delta, turnID: turnID)
+                case .diagnostic(let diagnostic):
+                    defer { logEntryIndex += 1 }
+                    return .diagnostic(
+                        diagnostic,
+                        turnID: turnID,
+                        id: "\(turnID.rawValue):diagnostic:\(logEntryIndex)"
+                    )
                 case .terminal:
                     return nil
                 case .snapshot(let snapshot):
@@ -688,7 +713,7 @@ package struct CodexResponseCollector {
         var accumulator = CodexResponseAccumulator()
         for try await event in events {
             switch event {
-            case .started, .snapshot, .unknown:
+            case .started, .snapshot, .diagnostic, .unknown:
                 continue
             case .itemStarted, .itemUpdated, .itemCompleted, .message, .messageDelta,
                 .reasoningSummaryPartAdded, .reasoningDelta:
@@ -717,7 +742,7 @@ private struct CodexResponseAccumulator {
         case .tokenUsageUpdated(let newUsage):
             usage = newUsage
             return true
-        case .started, .snapshot, .terminal, .unknown:
+        case .started, .snapshot, .diagnostic, .terminal, .unknown:
             return false
         case .itemStarted, .itemUpdated, .itemCompleted, .message, .messageDelta,
             .reasoningSummaryPartAdded, .reasoningDelta:
@@ -730,7 +755,7 @@ private struct CodexResponseAccumulator {
         case .tokenUsageUpdated(let newUsage, _):
             usage = newUsage
             return true
-        case .turnStarted, .snapshot, .terminal, .statusChanged, .closed, .unknown:
+        case .turnStarted, .snapshot, .diagnostic, .terminal, .statusChanged, .closed, .unknown:
             return false
         case .itemStarted, .itemUpdated, .itemCompleted, .message, .messageDelta,
             .reasoningSummaryPartAdded, .reasoningDelta:
@@ -835,7 +860,7 @@ private struct CodexTranscriptAccumulator {
         case .reasoningDelta(let delta):
             upsert(Self.currentItem(from: delta))
             return true
-        case .started, .tokenUsageUpdated, .terminal, .unknown:
+        case .started, .diagnostic, .tokenUsageUpdated, .terminal, .unknown:
             return false
         }
     }
@@ -878,7 +903,7 @@ private struct CodexTranscriptAccumulator {
         case .reasoningDelta(let delta, _):
             upsert(Self.currentItem(from: delta))
             return true
-        case .turnStarted, .terminal, .tokenUsageUpdated, .statusChanged,
+        case .turnStarted, .diagnostic, .terminal, .tokenUsageUpdated, .statusChanged,
             .closed, .unknown:
             return false
         }

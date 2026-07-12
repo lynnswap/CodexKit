@@ -122,10 +122,10 @@ extension CodexThread {
 
     /// Starts a Codex code review in this thread.
     ///
-    /// The returned session exposes both the response stream for the review
-    /// turn and thread-level event streams, including log entries. When the
-    /// app-server uses a detached review thread, those event streams are bound
-    /// to that review thread.
+    /// The returned session owns the source, active review-thread, and turn
+    /// identities and exposes the review's typed terminal outcome. Native UI
+    /// consumers observe the corresponding chat through CodexDataKit instead
+    /// of constructing a second model graph from transport events.
     ///
     /// - Parameters:
     ///   - target: The repository changes or custom instructions to review.
@@ -154,15 +154,46 @@ extension CodexThread {
             kind: .review(sourceThreadID: id, delivery: delivery),
             state: state
         )
+        if delivery == .detached {
+            await router.registerDetachedReviewRoutingAttempt(pending)
+        }
         do {
             let response: AppServerAPI.Review.Start.Response = try await withThreadEventGeneration(
                 id,
-                router: router
+                router: router,
+                generationOperation: .reviewStart(delivery: delivery)
             ) { generation in
                 try await client.send(
                     AppServerAPI.Review.Start.Request(
                         params: .init(threadID: id.rawValue, target: target, delivery: delivery)
                     ),
+                    reconcileResponse: { response in
+                        let responseThreadID = CodexThreadID(
+                            rawValue: response.reviewThreadID
+                        )
+                        switch delivery {
+                        case .inline:
+                            guard responseThreadID == id else {
+                                throw CodexTransportFailure.contractViolation(
+                                    message: "An inline review must run on its source thread."
+                                )
+                            }
+                        case .detached:
+                            guard responseThreadID != id else {
+                                throw CodexTransportFailure.contractViolation(
+                                    message: "A detached review must run on a new review thread."
+                                )
+                            }
+                        }
+                        try await router.reconcileReviewStartResponse(
+                            pending,
+                            reviewThreadID: responseThreadID,
+                            initialSnapshot: CodexAppServer.turnSnapshots(
+                                from: [response.turn]
+                            )[0],
+                            generation: generation
+                        )
+                    },
                     onWriteAccepted: {
                         generation.acceptWrite()
                         pending.acceptWrite()
@@ -170,49 +201,46 @@ extension CodexThread {
                     onResponseRejected: {
                         generation.rejectResponse()
                         pending.rejectAcceptedWrite()
+                        try await router.rejectDetachedReviewRoutingAttemptResponse(pending)
                     },
-                    onResponseAccepted: generation.acceptResponse,
                     onPostWriteCancellation: { response in
                         let review = await reviewSession(
                             from: response,
-                            pending: pending,
                             state: state
                         )
                         try await onPostWriteCancellation(review)
                     }
                 )
             }
-            return await reviewSession(from: response, pending: pending, state: state)
-        } catch {
+            return await reviewSession(from: response, state: state)
+        } catch let operationError {
+            do {
+                try await router.cancelDetachedReviewRoutingAttempt(pending)
+            } catch {
+                await finishPendingTurnOperation(
+                    pending,
+                    state: state,
+                    store: turnReplayStore
+                )
+                throw error
+            }
             await finishPendingTurnOperation(
                 pending,
                 state: state,
                 store: turnReplayStore
             )
-            throw error
+            throw operationError
         }
     }
 
     private func reviewSession(
         from response: AppServerAPI.Review.Start.Response,
-        pending: TurnReplayPendingToken,
         state: TurnGenerationHandleState
     ) async -> CodexReviewSession {
         let responseReviewThreadID = CodexThreadID(rawValue: response.reviewThreadID)
         let detachedReviewThreadID = responseReviewThreadID == id ? nil : responseReviewThreadID
         let turnID = CodexTurnID(rawValue: response.turnID)
         let initialTurn = CodexAppServer.turnSnapshots(from: [response.turn])[0]
-        await turnReplayStore.bind(
-            pending,
-            to: turnID,
-            initialSnapshot: initialTurn
-        )
-        if let detachedReviewThreadID {
-            await router.adoptDetachedThreadEventGeneration(
-                detachedReviewThreadID,
-                including: turnID
-            )
-        }
         let identity = CodexReviewIdentity(
             threadID: id,
             turnID: turnID,
@@ -262,7 +290,10 @@ extension CodexThread {
             )
         }
         if await state.snapshot() == .live {
-            await router.seedTurn(identity.turnID, threadID: reviewThreadID)
+            await router.adoptThreadEventGeneration(
+                reviewThreadID,
+                including: identity.turnID
+            )
         }
         let model = model ?? identity.model
         let turn = CodexTurn(
@@ -478,6 +509,11 @@ package func startCodexTurn(
                         summary: options.summary?.rawValue
                     )
                 ),
+                reconcileResponse: { response in
+                    try generation.seedResponseSnapshot(
+                        CodexAppServer.turnSnapshots(from: [response.turn])[0]
+                    )
+                },
                 onWriteAccepted: {
                     generation.acceptWrite()
                     pending.acceptWrite()
@@ -561,10 +597,11 @@ private func finishPendingTurnOperation(
 package func withThreadEventGeneration<Response: Sendable>(
     _ threadID: CodexThreadID,
     router: CodexAppServerNotificationRouter,
+    generationOperation: ThreadEventGenerationOperation = .standard,
     operation: @Sendable (ThreadEventGenerationAttempt) async throws -> Response
 ) async throws -> Response {
     let hub = router.threadEventHub
-    let checkpoint = try hub.registerCheckpoint(for: threadID)
+    let checkpoint = try hub.registerCheckpoint(for: threadID, operation: generationOperation)
     let generation = ThreadEventGenerationAttempt(hub: hub, checkpoint: checkpoint)
     do {
         return try await operation(generation)
@@ -589,6 +626,25 @@ package struct ThreadEventGenerationAttempt: Sendable {
 
     package func rejectResponse() {
         hub.reject(checkpoint)
+    }
+
+    package func seedResponseSnapshot(_ snapshot: CodexTurnSnapshot) throws {
+        try hub.seed(snapshot, at: checkpoint)
+    }
+
+    package func seedProvisionalResumeSnapshot(_ snapshot: CodexTurnSnapshot) {
+        hub.seedProvisionalResumeSnapshot(snapshot, at: checkpoint)
+    }
+
+    package func resolveReviewStartResponse(
+        eventThreadID: CodexThreadID,
+        responseSnapshot: CodexTurnSnapshot
+    ) throws {
+        try hub.resolveReviewStart(
+            checkpoint,
+            eventThreadID: eventThreadID,
+            responseSnapshot: responseSnapshot
+        )
     }
 
     package func acceptResponse() {
@@ -671,6 +727,7 @@ extension CodexTurn {
             threadID: threadID,
             turnID: id,
             client: client,
+            router: router,
             originalState: state,
             store: turnReplayStore,
             connectionLease: connectionLease,
@@ -698,12 +755,14 @@ private func interruptCodexTurnPreparingTarget(
     threadID: CodexThreadID,
     turnID: CodexTurnID,
     client: AppServerClient,
+    router: CodexAppServerNotificationRouter,
     originalState: TurnGenerationHandleState,
     store: TurnReplayStore,
     connectionLease: AppServerConnectionLease,
     willCancelActiveTurn: (@Sendable (CodexTurnCancellation) async -> Void)?
 ) async throws -> PreparedTurnInterruption {
-    for attempt in 0...interruptActivationRetryLimit {
+    var resolver = InterruptRaceResolver(expectedTurnID: turnID)
+    while true {
         do {
             try await sendInterrupt(threadID: threadID, turnID: turnID, client: client)
             return .init(
@@ -711,31 +770,28 @@ private func interruptCodexTurnPreparingTarget(
                 state: originalState
             )
         } catch {
-            if attempt < interruptActivationRetryLimit,
-               isExpectedTurnNotActive(error, turnID: turnID) {
-                try await Task.sleep(nanoseconds: interruptActivationRetryDelayNanoseconds)
+            switch resolver.decision(for: error) {
+            case .retry(let delay):
+                try await client.sleepForInterruptRace(delay)
                 continue
-            }
-            guard let activeTurnID = activeTurnID(from: error),
-                  activeTurnID != turnID.rawValue
-            else {
+            case .fail:
                 throw error
+            case .redirect(let activeTurn):
+                let cancellation = CodexTurnCancellation(threadID: threadID, turnID: activeTurn)
+                let state = await store.restoreGeneration(
+                    turnID: activeTurn,
+                    initialSnapshot: .init(id: activeTurn, state: .inProgress),
+                    connectionLease: connectionLease
+                )
+                await router.adoptThreadEventGeneration(threadID, including: activeTurn)
+                if let willCancelActiveTurn {
+                    await willCancelActiveTurn(cancellation)
+                }
+                try await sendInterrupt(threadID: threadID, turnID: activeTurn, client: client)
+                return .init(cancellation: cancellation, state: state)
             }
-            let activeTurn = CodexTurnID(rawValue: activeTurnID)
-            let cancellation = CodexTurnCancellation(threadID: threadID, turnID: activeTurn)
-            let state = await store.restoreGeneration(
-                turnID: activeTurn,
-                initialSnapshot: .init(id: activeTurn, state: .inProgress),
-                connectionLease: connectionLease
-            )
-            if let willCancelActiveTurn {
-                await willCancelActiveTurn(cancellation)
-            }
-            try await sendInterrupt(threadID: threadID, turnID: activeTurn, client: client)
-            return .init(cancellation: cancellation, state: state)
         }
     }
-    throw CancellationError()
 }
 
 @discardableResult
@@ -745,35 +801,29 @@ package func interruptCodexTurn(
     client: AppServerClient,
     willCancelActiveTurn: (@Sendable (CodexTurnCancellation) async -> Void)? = nil
 ) async throws -> CodexTurnCancellation {
-    for attempt in 0...interruptActivationRetryLimit {
+    var resolver = InterruptRaceResolver(expectedTurnID: turnID)
+    while true {
         do {
             try await sendInterrupt(threadID: threadID, turnID: turnID, client: client)
             return .init(threadID: threadID, turnID: turnID)
         } catch {
-            if attempt < interruptActivationRetryLimit,
-               isExpectedTurnNotActive(error, turnID: turnID) {
-                try await Task.sleep(nanoseconds: interruptActivationRetryDelayNanoseconds)
+            switch resolver.decision(for: error) {
+            case .retry(let delay):
+                try await client.sleepForInterruptRace(delay)
                 continue
-            }
-            guard let activeTurnID = activeTurnID(from: error),
-                  activeTurnID != turnID?.rawValue
-            else {
+            case .fail:
                 throw error
+            case .redirect(let activeTurn):
+                let cancellation = CodexTurnCancellation(threadID: threadID, turnID: activeTurn)
+                if let willCancelActiveTurn {
+                    await willCancelActiveTurn(cancellation)
+                }
+                try await sendInterrupt(threadID: threadID, turnID: activeTurn, client: client)
+                return cancellation
             }
-            let activeTurn = CodexTurnID(rawValue: activeTurnID)
-            let cancellation = CodexTurnCancellation(threadID: threadID, turnID: activeTurn)
-            if let willCancelActiveTurn {
-                await willCancelActiveTurn(cancellation)
-            }
-            try await sendInterrupt(threadID: threadID, turnID: activeTurn, client: client)
-            return cancellation
         }
     }
-    throw CancellationError()
 }
-
-private let interruptActivationRetryLimit = 5
-private let interruptActivationRetryDelayNanoseconds: UInt64 = 50_000_000
 
 private func sendInterrupt(
     threadID: CodexThreadID,
@@ -784,44 +834,6 @@ private func sendInterrupt(
         AppServerAPI.Turn.Interrupt.Request(
             params: .init(threadID: threadID.rawValue, turnID: turnID?.rawValue ?? "")
         ))
-}
-
-private func activeTurnID(from error: Error) -> String? {
-    guard let message = serverError(from: error)?.message,
-          let range = message.range(of: " but found ")
-    else {
-        return nil
-    }
-    return String(message[range.upperBound...])
-        .trimmingCharacters(in: CharacterSet(charactersIn: "` ").union(.whitespacesAndNewlines))
-        .nonEmpty
-}
-
-private func isExpectedTurnNotActive(_ error: Error, turnID: CodexTurnID?) -> Bool {
-    guard turnID != nil,
-          let message = serverError(from: error)?.message
-    else {
-        return false
-    }
-    let normalized = message.lowercased()
-    return normalized.contains("no active turn") && normalized.contains("interrupt")
-}
-
-private func serverError(from error: Error) -> CodexServerError? {
-    if case CodexAppServerError.request(let failure) = error,
-       case .server(let serverError) = failure.kind {
-        return serverError
-    }
-    if case JSONRPC.Error.responseError(let serverError) = error {
-        return serverError
-    }
-    return nil
-}
-
-private extension String {
-    var nonEmpty: String? {
-        isEmpty ? nil : self
-    }
 }
 
 extension CodexPrompt {

@@ -9,7 +9,59 @@ private let notificationRouterLogger = Logger(
 package actor CodexAppServerNotificationRouter {
     private typealias NotificationContext = AppServerNotificationDecoder.Context
 
+    private enum Phase {
+        case open
+        case terminating(CodexAppServerError)
+        case terminated(CodexAppServerError)
+
+        var terminationError: CodexAppServerError? {
+            switch self {
+            case .open:
+                nil
+            case .terminating(let error), .terminated(let error):
+                error
+            }
+        }
+    }
+
+    package struct DetachedReviewRoutingSnapshot: Equatable, Sendable {
+        package var attemptCount: Int
+        package var candidateCount: Int
+        package var drainCount: Int
+    }
+
+    private struct DetachedReviewRoutingAttempt {
+        var candidateThreadIDs: Set<CodexThreadID> = []
+    }
+
+    // A detached review's response is the first value that identifies its fresh event thread.
+    // Keep otherwise-unowned notifications intact until that request attempt can claim them;
+    // classifying a turn/started by arrival order discards unrelated concurrent work. The
+    // upstream fresh-thread contract means a later attempt cannot reuse an existing candidate.
+    private struct DetachedReviewRoutingCandidate {
+        var waitingAttempts: Set<TurnReplayPendingToken>
+        var notifications: [AppServerNotificationDecoder.DecodedNotification] = []
+    }
+
+    private enum NotificationDrainMode {
+        case claimedReview(CodexTurnID)
+        case unclaimed
+    }
+
+    private struct NotificationDrain {
+        var queuedNotifications: [AppServerNotificationDecoder.DecodedNotification] = []
+    }
+
     private var threadIDByTurnID: [CodexTurnID: CodexThreadID] = [:]
+    private var detachedReviewAttempts: [
+        TurnReplayPendingToken: DetachedReviewRoutingAttempt
+    ] = [:]
+    private var detachedReviewCandidatesByThreadID: [
+        CodexThreadID: DetachedReviewRoutingCandidate
+    ] = [:]
+    private var notificationDrainsByThreadID: [CodexThreadID: NotificationDrain] = [:]
+    private var notificationDrainPauseForTesting: (@Sendable () async -> Void)?
+    private var phase = Phase.open
     private var itemReducer = CodexItemReducer()
     private let accountEventHub: AccountEventHub
     package nonisolated let loginRegistry: LoginRegistry
@@ -81,6 +133,14 @@ package actor CodexAppServerNotificationRouter {
         threadEventHub.snapshotForTesting(threadID: threadID).subscriberCount
     }
 
+    package func detachedReviewRoutingSnapshotForTesting() -> DetachedReviewRoutingSnapshot {
+        .init(
+            attemptCount: detachedReviewAttempts.count,
+            candidateCount: detachedReviewCandidatesByThreadID.count,
+            drainCount: notificationDrainsByThreadID.count
+        )
+    }
+
     package func itemSnapshotForTesting(
         turnID: CodexTurnID,
         itemID: String
@@ -92,7 +152,7 @@ package actor CodexAppServerNotificationRouter {
         threadEventHub.resetGeneration(for: threadID)
     }
 
-    package func adoptDetachedThreadEventGeneration(
+    package func adoptThreadEventGeneration(
         _ threadID: CodexThreadID,
         including turnID: CodexTurnID
     ) {
@@ -100,26 +160,371 @@ package actor CodexAppServerNotificationRouter {
         seedTurn(turnID, threadID: threadID)
     }
 
+    package func registerDetachedReviewRoutingAttempt(
+        _ pending: TurnReplayPendingToken
+    ) {
+        precondition(
+            detachedReviewAttempts[pending] == nil,
+            "A detached review routing attempt may be registered exactly once."
+        )
+        detachedReviewAttempts[pending] = .init()
+    }
+
+    package func reconcileReviewStartResponse(
+        _ pending: TurnReplayPendingToken,
+        reviewThreadID: CodexThreadID,
+        initialSnapshot: CodexTurnSnapshot,
+        generation: ThreadEventGenerationAttempt
+    ) async throws {
+        try requireOpen()
+        await turnReplayStore.bind(
+            pending,
+            to: initialSnapshot.id,
+            initialSnapshot: initialSnapshot
+        )
+        try requireOpen()
+        try generation.resolveReviewStartResponse(
+            eventThreadID: reviewThreadID,
+            responseSnapshot: initialSnapshot
+        )
+        seedTurn(initialSnapshot.id, threadID: reviewThreadID)
+        try await resolveDetachedReviewRoutingAttempt(
+            pending,
+            reviewThreadID: reviewThreadID,
+            turnID: initialSnapshot.id
+        )
+        try requireOpen()
+    }
+
+    package func rejectDetachedReviewRoutingAttemptResponse(
+        _ pending: TurnReplayPendingToken
+    ) async throws {
+        try requireOpen()
+        guard var attempt = detachedReviewAttempts[pending] else {
+            return
+        }
+        var candidatesToDrain: [
+            (CodexThreadID, DetachedReviewRoutingCandidate, NotificationDrainMode)
+        ] = []
+        for threadID in attempt.candidateThreadIDs {
+            guard var candidate = detachedReviewCandidatesByThreadID[threadID] else {
+                continue
+            }
+            candidate.waitingAttempts.remove(pending)
+            if candidate.waitingAttempts.isEmpty {
+                detachedReviewCandidatesByThreadID.removeValue(forKey: threadID)
+                candidatesToDrain.append((threadID, candidate, .unclaimed))
+            } else {
+                detachedReviewCandidatesByThreadID[threadID] = candidate
+            }
+        }
+        attempt.candidateThreadIDs.removeAll(keepingCapacity: true)
+        detachedReviewAttempts[pending] = attempt
+        try await drainCandidates(candidatesToDrain)
+        try requireOpen()
+    }
+
+    package func cancelDetachedReviewRoutingAttempt(
+        _ pending: TurnReplayPendingToken
+    ) async throws {
+        guard let attempt = detachedReviewAttempts.removeValue(forKey: pending) else {
+            return
+        }
+        var candidatesToDrain: [
+            (CodexThreadID, DetachedReviewRoutingCandidate, NotificationDrainMode)
+        ] = []
+        for threadID in attempt.candidateThreadIDs {
+            guard var candidate = detachedReviewCandidatesByThreadID[threadID] else {
+                continue
+            }
+            candidate.waitingAttempts.remove(pending)
+            if candidate.waitingAttempts.isEmpty {
+                detachedReviewCandidatesByThreadID.removeValue(forKey: threadID)
+                candidatesToDrain.append((
+                    threadID,
+                    candidate,
+                    .unclaimed
+                ))
+            } else {
+                detachedReviewCandidatesByThreadID[threadID] = candidate
+            }
+        }
+        try await drainCandidates(candidatesToDrain)
+    }
+
+    private func resolveDetachedReviewRoutingAttempt(
+        _ pending: TurnReplayPendingToken,
+        reviewThreadID: CodexThreadID,
+        turnID: CodexTurnID
+    ) async throws {
+        guard let attempt = detachedReviewAttempts.removeValue(forKey: pending) else {
+            return
+        }
+        var candidatesToDrain: [
+            (CodexThreadID, DetachedReviewRoutingCandidate, NotificationDrainMode)
+        ] = []
+        for candidateThreadID in attempt.candidateThreadIDs {
+            guard var candidate = detachedReviewCandidatesByThreadID[candidateThreadID] else {
+                continue
+            }
+            if candidateThreadID == reviewThreadID {
+                detachedReviewCandidatesByThreadID.removeValue(forKey: candidateThreadID)
+                for waitingAttempt in candidate.waitingAttempts where waitingAttempt != pending {
+                    detachedReviewAttempts[waitingAttempt]?.candidateThreadIDs.remove(
+                        candidateThreadID
+                    )
+                }
+                candidatesToDrain.append((
+                    candidateThreadID,
+                    candidate,
+                    .claimedReview(turnID)
+                ))
+                continue
+            }
+
+            candidate.waitingAttempts.remove(pending)
+            if candidate.waitingAttempts.isEmpty {
+                detachedReviewCandidatesByThreadID.removeValue(forKey: candidateThreadID)
+                candidatesToDrain.append((
+                    candidateThreadID,
+                    candidate,
+                    .unclaimed
+                ))
+            } else {
+                detachedReviewCandidatesByThreadID[candidateThreadID] = candidate
+            }
+        }
+        try await drainCandidates(candidatesToDrain)
+    }
+
+    private func drainCandidates(
+        _ candidates: [(
+            CodexThreadID,
+            DetachedReviewRoutingCandidate,
+            NotificationDrainMode
+        )]
+    ) async throws {
+        try requireOpen()
+        beginNotificationDrains(candidates)
+        do {
+            for (threadID, candidate, mode) in candidates {
+                try await drainNotifications(
+                    candidate.notifications,
+                    threadID: threadID,
+                    mode: mode
+                )
+            }
+        } catch {
+            for (threadID, _, _) in candidates {
+                notificationDrainsByThreadID.removeValue(forKey: threadID)
+            }
+            throw error
+        }
+    }
+
+    private func beginNotificationDrains(
+        _ candidates: [(
+            CodexThreadID,
+            DetachedReviewRoutingCandidate,
+            NotificationDrainMode
+        )]
+    ) {
+        for (threadID, _, _) in candidates {
+            precondition(
+                notificationDrainsByThreadID[threadID] == nil,
+                "A thread may drain only one notification sequence at a time."
+            )
+            notificationDrainsByThreadID[threadID] = .init()
+        }
+    }
+
+    private func drainNotifications(
+        _ initialNotifications: [AppServerNotificationDecoder.DecodedNotification],
+        threadID: CodexThreadID,
+        mode: NotificationDrainMode
+    ) async throws {
+        guard phase.terminationError == nil else {
+            return
+        }
+        guard notificationDrainsByThreadID[threadID] != nil else {
+            preconditionFailure("A notification drain must install its routing gate first.")
+        }
+        if let notificationDrainPauseForTesting {
+            await notificationDrainPauseForTesting()
+        }
+        defer {
+            notificationDrainsByThreadID.removeValue(forKey: threadID)
+        }
+        var notifications = initialNotifications
+        while true {
+            for notification in notifications {
+                guard phase.terminationError == nil else {
+                    return
+                }
+                try await routeDrainedNotification(notification, mode: mode)
+            }
+            guard phase.terminationError == nil else {
+                return
+            }
+            guard var drain = notificationDrainsByThreadID[threadID] else {
+                preconditionFailure("An active notification drain lost its routing gate.")
+            }
+            if drain.queuedNotifications.isEmpty {
+                return
+            }
+            notifications = drain.queuedNotifications
+            drain.queuedNotifications.removeAll(keepingCapacity: true)
+            notificationDrainsByThreadID[threadID] = drain
+        }
+    }
+
+    private func routeDrainedNotification(
+        _ notification: AppServerNotificationDecoder.DecodedNotification,
+        mode: NotificationDrainMode
+    ) async throws {
+        try requireOpen()
+        if case .claimedReview(let turnID) = mode,
+           case .turnStarted(let startedTurnID) = notification.payload,
+           (notification.context.turnID ?? startedTurnID) != turnID {
+            return
+        }
+        if let threadID = notification.context.threadID,
+           let turnID = notification.context.turnID {
+            threadIDByTurnID[turnID] = threadID
+        }
+        let replayRouting: ReplayRouting
+        switch mode {
+        case .claimedReview:
+            replayRouting = .boundOnly
+        case .unclaimed:
+            replayRouting = .boundOnly
+        }
+        try await routeNotification(
+            notification,
+            replayRouting: replayRouting
+        )
+    }
+
     package func route(
         _ decoded: AppServerNotificationDecoder.DecodedNotification
     ) async throws {
+        guard phase.terminationError == nil else {
+            return
+        }
         guard decoded.disposition != .explicitIgnore else {
             return
         }
 
         var context = decoded.context
-        if let threadID = context.threadID, let turnID = context.turnID {
-            threadIDByTurnID[turnID] = threadID
-        } else if let turnID = context.turnID, let threadID = threadIDByTurnID[turnID] {
-            context.threadID = threadID
+        if context.threadID == nil, let turnID = context.turnID {
+            context.threadID = threadIDByTurnID[turnID]
+                ?? detachedReviewCandidatesByThreadID.first { _, candidate in
+                    candidate.notifications.contains { $0.context.turnID == turnID }
+                }?.key
         }
         var routed = decoded
         routed.context = context
-        try await routeNotification(routed)
+        var replayRouting = ReplayRouting.unboundAllowed
+
+        if let threadID = context.threadID,
+           var drain = notificationDrainsByThreadID[threadID] {
+            drain.queuedNotifications.append(routed)
+            notificationDrainsByThreadID[threadID] = drain
+            return
+        }
+
+        if let threadID = context.threadID {
+            if var candidate = detachedReviewCandidatesByThreadID[threadID] {
+                candidate.notifications.append(routed)
+                detachedReviewCandidatesByThreadID[threadID] = candidate
+                return
+            }
+
+            let localDisposition = threadEventHub.turnStartDisposition(for: threadID)
+            if let turnID = context.turnID, case .turnStarted = decoded.payload {
+                switch await reviewSubturnStartDisposition(turnID, threadID: threadID) {
+                case .route:
+                    break
+                case .suppress:
+                    return
+                case .deferUntilOwned:
+                    break
+                }
+            }
+
+            let hasWriteAcceptedNonDetachedOperation = await turnReplayStore
+                .hasWriteAcceptedNonDetachedOperation(for: threadID)
+            let waitingAttempts = activeDetachedReviewRoutingAttempts()
+            if waitingAttempts.isEmpty == false,
+               hasWriteAcceptedNonDetachedOperation == false {
+                replayRouting = .boundOnly
+            }
+            let hasKnownOwner = context.turnID.flatMap { threadIDByTurnID[$0] } != nil
+                || localDisposition != .deferUntilOwned
+                || hasWriteAcceptedNonDetachedOperation
+            if hasKnownOwner == false {
+                if waitingAttempts.isEmpty == false {
+                    bufferNotification(
+                        routed,
+                        threadID: threadID,
+                        waitingAttempts: waitingAttempts
+                    )
+                    return
+                }
+            }
+        } else if activeDetachedReviewRoutingAttempts().isEmpty == false {
+            replayRouting = .boundOnly
+        }
+        if let threadID = context.threadID, let turnID = context.turnID {
+            threadIDByTurnID[turnID] = threadID
+        }
+        try await routeNotification(routed, replayRouting: replayRouting)
+    }
+
+    private enum ReplayRouting {
+        case unboundAllowed
+        case boundOnly
+    }
+
+    private func reviewSubturnStartDisposition(
+        _ turnID: CodexTurnID,
+        threadID: CodexThreadID
+    ) async -> ThreadEventTurnStartDisposition {
+        // Codex reviews can forward the internal reviewer's turn/started with a child ID
+        // while every substantive item and terminal belongs to the response's outer turn.
+        // Only that advisory start is ignored; other cross-turn events remain fail-fast.
+        let associatedTurnIDs = threadIDByTurnID.compactMap { associatedTurnID, associatedThreadID in
+            associatedThreadID == threadID && associatedTurnID != turnID ? associatedTurnID : nil
+        }
+        for associatedTurnID in associatedTurnIDs {
+            if await turnReplayStore.isActiveReviewGeneration(associatedTurnID) {
+                return .suppress
+            }
+        }
+        return threadEventHub.turnStartDisposition(for: threadID)
+    }
+
+    private func activeDetachedReviewRoutingAttempts() -> Set<TurnReplayPendingToken> {
+        Set(detachedReviewAttempts.keys.filter(\.isWriteAccepted))
+    }
+
+    private func bufferNotification(
+        _ notification: AppServerNotificationDecoder.DecodedNotification,
+        threadID: CodexThreadID,
+        waitingAttempts: Set<TurnReplayPendingToken>
+    ) {
+        detachedReviewCandidatesByThreadID[threadID] = .init(
+            waitingAttempts: waitingAttempts,
+            notifications: [notification]
+        )
+        for pending in waitingAttempts {
+            detachedReviewAttempts[pending]?.candidateThreadIDs.insert(threadID)
+        }
     }
 
     private func routeNotification(
-        _ notification: AppServerNotificationDecoder.DecodedNotification
+        _ notification: AppServerNotificationDecoder.DecodedNotification,
+        replayRouting: ReplayRouting = .unboundAllowed
     ) async throws {
         let context = notification.context
         switch notification.payload {
@@ -133,7 +538,10 @@ package actor CodexAppServerNotificationRouter {
             let outcome = try terminalOutcome(from: turn, context: context)
             let turnID = context.turnID ?? outcome.response.turnID
             releasedTurnID = turnID
-            _ = await turnReplayStore.finishIfTracked(outcome)
+            await finishReplay(
+                outcome,
+                replayRouting: replayRouting
+            )
             if let threadID = context.threadID ?? threadIDByTurnID[turnID] {
                 try routeThreadEvent(.terminal(outcome), threadID: threadID)
             }
@@ -143,16 +551,17 @@ package actor CodexAppServerNotificationRouter {
             guard let turnID = context.turnID else {
                 preconditionFailure("Validated item notification lost turnId.")
             }
-            let event = try reduceItemEvent(mutation, turnID: turnID)
+            let event = try itemReducer.reduce(mutation, turnID: turnID)
             if let threadID = context.threadID ?? threadIDByTurnID[turnID] {
                 try routeThreadEvent(
                     Self.threadEvent(from: event, turnID: turnID, threadID: threadID),
                     threadID: threadID
                 )
             }
-            recordReplayDisposition(
-                await turnReplayStore.routeIfTracked(event, for: turnID),
-                turnID: turnID
+            await routeReplay(
+                event,
+                turnID: turnID,
+                replayRouting: replayRouting
             )
 
         case .turnStarted(let payloadTurnID):
@@ -161,9 +570,10 @@ package actor CodexAppServerNotificationRouter {
                 try routeThreadEvent(.turnStarted(turnID), threadID: threadID)
             }
             let event = CodexTurnEvent.started(turnID)
-            recordReplayDisposition(
-                await turnReplayStore.routeIfTracked(event, for: turnID),
-                turnID: turnID
+            await routeReplay(
+                event,
+                turnID: turnID,
+                replayRouting: replayRouting
             )
 
         case .threadStatus(let status):
@@ -180,9 +590,10 @@ package actor CodexAppServerNotificationRouter {
             }
             if let turnID = context.turnID {
                 let event = CodexTurnEvent.tokenUsageUpdated(usage)
-                recordReplayDisposition(
-                    await turnReplayStore.routeIfTracked(event, for: turnID),
-                    turnID: turnID
+                await routeReplay(
+                    event,
+                    turnID: turnID,
+                    replayRouting: replayRouting
                 )
             }
 
@@ -217,14 +628,53 @@ package actor CodexAppServerNotificationRouter {
             }
             if let turnID = context.turnID {
                 let event = CodexTurnEvent.unknown(raw)
-                recordReplayDisposition(
-                    await turnReplayStore.routeIfTracked(event, for: turnID),
-                    turnID: turnID
+                await routeReplay(
+                    event,
+                    turnID: turnID,
+                    replayRouting: replayRouting
                 )
             }
 
         case .ignored:
             preconditionFailure("Explicit-ignore notification reached the router.")
+        }
+    }
+
+    private func routeReplay(
+        _ event: CodexTurnEvent,
+        turnID: CodexTurnID,
+        replayRouting: ReplayRouting
+    ) async {
+        switch replayRouting {
+        case .unboundAllowed:
+            recordReplayDisposition(
+                await turnReplayStore.routeIfTracked(event, for: turnID),
+                turnID: turnID
+            )
+        case .boundOnly:
+            recordReplayDisposition(
+                await turnReplayStore.routeIfTracked(
+                    event,
+                    for: turnID,
+                    allowsOrphanGeneration: false
+                ),
+                turnID: turnID
+            )
+        }
+    }
+
+    private func finishReplay(
+        _ outcome: CodexTurnOutcome,
+        replayRouting: ReplayRouting
+    ) async {
+        switch replayRouting {
+        case .unboundAllowed:
+            _ = await turnReplayStore.finishIfTracked(outcome)
+        case .boundOnly:
+            _ = await turnReplayStore.finishIfTracked(
+                outcome,
+                allowsOrphanGeneration: false
+            )
         }
     }
 
@@ -273,6 +723,8 @@ package actor CodexAppServerNotificationRouter {
             return .reasoningSummaryPartAdded(part, turnID: turnID)
         case .reasoningDelta(let delta):
             return .reasoningDelta(delta, turnID: turnID)
+        case .diagnostic(let diagnostic):
+            return .diagnostic(diagnostic, turnID: turnID)
         case .tokenUsageUpdated(let usage):
             return .tokenUsageUpdated(usage, turnID: turnID)
         case .terminal(let outcome):
@@ -285,50 +737,31 @@ package actor CodexAppServerNotificationRouter {
         }
     }
 
-    private func reduceItemEvent(
-        _ mutation: CodexItemReducer.Mutation,
-        turnID: CodexTurnID
-    ) throws -> CodexTurnEvent {
-        let item = try itemReducer.apply(mutation, turnID: turnID)
-        switch mutation {
-        case .started:
-            return .itemStarted(item)
-        case .completed:
-            return .itemCompleted(item)
-        case .agentMessageDelta(let itemID, let delta):
-            return .messageDelta(.init(
-                text: delta,
-                itemID: itemID,
-                phase: item.message?.phase,
-                currentItem: item
-            ))
-        case .reasoningSummaryPartAdded(let itemID, let index):
-            return .reasoningSummaryPartAdded(.init(
-                itemID: itemID,
-                kind: .summary,
-                index: index,
-                currentItem: item
-            ))
-        case .reasoningSummaryDelta(let itemID, let index, let delta):
-            let part = CodexReasoningPart(itemID: itemID, kind: .summary, index: index)
-            return .reasoningDelta(.init(part: part, delta: delta, currentItem: item))
-        case .reasoningTextDelta(let itemID, let index, let delta):
-            let part = CodexReasoningPart(itemID: itemID, kind: .text, index: index)
-            return .reasoningDelta(.init(part: part, delta: delta, currentItem: item))
-        case .planDelta, .commandOutputDelta, .filePatchSnapshot, .mcpProgress:
-            return .itemUpdated(item)
+    package func finishAll(with termination: CodexConnectionTermination) async {
+        let error = CodexAppServerError.connectionTerminated(termination)
+        guard case .open = phase else {
+            return
         }
-    }
-
-    package func finishAll(throwing error: CodexAppServerError) async {
+        phase = .terminating(error)
+        detachedReviewAttempts.removeAll(keepingCapacity: false)
+        detachedReviewCandidatesByThreadID.removeAll(keepingCapacity: false)
         itemReducer.releaseAll()
         threadEventHub.finish(throwing: error)
+        await turnReplayStore.terminateAll(with: termination)
         await accountEventHub.finish(throwing: error)
         await loginRegistry.finish(throwing: error)
+        notificationDrainsByThreadID.removeAll(keepingCapacity: false)
+        phase = .terminated(error)
     }
 
     package func finishLogin(throwing error: CodexAppServerError) async {
         await loginRegistry.finish(throwing: error)
+    }
+
+    package func setNotificationDrainPauseForTesting(
+        _ pause: (@Sendable () async -> Void)?
+    ) {
+        notificationDrainPauseForTesting = pause
     }
 
     private nonisolated func recordReplayDisposition(
@@ -344,6 +777,12 @@ package actor CodexAppServerNotificationRouter {
         notificationRouterLogger.warning(
             "Compacted \(count, privacy: .public) slow turn replay subscriber(s) for \(turnID.rawValue, privacy: .public)"
         )
+    }
+
+    private func requireOpen() throws {
+        if let error = phase.terminationError {
+            throw error
+        }
     }
 
     private func terminalOutcome(
