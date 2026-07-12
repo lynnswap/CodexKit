@@ -316,8 +316,8 @@ review runs and does not depend on any higher-level review domain model.
 
 `CodexAppServer` also owns app-server review restart and cleanup lifecycle
 state. A host that needs to interrupt and restart a review can prepare a
-transient token, restart from it, then perform best-effort cleanup without
-tracking detached review thread IDs itself:
+transient token, restart from it, then perform cleanup without tracking
+detached review thread IDs itself:
 
 ```swift
 let token = try await appServer.prepareReviewRestart(identity)
@@ -326,8 +326,15 @@ let restarted = try await appServer.restartPreparedReview(
     target: .baseBranch("main"),
     delivery: .detached
 )
-await appServer.cleanupReview(restarted.identity)
+let cleanup = await appServer.cleanupReview(restarted.identity)
+if cleanup.succeeded == false {
+    persistForLaterCleanup(cleanup.attemptedThreadIDs)
+}
 ```
+
+Cleanup returns every attempted thread ID and its ordered failures. When any
+deletion fails, identities retained by restart preparation stay registered so
+the same app-server generation can retry without losing cleanup ownership.
 
 Preparation and restart are owned by one process-local coordinator. Concurrent
 restart calls with the same token, target, delivery, and thread options join one
@@ -496,6 +503,8 @@ The public boundary is:
 - `CodexReviewTarget`
 - `CodexReviewSession`
 - `CodexReviewIdentity`
+- `CodexReviewCleanupFailure`
+- `CodexReviewCleanupResult`
 - `CodexReviewRestartToken`
 - `CodexTurnSnapshot`
 - `CodexTurnStatus`
@@ -515,7 +524,6 @@ The public boundary is:
 - `CodexModel`
 - `CodexAccount`
 - `CodexAccountEvent`
-- `CodexLoginCompletion`
 - `CodexLoginHandle`
 
 Unknown notifications and unknown item kinds are preserved so clients can keep

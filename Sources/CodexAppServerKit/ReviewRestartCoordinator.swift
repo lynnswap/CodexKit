@@ -369,10 +369,6 @@ package actor ReviewRestartCoordinator {
         retain(identities, ownerToken: nil)
     }
 
-    package func discardRetainedIdentities(sourceThreadID: CodexThreadID) {
-        retainedIdentityRecordsBySourceThreadID.removeValue(forKey: sourceThreadID)
-    }
-
     package func waitForRestartWaiterCountForTesting(
         tokenID: CodexReviewRestartToken.ID,
         atLeast minimumCount: Int

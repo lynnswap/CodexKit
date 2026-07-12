@@ -735,40 +735,21 @@ public actor CodexAppServer {
         )
     }
 
-    /// Deletes all app-server threads owned by a review lifecycle.
+    /// Deletes all app-server threads owned by a review lifecycle and reports
+    /// each failed deletion in source-last attempt order.
     ///
     /// Retained cleanup identities from prepared restarts are included, duplicate
     /// thread identifiers are removed, and the source thread is deleted last.
-    /// Delete failures are intentionally ignored to match best-effort cleanup
-    /// behavior.
+    /// Retained restart identities remain registered when any deletion fails so
+    /// the caller can retry without losing thread identities known only to this
+    /// app-server generation.
     ///
     /// - Parameters:
     ///   - identity: Review identity whose source thread owns the lifecycle.
     ///   - additionalCleanupThreadIDs: Extra cleanup ID sequences, in preferred
     ///     per-sequence order, to merge with retained review cleanup IDs.
+    @discardableResult
     public func cleanupReview(
-        _ identity: CodexReviewIdentity,
-        additionalCleanupThreadIDs: [[CodexThreadID]] = []
-    ) async {
-        let result = await cleanupReviewReportingFailures(
-            identity,
-            additionalCleanupThreadIDs: additionalCleanupThreadIDs
-        )
-        if result.succeeded == false {
-            await reviewRestartCoordinator.discardRetainedIdentities(
-                sourceThreadID: identity.sourceThreadID
-            )
-        }
-    }
-
-    /// Deletes all app-server threads owned by a review lifecycle and reports
-    /// each failed deletion in source-last attempt order.
-    ///
-    /// Unlike ``cleanupReview(_:additionalCleanupThreadIDs:)``, retained restart
-    /// identities remain registered when any deletion fails. A durable caller
-    /// can therefore retry without losing thread identities known only to this
-    /// app-server generation.
-    public func cleanupReviewReportingFailures(
         _ identity: CodexReviewIdentity,
         additionalCleanupThreadIDs: [[CodexThreadID]] = []
     ) async -> CodexReviewCleanupResult {
@@ -1107,7 +1088,7 @@ public actor CodexAppServer {
     }
 
     private func cleanupReviewIgnoringCallerCancellation(_ identity: CodexReviewIdentity) async {
-        await Task { [self] in
+        _ = await Task { [self] in
             await cleanupReview(identity)
         }.value
     }

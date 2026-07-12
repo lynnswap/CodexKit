@@ -2535,6 +2535,9 @@ struct CodexAppServerKitTests {
             params: TurnCompletedParams(threadID: "thread-review", turn: .init(id: "turn-new", status: "interrupted"))
         )
         _ = try await prepareTask.value
+        for _ in 0..<3 {
+            try await runtime.transport.enqueueEmpty(for: "thread/delete")
+        }
         await runtime.server.cleanupReview(restartedIdentity)
 
         let interruptTurnIDs = try await runtime.transport.recordedRequests(method: "turn/interrupt").map {
@@ -2558,14 +2561,27 @@ struct CodexAppServerKitTests {
             turnID: "turn-review",
             reviewThreadID: "thread-review"
         )
+        for _ in 0..<4 {
+            try await runtime.transport.enqueueEmpty(for: "thread/delete")
+        }
 
-        await runtime.server.cleanupReview(
+        let result = await runtime.server.cleanupReview(
             identity,
             additionalCleanupThreadIDs: [
                 ["thread-source", "thread-extra", "thread-review"],
                 ["thread-extra", "thread-extra-2", "thread-source"],
             ]
         )
+
+        #expect(result == CodexReviewCleanupResult(
+            attemptedThreadIDs: [
+                "thread-review",
+                "thread-extra",
+                "thread-extra-2",
+                "thread-source",
+            ],
+            failures: []
+        ))
 
         let deletedThreadIDs = try await runtime.transport.recordedRequests(method: "thread/delete").map {
             try $0.decodeParams(AppServerAPI.Thread.Delete.Params.self).threadID
@@ -2574,6 +2590,64 @@ struct CodexAppServerKitTests {
             "thread-review",
             "thread-extra",
             "thread-extra-2",
+            "thread-source",
+        ])
+    }
+
+    @Test func cleanupReviewRestoresRetainedIdentitiesAfterDeletionFailure() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-review"))
+        try await runtime.transport.enqueueEmpty(for: "turn/interrupt")
+        let identity = CodexReviewIdentity(
+            threadID: "thread-source",
+            turnID: "turn-review",
+            reviewThreadID: "thread-review"
+        )
+
+        let prepareTask = Task {
+            try await runtime.server.prepareReviewRestart(identity)
+        }
+        defer {
+            prepareTask.cancel()
+        }
+        await runtime.transport.waitForRequest(method: "turn/interrupt")
+        try await runtime.transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(
+                threadID: "thread-review",
+                turn: .init(id: "turn-review", status: "interrupted")
+            )
+        )
+        _ = try await prepareTask.value
+
+        await runtime.transport.enqueueFailure(
+            code: -32_000,
+            message: "delete failed",
+            for: "thread/delete"
+        )
+        for _ in 0..<3 {
+            try await runtime.transport.enqueueEmpty(for: "thread/delete")
+        }
+        let failedCleanup = await runtime.server.cleanupReview(identity)
+        #expect(failedCleanup.attemptedThreadIDs == ["thread-review", "thread-source"])
+        #expect(failedCleanup.failures.map(\.threadID) == ["thread-review"])
+        #expect(failedCleanup.failures.first?.message.contains("delete failed") == true)
+
+        let retriedCleanup = await runtime.server.cleanupReview(identity)
+        #expect(retriedCleanup == CodexReviewCleanupResult(
+            attemptedThreadIDs: ["thread-review", "thread-source"],
+            failures: []
+        ))
+
+        let deletedThreadIDs = try await runtime.transport
+            .recordedRequests(method: "thread/delete")
+            .map { request in
+                try request.decodeParams(AppServerAPI.Thread.Delete.Params.self).threadID
+            }
+        #expect(deletedThreadIDs == [
+            "thread-review",
+            "thread-source",
+            "thread-review",
             "thread-source",
         ])
     }

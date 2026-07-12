@@ -2355,13 +2355,13 @@ public struct CodexTokenUsage: Equatable, Sendable {
     }
 }
 
-public struct CodexMessageDelta: Equatable, Sendable {
-    public var text: String
-    public let itemID: String
-    public var phase: CodexMessagePhase?
+package struct CodexMessageDelta: Equatable, Sendable {
+    package var text: String
+    package let itemID: String
+    package var phase: CodexMessagePhase?
     package var currentItem: CodexThreadItem?
 
-    public init(text: String, itemID: String, phase: CodexMessagePhase? = nil) {
+    package init(text: String, itemID: String, phase: CodexMessagePhase? = nil) {
         Self.preconditionValidItemID(itemID)
         self.text = text
         self.itemID = itemID
@@ -2382,7 +2382,7 @@ public struct CodexMessageDelta: Equatable, Sendable {
         self.currentItem = currentItem
     }
 
-    public static func == (lhs: Self, rhs: Self) -> Bool {
+    package static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.text == rhs.text
             && lhs.itemID == rhs.itemID
             && lhs.phase == rhs.phase
@@ -2397,18 +2397,18 @@ public struct CodexMessageDelta: Equatable, Sendable {
 }
 
 /// A reasoning summary or raw reasoning text part emitted by app-server.
-public struct CodexReasoningPart: Identifiable, Equatable, Sendable {
-    public enum Kind: Equatable, Sendable {
+package struct CodexReasoningPart: Identifiable, Equatable, Sendable {
+    package enum Kind: Equatable, Sendable {
         case summary
         case text
     }
 
-    public var itemID: String
-    public var kind: Kind
-    public var index: Int
+    package var itemID: String
+    package var kind: Kind
+    package var index: Int
     package var currentItem: CodexThreadItem?
 
-    public var id: String {
+    package var id: String {
         switch kind {
         case .summary:
             "\(itemID):summary:\(index)"
@@ -2417,7 +2417,7 @@ public struct CodexReasoningPart: Identifiable, Equatable, Sendable {
         }
     }
 
-    public init(itemID: String, kind: Kind, index: Int) {
+    package init(itemID: String, kind: Kind, index: Int) {
         self.itemID = itemID
         self.kind = kind
         self.index = index
@@ -2436,7 +2436,7 @@ public struct CodexReasoningPart: Identifiable, Equatable, Sendable {
         self.currentItem = currentItem
     }
 
-    public static func == (lhs: Self, rhs: Self) -> Bool {
+    package static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.itemID == rhs.itemID
             && lhs.kind == rhs.kind
             && lhs.index == rhs.index
@@ -2444,16 +2444,16 @@ public struct CodexReasoningPart: Identifiable, Equatable, Sendable {
 }
 
 /// Incremental text for a reasoning summary or raw reasoning text part.
-public struct CodexReasoningDelta: Identifiable, Equatable, Sendable {
-    public var part: CodexReasoningPart
-    public var delta: String
+package struct CodexReasoningDelta: Identifiable, Equatable, Sendable {
+    package var part: CodexReasoningPart
+    package var delta: String
     package var currentItem: CodexThreadItem?
 
-    public var id: String {
+    package var id: String {
         part.id
     }
 
-    public init(part: CodexReasoningPart, delta: String) {
+    package init(part: CodexReasoningPart, delta: String) {
         self.part = part
         self.delta = delta
         currentItem = nil
@@ -2469,7 +2469,7 @@ public struct CodexReasoningDelta: Identifiable, Equatable, Sendable {
         self.currentItem = currentItem
     }
 
-    public static func == (lhs: Self, rhs: Self) -> Bool {
+    package static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.part == rhs.part && lhs.delta == rhs.delta
     }
 }
@@ -2508,8 +2508,8 @@ package enum CodexThreadEvent: Equatable, Sendable {
     case unknown(CodexRawNotification)
 }
 
-public enum CodexThreadLogEntry: Identifiable, Equatable, Sendable {
-    public enum Phase: Equatable, Sendable {
+package enum CodexThreadLogEntry: Identifiable, Equatable, Sendable {
+    package enum Phase: Equatable, Sendable {
         case started
         case updated
         case completed
@@ -2525,7 +2525,7 @@ public enum CodexThreadLogEntry: Identifiable, Equatable, Sendable {
     case reasoningDelta(CodexReasoningDelta, turnID: CodexTurnID?)
     case diagnostic(CodexTurnDiagnostic, turnID: CodexTurnID, id: String)
 
-    public var id: String {
+    package var id: String {
         switch self {
         case .itemStarted(let item, _), .itemUpdated(let item, _), .itemCompleted(let item, _):
             item.id
@@ -2540,7 +2540,7 @@ public enum CodexThreadLogEntry: Identifiable, Equatable, Sendable {
         }
     }
 
-    public var turnID: CodexTurnID? {
+    package var turnID: CodexTurnID? {
         switch self {
         case .itemStarted(_, let turnID), .itemUpdated(_, let turnID),
              .itemCompleted(_, let turnID), .messageDelta(_, let turnID, _),
@@ -2551,7 +2551,7 @@ public enum CodexThreadLogEntry: Identifiable, Equatable, Sendable {
         }
     }
 
-    public var phase: Phase {
+    package var phase: Phase {
         switch self {
         case .itemStarted, .reasoningPartStarted:
             .started
@@ -2566,7 +2566,7 @@ public enum CodexThreadLogEntry: Identifiable, Equatable, Sendable {
         }
     }
 
-    public var item: CodexThreadItem? {
+    package var item: CodexThreadItem? {
         switch self {
         case .itemStarted(let item, _), .itemUpdated(let item, _), .itemCompleted(let item, _):
             item
@@ -2579,21 +2579,21 @@ public enum CodexThreadLogEntry: Identifiable, Equatable, Sendable {
         }
     }
 
-    public var messageDelta: CodexMessageDelta? {
+    package var messageDelta: CodexMessageDelta? {
         if case .messageDelta(let delta, _, _) = self {
             return delta
         }
         return nil
     }
 
-    public var reasoningDelta: CodexReasoningDelta? {
+    package var reasoningDelta: CodexReasoningDelta? {
         if case .reasoningDelta(let delta, _) = self {
             return delta
         }
         return nil
     }
 
-    public var diagnostic: CodexTurnDiagnostic? {
+    package var diagnostic: CodexTurnDiagnostic? {
         if case .diagnostic(let diagnostic, _, _) = self {
             return diagnostic
         }
@@ -2918,17 +2918,17 @@ public struct CodexAccount: Identifiable, Equatable, Sendable {
 }
 
 /// The result of an app-server account login completion notification.
-public struct CodexLoginCompletion: Equatable, Sendable {
+package struct CodexLoginCompletion: Equatable, Sendable {
     /// The app-server login identifier, when the notification is scoped to a login flow.
-    public var loginID: CodexLoginHandle.ID?
+    package var loginID: CodexLoginHandle.ID?
 
     /// Whether the login completed successfully.
-    public var success: Bool
+    package var success: Bool
 
     /// The server-provided failure message when `success` is false.
-    public var error: String?
+    package var error: String?
 
-    public init(loginID: CodexLoginHandle.ID? = nil, success: Bool, error: String? = nil) {
+    package init(loginID: CodexLoginHandle.ID? = nil, success: Bool, error: String? = nil) {
         self.loginID = loginID
         self.success = success
         self.error = error

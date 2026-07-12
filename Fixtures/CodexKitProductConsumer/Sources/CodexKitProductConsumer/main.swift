@@ -122,6 +122,13 @@ struct CodexKitProductConsumer {
             precondition(discarded.isEmpty)
             let discardedAll = await runtime.server.discardAllPreparedReviewRestarts()
             precondition(discardedAll.isEmpty)
+
+            let cleanup = await runtime.server.cleanupReview(.init(
+                threadID: "thread-fixture",
+                turnID: "turn-fixture"
+            ))
+            precondition(cleanup.attemptedThreadIDs == ["thread-fixture"])
+            precondition(cleanup.failures.isEmpty)
         } catch {
             await runtime.close()
             throw error
