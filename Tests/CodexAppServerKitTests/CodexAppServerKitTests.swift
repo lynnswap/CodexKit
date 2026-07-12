@@ -6625,6 +6625,110 @@ struct CodexAppServerKitTests {
         #expect(await transport.recordedRequests(method: "account/login/cancel").count == 1)
     }
 
+    @Test func unknownPendingLoginCancelOutcomeRequiresReconciliation() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueChatGPTLogin(
+            loginID: "login-1",
+            authenticationURL: URL(string: "https://chatgpt.com/auth")!
+        )
+        await transport.enqueueFailure(
+            code: -32_000,
+            message: "cancel response lost",
+            for: "account/login/cancel"
+        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let handle = try await harness.server.loginChatGPT()
+
+        let outcome = try await handle.cancel(acknowledgementTimeout: .seconds(5))
+
+        guard case .authenticationCommittedNeedsConnectionReconciliation(
+            .cancelOutcomeUnknown(let failure)
+        ) = outcome else {
+            Issue.record("Expected an unknown pending cancel outcome to require reconciliation.")
+            return
+        }
+        #expect(failure?.method == "account/login/cancel")
+        #expect(try await handle.result() == outcome)
+
+        try await transport.emitServerNotificationJSON(
+            method: "account/login/completed",
+            json: #"{"loginId":"login-1","success":true,"error":null}"#
+        )
+        try await transport.emitServerNotificationJSON(
+            method: "account/updated",
+            json: #"{"authMode":"chatgpt","planType":"plus"}"#
+        )
+        #expect(try await handle.result() == outcome)
+    }
+
+    @Test func loginSuccessTerminalWinsOverLateCancelResponse() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueChatGPTLogin(
+            loginID: "login-1",
+            authenticationURL: URL(string: "https://chatgpt.com/auth")!
+        )
+        try await transport.enqueue(
+            AppServerAPI.Account.Login.Cancel.Response(),
+            for: "account/login/cancel"
+        )
+        let cancelGate = CodexAppServerTestGate()
+        await transport.holdNextIgnoringCancellation(
+            method: "account/login/cancel",
+            gate: cancelGate
+        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let handle = try await harness.server.loginChatGPT()
+        let cancellation = Task {
+            try await handle.cancel(acknowledgementTimeout: .seconds(5))
+        }
+        await transport.waitForRequest(method: "account/login/cancel")
+
+        try await transport.emitServerNotificationJSON(
+            method: "account/login/completed",
+            json: #"{"loginId":"login-1","success":true,"error":null}"#
+        )
+        try await transport.emitServerNotificationJSON(
+            method: "account/updated",
+            json: #"{"authMode":"chatgpt","planType":"plus"}"#
+        )
+        #expect(try await handle.result() == .succeeded)
+        await cancelGate.open()
+
+        #expect(try await cancellation.value == .succeeded)
+    }
+
+    @Test func loginFailureTerminalWinsOverLateCancelResponse() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueChatGPTLogin(
+            loginID: "login-1",
+            authenticationURL: URL(string: "https://chatgpt.com/auth")!
+        )
+        try await transport.enqueue(
+            AppServerAPI.Account.Login.Cancel.Response(),
+            for: "account/login/cancel"
+        )
+        let cancelGate = CodexAppServerTestGate()
+        await transport.holdNextIgnoringCancellation(
+            method: "account/login/cancel",
+            gate: cancelGate
+        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let handle = try await harness.server.loginChatGPT()
+        let cancellation = Task {
+            try await handle.cancel(acknowledgementTimeout: .seconds(5))
+        }
+        await transport.waitForRequest(method: "account/login/cancel")
+
+        try await transport.emitServerNotificationJSON(
+            method: "account/login/completed",
+            json: #"{"loginId":"login-1","success":false,"error":"denied"}"#
+        )
+        #expect(try await handle.result() == .failed(message: "denied"))
+        await cancelGate.open()
+
+        #expect(try await cancellation.value == .failed(message: "denied"))
+    }
+
     @Test func cancellingLoginResultWaiterDoesNotCancelSharedLogin() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueueChatGPTLogin(

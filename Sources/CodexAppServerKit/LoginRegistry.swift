@@ -307,7 +307,8 @@ package actor LoginState {
             do {
                 outcome = try await task.value.get()
             } catch {
-                if case .successAwaitingAccount = phase {
+                switch phase {
+                case .pending, .successAwaitingAccount:
                     let requestFailure: CodexRequestFailure?
                     if let appServerError = error as? CodexAppServerError,
                         case .request(let failure) = appServerError
@@ -323,14 +324,23 @@ package actor LoginState {
                         )
                     resolve(.success(reconciliation))
                     return reconciliation
+                case .terminal(let result):
+                    return try result.get()
+                case .starting:
+                    throw error
                 }
-                throw error
             }
-            if case .successAwaitingAccount = phase {
+            switch phase {
+            case .successAwaitingAccount:
                 return try await result()
+            case .terminal(let result):
+                return try result.get()
+            case .pending:
+                resolve(.success(outcome))
+                return outcome
+            case .starting:
+                preconditionFailure("A started login cannot return to its starting phase.")
             }
-            resolve(.success(outcome))
-            return outcome
         case .starting:
             throw CodexAppServerError.loginAlreadyInProgress
         }
