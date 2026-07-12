@@ -292,8 +292,8 @@ struct CodexItemIdentityPromotionTests {
         #expect(promotedItem.message?.phase == .finalAnswer)
     }
 
-    @Test("review markers with the same raw ID keep distinct item identities")
-    func reviewMarkersWithSameRawIDKeepDistinctItemIdentities() async throws {
+    @Test("review marker identity retains raw ID and kind")
+    func reviewMarkerIdentityRetainsRawIDAndKind() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         let context = CodexModelContainer(appServer: runtime.server).mainContext
         let chat = context.model(for: CodexThreadID(rawValue: "thread-review-marker-identity"))
@@ -318,6 +318,11 @@ struct CodexItemIdentityPromotionTests {
                                 kind: .exitedReviewMode,
                                 text: "exited"
                             ),
+                            reviewMarkerItem(
+                                id: "8f80d976-f70d-4d37-af93-f8ba57fb802f",
+                                kind: .enteredReviewMode,
+                                text: "entered again"
+                            ),
                         ]
                     ),
                 ]
@@ -325,10 +330,23 @@ struct CodexItemIdentityPromotionTests {
             workspace: Optional<CodexWorkspace>.none
         )
 
-        #expect(chat.items.count == 2)
-        #expect(chat.items.map(\.kind) == [.enteredReviewMode, .exitedReviewMode])
-        #expect(Set(chat.items.map(\.id)).count == 2)
-        #expect(chat.items.map(\.itemID) == ["review-marker", "review-marker"])
+        #expect(chat.items.count == 3)
+        #expect(chat.items.map(\.kind) == [
+            .enteredReviewMode,
+            .exitedReviewMode,
+            .enteredReviewMode,
+        ])
+        #expect(Set(chat.items.map(\.id)).count == 3)
+        #expect(chat.items.map(\.itemID) == [
+            "review-marker",
+            "review-marker",
+            "8f80d976-f70d-4d37-af93-f8ba57fb802f",
+        ])
+        #expect(chat.items.map(\.id.rawValue) == [
+            "turn-review-marker-identity:enteredReviewMode:review-marker",
+            "turn-review-marker-identity:exitedReviewMode:review-marker",
+            "turn-review-marker-identity:enteredReviewMode:8f80d976-f70d-4d37-af93-f8ba57fb802f",
+        ])
         let locators = chat.items.map {
             CodexChatItemLocator(
                 id: $0.itemID,
@@ -336,7 +354,7 @@ struct CodexItemIdentityPromotionTests {
                 turnID: turnID
             )
         }
-        #expect(Set(locators).count == 2)
+        #expect(Set(locators).count == 3)
     }
 
     private func agentMessageItem(

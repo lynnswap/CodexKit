@@ -301,7 +301,14 @@ package struct CodexItemReducer {
         default:
             break
         }
-        return merged
+        return CodexThreadItem(
+            id: merged.id,
+            kind: merged.kind,
+            content: merged.content,
+            origin: started.origin,
+            semanticRelation: started.semanticRelation,
+            rawPayload: merged.rawPayload
+        )
     }
 
     private static func grow(_ values: inout [String]?, through index: Int) {

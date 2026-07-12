@@ -5,6 +5,31 @@ import Testing
 
 @Suite("AppServerNotificationDecoder")
 struct AppServerNotificationDecoderTests {
+    @Test func currentV2MapperAssignsReviewRolloutCompanionMetadataOnlyToFixedAgentItem() throws {
+        let reviewAssistant = try #require(AppServerThreadItemMapping.threadItem(from: .object([
+            "id": .string("review_rollout_assistant"),
+            "type": .string("agentMessage"),
+            "text": .string("review output"),
+        ])))
+        let sameIDWrongKind = try #require(AppServerThreadItemMapping.threadItem(from: .object([
+            "id": .string("review_rollout_assistant"),
+            "type": .string("plan"),
+            "text": .string("plan"),
+        ])))
+        let ordinaryAssistant = try #require(AppServerThreadItemMapping.threadItem(from: .object([
+            "id": .string("assistant-1"),
+            "type": .string("agentMessage"),
+            "text": .string("answer"),
+        ])))
+
+        #expect(reviewAssistant.origin == .reviewRolloutAssistant)
+        #expect(reviewAssistant.semanticRelation == .companionOf(.exitedReviewMode))
+        #expect(sameIDWrongKind.origin == .currentV2Item)
+        #expect(sameIDWrongKind.semanticRelation == nil)
+        #expect(ordinaryAssistant.origin == .currentV2Item)
+        #expect(ordinaryAssistant.semanticRelation == nil)
+    }
+
     @Test func pinnedNotificationInventoryHasOneDispositionPerMethod() {
         let route: Set<String> = [
             "error",

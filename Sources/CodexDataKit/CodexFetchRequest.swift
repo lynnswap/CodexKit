@@ -327,25 +327,32 @@ extension CodexSectionDescriptor where Model == CodexChat {
     }
 }
 
-public struct CodexFetchDescriptor<Model: CodexPersistentModel>: Sendable {
+public struct CodexFetchDescriptor<Model: CodexPersistentModel>: Equatable, Sendable {
     public var predicate: Predicate<Model>?
     public var sortBy: [CodexSortDescriptor<Model>]
     public var fetchLimit: Int?
     public var fetchOffset: Int?
-    public var includePendingChanges: Bool
+    public var includeContextChanges: Bool
 
     public init(
         predicate: Predicate<Model>? = nil,
         sortBy: [CodexSortDescriptor<Model>] = [],
         fetchLimit: Int? = nil,
         fetchOffset: Int? = nil,
-        includePendingChanges: Bool = true
+        includeContextChanges: Bool = true
     ) {
         self.predicate = predicate
         self.sortBy = sortBy
         self.fetchLimit = fetchLimit
         self.fetchOffset = fetchOffset
-        self.includePendingChanges = includePendingChanges
+        self.includeContextChanges = includeContextChanges
+    }
+
+    public static func == (
+        lhs: CodexFetchDescriptor<Model>,
+        rhs: CodexFetchDescriptor<Model>
+    ) -> Bool {
+        lhs.querySignature == rhs.querySignature
     }
 
     package var normalizedFetchOffset: Int {
@@ -444,62 +451,6 @@ package enum CodexKnownKeyPaths {
     }
 }
 
-public final class CodexFetchRequest<Model: CodexPersistentModel> {
-    public var predicate: Predicate<Model>?
-    public var sortDescriptors: [CodexSortDescriptor<Model>]
-    public var fetchLimit: Int?
-    public var fetchOffset: Int?
-    public var includePendingChanges: Bool
-
-    public var fetchDescriptor: CodexFetchDescriptor<Model> {
-        get {
-            CodexFetchDescriptor(
-                predicate: predicate,
-                sortBy: sortDescriptors,
-                fetchLimit: fetchLimit,
-                fetchOffset: fetchOffset,
-                includePendingChanges: includePendingChanges
-            )
-        }
-        set {
-            predicate = newValue.predicate
-            sortDescriptors = newValue.sortBy
-            fetchLimit = newValue.fetchLimit
-            fetchOffset = newValue.fetchOffset
-            includePendingChanges = newValue.includePendingChanges
-        }
-    }
-
-    public init(
-        predicate: Predicate<Model>? = nil,
-        sortDescriptors: [CodexSortDescriptor<Model>] = [],
-        fetchLimit: Int? = nil,
-        fetchOffset: Int? = nil,
-        includePendingChanges: Bool = true
-    ) {
-        self.predicate = predicate
-        self.sortDescriptors = sortDescriptors
-        self.fetchLimit = fetchLimit
-        self.fetchOffset = fetchOffset
-        self.includePendingChanges = includePendingChanges
-    }
-
-    public convenience init(_ descriptor: CodexFetchDescriptor<Model>) {
-        self.init(
-            predicate: descriptor.predicate,
-            sortDescriptors: descriptor.sortBy,
-            fetchLimit: descriptor.fetchLimit,
-            fetchOffset: descriptor.fetchOffset,
-            includePendingChanges: descriptor.includePendingChanges
-        )
-    }
-
-    package func copy() -> CodexFetchRequest<Model> {
-        CodexFetchRequest(fetchDescriptor)
-    }
-
-}
-
 extension CodexFetchDescriptor where Model == CodexWorkspaceGroup {
     public static var workspaceGroups: Self {
         .init(sortBy: codexDefaultWorkspaceGroupSortDescriptors())
@@ -546,54 +497,6 @@ extension CodexFetchDescriptor where Model == CodexChat {
             sortBy: sortBy,
             fetchLimit: fetchLimit
         )
-    }
-}
-
-extension CodexFetchRequest where Model == CodexWorkspaceGroup {
-    public static var workspaceGroups: Self {
-        Self(.workspaceGroups)
-    }
-}
-
-extension CodexFetchRequest where Model == CodexWorkspace {
-    public static var workspaces: Self {
-        Self(.workspaces)
-    }
-
-    public static func workspaces(
-        sortDescriptors: [CodexSortDescriptor<CodexWorkspace>] =
-            codexDefaultWorkspaceSortDescriptors()
-    ) -> Self {
-        Self(.workspaces(sortBy: sortDescriptors))
-    }
-}
-
-extension CodexFetchRequest where Model == CodexChat {
-    public static var recentChats: Self {
-        Self(.recentChats)
-    }
-
-    public static func chats(
-        in workspace: CodexWorkspace,
-        fetchLimit: Int? = nil
-    ) -> Self {
-        chats(
-            in: workspace,
-            sortDescriptors: codexDefaultChatSortDescriptors(),
-            fetchLimit: fetchLimit
-        )
-    }
-
-    public static func chats(
-        in workspace: CodexWorkspace,
-        sortDescriptors: [CodexSortDescriptor<CodexChat>],
-        fetchLimit: Int? = nil
-    ) -> Self {
-        Self(.chats(
-            in: workspace,
-            sortBy: sortDescriptors,
-            fetchLimit: fetchLimit
-        ))
     }
 }
 
@@ -810,10 +713,12 @@ public final class CodexFetchedResults<Model: CodexPersistentModel> {
         transactionRelay.finish()
     }
 
-    package func makeTransactionStream()
-        -> AsyncStream<CodexFetchedResultsTransaction<Model>>
-    {
+    public var transactions: AsyncStream<CodexFetchedResultsTransaction<Model>> {
         transactionRelay.makeStream()
+    }
+
+    public var snapshot: CodexFetchedResultsSnapshot<Model.ID> {
+        CodexFetchedResultsSnapshot(sections: sections)
     }
 
     package func waitUntilPendingLoad() async {
@@ -1026,17 +931,13 @@ public final class CodexFetchedResults<Model: CodexPersistentModel> {
         return result
     }
 
-    private var currentSnapshot: CodexFetchedResultsSnapshot<Model.ID> {
-        CodexFetchedResultsSnapshot(sections: sections)
-    }
-
     private func updateItemsAndSections(
         items newItems: [Model],
         sections newSections: [CodexFetchSection<Model>],
         reason: CodexFetchedResultsTransactionReason,
         updatedItemIDs: Set<Model.ID> = []
     ) {
-        let oldSnapshot = currentSnapshot
+        let oldSnapshot = snapshot
         items = newItems
         sections = newSections
         yieldTransaction(
@@ -1057,7 +958,7 @@ public final class CodexFetchedResults<Model: CodexPersistentModel> {
         let transaction = CodexFetchedResultsTransaction<Model>(
             reason: reason,
             oldSnapshot: oldSnapshot,
-            newSnapshot: currentSnapshot,
+            newSnapshot: snapshot,
             updatedItemIDs: updatedItemIDs
         )
         guard transaction.hasChanges
@@ -1357,7 +1258,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
 
     private var canInsertLiveModel: Bool {
         canEvaluateFilterLocally
-            && fetchDescriptor.includePendingChanges
+            && fetchDescriptor.includeContextChanges
             && fetchDescriptor.normalizedFetchOffset == 0
             && (nextCursor == nil || fetchDescriptor.fetchLimit == nil)
     }

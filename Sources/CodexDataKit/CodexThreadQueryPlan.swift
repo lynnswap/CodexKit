@@ -43,7 +43,7 @@ package struct CodexThreadQueryPlan: Sendable {
     package var sortPlans: [CodexSortPlan<CodexChat>]
     package var fetchLimit: Int?
     package var fetchOffset: Int
-    package var includePendingChanges: Bool
+    package var includeContextChanges: Bool
     private var serverFilter: CodexThreadServerFilter
 
     package init(descriptor: CodexFetchDescriptor<CodexChat>) throws {
@@ -57,10 +57,10 @@ package struct CodexThreadQueryPlan: Sendable {
             self.predicateSignature = nil
             self.serverFilter = .defaultChatFilter
         }
-        self.sortPlans = try descriptor.validatedSortPlans()
+        self.sortPlans = try Self.effectiveSortPlans(for: descriptor.sortBy)
         self.fetchLimit = descriptor.fetchLimit
         self.fetchOffset = descriptor.normalizedFetchOffset
-        self.includePendingChanges = descriptor.includePendingChanges
+        self.includeContextChanges = descriptor.includeContextChanges
     }
 
     package var signature: CodexFetchDescriptorSignature {
@@ -70,7 +70,7 @@ package struct CodexThreadQueryPlan: Sendable {
             sortPlans: sortPlans.map(\.signature),
             fetchLimit: fetchLimit,
             fetchOffset: fetchOffset,
-            includePendingChanges: includePendingChanges,
+            includeContextChanges: includeContextChanges,
             validationFailure: nil
         )
     }
@@ -115,7 +115,18 @@ package struct CodexThreadQueryPlan: Sendable {
     }
 
     package var usesServerOwnedOrdering: Bool {
-        sortPlans.first?.key == .recencyAt || sortPlans.isEmpty
+        sortPlans.first?.key == .recencyAt
+    }
+
+    package static func effectiveSortPlans(
+        for descriptors: [CodexSortDescriptor<CodexChat>]
+    ) throws -> [CodexSortPlan<CodexChat>] {
+        if descriptors.isEmpty {
+            return [try CodexSortPlan(
+                descriptor: CodexSortDescriptor(\CodexChat.createdAt, order: .reverse)
+            )]
+        }
+        return try descriptors.map(CodexSortPlan.init(descriptor:))
     }
 
     package func mutationStrategy(
@@ -204,7 +215,7 @@ package struct CodexFetchDescriptorSignature: Hashable, Sendable {
     package var sortPlans: [CodexSortPlanSignature]
     package var fetchLimit: Int?
     package var fetchOffset: Int
-    package var includePendingChanges: Bool
+    package var includeContextChanges: Bool
     package var validationFailure: CodexFetchValidationError?
 }
 
@@ -252,7 +263,7 @@ extension CodexFetchDescriptor {
                 sortPlans: try validatedSortPlans().map(\.signature),
                 fetchLimit: fetchLimit,
                 fetchOffset: normalizedFetchOffset,
-                includePendingChanges: includePendingChanges,
+                includeContextChanges: includeContextChanges,
                 validationFailure: nil
             )
         } catch let failure as CodexFetchValidationError {
@@ -262,7 +273,7 @@ extension CodexFetchDescriptor {
                 sortPlans: [],
                 fetchLimit: fetchLimit,
                 fetchOffset: normalizedFetchOffset,
-                includePendingChanges: includePendingChanges,
+                includeContextChanges: includeContextChanges,
                 validationFailure: failure
             )
         } catch {

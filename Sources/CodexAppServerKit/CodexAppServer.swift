@@ -1151,7 +1151,7 @@ public actor CodexAppServer {
             name: snapshot.name,
             preview: snapshot.preview,
             modelProvider: snapshot.modelProvider,
-            sourceKind: snapshot.sourceKind.map(CodexThreadSourceKind.init(rawValue:)),
+            sourceKind: snapshot.sourceKind,
             createdAt: snapshot.createdAt.map { Date(timeIntervalSince1970: TimeInterval($0)) },
             updatedAt: snapshot.updatedAt.map { Date(timeIntervalSince1970: TimeInterval($0)) },
             recencyAt: snapshot.recencyAt.map { Date(timeIntervalSince1970: TimeInterval($0)) },
@@ -1292,7 +1292,9 @@ public actor CodexAppServer {
         return turnSnapshots(from: turns)
     }
 
-    private nonisolated static func account(from snapshot: AppServerAPI.Account.Snapshot) -> CodexAccount {
+    package nonisolated static func account(
+        from snapshot: AppServerAPI.Account.Snapshot
+    ) -> CodexAccount {
         .init(
             id: snapshot.id,
             kind: .init(rawValue: snapshot.kind.rawValue) ?? .chatGPT,

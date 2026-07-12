@@ -173,7 +173,11 @@ struct CodexAppServerKitTests {
     }
 
     @Test func testRuntimeStartsAppServerWithoutLaunchingProcess() async throws {
-        let runtime = try await CodexAppServerTestRuntime.start(codexHome: "/tmp/codex")
+        let runtime = try await CodexAppServerTestRuntime.start(configuration: .init(
+            localProcess: .init(
+                codexHomeURL: URL(fileURLWithPath: "/tmp/codex", isDirectory: true)
+            )
+        ))
         try await runtime.transport.enqueueThreadStart(threadID: "thread-test", model: "gpt-5")
 
         let thread = try await runtime.server.startThread(
@@ -189,12 +193,110 @@ struct CodexAppServerKitTests {
         #expect(await runtime.transport.recordedNotifications().map(\.method) == [
             "initialized"
         ])
+        await runtime.close()
+    }
+
+    @Test func testRuntimeUsesTypedConfigurationFixtures() async throws {
+        let configURL = URL(fileURLWithPath: "/tmp/codex/config.toml")
+        let layerMetadata = try CodexAppServerTestConfigurationLayerMetadata(
+            source: .user(file: configURL, profile: nil),
+            version: "config-v1"
+        )
+        let result = try CodexAppServerTestConfigurationReadResult(
+            configuration: .init(
+                model: "gpt-5-codex",
+                reviewModel: "gpt-5-codex-review",
+                reasoningEffort: .high,
+                serviceTier: "flex"
+            ),
+            origins: ["model": layerMetadata],
+            layers: [try .init(
+                metadata: layerMetadata,
+                configuration: .object(["model": .string("gpt-5-codex")])
+            )]
+        )
+        let runtime = try await CodexAppServerTestRuntime.start()
+        try await runtime.transport.enqueueConfiguration(result)
+
+        let configuration = try await runtime.server.configuration()
+
+        #expect(configuration == result.configuration)
+        #expect(
+            await runtime.transport.recordedRequests(for: .configurationRead).map(\.request)
+                == [.configurationRead]
+        )
+        await runtime.close()
+    }
+
+    @Test func typedConfigurationWriteFixturePreservesOverrideContract() async throws {
+        let configURL = URL(fileURLWithPath: "/tmp/codex/config.toml")
+        let layerMetadata = try CodexAppServerTestConfigurationLayerMetadata(
+            source: .system(file: URL(fileURLWithPath: "/etc/codex/managed.toml")),
+            version: "managed-v1"
+        )
+        let writeResult = try CodexAppServerTestConfigurationWriteResult(
+            status: .okOverridden,
+            version: "config-v2",
+            fileURL: configURL,
+            overriddenMetadata: try .init(
+                message: "Managed configuration overrides this value.",
+                overridingLayer: layerMetadata,
+                effectiveValue: .string("gpt-5-codex")
+            )
+        )
+        let runtime = try await CodexAppServerTestRuntime.start()
+        try await runtime.transport.enqueueConfigurationWrite(writeResult)
+        var patch = CodexConfigurationPatch()
+        patch.setReviewModel("gpt-5-codex-review")
+
+        try await runtime.server.updateConfiguration(patch)
+
+        let request = try #require(
+            await runtime.transport.recordedRequests(for: .configurationUpdate).last
+        )
+        #expect(request.request == .configurationUpdate(patch))
+        await runtime.close()
+    }
+
+    @Test func configurationFixturesRejectInvalidOwnershipMetadata() throws {
+        #expect(throws: CodexAppServerTestError.invalidFixture(
+            "configuration layer file must be an absolute file URL"
+        )) {
+            _ = try CodexAppServerTestConfigurationLayerMetadata(
+                source: .system(file: URL(string: "https://example.com/config.toml")!),
+                version: "config-v1"
+            )
+        }
+
+        let configURL = URL(fileURLWithPath: "/tmp/codex/config.toml")
+        #expect(throws: CodexAppServerTestError.invalidFixture(
+            "an overridden configuration write requires override metadata"
+        )) {
+            _ = try CodexAppServerTestConfigurationWriteResult(
+                status: .okOverridden,
+                version: "config-v1",
+                fileURL: configURL
+            )
+        }
+    }
+
+    @Test func manualDeadlineClockResumesOnlyAfterExplicitAdvance() async throws {
+        let clock = CodexAppServerTestDeadlineClock()
+        let sleeper = Task {
+            try await clock.codexDeadlineClock.sleep(.seconds(5))
+        }
+
+        try await clock.waitForSleeperCount(1)
+        clock.advance(by: .seconds(5))
+        try await sleeper.value
+        clock.close()
     }
 
     @Test func testTransportHoldsRequestsAtExplicitGate() async throws {
         let transport = CodexAppServerTestTransport()
         let gate = CodexAppServerTestGate()
         await transport.holdNext(method: "ping", gate: gate)
+        try await transport.enqueueEmpty(for: "ping")
         let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
         let client = harness.client
 
@@ -211,6 +313,54 @@ struct CodexAppServerKitTests {
 
         await gate.open()
         try await task.value
+        await harness.close()
+    }
+
+    @Test func testGateCancellationThrowsAndRemovesItsWaiter() async throws {
+        let gate = CodexAppServerTestGate()
+        let task = Task {
+            try await gate.wait()
+        }
+        await gate.waitUntilBlocked()
+
+        task.cancel()
+
+        await #expect(throws: CancellationError.self) {
+            try await task.value
+        }
+        await gate.open()
+
+        let closedGate = CodexAppServerTestGate()
+        await closedGate.close()
+        await #expect(throws: CancellationError.self) {
+            try await closedGate.wait()
+        }
+    }
+
+    @Test func unstubbedTestTransportRequestFailsWithRequestIdentity() async throws {
+        let transport = CodexAppServerTestTransport()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+
+        do {
+            let _: EmptyResponse = try await harness.client.send(
+                method: "unstubbed/probe",
+                params: EmptyResponse(),
+                responseType: EmptyResponse.self
+            )
+            Issue.record("Expected an unstubbed test transport request to fail.")
+        } catch let error as CodexAppServerError {
+            guard case .request(let failure) = error else {
+                Issue.record("Expected a typed request failure, got \(error).")
+                return
+            }
+            #expect(failure.requestID == 1)
+            #expect(failure.method == "unstubbed/probe")
+            #expect(failure.purpose == .operation("unstubbed/probe"))
+            #expect(failure.kind == .transport(.contractViolation(
+                message: "No test response is configured for unstubbed/probe."
+            )))
+        }
+
         await harness.close()
     }
 
@@ -500,9 +650,11 @@ struct CodexAppServerKitTests {
         try await runtime.transport.enqueueThreadResume(.init(id: "thread-list-turns-terminal"))
         let thread = try await runtime.server.resumeThread("thread-list-turns-terminal")
         let gate = CodexAppServerTestGate()
-        try await runtime.transport.enqueueThreadTurns(.init(turns: [
-            .init(id: "turn-list-turns-terminal", state: .inProgress),
-        ]))
+        let listedTurn = try CodexAppServerTestTurn(
+            snapshot: .init(id: "turn-list-turns-terminal", state: .inProgress),
+            items: []
+        )
+        try await runtime.transport.enqueueThreadTurns(.init(turns: [listedTurn]))
         await runtime.transport.holdNext(method: "thread/turns/list", gate: gate)
 
         let listTask = Task { try await thread.listTurns() }
@@ -531,7 +683,10 @@ struct CodexAppServerKitTests {
     @Test func appServerStartReviewStartsThreadThenReview() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         try await runtime.transport.enqueueThreadStart(threadID: "thread-source", model: "gpt-5")
-        try await runtime.transport.enqueueReviewStart(turnID: "turn-review")
+        try await runtime.transport.enqueueReviewStart(
+            turnID: "turn-review",
+            reviewThreadID: "thread-source"
+        )
         let workspace = URL(fileURLWithPath: "/tmp/project", isDirectory: true)
 
         let review = try await runtime.server.startReview(
@@ -590,6 +745,35 @@ struct CodexAppServerKitTests {
         #expect(review.model == "gpt-5")
         #expect(review.identity.reviewThreadID == nil)
         #expect(review.identity.model == "gpt-5")
+    }
+
+    @Test func reviewStartRequiresTheResponseEventThreadIdentity() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueJSON(
+            #"{"turn":{"id":"turn-review","status":"inProgress"}}"#,
+            for: "review/start"
+        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let thread = CodexThread(
+            id: "thread-1",
+            client: harness.client,
+            router: harness.router,
+            connectionLease: harness.lease
+        )
+
+        do {
+            _ = try await thread.startReview(target: .baseBranch("main"))
+            Issue.record("Expected a missing reviewThreadId to fail decoding.")
+        } catch let error as CodexAppServerError {
+            guard case .request(let failure) = error,
+                  case .invalidResponse = failure.kind else {
+                Issue.record("Expected a typed invalid response, got \(error).")
+                await harness.close()
+                return
+            }
+            #expect(failure.method == "review/start")
+        }
+        await harness.close()
     }
 
     @Test func appServerStartReviewDeletesSourceThreadWhenReviewStartFails() async throws {
@@ -1277,6 +1461,61 @@ struct CodexAppServerKitTests {
         }
     }
 
+    @Test func currentV2ThreadSessionSourcesRoundTripLosslessly() throws {
+        let sources: [AppServerAPI.Thread.SessionSource] = [
+            .cli,
+            .vscode,
+            .exec,
+            .appServer,
+            .custom("automation"),
+            .subAgent(.review),
+            .subAgent(.compact),
+            .subAgent(.threadSpawn(.init(
+                parentThreadID: "parent-thread",
+                depth: 2,
+                agentPath: "reviewer/worker",
+                agentNickname: "Scout",
+                agentRole: "reviewer"
+            ))),
+            .subAgent(.memoryConsolidation),
+            .subAgent(.other("custom-agent")),
+            .unknown,
+        ]
+
+        for source in sources {
+            let data = try JSONEncoder().encode(source)
+            #expect(try JSONDecoder().decode(AppServerAPI.Thread.SessionSource.self, from: data) == source)
+        }
+    }
+
+    @Test func threadListProjectsCanonicalSubAgentReviewSource() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueJSON(
+            #"{"data":[{"id":"thread-review","source":{"subAgent":"review"}}]}"#,
+            for: "thread/list"
+        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+
+        let snapshot = try #require(try await harness.server.listThreads().threads.first)
+
+        #expect(snapshot.sourceKind == .subAgentReview)
+        #expect(snapshot.hasField(.sourceKind))
+    }
+
+    @Test func threadListDoesNotUseLegacySourceKindFallback() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueJSON(
+            #"{"data":[{"id":"thread-legacy","sourceKind":"appServer"}]}"#,
+            for: "thread/list"
+        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+
+        let snapshot = try #require(try await harness.server.listThreads().threads.first)
+
+        #expect(snapshot.sourceKind == nil)
+        #expect(snapshot.hasField(.sourceKind) == false)
+    }
+
     @Test func threadSnapshotsTrackOmittedAndNullFields() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueueJSON(
@@ -1463,50 +1702,61 @@ struct CodexAppServerKitTests {
 
     @Test func threadStoreDrivesRuntimeThreadStubsAfterStart() async throws {
         let workspace = URL(fileURLWithPath: "/tmp/project", isDirectory: true)
-        let initial = CodexThreadSnapshot(
+        let initial = try makeRuntimeStoredThreadFixture(
             id: "thread-a",
             workspace: workspace,
-            name: "A",
-            modelProvider: "openai"
+            name: "A"
         )
-        let store = CodexAppServerTestThreadStore(threads: [initial])
+        let store = try CodexAppServerTestThreadStore(threads: [initial])
         let runtime = try await CodexAppServerTestRuntime.start(threadStore: store)
 
         let firstPage = try await runtime.server.listThreads()
-        #expect(firstPage.threads == [initial])
+        #expect(firstPage.threads.map(\.id) == [initial.snapshot.id])
+        #expect(firstPage.threads.allSatisfy { $0.turns == nil })
         #expect(firstPage.nextCursor == nil)
         #expect(firstPage.backwardsCursor == nil)
 
-        let updated = CodexThreadSnapshot(
+        let updated = try makeRuntimeStoredThreadFixture(
             id: "thread-b",
             workspace: workspace,
             name: "B",
             preview: "Updated",
-            modelProvider: "openai",
-            turns: [CodexTurnSnapshot(id: "turn-b", state: .completed)]
+            turns: [try makeRuntimeTestTurnFixture(id: "turn-b")]
         )
         await store.upsert(updated)
 
-        #expect(await store.snapshot(id: "thread-b") == updated)
-        #expect(await store.snapshots().map(\.id.rawValue) == ["thread-b", "thread-a"])
+        #expect(await store.storedThread(id: "thread-b") == updated)
 
         let secondPage = try await runtime.server.listThreads()
-        #expect(secondPage.threads == [updated, initial])
+        #expect(secondPage.threads.map(\.id) == [updated.snapshot.id, initial.snapshot.id])
+        #expect(secondPage.threads.map(\.preview) == [updated.snapshot.preview, initial.snapshot.preview])
+        #expect(secondPage.threads.allSatisfy { $0.turns == nil })
 
         let resumed = try await runtime.server.resumeThread("thread-b")
         let read = try await resumed.read(includeTurns: true)
-        #expect(read == updated)
+        #expect(read == updated.snapshot)
 
         await store.remove(id: "thread-a")
         let removedPage = try await runtime.server.listThreads()
-        #expect(removedPage.threads == [updated])
+        #expect(removedPage.threads.map(\.id) == [updated.snapshot.id])
+        #expect(removedPage.threads.first?.turns == nil)
 
         let startedWorkspace = URL(fileURLWithPath: "/tmp/started", isDirectory: true)
+        let plannedStart = try makeRuntimeStoredThreadFixture(
+            id: "thread-started",
+            workspace: startedWorkspace,
+            model: "gpt-5",
+            createdAt: Date(timeIntervalSince1970: 100),
+            updatedAt: Date(timeIntervalSince1970: 100),
+            recencyAt: Date(timeIntervalSince1970: 100),
+            ephemeral: true
+        )
+        try await store.enqueueStart(plannedStart)
         let started = try await runtime.server.startThread(
             in: startedWorkspace,
             options: .init(model: "gpt-5", modelProvider: "openai", ephemeral: true)
         )
-        let startedSnapshot = try #require(await store.snapshot(id: started.id))
+        let startedSnapshot = try #require(await store.storedThread(id: started.id)).snapshot
         #expect(startedSnapshot.workspace == startedWorkspace)
         #expect(startedSnapshot.modelProvider == "openai")
         #expect(startedSnapshot.ephemeral == true)
@@ -1514,9 +1764,9 @@ struct CodexAppServerKitTests {
     }
 
     @Test func threadStoreThreadReadHonorsIncludeTurns() async throws {
-        let stored = CodexThreadSnapshot(
+        let stored = try makeRuntimeStoredThreadFixture(
             id: "thread-with-turns",
-            turns: [CodexTurnSnapshot(id: "turn-from-store", state: .completed)]
+            turns: [try makeRuntimeTestTurnFixture(id: "turn-from-store")]
         )
         let runtime = try await CodexAppServerTestRuntime.start(threads: [stored])
         let thread = try await runtime.server.resumeThread("thread-with-turns")
@@ -1531,10 +1781,10 @@ struct CodexAppServerKitTests {
     }
 
     @Test func threadStoreHonorsThreadListPagination() async throws {
-        let threads = [
-            CodexThreadSnapshot(id: "thread-a", name: "A"),
-            CodexThreadSnapshot(id: "thread-b", name: "B"),
-            CodexThreadSnapshot(id: "thread-c", name: "C"),
+        let threads = try [
+            makeRuntimeStoredThreadFixture(id: "thread-a", name: "A"),
+            makeRuntimeStoredThreadFixture(id: "thread-b", name: "B"),
+            makeRuntimeStoredThreadFixture(id: "thread-c", name: "C"),
         ]
         let runtime = try await CodexAppServerTestRuntime.start(threads: threads)
 
@@ -1552,14 +1802,147 @@ struct CodexAppServerKitTests {
         #expect(secondPage.backwardsCursor != nil)
     }
 
+    @Test func threadStoreOwnsArchiveMembershipSortingAndMutations() async throws {
+        let activeOld = try makeRuntimeStoredThreadFixture(
+            id: "active-old",
+            createdAt: Date(timeIntervalSince1970: 10),
+            updatedAt: Date(timeIntervalSince1970: 40),
+            recencyAt: Date(timeIntervalSince1970: 20)
+        )
+        let activeNew = try makeRuntimeStoredThreadFixture(
+            id: "active-new",
+            createdAt: Date(timeIntervalSince1970: 30),
+            updatedAt: Date(timeIntervalSince1970: 20),
+            recencyAt: Date(timeIntervalSince1970: 50)
+        )
+        let archived = try makeRuntimeStoredThreadFixture(
+            id: "archived",
+            createdAt: Date(timeIntervalSince1970: 60),
+            updatedAt: Date(timeIntervalSince1970: 60),
+            recencyAt: Date(timeIntervalSince1970: 60),
+            isArchived: true
+        )
+        let store = try CodexAppServerTestThreadStore(threads: [activeOld, activeNew, archived])
+        let runtime = try await CodexAppServerTestRuntime.start(threadStore: store)
+
+        #expect(try await runtime.server.listThreads().threads.map(\.id) == [
+            activeNew.snapshot.id,
+            activeOld.snapshot.id,
+        ])
+        #expect(try await runtime.server.listThreads(.init(
+            archived: true
+        )).threads.map(\.id) == [archived.snapshot.id])
+        #expect(try await runtime.server.listThreads(.init(
+            sortDirection: .ascending,
+            sortKey: .updatedAt
+        )).threads.map(\.id) == [activeNew.snapshot.id, activeOld.snapshot.id])
+
+        try await runtime.server.archiveThread(activeNew.snapshot.id)
+        #expect(try await runtime.server.listThreads().threads.map(\.id) == [activeOld.snapshot.id])
+        #expect(try await runtime.server.listThreads(.init(
+            archived: true,
+            sortDirection: .ascending,
+            sortKey: .createdAt
+        )).threads.map(\.id) == [activeNew.snapshot.id, archived.snapshot.id])
+
+        _ = try await runtime.server.unarchiveThread(activeNew.snapshot.id)
+        try await runtime.server.deleteThread(activeOld.snapshot.id)
+        #expect(try await runtime.server.listThreads().threads.map(\.id) == [activeNew.snapshot.id])
+        #expect(await store.storedThread(id: activeOld.snapshot.id) == nil)
+        await runtime.close()
+    }
+
+    @Test func threadStoreAndQueuedThreadResponsesAreMutuallyExclusive() async throws {
+        let storeRuntime = try await CodexAppServerTestRuntime.start(
+            threadStore: try CodexAppServerTestThreadStore()
+        )
+        await #expect(throws: CodexAppServerTestError.invalidFixture(
+            "Cannot enqueue thread/list while an authoritative thread store owns thread state."
+        )) {
+            try await storeRuntime.transport.enqueueThreadList(
+                CodexAppServerTestThreadPage(threads: [])
+            )
+        }
+        await storeRuntime.close()
+
+        let queuedTransport = CodexAppServerTestTransport()
+        try await queuedTransport.enqueueThreadList(CodexAppServerTestThreadPage(threads: []))
+        await #expect(throws: CodexAppServerTestError.invalidFixture(
+            "Queued thread responses and an authoritative thread store are mutually exclusive."
+        )) {
+            try await queuedTransport.stubThreads(try CodexAppServerTestThreadStore())
+        }
+        await queuedTransport.close()
+    }
+
+    @Test func authoritativeThreadStoreNeverFabricatesAnUnplannedStart() async throws {
+        let store = try CodexAppServerTestThreadStore()
+        let runtime = try await CodexAppServerTestRuntime.start(threadStore: store)
+
+        do {
+            _ = try await runtime.server.startThread(
+                in: URL(fileURLWithPath: "/tmp/unplanned", isDirectory: true)
+            )
+            Issue.record("Expected an unplanned thread/start to be rejected.")
+        } catch let error as CodexAppServerError {
+            guard case .request(let failure) = error,
+                  case .server(let serverError) = failure.kind else {
+                Issue.record("Expected a typed server rejection, got \(error).")
+                return
+            }
+            #expect(serverError.code == -32602)
+            #expect(serverError.message == "thread/start requires an explicitly planned test thread.")
+        }
+        #expect(await store.storedThread(id: "unplanned") == nil)
+        await runtime.close()
+    }
+
+    @Test func authoritativeThreadStoreConsumesPlannedForkWithoutMutatingSource() async throws {
+        let source = try makeRuntimeStoredThreadFixture(
+            id: "fork-source",
+            name: "Source"
+        )
+        let fork = try makeRuntimeStoredThreadFixture(
+            id: "fork-result",
+            name: "Fork",
+            ephemeral: false,
+            forkedFromID: source.snapshot.id
+        )
+        let store = try CodexAppServerTestThreadStore(threads: [source])
+        try await store.enqueueFork(fork, from: source.snapshot.id)
+        let runtime = try await CodexAppServerTestRuntime.start(threadStore: store)
+
+        let handle = try await runtime.server.forkThread(
+            source.snapshot.id,
+            options: .init(modelProvider: "openai", ephemeral: false)
+        )
+
+        #expect(handle.id == fork.snapshot.id)
+        #expect(await store.storedThread(id: source.snapshot.id) == source)
+        #expect(await store.storedThread(id: fork.snapshot.id) == fork)
+        do {
+            _ = try await runtime.server.forkThread(source.snapshot.id)
+            Issue.record("Expected an unplanned thread/fork to be rejected.")
+        } catch let error as CodexAppServerError {
+            guard case .request(let failure) = error,
+                  case .server(let serverError) = failure.kind else {
+                Issue.record("Expected a typed server rejection, got \(error).")
+                return
+            }
+            #expect(serverError.code == -32602)
+        }
+        #expect(await store.storedThread(id: source.snapshot.id) == source)
+        await runtime.close()
+    }
+
     @Test func threadStoreHonorsThreadTurnListPagination() async throws {
-        let turns = [
-            CodexTurnSnapshot(id: "turn-a", state: .completed),
-            CodexTurnSnapshot(id: "turn-b", state: .completed),
-            CodexTurnSnapshot(id: "turn-c", state: .completed),
+        let turns = try [
+            makeRuntimeTestTurnFixture(id: "turn-a"),
+            makeRuntimeTestTurnFixture(id: "turn-b"),
+            makeRuntimeTestTurnFixture(id: "turn-c"),
         ]
         let runtime = try await CodexAppServerTestRuntime.start(threads: [
-            CodexThreadSnapshot(id: "thread-turns", turns: turns)
+            makeRuntimeStoredThreadFixture(id: "thread-turns", turns: turns)
         ])
         let thread = try await runtime.server.resumeThread("thread-turns")
 
@@ -1578,16 +1961,21 @@ struct CodexAppServerKitTests {
     }
 
     @Test func transportStubThreadsAcceptsMutableThreadStore() async throws {
-        let store = CodexAppServerTestThreadStore()
+        let store = try CodexAppServerTestThreadStore()
         let transport = CodexAppServerTestTransport()
         try await transport.stubThreads(store)
         let runtime = try await CodexAppServerTestRuntime.start(transport: transport)
 
-        let snapshot = CodexThreadSnapshot(id: "thread-transport", name: "Transport")
-        await store.upsert(snapshot)
+        let stored = try makeRuntimeStoredThreadFixture(
+            id: "thread-transport",
+            name: "Transport"
+        )
+        await store.upsert(stored)
 
         let page = try await runtime.server.listThreads()
-        #expect(page.threads == [snapshot])
+        #expect(page.threads.map(\.id) == [stored.snapshot.id])
+        #expect(page.threads.first?.name == stored.snapshot.name)
+        #expect(page.threads.first?.turns == nil)
     }
 
     @Test func appServerArchiveThreadSerializesThreadID() async throws {
@@ -1626,7 +2014,6 @@ struct CodexAppServerKitTests {
             target: .baseBranch("main"),
             delivery: .detached
         )
-
         #expect(review.threadID == "thread-1")
         #expect(review.turnID == "turn-review")
         #expect(review.reviewThreadID == "thread-review")
@@ -1806,7 +2193,10 @@ struct CodexAppServerKitTests {
     @Test func inlineReviewIdentityKeepsDetachedReviewThreadNil() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         try await runtime.transport.enqueueThreadStart(threadID: "thread-source", model: "gpt-5")
-        try await runtime.transport.enqueueReviewStart(turnID: "turn-review")
+        try await runtime.transport.enqueueReviewStart(
+            turnID: "turn-review",
+            reviewThreadID: "thread-source"
+        )
 
         let thread = try await runtime.server.startThread(
             in: URL(fileURLWithPath: "/tmp/project", isDirectory: true),
@@ -1878,7 +2268,10 @@ struct CodexAppServerKitTests {
 
     @Test func appServerResumeReviewUsesThreadOptionModelOverride() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
-        try await runtime.transport.enqueueThreadResume(.init(id: "thread-review"))
+        try await runtime.transport.enqueueThreadResume(
+            .init(id: "thread-review"),
+            model: "gpt-5.1"
+        )
         let identity = CodexReviewIdentity(
             threadID: "thread-source",
             turnID: "turn-review",
@@ -2839,7 +3232,7 @@ struct CodexAppServerKitTests {
             responseType: EmptyResponse.self
         )
 
-        #expect(await transport.recordedRequests().map(\.method) == ["ping", "ping"])
+        #expect(await transport.recordedRequests(method: "ping").count == 2)
         await harness.close()
     }
 
@@ -2949,7 +3342,7 @@ struct CodexAppServerKitTests {
 
     @Test func requestCancellationIsNeverWrapped() async throws {
         let transport = CodexAppServerTestTransport()
-        await transport.handle(method: "ping") { _ in
+        try await transport.handle(method: "ping") { _ in
             throw CancellationError()
         }
         let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
@@ -3806,11 +4199,30 @@ struct CodexAppServerKitTests {
         #expect(currentGeneration.last == .closed)
     }
 
-    @Test func resumeThreadCapturesEventsReceivedDuringResume() async throws {
+    @Test func resumeThreadReidentifiesResponseSnapshotFromCanonicalEventsDuringResume() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         let gate = CodexAppServerTestGate()
         await runtime.transport.holdNext(method: "thread/resume", gate: gate)
-        try await runtime.transport.enqueueThreadResume(.init(id: "thread-resume-events"))
+        try await runtime.transport.enqueueThreadResume(.init(
+            id: "thread-resume-events",
+            turns: [
+                .init(
+                    id: "rollout-synthesized-turn",
+                    state: .inProgress,
+                    items: [
+                        .init(
+                            id: "response-message",
+                            kind: .agentMessage,
+                            content: .message(.init(
+                                id: "response-message",
+                                role: .assistant,
+                                text: "From resume response"
+                            ))
+                        ),
+                    ]
+                ),
+            ]
+        ))
 
         let resumeTask = Task {
             try await runtime.server.resumeThread("thread-resume-events")
@@ -3912,7 +4324,11 @@ struct CodexAppServerKitTests {
 
     @Test func startReviewBeginsNewThreadEventGeneration() async throws {
         let transport = CodexAppServerTestTransport()
-        try await transport.enqueueReviewStart(turnID: "turn-review", status: .inProgress)
+        try await transport.enqueueReviewStart(
+            turnID: "turn-review",
+            reviewThreadID: "thread-1",
+            status: .inProgress
+        )
         let gate = CodexAppServerTestGate()
         await transport.holdNext(method: "review/start", gate: gate)
         let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
@@ -5826,12 +6242,10 @@ struct CodexAppServerKitTests {
         let stream = try await thread.streamResponse(to: "Run the slow checks.")
         try await stream.steer(with: "Prefer the smallest fix.")
 
-        #expect(
-            await transport.recordedRequests().map(\.method) == [
-                "turn/start",
-                "turn/steer",
-            ])
-        let request = try #require(await transport.recordedRequests().last)
+        #expect(await transport.recordedRequests(method: "turn/start").count == 1)
+        let request = try #require(
+            await transport.recordedRequests(method: "turn/steer").last
+        )
         let params = try JSONDecoder().decode(
             AppServerAPI.Turn.Steer.Params.self, from: request.params)
         #expect(params.threadID == "thread-1")

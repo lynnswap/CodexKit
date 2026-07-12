@@ -6,6 +6,30 @@ import CodexAppServerKitTesting
 
 @Suite("CodexItemReducer")
 struct CodexItemReducerTests {
+    @Test func completionPreservesSemanticMetadataFromStartedItem() throws {
+        var reducer = CodexItemReducer()
+        let started = CodexThreadItem(
+            id: "message-1",
+            kind: .agentMessage,
+            content: .message(.init(id: "message-1", role: .assistant, text: "partial")),
+            origin: .reviewRolloutAssistant,
+            semanticRelation: .companionOf(.exitedReviewMode)
+        )
+
+        _ = try reducer.apply(.started(started), turnID: "turn-1")
+        let completed = try reducer.apply(
+            .completed(.init(
+                id: "message-1",
+                kind: .agentMessage,
+                content: .message(.init(id: "message-1", role: .assistant, text: "done"))
+            )),
+            turnID: "turn-1"
+        )
+
+        #expect(completed.origin == .reviewRolloutAssistant)
+        #expect(completed.semanticRelation == .companionOf(.exitedReviewMode))
+    }
+
     @Test func internalCurrentItemProjectionDoesNotChangeDeltaEquality() {
         let item = CodexThreadItem(
             id: "message-1",

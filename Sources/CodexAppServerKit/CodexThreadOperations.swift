@@ -198,7 +198,7 @@ extension CodexThread {
         pending: TurnReplayPendingToken,
         state: TurnGenerationHandleState
     ) async -> CodexReviewSession {
-        let responseReviewThreadID = response.reviewThreadID.map(CodexThreadID.init(rawValue:))
+        let responseReviewThreadID = CodexThreadID(rawValue: response.reviewThreadID)
         let detachedReviewThreadID = responseReviewThreadID == id ? nil : responseReviewThreadID
         let turnID = CodexTurnID(rawValue: response.turnID)
         let initialTurn = CodexAppServer.turnSnapshots(from: [response.turn])[0]

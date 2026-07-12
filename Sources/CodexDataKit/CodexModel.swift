@@ -393,6 +393,12 @@ public final class CodexTurn: CodexPersistentModel {
     package func detachContextItem(_ item: CodexItem) {
         items.removeAll { $0 === item }
     }
+
+    package func detachFromContext() {
+        chat = nil
+        modelContext = nil
+        items = []
+    }
 }
 
 @Observable
@@ -402,6 +408,8 @@ public final class CodexItem: CodexPersistentModel {
     public fileprivate(set) var itemsLoadState: CodexTurnItemsLoadState
     public var kind: CodexThreadItem.Kind
     public var content: CodexThreadItem.Content
+    public private(set) var origin: CodexThreadItem.Origin
+    public private(set) var semanticRelation: CodexThreadItem.SemanticRelation?
     public var rawPayload: Data?
 
     public private(set) weak var chat: CodexChat?
@@ -430,7 +438,14 @@ public final class CodexItem: CodexPersistentModel {
     }
 
     fileprivate var threadItem: CodexThreadItem {
-        CodexThreadItem(id: itemID, kind: kind, content: content, rawPayload: rawPayload)
+        CodexThreadItem(
+            id: itemID,
+            kind: kind,
+            content: content,
+            origin: origin,
+            semanticRelation: semanticRelation,
+            rawPayload: rawPayload
+        )
     }
 
     fileprivate var mergeKey: CodexChatItemKey {
@@ -456,6 +471,8 @@ public final class CodexItem: CodexPersistentModel {
         self.itemsLoadState = itemsLoadState
         self.kind = threadItem.kind
         self.content = threadItem.content
+        self.origin = threadItem.origin
+        self.semanticRelation = threadItem.semanticRelation
         self.rawPayload = threadItem.rawPayload
     }
 
@@ -478,6 +495,8 @@ public final class CodexItem: CodexPersistentModel {
         self.itemsLoadState = itemsLoadState
         kind = threadItem.kind
         content = threadItem.content
+        origin = threadItem.origin
+        semanticRelation = threadItem.semanticRelation
         rawPayload = threadItem.rawPayload
     }
 }
@@ -524,10 +543,6 @@ package struct CodexChatItemKey: Hashable {
         kind: CodexThreadItem.Kind?
     ) -> String {
         switch kind {
-        case .enteredReviewMode:
-            "review-marker:enteredReviewMode"
-        case .exitedReviewMode:
-            "review-marker:exitedReviewMode"
         case .some(let kind):
             "\(kind.rawValue):\(rawItemID)"
         default:
@@ -626,6 +641,11 @@ public final class CodexChat: CodexPersistentModel {
         // serving the scoped lookup from the ignored index.
         _ = items
         return itemsByTurnID[turnID] ?? []
+    }
+
+    /// Returns the context-owned transcript projection for one loaded turn.
+    public func transcript(in turnID: CodexTurnID) -> CodexTranscript {
+        .init(items: items(in: turnID).map(\.threadItem))
     }
 
     package init(
@@ -728,6 +748,23 @@ public final class CodexChat: CodexPersistentModel {
     }
 
     package func detachFromContext() {
+        for item in items {
+            item.detachFromContext()
+        }
+        for turn in turns {
+            for item in turn.items {
+                item.detachFromContext()
+            }
+            turn.detachFromContext()
+        }
+        turns = []
+        items = []
+        turnsByID = [:]
+        itemsByMergeKey = [:]
+        itemsByTurnID = [:]
+        liveMergeState = LiveMergeState()
+        provisionalSeedTurnID = nil
+        seededReviewTurnID = nil
         workspace = nil
         modelContext = nil
     }
@@ -738,13 +775,18 @@ public final class CodexChat: CodexPersistentModel {
         }
     }
 
-    public nonisolated(nonsending) func observe(
-        includeTurns: Bool = true
+    public func observe(
+        includeTurns: Bool = true,
+        isolation: isolated any Actor = #isolation
     ) async throws -> CodexChatObservation {
         guard let modelContext else {
             throw CodexModelContextError.modelIsDetached
         }
-        return try await modelContext.observe(self, includeTurns: includeTurns)
+        return try await modelContext.observe(
+            self,
+            includeTurns: includeTurns,
+            isolation: isolation
+        )
     }
 
     private func shouldApplyOptionalMetadata<Value>(_ incoming: Value?, existing: Value?) -> Bool {
@@ -858,13 +900,99 @@ public final class CodexChat: CodexPersistentModel {
     private func normalizedIncomingTurnRecords(
         _ records: [CodexTurnSnapshot]
     ) -> [CodexTurnSnapshot] {
-        recordsByRemovingReplacedProvisionalSeed(records).map { record in
+        let normalized = recordsByRemovingReplacedProvisionalSeed(records).map { record in
             var record = record
             record.items = itemsByReplacingFallbackAgentMessageItems(record.items)
             if let liveTurnID = liveTurnID(adopting: record) {
                 record.id = liveTurnID
             }
             return record
+        }
+        var recordsByID: [CodexTurnID: Int] = [:]
+        var coalesced: [CodexTurnSnapshot] = []
+        coalesced.reserveCapacity(normalized.count)
+        for record in normalized {
+            guard let index = recordsByID[record.id] else {
+                recordsByID[record.id] = coalesced.count
+                coalesced.append(record)
+                continue
+            }
+            coalesced[index] = coalescing(coalesced[index], with: record)
+        }
+        return coalesced
+    }
+
+    private func coalescing(
+        _ existing: CodexTurnSnapshot,
+        with incoming: CodexTurnSnapshot
+    ) -> CodexTurnSnapshot {
+        precondition(existing.id == incoming.id)
+        return CodexTurnSnapshot(
+            id: existing.id,
+            state: incoming.state,
+            itemsLoadState: mostCompleteItemsLoadState(
+                existing.itemsLoadState,
+                incoming.itemsLoadState
+            ),
+            items: coalescingItems(existing.items, with: incoming.items, turnID: existing.id),
+            startedAt: earliest(existing.startedAt, incoming.startedAt),
+            completedAt: latest(existing.completedAt, incoming.completedAt),
+            duration: incoming.duration ?? existing.duration
+        )
+    }
+
+    private func coalescingItems(
+        _ existing: [CodexThreadItem],
+        with incoming: [CodexThreadItem],
+        turnID: CodexTurnID
+    ) -> [CodexThreadItem] {
+        var items: [CodexThreadItem] = []
+        var itemIndexByKey: [CodexChatItemKey: Int] = [:]
+        for item in existing + incoming {
+            let key = CodexChatItemKey(threadItem: item, turnID: turnID)
+            if let index = itemIndexByKey[key] {
+                items[index] = item
+            } else {
+                itemIndexByKey[key] = items.count
+                items.append(item)
+            }
+        }
+        return items
+    }
+
+    private func mostCompleteItemsLoadState(
+        _ lhs: CodexTurnItemsLoadState,
+        _ rhs: CodexTurnItemsLoadState
+    ) -> CodexTurnItemsLoadState {
+        switch (lhs, rhs) {
+        case (.full, _), (_, .full):
+            .full
+        case (.summary, _), (_, .summary):
+            .summary
+        case (.notLoaded, .notLoaded):
+            .notLoaded
+        }
+    }
+
+    private func earliest(_ lhs: Date?, _ rhs: Date?) -> Date? {
+        switch (lhs, rhs) {
+        case (.some(let lhs), .some(let rhs)):
+            min(lhs, rhs)
+        case (.some(let value), .none), (.none, .some(let value)):
+            value
+        case (.none, .none):
+            nil
+        }
+    }
+
+    private func latest(_ lhs: Date?, _ rhs: Date?) -> Date? {
+        switch (lhs, rhs) {
+        case (.some(let lhs), .some(let rhs)):
+            max(lhs, rhs)
+        case (.some(let value), .none), (.none, .some(let value)):
+            value
+        case (.none, .none):
+            nil
         }
     }
 
@@ -981,7 +1109,6 @@ public final class CodexChat: CodexPersistentModel {
                 let turn = contextTurn(id: record.id)
                 if let existing = existingByKey[incomingKey]
                     ?? fallbackAgentMessageItem(matching: incomingItem, turnID: record.id)
-                    ?? reviewModeMarkerItem(matching: incomingItem, turnID: record.id)
                 {
                     let identifier = ObjectIdentifier(existing)
                     guard reusedItems.insert(identifier).inserted else {
@@ -1336,12 +1463,7 @@ public final class CodexChat: CodexPersistentModel {
                 && fallbackItem == nil
                 ? commandReplayItem(matching: incomingItem, turnID: turnID)
                 : nil
-            let markerItem = indexedItem == nil
-                && fallbackItem == nil
-                && replayItem == nil
-                ? reviewModeMarkerItem(matching: incomingItem, turnID: turnID)
-                : nil
-            let existingItem = indexedItem ?? fallbackItem ?? replayItem ?? markerItem
+            let existingItem = indexedItem ?? fallbackItem ?? replayItem
             if let existing = existingItem
             {
                 let previousItem = existing.threadItem
@@ -1419,23 +1541,6 @@ public final class CodexChat: CodexPersistentModel {
             }
         }
         return changes
-    }
-
-    // A turn enters and exits review mode at most once, but the live
-    // notification and the rollout materialization carry different item ids
-    // for the same marker (real item id vs index-synthesized id). Resolve
-    // review-mode markers as per-turn singletons so both identities merge
-    // into one item.
-    private func reviewModeMarkerItem(
-        matching incomingItem: CodexThreadItem,
-        turnID: CodexTurnID?
-    ) -> CodexItem? {
-        guard incomingItem.isReviewModeMarker, let turnID else {
-            return nil
-        }
-        return items.first { item in
-            item.kind == incomingItem.kind && item.turnID == turnID
-        }
     }
 
     private func fallbackAgentMessageItem(
@@ -1626,7 +1731,11 @@ public final class CodexChat: CodexPersistentModel {
         default:
             return incomingItem
         }
-        return itemByReplacingContent(in: incomingItem, with: content)
+        return itemByReplacingContent(
+            in: incomingItem,
+            with: content,
+            preservingSemanticMetadataFrom: existingItem
+        )
     }
 
     private func mergedLifecycleStatus(
@@ -1744,12 +1853,16 @@ public final class CodexChat: CodexPersistentModel {
 
     private func itemByReplacingContent(
         in item: CodexThreadItem,
-        with content: CodexThreadItem.Content
+        with content: CodexThreadItem.Content,
+        preservingSemanticMetadataFrom metadataSource: CodexThreadItem? = nil
     ) -> CodexThreadItem {
-        CodexThreadItem(
+        let metadataSource = metadataSource ?? item
+        return CodexThreadItem(
             id: item.id,
             kind: item.kind,
             content: content,
+            origin: metadataSource.origin,
+            semanticRelation: metadataSource.semanticRelation,
             rawPayload: item.rawPayload
         )
     }
@@ -1888,6 +2001,8 @@ public final class CodexChat: CodexPersistentModel {
             id: existingItem.id,
             kind: existingItem.kind,
             content: content,
+            origin: existingItem.origin,
+            semanticRelation: existingItem.semanticRelation,
             rawPayload: incomingItem.rawPayload ?? existingItem.rawPayload
         )
     }
@@ -2357,9 +2472,6 @@ public final class CodexChat: CodexPersistentModel {
                 retainedItems.insert(ObjectIdentifier(item))
             }
             if let item = commandReplayItem(matching: incomingItem, turnID: turnID) {
-                retainedItems.insert(ObjectIdentifier(item))
-            }
-            if let item = reviewModeMarkerItem(matching: incomingItem, turnID: turnID) {
                 retainedItems.insert(ObjectIdentifier(item))
             }
         }

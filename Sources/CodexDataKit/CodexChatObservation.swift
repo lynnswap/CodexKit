@@ -77,6 +77,8 @@ public final class CodexChatObservation {
     }
 
     private let leaseID: UUID
+    // The stream must not outlive the context that applies its events.
+    private let modelContext: CodexModelContext
     private let releaseSignal: ChatObservationReleaseSignal
     private let closeState = Mutex<CloseState>(.open)
 
@@ -84,11 +86,13 @@ public final class CodexChatObservation {
         chat: CodexChat,
         updates: CodexChatUpdates,
         leaseID: UUID,
+        modelContext: CodexModelContext,
         releaseSignal: ChatObservationReleaseSignal
     ) {
         self.chat = chat
         self.updates = updates
         self.leaseID = leaseID
+        self.modelContext = modelContext
         self.releaseSignal = releaseSignal
     }
 
@@ -123,6 +127,10 @@ public final class CodexChatObservation {
         }
         guard shouldRelease else { return }
         releaseSignal.release(leaseID)
+    }
+
+    package var releaseSignalForTesting: ChatObservationReleaseSignal {
+        releaseSignal
     }
 
     deinit {
@@ -398,6 +406,7 @@ package final class ChatObservationReleaseSignal: Sendable {
         var acknowledgementsByLeaseID: [UUID: [ChatObservationReleaseAcknowledgement]] = [:]
         var receiverIsActive = false
         var isTerminated = false
+        var receiverDidComplete = false
     }
 
     private let state = Mutex(State())
@@ -491,6 +500,7 @@ package final class ChatObservationReleaseSignal: Sendable {
         let acknowledgements = state.withLock { state in
             let acknowledgements = state.acknowledgementsByLeaseID.values.flatMap { $0 }
             state.acknowledgementsByLeaseID.removeAll(keepingCapacity: false)
+            state.receiverDidComplete = true
             return acknowledgements
         }
         for acknowledgement in acknowledgements {
@@ -500,6 +510,10 @@ package final class ChatObservationReleaseSignal: Sendable {
 
     package func releasedLeaseCountForTesting() -> Int {
         state.withLock { $0.releasedLeaseIDs.count }
+    }
+
+    package func receiverDidCompleteForTesting() -> Bool {
+        state.withLock { $0.receiverDidComplete }
     }
 
     private func beginReceive() -> Bool {

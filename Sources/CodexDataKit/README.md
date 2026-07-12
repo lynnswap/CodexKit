@@ -6,12 +6,11 @@ Use this package when app or UI code needs workspace group, workspace, and chat 
 
 ## Main Types
 
-- `CodexModelContainer`: Owns the `CodexAppServer` and vends the main `CodexModelContext`.
+- `CodexModelContainer`: Associates a `CodexAppServer` with an eagerly created main-actor `CodexModelContext`.
 - `CodexModelContext`: Fetches models, preserves model identity, and performs app-server actions for attached models.
-- `CodexFetchDescriptor`: SwiftData-style value description of predicate, sort order, limit, offset, and pending-change inclusion.
-- `CodexFetchRequest`: CoreData-style mutable request object for predicate, sort descriptors, limit, offset, and pending-change inclusion.
-- `CodexFetchedResults`: Observable CoreData-style fetch results with items, optional sections, cursors, loading phase, and errors.
-- `CodexFetchedResultsController`: Non-UI fetched-results controller that keeps `CodexFetchedResults` as the current-value owner and exposes ordered snapshot transactions.
+- `CodexModelActor`, `CodexDefaultSerialModelExecutor`: Own a separate context graph on a serial model-actor executor.
+- `CodexFetchDescriptor`: Value description of predicate, sort order, limit, offset, and context-change inclusion.
+- `CodexFetchedResults`: The observable owner of query criteria, items, optional sections, cursors, typed phase, identity snapshot, and ordered transactions.
 - `CodexFetchedResultsSnapshot`, `CodexFetchedResultsTransaction`: Section and item ID snapshots plus section/item changes suitable for conversion to native UI update APIs.
 - `CodexPersistentModel`: SwiftData-style model protocol. The protocol itself is not main-actor isolated; concrete context ownership decides the isolation domain.
 - `CodexWorkspaceGroup`, `CodexWorkspace`, `CodexChat`, `CodexTurn`, `CodexItem`: Observable model objects attached to a model context.
@@ -21,9 +20,11 @@ Use this package when app or UI code needs workspace group, workspace, and chat 
 ## Quick Start
 
 ```swift
+import CodexAppServerKit
 import CodexDataKit
 
-let container = try await CodexModelContainer()
+let appServer = try await CodexAppServer()
+let container = CodexModelContainer(appServer: appServer)
 let context = container.mainContext
 
 let chats = context.fetchedResults(for: CodexFetchDescriptor<CodexChat>.recentChats)
@@ -32,11 +33,19 @@ try await chats.performFetch()
 for chat in chats.items {
     print(chat.title)
 }
+
+await appServer.close()
 ```
+
+The container does not take app-server close authority. `init(appServer:)` associates
+a caller-managed server, and the owner that created that server remains responsible
+for closing it. Internally, contexts retain a context-family coordinator rather than
+the container facade, so retaining a context does not create a container/main-context
+cycle or silently lose cross-context delivery.
 
 ## Fetching
 
-Use `CodexFetchDescriptor` when you want SwiftData-style value configuration:
+Use `CodexFetchDescriptor` as the canonical query value:
 
 ```swift
 let workspaceID = CodexWorkspaceID(rawValue: workspaceURL.standardizedFileURL.resolvingSymlinksInPath().path)
@@ -57,21 +66,6 @@ let results = context.fetchedResults(
 try await results.performFetch()
 ```
 
-Use `CodexFetchRequest` when request construction reads better as a mutable CoreData-like object:
-
-```swift
-let request = CodexFetchRequest<CodexChat>()
-let workspaceID = CodexWorkspaceID(rawValue: workspaceURL.standardizedFileURL.resolvingSymlinksInPath().path)
-request.predicate = #Predicate<CodexChat> { chat in
-    chat.isArchived == false && chat.workspaceID == workspaceID
-}
-request.sortDescriptors = [CodexSortDescriptor(\.updatedAt, order: .reverse)]
-request.fetchLimit = 100
-
-let results = context.fetchedResults(for: request)
-try await results.performFetch()
-```
-
 Sort descriptors use the known key-path contract directly. A key path must map to a
 supported CodexDataKit model field; arbitrary key paths are not silently treated as
 app-server sorts. Section descriptors support the same key-path style, plus
@@ -85,12 +79,17 @@ evaluated literally: if it does not mention `isArchived`, CodexDataKit fetches a
 merges both active and archived server scopes. Add `chat.isArchived == false` when a
 consumer wants active chats only.
 
-Chat fetches include pending/live context changes by default, matching SwiftData's
-`includePendingChanges` shape. A `CodexChat` created or actively observed by the
+Chat fetches include eligible context changes by default. A `CodexChat` created or actively observed by the
 context remains eligible for fetch results when the app-server thread list
 temporarily omits it, as long as the predicate can be decided locally. Set
-`includePendingChanges` to `false` on `CodexFetchDescriptor` or `CodexFetchRequest`
+`includeContextChanges` to `false` on `CodexFetchDescriptor`
 when a fetch should report only the server-owned page membership.
+
+Every effective local ordering ends with the model's typed ID in the primary sort
+direction. The pinned app-server's `createdAt` and `updatedAt` cursors do not include
+that tie-breaker, so those sorts enumerate the server through its stable `recencyAt`
+cursor and then sort/page locally. Only a single primary `recencyAt` sort uses direct
+server paging.
 
 Fetches preserve object identity. If the same app-server thread appears in a later refresh, CodexDataKit mutates the existing `CodexChat` instance instead of replacing it.
 
@@ -142,20 +141,20 @@ let chats = context.fetchedResults(
 )
 ```
 
-Passing no section descriptor gives a single unsectioned result. Section identifiers stay typed as `CodexFetchSectionID`, so workspace and workspace-group sections can be used directly in UI selection state.
+Passing no section descriptor gives a single unsectioned result. Section identifiers stay typed as `CodexFetchSectionID`, so workspace and workspace-group sections can be used directly in UI selection state. Sectioning is a projection after global sorting, offset, and limit: section order follows each section's first item, and members preserve global relative order. A section key is not silently inserted as the primary sort.
 
 ## Fetched Results Transactions
 
-Use `CodexFetchedResultsController` when non-SwiftUI UI code needs ordered changes instead of only the observable current value.
+Use `CodexFetchedResults` when non-SwiftUI UI code needs ordered changes instead of only the observable current value.
 
 ```swift
-let controller = context.fetchedResultsController(
+let results = context.fetchedResults(
     for: CodexFetchDescriptor<CodexChat>.recentChats,
     sectionedBy: .workspaceGroup
 )
 
 Task {
-    for await transaction in controller.transactions {
+    for await transaction in results.transactions {
         apply(
             oldSnapshot: transaction.oldSnapshot,
             newSnapshot: transaction.newSnapshot,
@@ -165,10 +164,10 @@ Task {
     }
 }
 
-try await controller.performFetch()
+try await results.performFetch()
 ```
 
-The controller does not fetch or store a second copy of the model graph. Its `items`, `sections`, `snapshot`, cursors, and phase are forwarded from the underlying `CodexFetchedResults`, and transactions are emitted from the same state updates that mutate those current values. Snapshots contain section IDs, optional titles, and item IDs only; section and item changes are ordered and include insert, delete, move, and update cases. The transaction stream buffers only the newest transaction. Every transaction carries complete old and new identity snapshots, so a consumer whose current snapshot no longer equals `oldSnapshot` replaces it with `newSnapshot` instead of replaying stale granular changes.
+`CodexFetchedResults` is the single owner of both current values and transactions; there is no forwarding controller or second model graph. Snapshots contain section IDs, optional titles, and item IDs only; section and item changes are ordered and include insert, delete, move, and update cases. The transaction stream buffers only the newest transaction. Every transaction carries complete old and new identity snapshots, so a consumer whose current snapshot no longer equals `oldSnapshot` replaces it with `newSnapshot` instead of replaying stale granular changes.
 
 CodexDataKit does not import AppKit, UIKit, or SwiftUI for this API. Convert `CodexFetchedResultsTransaction` into `NSCollectionView`, `UICollectionView`, diffable data source, or `NSOutlineView` updates in the UI layer. Detail transcript streams remain the responsibility of `CodexChat.observe()`.
 
@@ -182,26 +181,51 @@ let chat = try await workspace?.startChat()
 try await chat?.send("Explain the latest diff.")
 ```
 
-Attached models expose their context:
+Attached models expose their context for identity and model operations. App-server
+lifecycle remains owned by the composition root, not by a model:
 
 ```swift
-if let server = chat?.modelContext?.appServer {
-    print(server)
+let sameContext = chat?.modelContext === context
+print(sameContext)
+```
+
+Each CodexDataKit model graph is owned by the context that vended it. The container
+eagerly creates its UI-facing `mainContext`, similar to SwiftData's
+`ModelContainer.mainContext`. A `CodexModelActor` creates a separate context through
+`CodexDefaultSerialModelExecutor`; its actor-isolated `modelContext` is the only
+mutation entry point for that graph.
+
+```swift
+actor IndexWorker: CodexModelActor {
+    nonisolated let modelContainer: CodexModelContainer
+    nonisolated let modelExecutor: CodexDefaultSerialModelExecutor
+
+    init(container: CodexModelContainer) {
+        modelContainer = container
+        modelExecutor = CodexDefaultSerialModelExecutor(modelContainer: container)
+    }
+
+    func recentChatIDs() async throws -> [CodexThreadID] {
+        try await modelContext.fetch(
+            CodexFetchDescriptor<CodexChat>.recentChats
+        ).map(\.id)
+    }
 }
 ```
 
-Current CodexDataKit models are owned by the container's main context. Treat model
-instances like Core Data or SwiftData model objects: keep them inside the context
-that vended them, mutate same-identity objects in place, and pass semantic IDs or
-value DTOs across concurrency domains. Do not make UI-owned mirrors of model
-properties just to observe changes.
-
-The main context is the UI-facing context, similar to SwiftData's
-`ModelContainer.mainContext`. Future background contexts or model actors should own
-their own model instances and merge by semantic IDs, not share mutable model
-objects across actors.
+Treat these instances like Core Data or SwiftData model objects: keep them inside
+their vending context, mutate same-identity objects in place, and pass semantic IDs
+or value DTOs across concurrency domains. Main and model-actor contexts own distinct
+instances and merge supported changes by semantic identity; they never share a
+mutable model object. Do not make UI-owned mirrors of model properties just to
+observe changes.
 
 Keep review-specific state, parsed findings, and review timelines outside CodexDataKit. CodexDataKit owns generic Codex app-server data models; higher-level packages can layer their own indices on top of `CodexChat.id`, workspace IDs, or sectioned fetch results.
+
+When a consumer needs the canonical transcript for one loaded turn, use
+`chat.transcript(in:)`. This projection is built by the chat owner from the
+context's current items; consumers do not reconstruct `CodexThreadItem` values
+or invent a separate output cache.
 
 ## Live Chat Observation
 
@@ -231,7 +255,7 @@ Item removal and text-append updates use `CodexChatItemLocator`, whose turn ID, 
 
 `CodexChatObservation.chat` remains the context-owned semantic action and identity handle. Do not reread it to apply an update: the graph may already contain later mutations. Keep selection state as semantic IDs and build app-specific presentation state only from event payloads. `CodexChatUpdate.affectedTurnID` can scope update handling after the projection has validated and applied the event cursor.
 
-Subscriber queues are bounded. A slow subscriber receives a complete `.bufferOverflow` snapshot instead of an unbounded delta backlog. Explicit `close()` finishes that subscriber and waits for its release; closing the last lease also cancels and joins the shared upstream pump. Iterator task cancellation releases the same lease. Dropping the observation sends a synchronous best-effort release, but normal teardown should always await `close()`.
+Subscriber queues are bounded. A slow subscriber receives a complete `.bufferOverflow` snapshot instead of an unbounded delta backlog. An observation handle retains its context while the handle is alive, so its stream never silently outlives the mutation owner. Explicit `close()` finishes that subscriber and waits for its lease release; closing the last lease also cancels and joins the shared upstream pump. Iterator task cancellation releases the same lease. Deinitialization only signals release and cannot await pump completion, so lifecycle owners should call and await `close()` during normal teardown.
 
 CodexDataKit may read app-server thread snapshots internally to establish or reconcile the current value. Those reads are not part of the observation stream. Once live events have advanced an observed chat, later thread reads are merged into the existing model and must not rewind already-applied live turns or items unless an explicit model operation such as rollback requests replacement.
 
@@ -286,16 +310,20 @@ import Testing
 
 @MainActor
 @Test func loadsChats() async throws {
-    let runtime = try await CodexAppServerTestRuntime.start(threads: [
-        .init(id: "thread-1", name: "First")
-    ])
+    let runtime = try await CodexAppServerTestRuntime.start(threads: [])
 
-    let context = CodexModelContainer(appServer: runtime.server).mainContext
+    let container = CodexModelContainer(appServer: runtime.server)
+    let context = container.mainContext
     let results = context.fetchedResults(for: CodexFetchDescriptor<CodexChat>.recentChats)
     try await results.performFetch()
 
-    #expect(results.items.first?.title == "First")
+    #expect(results.items.isEmpty)
+    await runtime.close()
 }
 ```
+
+Use `CodexAppServerTestStoredThread` when a test needs nonempty results. The
+fixture owns the complete current-v2 thread/turn wire value and validates its
+`CodexThreadSnapshot` projection instead of re-encoding production models.
 
 For lower-level app-server APIs, see [../CodexAppServerKit/README.md](../CodexAppServerKit/README.md).

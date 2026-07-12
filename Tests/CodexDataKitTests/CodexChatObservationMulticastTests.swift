@@ -11,12 +11,12 @@ struct CodexChatObservationMulticastTests {
         let runtime = try await CodexAppServerTestRuntime.start()
         let context = CodexModelContainer(appServer: runtime.server).mainContext
 
-        try await runtime.transport.enqueueThreadResume(.init(id: "thread-multicast"))
-        try await runtime.transport.enqueueThreadRead(.init(
-            id: "thread-multicast",
-            status: .idle,
-            turns: []
-        ))
+        try await runtime.transport.enqueueThreadResume(
+            try observationStoredThread(id: "thread-multicast")
+        )
+        try await runtime.transport.enqueueThreadRead(
+            try observationStoredThread(id: "thread-multicast")
+        )
 
         let chat = context.model(for: CodexThreadID(rawValue: "thread-multicast"))
         let observation = try await chat.observe()
@@ -50,12 +50,12 @@ struct CodexChatObservationMulticastTests {
         let threadID = CodexThreadID(rawValue: "thread-typed-emitter")
         let turnID = CodexTurnID(rawValue: "turn-typed-emitter")
 
-        try await runtime.transport.enqueueThreadResume(.init(id: threadID))
-        try await runtime.transport.enqueueThreadRead(.init(
-            id: threadID,
-            status: .idle,
-            turns: []
-        ))
+        try await runtime.transport.enqueueThreadResume(
+            try observationStoredThread(id: threadID)
+        )
+        try await runtime.transport.enqueueThreadRead(
+            try observationStoredThread(id: threadID)
+        )
 
         let chat = context.model(for: threadID)
         let observation = try await chat.observe()
@@ -194,8 +194,12 @@ struct CodexChatObservationMulticastTests {
         let context = CodexModelContainer(appServer: runtime.server).mainContext
         let threadID = CodexThreadID(rawValue: "thread-specialized-emitter")
         let turnID = CodexTurnID(rawValue: "turn-specialized-emitter")
-        try await runtime.transport.enqueueThreadResume(.init(id: threadID))
-        try await runtime.transport.enqueueThreadRead(.init(id: threadID, turns: []))
+        try await runtime.transport.enqueueThreadResume(
+            try observationStoredThread(id: threadID)
+        )
+        try await runtime.transport.enqueueThreadRead(
+            try observationStoredThread(id: threadID)
+        )
 
         let chat = context.model(for: threadID)
         let observation = try await chat.observe()
@@ -328,8 +332,12 @@ struct CodexChatObservationMulticastTests {
         let context = CodexModelContainer(appServer: runtime.server).mainContext
         let threadID = CodexThreadID(rawValue: "thread-terminal-emitter")
         let turnID = CodexTurnID(rawValue: "turn-terminal-emitter")
-        try await runtime.transport.enqueueThreadResume(.init(id: threadID))
-        try await runtime.transport.enqueueThreadRead(.init(id: threadID, turns: []))
+        try await runtime.transport.enqueueThreadResume(
+            try observationStoredThread(id: threadID)
+        )
+        try await runtime.transport.enqueueThreadRead(
+            try observationStoredThread(id: threadID)
+        )
 
         let chat = context.model(for: threadID)
         let observation = try await chat.observe()
@@ -372,12 +380,12 @@ struct CodexChatObservationMulticastTests {
         let runtime = try await CodexAppServerTestRuntime.start()
         let context = CodexModelContainer(appServer: runtime.server).mainContext
 
-        try await runtime.transport.enqueueThreadResume(.init(id: "thread-no-consumer"))
-        try await runtime.transport.enqueueThreadRead(.init(
-            id: "thread-no-consumer",
-            status: .idle,
-            turns: []
-        ))
+        try await runtime.transport.enqueueThreadResume(
+            try observationStoredThread(id: "thread-no-consumer")
+        )
+        try await runtime.transport.enqueueThreadRead(
+            try observationStoredThread(id: "thread-no-consumer")
+        )
 
         let chat = context.model(for: CodexThreadID(rawValue: "thread-no-consumer"))
         let observation = try await chat.observe()
@@ -409,12 +417,12 @@ struct CodexChatObservationMulticastTests {
         let runtime = try await CodexAppServerTestRuntime.start()
         let context = CodexModelContainer(appServer: runtime.server).mainContext
 
-        try await runtime.transport.enqueueThreadResume(.init(id: "thread-no-duplicate"))
-        try await runtime.transport.enqueueThreadRead(.init(
-            id: "thread-no-duplicate",
-            status: .idle,
-            turns: []
-        ))
+        try await runtime.transport.enqueueThreadResume(
+            try observationStoredThread(id: "thread-no-duplicate")
+        )
+        try await runtime.transport.enqueueThreadRead(
+            try observationStoredThread(id: "thread-no-duplicate")
+        )
 
         let chat = context.model(for: CodexThreadID(rawValue: "thread-no-duplicate"))
         let observation = try await chat.observe()
@@ -451,12 +459,12 @@ struct CodexChatObservationMulticastTests {
         let runtime = try await CodexAppServerTestRuntime.start()
         let context = CodexModelContainer(appServer: runtime.server).mainContext
 
-        try await runtime.transport.enqueueThreadResume(.init(id: "thread-finish-multicast"))
-        try await runtime.transport.enqueueThreadRead(.init(
-            id: "thread-finish-multicast",
-            status: .idle,
-            turns: []
-        ))
+        try await runtime.transport.enqueueThreadResume(
+            try observationStoredThread(id: "thread-finish-multicast")
+        )
+        try await runtime.transport.enqueueThreadRead(
+            try observationStoredThread(id: "thread-finish-multicast")
+        )
 
         let chat = context.model(for: CodexThreadID(rawValue: "thread-finish-multicast"))
         let observation = try await chat.observe()
@@ -484,12 +492,12 @@ struct CodexChatObservationMulticastTests {
         let runtime = try await CodexAppServerTestRuntime.start()
         let context = CodexModelContainer(appServer: runtime.server).mainContext
 
-        try await runtime.transport.enqueueThreadResume(.init(id: "thread-close-leases"))
-        try await runtime.transport.enqueueThreadRead(.init(
-            id: "thread-close-leases",
-            status: .idle,
-            turns: []
-        ))
+        try await runtime.transport.enqueueThreadResume(
+            try observationStoredThread(id: "thread-close-leases")
+        )
+        try await runtime.transport.enqueueThreadRead(
+            try observationStoredThread(id: "thread-close-leases")
+        )
         let chat = context.model(for: CodexThreadID(rawValue: "thread-close-leases"))
         let first = try await chat.observe()
         let second = try await chat.observe()
@@ -515,12 +523,12 @@ struct CodexChatObservationMulticastTests {
         await second.close()
         #expect(await secondRecorder.waitUntilFinished())
 
-        try await runtime.transport.enqueueThreadResume(.init(id: "thread-close-leases"))
-        try await runtime.transport.enqueueThreadRead(.init(
-            id: "thread-close-leases",
-            status: .idle,
-            turns: []
-        ))
+        try await runtime.transport.enqueueThreadResume(
+            try observationStoredThread(id: "thread-close-leases")
+        )
+        try await runtime.transport.enqueueThreadRead(
+            try observationStoredThread(id: "thread-close-leases")
+        )
         let restarted = try await chat.observe()
         var restartedEvents = restarted.updates.makeAsyncIterator()
         let initial = try #require(await restartedEvents.next())
@@ -564,12 +572,12 @@ struct CodexChatObservationMulticastTests {
     func iteratorCancellationReleasesLease() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         let context = CodexModelContainer(appServer: runtime.server).mainContext
-        try await runtime.transport.enqueueThreadResume(.init(id: "thread-iterator-cancel"))
-        try await runtime.transport.enqueueThreadRead(.init(
-            id: "thread-iterator-cancel",
-            status: .idle,
-            turns: []
-        ))
+        try await runtime.transport.enqueueThreadResume(
+            try observationStoredThread(id: "thread-iterator-cancel")
+        )
+        try await runtime.transport.enqueueThreadRead(
+            try observationStoredThread(id: "thread-iterator-cancel")
+        )
         let chat = context.model(for: CodexThreadID(rawValue: "thread-iterator-cancel"))
         let observation = try await chat.observe()
         let consumer = Task { @MainActor in
@@ -580,12 +588,12 @@ struct CodexChatObservationMulticastTests {
         await consumer.value
         await observation.close()
 
-        try await runtime.transport.enqueueThreadResume(.init(id: "thread-iterator-cancel"))
-        try await runtime.transport.enqueueThreadRead(.init(
-            id: "thread-iterator-cancel",
-            status: .idle,
-            turns: []
-        ))
+        try await runtime.transport.enqueueThreadResume(
+            try observationStoredThread(id: "thread-iterator-cancel")
+        )
+        try await runtime.transport.enqueueThreadRead(
+            try observationStoredThread(id: "thread-iterator-cancel")
+        )
         let restarted = try await chat.observe()
         var events = restarted.updates.makeAsyncIterator()
         let initial = try #require(await events.next())
@@ -597,6 +605,47 @@ struct CodexChatObservationMulticastTests {
         #expect(reason == .generationRestart)
         await restarted.close()
     }
+}
+
+private func observationStoredThread(
+    id: CodexThreadID
+) throws -> CodexAppServerTestStoredThread {
+    let workspace = URL(fileURLWithPath: "/tmp/codex-data-kit-observation", isDirectory: true)
+    return try .init(
+        snapshot: .init(
+            id: id,
+            workspace: workspace,
+            preview: id.rawValue,
+            modelProvider: "openai",
+            sourceKind: .appServer,
+            createdAt: Date(timeIntervalSince1970: 10),
+            updatedAt: Date(timeIntervalSince1970: 20),
+            status: .idle,
+            ephemeral: false,
+            turns: []
+        ),
+        turns: [],
+        metadata: .init(
+            sessionID: "session-\(id.rawValue)",
+            cliVersion: "codex-cli-test",
+            source: .appServer
+        ),
+        runtimeMetadata: .init(
+            model: "gpt-5",
+            modelProvider: "openai",
+            serviceTier: nil,
+            cwd: workspace,
+            runtimeWorkspaceRoots: [workspace],
+            instructionSources: [],
+            approvalPolicy: .never,
+            approvalsReviewer: .user,
+            sandbox: .dangerFullAccess,
+            activePermissionProfile: nil,
+            reasoningEffort: nil,
+            multiAgentMode: .explicitRequestOnly
+        ),
+        isArchived: false
+    )
 }
 
 private struct ObservationTestThreadItemParams: Encodable, Sendable {

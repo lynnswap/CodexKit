@@ -48,6 +48,26 @@ public struct CodexAppServerTestItem: Equatable, Sendable {
         self.wireValue = .object(fields)
     }
 
+    public static func userMessage(id: String, text: String) throws -> Self {
+        try validateID(id)
+        var fields = baseFields(id: id, type: "userMessage")
+        fields["content"] = .array([
+            .object([
+                "type": .string("text"),
+                "text": .string(text),
+                "textElements": .array([]),
+            ])
+        ])
+        return Self(
+            domainProjection: .init(
+                id: id,
+                kind: .userMessage,
+                content: .message(.init(id: id, role: .user, text: text))
+            ),
+            fields: fields
+        )
+    }
+
     public static func agentMessage(
         id: String,
         text: String,
@@ -273,11 +293,233 @@ public struct CodexAppServerTestItem: Equatable, Sendable {
     }
 }
 
+public enum CodexAppServerTestAuthMode: Equatable, Sendable {
+    case apiKey
+    case chatGPT
+    case chatGPTAuthTokens
+    case headers
+    case agentIdentity
+    case personalAccessToken
+    case bedrockAPIKey
+
+    package var wireValue: String {
+        switch self {
+        case .apiKey: "apikey"
+        case .chatGPT: "chatgpt"
+        case .chatGPTAuthTokens: "chatGPTAuthTokens"
+        case .headers: "headers"
+        case .agentIdentity: "agentIdentity"
+        case .personalAccessToken: "personalAccessToken"
+        case .bedrockAPIKey: "bedrockApiKey"
+        }
+    }
+}
+
+public enum CodexAppServerTestPlanType: Equatable, Sendable {
+    case free
+    case go
+    case plus
+    case pro
+    case proLite
+    case team
+    case selfServeBusinessUsageBased
+    case business
+    case enterpriseCBPUsageBased
+    case enterprise
+    case edu
+    case unknown
+
+    package var wireValue: String {
+        switch self {
+        case .free: "free"
+        case .go: "go"
+        case .plus: "plus"
+        case .pro: "pro"
+        case .proLite: "prolite"
+        case .team: "team"
+        case .selfServeBusinessUsageBased: "self_serve_business_usage_based"
+        case .business: "business"
+        case .enterpriseCBPUsageBased: "enterprise_cbp_usage_based"
+        case .enterprise: "enterprise"
+        case .edu: "edu"
+        case .unknown: "unknown"
+        }
+    }
+}
+
+public struct CodexAppServerTestAccountUpdate: Equatable, Sendable {
+    public var authMode: CodexAppServerTestAuthMode?
+    public var planType: CodexAppServerTestPlanType?
+
+    public init(
+        authMode: CodexAppServerTestAuthMode?,
+        planType: CodexAppServerTestPlanType?
+    ) {
+        self.authMode = authMode
+        self.planType = planType
+    }
+}
+
+public struct CodexAppServerTestRateLimitSnapshot: Equatable, Sendable {
+    public enum ReachedType: Equatable, Sendable {
+        case rateLimitReached
+        case workspaceOwnerCreditsDepleted
+        case workspaceMemberCreditsDepleted
+        case workspaceOwnerUsageLimitReached
+        case workspaceMemberUsageLimitReached
+
+        fileprivate var wireValue: String {
+            switch self {
+            case .rateLimitReached: "rate_limit_reached"
+            case .workspaceOwnerCreditsDepleted: "workspace_owner_credits_depleted"
+            case .workspaceMemberCreditsDepleted: "workspace_member_credits_depleted"
+            case .workspaceOwnerUsageLimitReached: "workspace_owner_usage_limit_reached"
+            case .workspaceMemberUsageLimitReached: "workspace_member_usage_limit_reached"
+            }
+        }
+    }
+
+    public struct Window: Equatable, Sendable {
+        public var usedPercent: Int32
+        public var windowDurationMinutes: Int64?
+        public var resetsAtUnixSeconds: Int64?
+
+        public init(
+            usedPercent: Int32,
+            windowDurationMinutes: Int64?,
+            resetsAtUnixSeconds: Int64?
+        ) {
+            self.usedPercent = usedPercent
+            self.windowDurationMinutes = windowDurationMinutes
+            self.resetsAtUnixSeconds = resetsAtUnixSeconds
+        }
+
+        fileprivate var wireValue: CodexJSONValue {
+            .object([
+                "usedPercent": .int(Int(usedPercent)),
+                "windowDurationMins": windowDurationMinutes.map { .int(Int($0)) } ?? .null,
+                "resetsAt": resetsAtUnixSeconds.map { .int(Int($0)) } ?? .null,
+            ])
+        }
+    }
+
+    public struct Credits: Equatable, Sendable {
+        public var hasCredits: Bool
+        public var unlimited: Bool
+        public var balance: String?
+
+        public init(hasCredits: Bool, unlimited: Bool, balance: String?) {
+            self.hasCredits = hasCredits
+            self.unlimited = unlimited
+            self.balance = balance
+        }
+
+        fileprivate var wireValue: CodexJSONValue {
+            .object([
+                "hasCredits": .bool(hasCredits),
+                "unlimited": .bool(unlimited),
+                "balance": balance.map(CodexJSONValue.string) ?? .null,
+            ])
+        }
+    }
+
+    public struct SpendControl: Equatable, Sendable {
+        public var limit: String
+        public var used: String
+        public var remainingPercent: Int32
+        public var resetsAtUnixSeconds: Int64
+
+        public init(
+            limit: String,
+            used: String,
+            remainingPercent: Int32,
+            resetsAtUnixSeconds: Int64
+        ) throws {
+            guard limit.isEmpty == false, used.isEmpty == false else {
+                throw CodexAppServerTestError.invalidFixture(
+                    "rate-limit spend-control values must not be empty"
+                )
+            }
+            self.limit = limit
+            self.used = used
+            self.remainingPercent = remainingPercent
+            self.resetsAtUnixSeconds = resetsAtUnixSeconds
+        }
+
+        fileprivate var wireValue: CodexJSONValue {
+            .object([
+                "limit": .string(limit),
+                "used": .string(used),
+                "remainingPercent": .int(Int(remainingPercent)),
+                "resetsAt": .int(Int(resetsAtUnixSeconds)),
+            ])
+        }
+    }
+
+    public var limitID: String?
+    public var limitName: String?
+    public var primary: Window?
+    public var secondary: Window?
+    public var credits: Credits?
+    public var individualLimit: SpendControl?
+    public var planType: CodexAppServerTestPlanType?
+    public var reachedType: ReachedType?
+
+    public init(
+        limitID: String?,
+        limitName: String?,
+        primary: Window?,
+        secondary: Window?,
+        credits: Credits?,
+        individualLimit: SpendControl?,
+        planType: CodexAppServerTestPlanType?,
+        reachedType: ReachedType?
+    ) throws {
+        if let limitID, limitID.isEmpty {
+            throw CodexAppServerTestError.invalidFixture("rate-limit id must not be empty")
+        }
+        self.limitID = limitID
+        self.limitName = limitName
+        self.primary = primary
+        self.secondary = secondary
+        self.credits = credits
+        self.individualLimit = individualLimit
+        self.planType = planType
+        self.reachedType = reachedType
+    }
+
+    package var wireValue: CodexJSONValue {
+        .object([
+            "limitId": limitID.map(CodexJSONValue.string) ?? .null,
+            "limitName": limitName.map(CodexJSONValue.string) ?? .null,
+            "primary": primary?.wireValue ?? .null,
+            "secondary": secondary?.wireValue ?? .null,
+            "credits": credits?.wireValue ?? .null,
+            "individualLimit": individualLimit?.wireValue ?? .null,
+            "planType": planType.map { .string($0.wireValue) } ?? .null,
+            "rateLimitReachedType": reachedType.map { .string($0.wireValue) } ?? .null,
+        ])
+    }
+}
+
+public struct CodexAppServerTestRateLimitsUpdate: Equatable, Sendable {
+    public var snapshot: CodexAppServerTestRateLimitSnapshot
+
+    public init(snapshot: CodexAppServerTestRateLimitSnapshot) {
+        self.snapshot = snapshot
+    }
+}
+
+public enum CodexAppServerTestLoginCompletion: Equatable, Sendable {
+    case succeeded
+    case failed(message: String?)
+}
+
 public actor CodexAppServerTestNotificationEmitter {
     private var nextFixtureTimestampMilliseconds = 4_102_444_800_000
     private let transport: CodexAppServerTestTransport
 
-    package init(transport: CodexAppServerTestTransport) {
+    public init(transport: CodexAppServerTestTransport) {
         self.transport = transport
     }
 
@@ -515,6 +757,56 @@ public actor CodexAppServerTestNotificationEmitter {
                 "turnId": .string(turnID.rawValue),
                 "error": error.wireValueForTesting,
                 "willRetry": .bool(willRetry),
+            ])
+        )
+    }
+
+    public func emitAccountChanged(
+        _ update: CodexAppServerTestAccountUpdate
+    ) async throws {
+        try await transport.emitServerNotification(
+            method: "account/updated",
+            params: CodexJSONValue.object([
+                "authMode": update.authMode.map { .string($0.wireValue) } ?? .null,
+                "planType": update.planType.map { .string($0.wireValue) } ?? .null,
+            ])
+        )
+    }
+
+    public func emitRateLimitsUpdated(
+        _ update: CodexAppServerTestRateLimitsUpdate
+    ) async throws {
+        try await transport.emitServerNotification(
+            method: "account/rateLimits/updated",
+            params: CodexJSONValue.object([
+                "rateLimits": update.snapshot.wireValue,
+            ])
+        )
+    }
+
+    public func emitLoginCompleted(
+        loginID: CodexLoginHandle.ID,
+        completion: CodexAppServerTestLoginCompletion
+    ) async throws {
+        guard loginID.rawValue.isEmpty == false else {
+            throw CodexAppServerTestError.invalidFixture("login id must not be empty")
+        }
+        let success: Bool
+        let error: CodexJSONValue
+        switch completion {
+        case .succeeded:
+            success = true
+            error = .null
+        case .failed(let message):
+            success = false
+            error = message.map(CodexJSONValue.string) ?? .null
+        }
+        try await transport.emitServerNotification(
+            method: "account/login/completed",
+            params: CodexJSONValue.object([
+                "loginId": .string(loginID.rawValue),
+                "success": .bool(success),
+                "error": error,
             ])
         )
     }

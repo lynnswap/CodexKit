@@ -1447,6 +1447,19 @@ public struct CodexTranscript: Equatable, Sendable {
 }
 
 public struct CodexThreadItem: Identifiable, Equatable, Sendable {
+    public enum Origin: Hashable, Sendable {
+        case currentV2Item
+        case reviewRolloutAssistant
+    }
+
+    public enum SemanticTarget: Hashable, Sendable {
+        case exitedReviewMode
+    }
+
+    public enum SemanticRelation: Hashable, Sendable {
+        case companionOf(SemanticTarget)
+    }
+
     public enum Kind: Hashable, Sendable {
         case userMessage
         case agentMessage
@@ -1576,6 +1589,8 @@ public struct CodexThreadItem: Identifiable, Equatable, Sendable {
     public var id: String
     public var kind: Kind
     public var content: Content
+    public private(set) var origin: Origin
+    public private(set) var semanticRelation: SemanticRelation?
     public var rawPayload: Data?
 
     public init(
@@ -1584,10 +1599,39 @@ public struct CodexThreadItem: Identifiable, Equatable, Sendable {
         content: Content,
         rawPayload: Data? = nil
     ) {
+        let semanticMetadata = Self.semanticMetadata(id: id, kind: kind)
         self.id = id
         self.kind = kind
         self.content = content
+        self.origin = semanticMetadata.origin
+        self.semanticRelation = semanticMetadata.relation
         self.rawPayload = rawPayload
+    }
+
+    package init(
+        id: String,
+        kind: Kind,
+        content: Content,
+        origin: Origin,
+        semanticRelation: SemanticRelation?,
+        rawPayload: Data? = nil
+    ) {
+        self.id = id
+        self.kind = kind
+        self.content = content
+        self.origin = origin
+        self.semanticRelation = semanticRelation
+        self.rawPayload = rawPayload
+    }
+
+    private static func semanticMetadata(
+        id: String,
+        kind: Kind
+    ) -> (origin: Origin, relation: SemanticRelation?) {
+        guard kind == .agentMessage, id == "review_rollout_assistant" else {
+            return (.currentV2Item, nil)
+        }
+        return (.reviewRolloutAssistant, .companionOf(.exitedReviewMode))
     }
 
     public var text: String? {

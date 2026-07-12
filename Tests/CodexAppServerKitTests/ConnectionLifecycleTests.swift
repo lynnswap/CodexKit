@@ -558,7 +558,7 @@ private actor LateTerminationTestTransport: JSONRPC.Transport {
     }
 
     func nextInboundEvent() async throws -> JSONRPC.InboundEvent? {
-        await inboundGate.wait()
+        try await inboundGate.wait()
         return nil
     }
 
@@ -577,7 +577,7 @@ private actor LateTerminationTestTransport: JSONRPC.Transport {
     func finishPendingResponsesAfterInboundDrain(_ failure: CodexTransportFailure) async {}
 
     func waitForProcessExit() async -> JSONRPC.ProcessExitObservation {
-        await processExitGate.wait()
+        await processExitGate.waitIgnoringCancellation()
         return .failed(.io(errno: EIO, message: "late process observation"))
     }
 
@@ -613,26 +613,26 @@ private actor ResponsesOnlyDiagnosticTestTransport: JSONRPC.Transport {
         defer { inboundIndex += 1 }
         switch inboundIndex {
         case 0:
-            await malformedNotificationGate.wait()
+            try await malformedNotificationGate.wait()
             return .notification(.init(
                 method: "turn/completed",
                 params: Data(#"{}"#.utf8)
             ))
         case 1:
-            await droppedNotificationGate.wait()
+            try await droppedNotificationGate.wait()
             return .notification(.init(
                 method: "future/notification",
                 params: Data(#"{}"#.utf8)
             ))
         case 2:
-            await droppedServerRequestGate.wait()
+            try await droppedServerRequestGate.wait()
             return .serverRequest(
                 id: .string("request-after-failure"),
                 method: "item/commandExecution/requestApproval",
                 params: Data(#"{}"#.utf8)
             )
         case 3:
-            await inboundTerminalGate.wait()
+            try await inboundTerminalGate.wait()
             return nil
         default:
             preconditionFailure("The responses-only test transport has a fixed inbound script.")

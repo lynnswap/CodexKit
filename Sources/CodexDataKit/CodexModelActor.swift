@@ -2,21 +2,12 @@ import Dispatch
 
 public protocol CodexModelActor: Actor {
     nonisolated var modelContainer: CodexModelContainer { get }
-    nonisolated var modelExecutor: any CodexModelExecutor { get }
+    nonisolated var modelExecutor: CodexDefaultSerialModelExecutor { get }
 }
-
-public protocol CodexModelExecutor: Executor {
-    var modelContext: CodexModelContext { get }
-}
-
-public protocol CodexSerialModelExecutor: CodexModelExecutor, SerialExecutor {}
 
 public extension CodexModelActor {
     nonisolated var unownedExecutor: UnownedSerialExecutor {
-        guard let serialExecutor = modelExecutor as? any SerialExecutor else {
-            preconditionFailure("CodexModelActor requires a serial model executor.")
-        }
-        return serialExecutor.asUnownedSerialExecutor()
+        modelExecutor.asUnownedSerialExecutor()
     }
 
     var modelContext: CodexModelContext {
@@ -24,8 +15,10 @@ public extension CodexModelActor {
     }
 }
 
-public final class CodexDefaultSerialModelExecutor: @unchecked Sendable, CodexSerialModelExecutor {
-    public let modelContext: CodexModelContext
+// DispatchQueue serializes every job, and the context is package-only so it can
+// only be reached through CodexModelActor's actor-isolated modelContext property.
+public final class CodexDefaultSerialModelExecutor: @unchecked Sendable, SerialExecutor {
+    package let modelContext: CodexModelContext
 
     private let queue: DispatchQueue
 
@@ -33,7 +26,7 @@ public final class CodexDefaultSerialModelExecutor: @unchecked Sendable, CodexSe
         self.init(modelContext: CodexModelContext(modelContainer))
     }
 
-    public init(modelContext: CodexModelContext) {
+    package init(modelContext: CodexModelContext) {
         self.modelContext = modelContext
         self.queue = DispatchQueue(
             label: "com.openai.codex-data-kit.model-executor",
