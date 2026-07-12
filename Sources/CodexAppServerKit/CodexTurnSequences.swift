@@ -276,7 +276,7 @@ package struct CodexThreadLogSequence: AsyncSequence, Sendable {
             defer {
                 logEntryIndex += 1
             }
-            return "\(delta.itemID ?? "agent-message-delta"):\(logEntryIndex)"
+            return "\(delta.itemID):\(logEntryIndex)"
         }
 
         private mutating func nextDiagnosticLogEntryID(turnID: CodexTurnID) -> String {
@@ -665,7 +665,7 @@ package struct CodexTurnLogSequence: AsyncSequence, Sendable {
                     return .messageDelta(
                         delta,
                         turnID: turnID,
-                        id: "\(delta.itemID ?? "agent-message-delta"):\(logEntryIndex)"
+                        id: "\(delta.itemID):\(logEntryIndex)"
                     )
                 case .reasoningSummaryPartAdded(let part):
                     return .reasoningPartStarted(part, turnID: turnID)
@@ -845,10 +845,7 @@ private struct CodexTranscriptAccumulator {
                     id: message.id,
                     kind: message.role == .user ? .userMessage : .agentMessage,
                     content: .message(message)
-                ),
-                replacingFallbackID: message.role == .assistant
-                    ? CodexAgentMessageFallbackID.unscoped
-                    : nil
+                )
             )
             return true
         case .messageDelta(let delta):
@@ -882,16 +879,13 @@ private struct CodexTranscriptAccumulator {
         case .itemStarted(let item, _), .itemUpdated(let item, _), .itemCompleted(let item, _):
             upsert(item)
             return true
-        case .message(let message, let turnID):
+        case .message(let message, _):
             upsert(
                 .init(
                     id: message.id,
                     kind: message.role == .user ? .userMessage : .agentMessage,
                     content: .message(message)
-                ),
-                replacingFallbackID: message.role == .assistant
-                    ? scopedFallbackMessageID(turnID: turnID)
-                    : nil
+                )
             )
             return true
         case .messageDelta(let delta, _):
@@ -909,30 +903,13 @@ private struct CodexTranscriptAccumulator {
         }
     }
 
-    private mutating func upsert(
-        _ item: CodexThreadItem,
-        replacingFallbackID fallbackID: String? = nil
-    ) {
-        if let fallbackID,
-           fallbackID != item.id,
-           item.kind == .agentMessage,
-           itemIndexesByID[item.id] == nil,
-           let fallbackIndex = itemIndexesByID.removeValue(forKey: fallbackID)
-        {
-            itemIndexesByID[item.id] = fallbackIndex
-            items[fallbackIndex] = item
-            return
-        }
+    private mutating func upsert(_ item: CodexThreadItem) {
         if let index = itemIndexesByID[item.id] {
             items[index] = item
         } else {
             itemIndexesByID[item.id] = items.count
             items.append(item)
         }
-    }
-
-    private func scopedFallbackMessageID(turnID: CodexTurnID?) -> String {
-        CodexAgentMessageFallbackID.scoped(turnID: turnID)
     }
 
     private static func currentItem(from delta: CodexMessageDelta) -> CodexThreadItem {

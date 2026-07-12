@@ -4168,7 +4168,7 @@ struct CodexAppServerKitTests {
         )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
-            params: TurnDeltaParams(turnID: "turn-1", delta: "Done")
+            params: TurnDeltaParams(turnID: "turn-1", itemID: "message-1", delta: "Done")
         )
         try await transport.emitServerNotification(
             method: "turn/completed",
@@ -4290,6 +4290,7 @@ struct CodexAppServerKitTests {
             params: TurnDeltaParams(
                 threadID: "thread-1",
                 turnID: "turn-2",
+                itemID: "message-1",
                 delta: "Current"
             )
         )
@@ -4325,6 +4326,7 @@ struct CodexAppServerKitTests {
             params: TurnDeltaParams(
                 threadID: "thread-review",
                 turnID: "turn-old",
+                itemID: "message-1",
                 delta: "Old"
             )
         )
@@ -4347,6 +4349,7 @@ struct CodexAppServerKitTests {
             params: TurnDeltaParams(
                 threadID: "thread-review",
                 turnID: "turn-current",
+                itemID: "message-1",
                 delta: "Current"
             )
         )
@@ -4423,6 +4426,7 @@ struct CodexAppServerKitTests {
             params: TurnDeltaParams(
                 threadID: "thread-resume-events",
                 turnID: "turn-resume-events",
+                itemID: "message-1",
                 delta: "During resume"
             )
         )
@@ -4480,6 +4484,7 @@ struct CodexAppServerKitTests {
             params: TurnDeltaParams(
                 threadID: "thread-resume-events",
                 turnID: "turn-resume-events",
+                itemID: "message-1",
                 delta: "After resume"
             )
         )
@@ -4521,6 +4526,7 @@ struct CodexAppServerKitTests {
             params: TurnDeltaParams(
                 threadID: "thread-1",
                 turnID: "turn-1",
+                itemID: "message-1",
                 delta: "Previous generation"
             )
         )
@@ -4547,6 +4553,7 @@ struct CodexAppServerKitTests {
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(
                 turnID: "turn-2",
+                itemID: "message-1",
                 delta: "During start"
             )
         )
@@ -4593,6 +4600,7 @@ struct CodexAppServerKitTests {
             params: TurnDeltaParams(
                 threadID: "thread-1",
                 turnID: "turn-previous",
+                itemID: "message-1",
                 delta: "Previous generation"
             )
         )
@@ -4623,6 +4631,7 @@ struct CodexAppServerKitTests {
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(
                 turnID: "turn-review",
+                itemID: "message-1",
                 delta: "During review start"
             )
         )
@@ -4703,6 +4712,7 @@ struct CodexAppServerKitTests {
             params: TurnDeltaParams(
                 threadID: "thread-review-previous",
                 turnID: "turn-previous",
+                itemID: "message-1",
                 delta: "Previous detached generation"
             )
         )
@@ -4742,6 +4752,7 @@ struct CodexAppServerKitTests {
             params: TurnDeltaParams(
                 threadID: "thread-review",
                 turnID: "turn-review",
+                itemID: "message-1",
                 delta: "During detached review start"
             )
         )
@@ -5159,6 +5170,7 @@ struct CodexAppServerKitTests {
             params: TurnDeltaParams(
                 threadID: "thread-1",
                 turnID: "turn-previous",
+                itemID: "message-1",
                 delta: "Previous generation"
             )
         )
@@ -5190,6 +5202,7 @@ struct CodexAppServerKitTests {
             params: TurnDeltaParams(
                 threadID: "thread-1",
                 turnID: "turn-compact",
+                itemID: "message-1",
                 delta: "Current compact generation"
             )
         )
@@ -5232,6 +5245,7 @@ struct CodexAppServerKitTests {
             params: TurnDeltaParams(
                 threadID: "thread-1",
                 turnID: "turn-previous",
+                itemID: "message-1",
                 delta: "Previous generation"
             )
         )
@@ -5281,6 +5295,7 @@ struct CodexAppServerKitTests {
             params: TurnDeltaParams(
                 threadID: "thread-resume-failure",
                 turnID: "turn-resume-failure",
+                itemID: "message-1",
                 delta: "Before failed resume"
             )
         )
@@ -5549,7 +5564,7 @@ struct CodexAppServerKitTests {
         )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
-            params: TurnDeltaParams(turnID: "turn-1", delta: "Final")
+            params: TurnDeltaParams(turnID: "turn-1", itemID: "message-1", delta: "Final")
         )
         var updated = try await iterator.next()
         while let snapshot = updated, snapshot.content != "Final" {
@@ -5710,7 +5725,7 @@ struct CodexAppServerKitTests {
         )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
-            params: TurnDeltaParams(turnID: "turn-1", delta: "Partial")
+            params: TurnDeltaParams(turnID: "turn-1", itemID: "message-1", delta: "Partial")
         )
         var partial = try await iterator.next()
         while let snapshot = partial, snapshot.content != "Partial" {
@@ -5862,11 +5877,21 @@ struct CodexAppServerKitTests {
         )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
-            params: TurnDeltaParams(threadID: "thread-1", turnID: "turn-1", delta: "First")
+            params: TurnDeltaParams(
+                threadID: "thread-1",
+                turnID: "turn-1",
+                itemID: "message-1",
+                delta: "First"
+            )
         )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
-            params: TurnDeltaParams(threadID: "thread-1", turnID: "turn-1", delta: "Second")
+            params: TurnDeltaParams(
+                threadID: "thread-1",
+                turnID: "turn-1",
+                itemID: "message-1",
+                delta: "Second"
+            )
         )
         try await transport.emitServerNotification(
             method: "thread/closed",
@@ -5893,7 +5918,12 @@ struct CodexAppServerKitTests {
         )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
-            params: TurnDeltaParams(threadID: "thread-1", turnID: "turn-1", delta: "First")
+            params: TurnDeltaParams(
+                threadID: "thread-1",
+                turnID: "turn-1",
+                itemID: "message-1",
+                delta: "First"
+            )
         )
         try await transport.emitServerNotification(
             method: "turn/completed",
@@ -5907,7 +5937,12 @@ struct CodexAppServerKitTests {
         )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
-            params: TurnDeltaParams(threadID: "thread-1", turnID: "turn-2", delta: "Second")
+            params: TurnDeltaParams(
+                threadID: "thread-1",
+                turnID: "turn-2",
+                itemID: "message-1",
+                delta: "Second"
+            )
         )
         try await transport.emitServerNotification(
             method: "thread/closed",
@@ -7088,7 +7123,7 @@ private struct ReviewErrorParams: Encodable, Sendable {
 private struct TurnDeltaParams: Encodable, Sendable {
     var threadID: String = "thread-1"
     var turnID: String
-    var itemID: String = "message-1"
+    var itemID: String
     var delta: String
 
     enum CodingKeys: String, CodingKey {

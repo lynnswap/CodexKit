@@ -301,7 +301,7 @@ package struct AppServerNotificationDecoder {
             )))
         case .itemAgentMessageDelta:
             return .item(.agentMessageDelta(
-                itemID: try object.requireNonEmptyString("itemId"),
+                itemID: try object.requireNonWhitespaceString("itemId"),
                 delta: try object.requireString("delta")
             ))
         case .itemPlanDelta:
@@ -1381,6 +1381,14 @@ private struct PayloadObject {
     func requireNonEmptyString(_ key: String) throws -> String {
         let value = try requireString(key)
         guard value.isEmpty == false else {
+            throw NotificationContractError.missingRequired(key)
+        }
+        return value
+    }
+
+    func requireNonWhitespaceString(_ key: String) throws -> String {
+        let value = try requireNonEmptyString(key)
+        guard value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else {
             throw NotificationContractError.missingRequired(key)
         }
         return value

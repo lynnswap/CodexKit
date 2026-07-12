@@ -861,10 +861,12 @@ public actor CodexAppServerTestNotificationEmitter {
         turnID: CodexTurnID,
         itemID: String
     ) throws {
-        guard threadID.rawValue.isEmpty == false,
-              turnID.rawValue.isEmpty == false,
-              itemID.isEmpty == false else {
-            throw CodexAppServerTestError.invalidFixture("thread, turn, and item ids must not be empty")
+        guard threadID.rawValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false,
+              turnID.rawValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false,
+              itemID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else {
+            throw CodexAppServerTestError.invalidFixture(
+                "thread, turn, and item ids must not be empty or whitespace"
+            )
         }
     }
 }

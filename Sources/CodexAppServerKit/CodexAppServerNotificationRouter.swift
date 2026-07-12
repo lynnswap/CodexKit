@@ -713,10 +713,7 @@ package actor CodexAppServerNotificationRouter {
         case .itemCompleted(let item):
             return .itemCompleted(item, turnID: turnID)
         case .message(let message):
-            return .message(
-                CodexAgentMessageFallbackID.scopedMessage(message, turnID: turnID),
-                turnID: turnID
-            )
+            return .message(message, turnID: turnID)
         case .messageDelta(let delta):
             return .messageDelta(delta, turnID: turnID)
         case .reasoningSummaryPartAdded(let part):

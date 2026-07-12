@@ -12000,7 +12000,7 @@ private struct TurnStartedParams: Encodable, Sendable {
 private struct TurnDeltaParams: Encodable, Sendable {
     var threadID: String
     var turnID: String
-    var itemID: String?
+    var itemID: String
     var delta: String
     var phase: String?
 

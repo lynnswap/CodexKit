@@ -2357,11 +2357,12 @@ public struct CodexTokenUsage: Equatable, Sendable {
 
 public struct CodexMessageDelta: Equatable, Sendable {
     public var text: String
-    public var itemID: String?
+    public let itemID: String
     public var phase: CodexMessagePhase?
     package var currentItem: CodexThreadItem?
 
-    public init(text: String, itemID: String? = nil, phase: CodexMessagePhase? = nil) {
+    public init(text: String, itemID: String, phase: CodexMessagePhase? = nil) {
+        Self.preconditionValidItemID(itemID)
         self.text = text
         self.itemID = itemID
         self.phase = phase
@@ -2374,6 +2375,7 @@ public struct CodexMessageDelta: Equatable, Sendable {
         phase: CodexMessagePhase?,
         currentItem: CodexThreadItem
     ) {
+        Self.preconditionValidItemID(itemID)
         self.text = text
         self.itemID = itemID
         self.phase = phase
@@ -2385,22 +2387,12 @@ public struct CodexMessageDelta: Equatable, Sendable {
             && lhs.itemID == rhs.itemID
             && lhs.phase == rhs.phase
     }
-}
 
-package enum CodexAgentMessageFallbackID {
-    package static let unscoped = "agent-message-delta"
-
-    package static func scoped(turnID: CodexTurnID?) -> String {
-        turnID.map { "\(unscoped):\($0.rawValue)" } ?? unscoped
-    }
-
-    package static func scopedMessage(_ message: CodexMessage, turnID: CodexTurnID?) -> CodexMessage {
-        guard message.id == unscoped else {
-            return message
-        }
-        var message = message
-        message.id = scoped(turnID: turnID)
-        return message
+    private static func preconditionValidItemID(_ itemID: String) {
+        precondition(
+            itemID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false,
+            "CodexMessageDelta.itemID must not be empty or whitespace."
+        )
     }
 }
 

@@ -222,6 +222,24 @@ struct AppServerNotificationDecoderTests {
                 json: #"{"threadId":"thread-1","turnId":"turn-1","itemId":"file-1","changes":[{"path":"File.swift","kind":{"type":"update"}}]}"#
             ))
         }
+        try expectMalformed(method: "item/agentMessage/delta") {
+            try decoder.decode(notification(
+                method: "item/agentMessage/delta",
+                json: #"{"threadId":"thread-1","turnId":"turn-1","delta":"missing"}"#
+            ))
+        }
+        try expectMalformed(method: "item/agentMessage/delta") {
+            try decoder.decode(notification(
+                method: "item/agentMessage/delta",
+                json: #"{"threadId":"thread-1","turnId":"turn-1","itemId":"","delta":"empty"}"#
+            ))
+        }
+        try expectMalformed(method: "item/agentMessage/delta") {
+            try decoder.decode(notification(
+                method: "item/agentMessage/delta",
+                json: #"{"threadId":"thread-1","turnId":"turn-1","itemId":" \n\t ","delta":"blank"}"#
+            ))
+        }
     }
 
     @Test func currentItemAndTerminalPayloadsKeepTheirTypedContracts() throws {
