@@ -657,6 +657,41 @@ public struct CodexReviewIdentity: Codable, Equatable, Identifiable, Sendable {
     }
 }
 
+/// One thread deletion that failed during review lifecycle cleanup.
+public struct CodexReviewCleanupFailure: Equatable, Sendable {
+    /// Thread whose deletion failed.
+    public var threadID: CodexThreadID
+
+    /// Stable diagnostic message from the app-server operation.
+    public var message: String
+
+    public init(threadID: CodexThreadID, message: String) {
+        self.threadID = threadID
+        self.message = message
+    }
+}
+
+/// Ordered result of deleting the threads retained by a review lifecycle.
+public struct CodexReviewCleanupResult: Equatable, Sendable {
+    /// Thread identifiers in the exact source-last order cleanup attempted.
+    public var attemptedThreadIDs: [CodexThreadID]
+
+    /// Failed deletions in attempted order.
+    public var failures: [CodexReviewCleanupFailure]
+
+    public var succeeded: Bool {
+        failures.isEmpty
+    }
+
+    public init(
+        attemptedThreadIDs: [CodexThreadID],
+        failures: [CodexReviewCleanupFailure]
+    ) {
+        self.attemptedThreadIDs = attemptedThreadIDs
+        self.failures = failures
+    }
+}
+
 /// Transient token for a review restart prepared by ``CodexAppServer``.
 public struct CodexReviewRestartToken: Equatable, Identifiable, Sendable {
     public typealias ID = String
@@ -2122,7 +2157,7 @@ package struct CodexResponseStream: AsyncSequence, Sendable {
     package func waitForCancelledResponse(
         _ cancellation: CodexTurnCancellation,
         preparedState: TurnGenerationHandleState? = nil
-    ) async throws {
+    ) async throws -> CodexTurnOutcome {
         let cancelledTurn = try await cancelledTurn(
             for: cancellation,
             preparedState: preparedState
@@ -2132,7 +2167,7 @@ package struct CodexResponseStream: AsyncSequence, Sendable {
             case .terminal(let outcome):
                 switch outcome {
                 case .interrupted, .completed, .invalidTerminalStatus:
-                    return
+                    return outcome
                 case .failed(let failedTurn):
                     throw failedTurn.error
                 }

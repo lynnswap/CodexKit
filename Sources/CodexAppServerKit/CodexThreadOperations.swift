@@ -651,8 +651,20 @@ extension CodexTurn {
     package func interruptAndAwaitTerminal(
         willCancelActiveTurn: (@Sendable (CodexTurnCancellation) async -> Void)? = nil
     ) async throws -> CodexTurnCancellation {
-        if try await state.cachedOutcome() != nil {
-            return .init(threadID: threadID, turnID: id)
+        try await interruptAndAwaitTerminalAcknowledgement(
+            willCancelActiveTurn: willCancelActiveTurn
+        ).cancellation
+    }
+
+    package func interruptAndAwaitTerminalAcknowledgement(
+        willCancelActiveTurn: (@Sendable (CodexTurnCancellation) async -> Void)? = nil
+    ) async throws -> CodexTurnInterruptionAcknowledgement {
+        if let outcome = try await state.cachedOutcome() {
+            let cancellation = CodexTurnCancellation(threadID: threadID, turnID: id)
+            return .init(
+                cancellation: cancellation,
+                outcome: outcome
+            )
         }
         let connectionLease = try await state.connectionLeaseForSiblingGeneration()
         let prepared = try await interruptCodexTurnPreparingTarget(
@@ -664,12 +676,17 @@ extension CodexTurn {
             connectionLease: connectionLease,
             willCancelActiveTurn: willCancelActiveTurn
         )
-        try await CodexResponseStream(turn: self).waitForCancelledResponse(
+        let outcome = try await CodexResponseStream(turn: self).waitForCancelledResponse(
             prepared.cancellation,
             preparedState: prepared.state
         )
-        return prepared.cancellation
+        return .init(cancellation: prepared.cancellation, outcome: outcome)
     }
+}
+
+package struct CodexTurnInterruptionAcknowledgement: Sendable {
+    package var cancellation: CodexTurnCancellation
+    package var outcome: CodexTurnOutcome
 }
 
 private struct PreparedTurnInterruption: Sendable {

@@ -170,8 +170,7 @@ public actor CodexAppServer {
     private let connectionEventHub: ConnectionEventHub
     private let connectionLease: AppServerConnectionLease
     private let loginRegistry: LoginRegistry
-    private var retainedReviewCleanupIdentitiesBySourceThreadID: [CodexThreadID: [CodexReviewIdentity]] = [:]
-    private var reviewRestartContextsByTokenID: [CodexReviewRestartToken.ID: CodexReviewRestartContext] = [:]
+    private let reviewRestartCoordinator: ReviewRestartCoordinator
 
     package nonisolated var appServerClient: AppServerClient {
         client
@@ -255,6 +254,7 @@ public actor CodexAppServer {
         self.connectionEventHub = client.connectionEventHub
         self.connectionLease = connectionLease
         self.loginRegistry = loginRegistry
+        self.reviewRestartCoordinator = ReviewRestartCoordinator()
     }
 
     package init(
@@ -306,6 +306,7 @@ public actor CodexAppServer {
         self.connectionEventHub = client.connectionEventHub
         self.connectionLease = connectionLease
         self.loginRegistry = loginRegistry
+        self.reviewRestartCoordinator = ReviewRestartCoordinator()
     }
 
     package init(
@@ -319,6 +320,7 @@ public actor CodexAppServer {
         self.connectionEventHub = client.connectionEventHub
         self.connectionLease = connectionLease
         self.loginRegistry = router.loginRegistry
+        self.reviewRestartCoordinator = ReviewRestartCoordinator()
     }
 
     package static func testing(
@@ -332,6 +334,7 @@ public actor CodexAppServer {
     /// Call this when the container is no longer needed. Closing is idempotent
     /// from the perspective of public callers.
     public func close() async {
+        _ = await reviewRestartCoordinator.invalidateAllAndWait()
         await connectionLease.closeConnection()
     }
 
@@ -579,35 +582,42 @@ public actor CodexAppServer {
         _ identity: CodexReviewIdentity,
         threadOptions: CodexThread.ResumeOptions = .init()
     ) async throws -> CodexReviewRestartToken {
-        let review = try await resumeReview(identity, threadOptions: threadOptions)
-        let cancellation = try await review.response.turn.interruptAndAwaitTerminal {
-            retryCancellation in
-            if retryCancellation.turnID != Optional(identity.turnID) {
-                await self.rememberReviewCleanupIdentity(
-                    for: retryCancellation,
+        try await reviewRestartCoordinator.prepare(
+            identity,
+            operations: .init { [self] identities in
+                let review = try await resumeReview(
+                    identity,
+                    threadOptions: threadOptions
+                )
+                let acknowledgement = try await review.response.turn
+                    .interruptAndAwaitTerminalAcknowledgement {
+                    retryCancellation in
+                    if retryCancellation.turnID != Optional(identity.turnID) {
+                        identities.record(Self.reviewCleanupIdentity(
+                            for: retryCancellation,
+                            sourceIdentity: identity,
+                            model: review.model
+                        ))
+                    }
+                }
+                guard case .interrupted = acknowledgement.outcome else {
+                    throw CodexTransportFailure.contractViolation(
+                        message: "Preparing a review restart requires an interrupted terminal acknowledgement."
+                    )
+                }
+                let cancellation = acknowledgement.cancellation
+                identities.record(identity)
+                identities.record(Self.reviewCleanupIdentity(
+                    for: cancellation,
                     sourceIdentity: identity,
                     model: review.model
+                ))
+                return .init(
+                    rollbackThreadID: cancellation.threadID,
+                    rollbackModel: review.model
                 )
             }
-        }
-        rememberReviewCleanupIdentity(identity)
-        rememberReviewCleanupIdentity(
-            for: cancellation,
-            sourceIdentity: identity,
-            model: review.model
         )
-        discardReviewRestartContexts(sourceThreadID: identity.sourceThreadID)
-
-        let token = CodexReviewRestartToken(
-            id: UUID().uuidString,
-            interruptedIdentity: identity
-        )
-        reviewRestartContextsByTokenID[token.id] = CodexReviewRestartContext(
-            interruptedIdentity: identity,
-            rollbackThreadID: cancellation.threadID,
-            rollbackModel: review.model
-        )
-        return token
     }
 
     /// Restarts a review that was previously prepared by ``prepareReviewRestart(_:threadOptions:)``.
@@ -632,69 +642,89 @@ public actor CodexAppServer {
         delivery: CodexReviewDelivery = .inline,
         threadOptions: CodexThread.ResumeOptions = .init()
     ) async throws -> CodexReviewSession {
-        try Task.checkCancellation()
-        guard var context = reviewRestartContextsByTokenID[token.id],
-              context.isRestarting == false else {
-            throw CodexAppServerError.reviewRestartUnavailable(token.id)
-        }
-        context.isRestarting = true
-        reviewRestartContextsByTokenID[token.id] = context
-
-        do {
-            if context.rollbackCompleted == false {
-                let rollbackThread = try await resumeThread(
-                    context.rollbackThreadID,
-                    options: .init(model: context.rollbackModel)
-                )
-                try await rollbackThread.rollback(turnCount: 1)
-                context.rollbackCompleted = true
-                reviewRestartContextsByTokenID[token.id] = context
-            }
-
-            try Task.checkCancellation()
-            var sourceThreadOptions = threadOptions
-            if sourceThreadOptions.model == nil,
-               context.interruptedIdentity.activeTurnThreadID == context.interruptedIdentity.sourceThreadID {
-                sourceThreadOptions.model = context.interruptedIdentity.model
-            }
-            let sourceThread = try await resumeThread(
-                context.interruptedIdentity.sourceThreadID,
-                options: sourceThreadOptions
+        let signature = ReviewRestartCoordinator.RestartInvocationSignature(
+            target: target,
+            delivery: delivery,
+            threadOptions: threadOptions
+        )
+        return try await reviewRestartCoordinator.restart(
+            token,
+            signature: signature,
+            operations: .init(
+                loadRollbackThread: { [self] context in
+                    try await resumeThread(
+                        context.rollbackThreadID,
+                        options: .init(model: context.rollbackModel)
+                    )
+                },
+                rollback: { thread in
+                    try await thread.rollback(turnCount: 1)
+                },
+                loadSourceThread: { [self] context in
+                    var sourceThreadOptions = threadOptions
+                    if sourceThreadOptions.model == nil,
+                       context.interruptedIdentity.activeTurnThreadID
+                        == context.interruptedIdentity.sourceThreadID {
+                        sourceThreadOptions.model = context.interruptedIdentity.model
+                    }
+                    return try await resumeThread(
+                        context.interruptedIdentity.sourceThreadID,
+                        options: sourceThreadOptions
+                    )
+                },
+                startReview: { sourceThread, identities in
+                    try await sourceThread.startReview(
+                        target: target,
+                        delivery: delivery,
+                        onPostWriteCancellation: { review in
+                            identities.record(review.identity)
+                            try await Self.interruptLateReviewSession(review)
+                        }
+                    )
+                },
+                cleanupLateSession: Self.interruptLateReviewSession
             )
-            try Task.checkCancellation()
-
-            let review = try await sourceThread.startReview(
-                target: target,
-                delivery: delivery,
-                onPostWriteCancellation: { [self] review in
-                    try await cleanupCancelledRestart(review, tokenID: token.id)
-                }
-            )
-            do {
-                try Task.checkCancellation()
-            } catch {
-                await cleanupReviewIgnoringCallerCancellation(review.identity)
-                throw error
-            }
-
-            reviewRestartContextsByTokenID.removeValue(forKey: token.id)
-            return review
-        } catch {
-            context.isRestarting = false
-            if reviewRestartContextsByTokenID[token.id]?.isRestarting == true {
-                reviewRestartContextsByTokenID[token.id] = context
-            }
-            throw error
-        }
+        )
     }
 
-    private func cleanupCancelledRestart(
-        _ review: CodexReviewSession,
+    /// Invalidates one prepared restart and returns every review identity whose
+    /// cleanup ownership was retained for its source thread.
+    ///
+    /// If preparation or restart is in flight, this operation cancels and
+    /// awaits it. A replacement session that arrives after invalidation is
+    /// interrupted before its identity is returned.
+    public func discardPreparedReviewRestart(
+        _ token: CodexReviewRestartToken
+    ) async -> [CodexReviewIdentity] {
+        await reviewRestartCoordinator.invalidate(token)
+    }
+
+    /// Invalidates all prepared restarts and transfers their retained cleanup
+    /// identities grouped by source thread.
+    ///
+    /// This terminally closes restart preparation for this app-server instance.
+    /// Call it while stopping the owning runtime, before ``close()``.
+    public func discardAllPreparedReviewRestarts()
+        async -> [CodexThreadID: [CodexReviewIdentity]] {
+        await reviewRestartCoordinator.invalidateAllAndWait()
+    }
+
+    package func waitForReviewRestartWaiterCountForTesting(
+        tokenID: CodexReviewRestartToken.ID,
+        atLeast minimumCount: Int
+    ) async {
+        await reviewRestartCoordinator.waitForRestartWaiterCountForTesting(
+            tokenID: tokenID,
+            atLeast: minimumCount
+        )
+    }
+
+    package func waitForReviewRestartInvalidationRequestForTesting(
         tokenID: CodexReviewRestartToken.ID
-    ) async throws {
-        try await interruptAndAwaitTerminal(review.response)
-        await cleanupReview(review.identity)
-        reviewRestartContextsByTokenID.removeValue(forKey: tokenID)
+    ) async {
+        await reviewRestartCoordinator.waitForInvalidationRequestForTesting(
+            tokenID: tokenID
+        )
     }
 
     /// Deletes all app-server threads owned by a review lifecycle.
@@ -712,11 +742,31 @@ public actor CodexAppServer {
         _ identity: CodexReviewIdentity,
         additionalCleanupThreadIDs: [[CodexThreadID]] = []
     ) async {
+        let result = await cleanupReviewReportingFailures(
+            identity,
+            additionalCleanupThreadIDs: additionalCleanupThreadIDs
+        )
+        if result.succeeded == false {
+            await reviewRestartCoordinator.discardRetainedIdentities(
+                sourceThreadID: identity.sourceThreadID
+            )
+        }
+    }
+
+    /// Deletes all app-server threads owned by a review lifecycle and reports
+    /// each failed deletion in source-last attempt order.
+    ///
+    /// Unlike ``cleanupReview(_:additionalCleanupThreadIDs:)``, retained restart
+    /// identities remain registered when any deletion fails. A durable caller
+    /// can therefore retry without losing thread identities known only to this
+    /// app-server generation.
+    public func cleanupReviewReportingFailures(
+        _ identity: CodexReviewIdentity,
+        additionalCleanupThreadIDs: [[CodexThreadID]] = []
+    ) async -> CodexReviewCleanupResult {
         let sourceThreadID = identity.sourceThreadID
-        let retainedIdentities = retainedReviewCleanupIdentitiesBySourceThreadID.removeValue(
-            forKey: sourceThreadID
-        ) ?? []
-        discardReviewRestartContexts(sourceThreadID: sourceThreadID)
+        let retainedIdentities = await reviewRestartCoordinator
+            .invalidateAndTakeRetainedIdentities(sourceThreadID: sourceThreadID)
 
         let cleanupThreadIDs = Self.orderedReviewCleanupThreadIDs(
             sourceThreadID: sourceThreadID,
@@ -724,9 +774,26 @@ public actor CodexAppServer {
                 + [identity.cleanupThreadIDs]
                 + additionalCleanupThreadIDs
         )
+        var failures: [CodexReviewCleanupFailure] = []
         for threadID in cleanupThreadIDs {
-            try? await deleteThread(threadID)
+            do {
+                try await deleteThread(threadID)
+            } catch {
+                failures.append(.init(
+                    threadID: threadID,
+                    message: error.localizedDescription
+                ))
+            }
         }
+        if failures.isEmpty == false {
+            await reviewRestartCoordinator.restoreRetainedIdentities(
+                retainedIdentities
+            )
+        }
+        return .init(
+            attemptedThreadIDs: cleanupThreadIDs,
+            failures: failures
+        )
     }
 
     /// Forks an existing Codex thread into a new thread.
@@ -1025,33 +1092,6 @@ public actor CodexAppServer {
         )
     }
 
-    private func rememberReviewCleanupIdentity(_ identity: CodexReviewIdentity) {
-        let sourceThreadID = identity.sourceThreadID
-        if retainedReviewCleanupIdentitiesBySourceThreadID[sourceThreadID, default: []]
-            .contains(identity) == false {
-            retainedReviewCleanupIdentitiesBySourceThreadID[sourceThreadID, default: []].append(identity)
-        }
-    }
-
-    private func rememberReviewCleanupIdentity(
-        for cancellation: CodexTurnCancellation,
-        sourceIdentity: CodexReviewIdentity,
-        model: String?
-    ) {
-        let cancelledIdentity = Self.reviewCleanupIdentity(
-            for: cancellation,
-            sourceIdentity: sourceIdentity,
-            model: model
-        )
-        rememberReviewCleanupIdentity(cancelledIdentity)
-    }
-
-    private func discardReviewRestartContexts(sourceThreadID: CodexThreadID) {
-        reviewRestartContextsByTokenID = reviewRestartContextsByTokenID.filter { _, context in
-            context.interruptedIdentity.sourceThreadID != sourceThreadID
-        }
-    }
-
     private func deleteThreadIgnoringCallerCancellation(_ id: CodexThreadID) async {
         await Task { [self] in
             try? await deleteThread(id)
@@ -1075,6 +1115,12 @@ public actor CodexAppServer {
             reviewThreadID: cancellation.threadID == sourceIdentity.sourceThreadID ? nil : cancellation.threadID,
             model: model ?? sourceIdentity.model
         )
+    }
+
+    private nonisolated static func interruptLateReviewSession(
+        _ review: CodexReviewSession
+    ) async throws {
+        try await interruptAndAwaitTerminal(review.response)
     }
 
     private nonisolated static func orderedReviewCleanupThreadIDs(
@@ -1275,12 +1321,4 @@ public actor CodexAppServer {
         return (.init(rawValue: loginID), url)
     }
 
-}
-
-private struct CodexReviewRestartContext: Sendable {
-    var interruptedIdentity: CodexReviewIdentity
-    var rollbackThreadID: CodexThreadID
-    var rollbackModel: String?
-    var rollbackCompleted: Bool = false
-    var isRestarting: Bool = false
 }

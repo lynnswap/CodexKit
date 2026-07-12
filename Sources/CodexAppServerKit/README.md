@@ -352,6 +352,28 @@ let restarted = try await appServer.restartPreparedReview(
 await appServer.cleanupReview(restarted.identity)
 ```
 
+Preparation and restart are owned by one process-local coordinator. Concurrent
+restart calls with the same token, target, delivery, and thread options join one
+shared operation; a cancelled waiter does not cancel that operation. A token
+allows at most two restart invocations, and the deprecated rollback request is
+sent successfully at most once.
+
+When a host stops a run before consuming its prepared token, invalidate it and
+take ownership of every identity retained for that source thread:
+
+```swift
+let retained = await appServer.discardPreparedReviewRestart(token)
+persistForLaterCleanup(retained)
+```
+
+Runtime owners use `discardAllPreparedReviewRestarts()` before closing the
+app-server connection. It waits for in-flight preparation and restart work,
+interrupts any replacement session that arrives after invalidation, and returns
+an ordered identity list for each source thread. This is a terminal close of
+restart preparation for that `CodexAppServer` instance. Neither discard
+operation deletes review threads; the caller decides when durable ownership
+permits final cleanup.
+
 ## Responses
 
 `CodexThread.respond` and `CodexReviewSession.collect` return
