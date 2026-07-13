@@ -6629,6 +6629,59 @@ struct CodexAppServerKitTests {
         #expect(await transport.recordedRequests().map(\.method) == ["account/login/start"])
     }
 
+    @Test func stockChatGPTLoginIgnoresSparseAccountUpdateWhileAwaitingReadiness() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueChatGPTLogin(
+            loginID: "login-1",
+            authenticationURL: URL(string: "https://chatgpt.com/auth")!
+        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let login = try await harness.server.loginChatGPT()
+
+        try await transport.emitServerNotificationJSON(
+            method: "account/login/completed",
+            json: #"{"loginId":"login-1","success":true,"error":null}"#
+        )
+        try await transport.emitServerNotificationJSON(
+            method: "account/updated",
+            json: #"{"planType":"plus"}"#
+        )
+        await #expect(throws: CodexAppServerError.loginAlreadyInProgress) {
+            _ = try await harness.server.loginChatGPT()
+        }
+
+        try await transport.emitServerNotificationJSON(
+            method: "account/updated",
+            json: #"{"authMode":"chatgpt","planType":"plus"}"#
+        )
+        #expect(try await login.result() == .succeeded)
+    }
+
+    @Test func stockChatGPTLoginRejectsExplicitNonChatGPTAccountAfterSuccess() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueChatGPTLogin(
+            loginID: "login-1",
+            authenticationURL: URL(string: "https://chatgpt.com/auth")!
+        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let login = try await harness.server.loginChatGPT()
+
+        try await transport.emitServerNotificationJSON(
+            method: "account/login/completed",
+            json: #"{"loginId":"login-1","success":true,"error":null}"#
+        )
+        try await transport.emitServerNotificationJSON(
+            method: "account/updated",
+            json: #"{"authMode":"apikey"}"#
+        )
+
+        #expect(
+            try await login.result() == .authenticationCommittedNeedsConnectionReconciliation(
+                .chatGPTAccountUnavailableAfterSuccess
+            )
+        )
+    }
+
     @Test func stockChatGPTLoginDropsMismatchedCompletionID() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueueChatGPTLogin(

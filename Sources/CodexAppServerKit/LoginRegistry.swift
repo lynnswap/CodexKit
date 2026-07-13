@@ -211,7 +211,10 @@ package actor LoginState {
         guard case .successAwaitingAccount = phase else {
             return
         }
-        guard update.authMode == .chatGPT else {
+        guard let authMode = update.authMode else {
+            return
+        }
+        guard authMode == .chatGPT else {
             resolve(
                 .success(
                     .authenticationCommittedNeedsConnectionReconciliation(
