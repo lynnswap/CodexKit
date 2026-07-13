@@ -702,8 +702,7 @@ public final class CodexChat: CodexPersistentModel {
                 if turn.status.isTerminal {
                     _ = terminalizeActiveItems(
                         in: turn.id,
-                        status: turn.status,
-                        completionDate: .preserveExisting
+                        status: turn.status
                     )
                 }
             }
@@ -1194,8 +1193,7 @@ public final class CodexChat: CodexPersistentModel {
         if let terminalStatus = turnsByID[response.turnID]?.status {
             changes.append(contentsOf: terminalizeActiveItems(
                 in: response.turnID,
-                status: terminalStatus,
-                completionDate: .infer(preferred: response.completedAt)
+                status: terminalStatus
             ))
         }
         changes.appendIfPresent(markIdleIfActive())
@@ -1669,15 +1667,9 @@ public final class CodexChat: CodexPersistentModel {
         return incoming
     }
 
-    private enum TerminalCompletionDatePolicy {
-        case preserveExisting
-        case infer(preferred: Date?)
-    }
-
     private func terminalizeActiveItems(
         in turnID: CodexTurnID,
-        status: CodexTurnStatus,
-        completionDate: TerminalCompletionDatePolicy
+        status: CodexTurnStatus
     ) -> [CodexChatMutation] {
         guard status.isTerminal else {
             return []
@@ -1685,19 +1677,8 @@ public final class CodexChat: CodexPersistentModel {
         var changes: [CodexChatMutation] = []
         for item in itemsByTurnID[turnID] ?? [] {
             let previousItem = item.threadItem
-            let completedAt: Date?
-            switch completionDate {
-            case .preserveExisting:
-                completedAt = nil
-            case .infer(let preferred):
-                completedAt = terminalCompletionDate(
-                    preferred: preferred,
-                    for: previousItem
-                )
-            }
             let terminalItem = itemByApplyingTerminalLifecycleStatus(
                 status,
-                completedAt: completedAt,
                 to: previousItem
             )
             guard terminalItem != previousItem else {
@@ -1711,7 +1692,6 @@ public final class CodexChat: CodexPersistentModel {
 
     private func itemByApplyingTerminalLifecycleStatus(
         _ status: CodexTurnStatus,
-        completedAt: Date?,
         to item: CodexThreadItem
     ) -> CodexThreadItem {
         let content: CodexThreadItem.Content
@@ -1721,9 +1701,6 @@ public final class CodexChat: CodexPersistentModel {
                 return item
             }
             command.status = lifecycleStatus(for: command, fallback: status)
-            if let completedAt {
-                command.completedAt = command.completedAt ?? completedAt
-            }
             content = .command(command)
         case .fileChange(var fileChange):
             guard shouldTerminalizeLifecycleStatus(fileChange.status) else {
@@ -1748,29 +1725,6 @@ public final class CodexChat: CodexPersistentModel {
             return true
         }
         return status.isTerminal == false
-    }
-
-    private func terminalCompletionDate(
-        preferred: Date?,
-        for item: CodexThreadItem
-    ) -> Date {
-        let fallback = Date()
-        guard let preferred else {
-            return fallback
-        }
-        guard let startedAt = commandStartedAt(in: item),
-            preferred <= startedAt
-        else {
-            return preferred
-        }
-        return fallback > startedAt ? fallback : startedAt.addingTimeInterval(0.001)
-    }
-
-    private func commandStartedAt(in item: CodexThreadItem) -> Date? {
-        guard case .command(let command) = item.content else {
-            return nil
-        }
-        return command.startedAt
     }
 
     private func lifecycleStatus(
@@ -2273,7 +2227,6 @@ public final class CodexChat: CodexPersistentModel {
             let previousItem = item.threadItem
             let terminalItem = itemByApplyingTerminalLifecycleStatus(
                 .completed,
-                completedAt: terminalCompletionDate(preferred: nil, for: previousItem),
                 to: previousItem
             )
             guard terminalItem != previousItem else {
