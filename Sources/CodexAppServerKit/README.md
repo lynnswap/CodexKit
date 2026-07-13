@@ -72,6 +72,28 @@ let configuration = CodexAppServer.Configuration(
 let appServer = try await CodexAppServer(configuration: configuration)
 ```
 
+Install a typed server-request handler when the host needs to answer approvals,
+user-input prompts, dynamic tool calls, or provider requests. Delegate request
+kinds the host does not override to the built-in policy:
+
+```swift
+let configuration = CodexAppServer.Configuration(
+    serverRequestHandler: { request in
+        switch request {
+        case .commandExecutionApproval:
+            return .approval(.accept)
+        case .userInput(let prompt):
+            return .userInput(.init(answers: prompt.questions.reduce(into: [:]) {
+                $0[$1.id] = .init(answers: [])
+            }))
+        default:
+            return try await CodexAppServer.Configuration
+                .defaultServerRequestHandler(request: request)
+        }
+    }
+)
+```
+
 ## Threads
 
 `CodexThread` is the long-lived session handle for a Codex conversation in a workspace. Use `respond` to wait for an exhaustive terminal outcome.

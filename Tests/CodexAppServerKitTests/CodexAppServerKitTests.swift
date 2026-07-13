@@ -196,6 +196,32 @@ struct CodexAppServerKitTests {
         await runtime.close()
     }
 
+    @Test func publicConfigurationRoutesTypedServerRequestsToTheHost() async throws {
+        let configuration = CodexAppServer.Configuration { request in
+            guard case .commandExecutionApproval(let approval) = request else {
+                return try await CodexAppServer.Configuration.defaultServerRequestHandler(
+                    request: request
+                )
+            }
+            #expect(approval.command == "git status")
+            return .approval(.accept)
+        }
+        let runtime = try await CodexAppServerTestRuntime.start(configuration: configuration)
+        let requestID = CodexServerRequestID.string("approval-public-handler")
+
+        try await runtime.transport.emitServerRequest(
+            id: requestID,
+            method: "item/commandExecution/requestApproval",
+            params: Data(
+                #"{"threadId":"thread-1","turnId":"turn-1","itemId":"item-1","startedAtMs":123,"command":"git status"}"#.utf8
+            )
+        )
+
+        let response = await runtime.transport.serverRequestResponse(for: requestID)
+        #expect(response == .result(Data(#"{"decision":"accept"}"#.utf8)))
+        await runtime.close()
+    }
+
     @Test func testRuntimeUsesTypedConfigurationFixtures() async throws {
         let configURL = URL(fileURLWithPath: "/tmp/codex/config.toml")
         let layerMetadata = try CodexAppServerTestConfigurationLayerMetadata(

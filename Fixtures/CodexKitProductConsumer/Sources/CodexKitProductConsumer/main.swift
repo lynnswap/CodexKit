@@ -65,8 +65,25 @@ struct CodexKitProductConsumer {
             isArchived: false
         )
         let deadlineClock = CodexAppServerTestDeadlineClock()
+        let configuration = CodexAppServer.Configuration(
+            serverRequestHandler: { request in
+                switch request {
+                case .commandExecutionApproval(let approval):
+                    precondition(approval.threadID.isEmpty == false)
+                    return .approval(.accept)
+                case .userInput(let prompt):
+                    return .userInput(.init(answers: prompt.questions.reduce(into: [:]) {
+                        $0[$1.id] = .init(answers: [])
+                    }))
+                default:
+                    return try await CodexAppServer.Configuration
+                        .defaultServerRequestHandler(request: request)
+                }
+            }
+        )
         let runtime = try await CodexAppServerTestRuntime.start(
             threads: [storedThread],
+            configuration: configuration,
             deadlineClock: deadlineClock
         )
 

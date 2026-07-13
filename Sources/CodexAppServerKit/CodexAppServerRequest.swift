@@ -50,7 +50,8 @@ package enum CodexServerRequestID: Hashable, Sendable, Codable {
     }
 }
 
-package enum CodexAppServerRequest: Equatable, Sendable {
+/// A typed request initiated by the Codex app-server.
+public enum CodexAppServerRequest: Equatable, Sendable {
     case commandExecutionApproval(CodexCommandExecutionApprovalRequest)
     case fileChangeApproval(CodexFileChangeApprovalRequest)
     case userInput(CodexUserInputRequest)
@@ -62,7 +63,8 @@ package enum CodexAppServerRequest: Equatable, Sendable {
     case currentTimeRead(CodexCurrentTimeReadRequest)
     case unknown(CodexRawServerRequest)
 
-    package var method: String {
+    /// The current-v2 JSON-RPC method represented by this request.
+    public var method: String {
         switch self {
         case .commandExecutionApproval:
             "item/commandExecution/requestApproval"
@@ -88,22 +90,22 @@ package enum CodexAppServerRequest: Equatable, Sendable {
     }
 }
 
-package struct CodexCommandExecutionApprovalRequest: Codable, Equatable, Sendable {
-    package var threadID: String
-    package var turnID: String
-    package var itemID: String
-    package var startedAtMs: Int64
-    package var approvalID: String?
-    package var environmentID: String?
-    package var reason: String?
-    package var networkApprovalContext: CodexJSONValue?
-    package var command: String?
-    package var cwd: String?
-    package var commandActions: [CodexJSONValue]?
-    package var additionalPermissions: CodexJSONValue?
-    package var proposedExecpolicyAmendment: CodexExecPolicyAmendment?
-    package var proposedNetworkPolicyAmendments: [CodexNetworkPolicyAmendment]?
-    package var availableDecisions: [CodexApprovalDecision]?
+public struct CodexCommandExecutionApprovalRequest: Codable, Equatable, Sendable {
+    public let threadID: String
+    public let turnID: String
+    public let itemID: String
+    public let startedAtMs: Int64
+    public let approvalID: String?
+    public let environmentID: String?
+    public let reason: String?
+    public let networkApprovalContext: CodexJSONValue?
+    public let command: String?
+    public let cwd: String?
+    public let commandActions: [CodexJSONValue]?
+    public let additionalPermissions: CodexJSONValue?
+    public let proposedExecpolicyAmendment: CodexExecPolicyAmendment?
+    public let proposedNetworkPolicyAmendments: [CodexNetworkPolicyAmendment]?
+    public let availableDecisions: [CodexApprovalDecision]?
 
     private enum CodingKeys: String, CodingKey {
         case threadID = "threadId"
@@ -124,13 +126,13 @@ package struct CodexCommandExecutionApprovalRequest: Codable, Equatable, Sendabl
     }
 }
 
-package struct CodexFileChangeApprovalRequest: Codable, Equatable, Sendable {
-    package var threadID: String
-    package var turnID: String
-    package var itemID: String
-    package var startedAtMs: Int64
-    package var reason: String?
-    package var grantRoot: String?
+public struct CodexFileChangeApprovalRequest: Codable, Equatable, Sendable {
+    public let threadID: String
+    public let turnID: String
+    public let itemID: String
+    public let startedAtMs: Int64
+    public let reason: String?
+    public let grantRoot: String?
 
     private enum CodingKeys: String, CodingKey {
         case threadID = "threadId"
@@ -142,26 +144,26 @@ package struct CodexFileChangeApprovalRequest: Codable, Equatable, Sendable {
     }
 }
 
-package struct CodexUserInputOption: Codable, Equatable, Sendable {
-    package var label: String
-    package var description: String
+public struct CodexUserInputOption: Codable, Equatable, Sendable {
+    public let label: String
+    public let description: String
 }
 
-package struct CodexUserInputQuestion: Codable, Equatable, Sendable {
-    package var id: String
-    package var header: String
-    package var question: String
-    package var isOther: Bool
-    package var isSecret: Bool
-    package var options: [CodexUserInputOption]?
+public struct CodexUserInputQuestion: Codable, Equatable, Sendable {
+    public let id: String
+    public let header: String
+    public let question: String
+    public let isOther: Bool
+    public let isSecret: Bool
+    public let options: [CodexUserInputOption]?
 }
 
-package struct CodexUserInputRequest: Codable, Equatable, Sendable {
-    package var threadID: String
-    package var turnID: String
-    package var itemID: String
-    package var questions: [CodexUserInputQuestion]
-    package var autoResolutionMs: UInt64?
+public struct CodexUserInputRequest: Codable, Equatable, Sendable {
+    public let threadID: String
+    public let turnID: String
+    public let itemID: String
+    public let questions: [CodexUserInputQuestion]
+    public let autoResolutionMs: UInt64?
 
     private enum CodingKeys: String, CodingKey {
         case threadID = "threadId"
@@ -172,11 +174,11 @@ package struct CodexUserInputRequest: Codable, Equatable, Sendable {
     }
 }
 
-package struct CodexMCPElicitationRequest: Codable, Equatable, Sendable {
-    package var threadID: String
-    package var turnID: String?
-    package var serverName: String
-    package var elicitation: CodexMCPElicitation
+public struct CodexMCPElicitationRequest: Codable, Equatable, Sendable {
+    public let threadID: String
+    public let turnID: String?
+    public let serverName: String
+    public let elicitation: CodexMCPElicitation
 
     private enum CodingKeys: String, CodingKey {
         case threadID = "threadId"
@@ -196,7 +198,7 @@ package struct CodexMCPElicitationRequest: Codable, Equatable, Sendable {
         case url
     }
 
-    package init(from decoder: Decoder) throws {
+    public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.threadID = try container.decode(String.self, forKey: .threadID)
         self.turnID = try container.decodeIfPresent(String.self, forKey: .turnID)
@@ -232,7 +234,7 @@ package struct CodexMCPElicitationRequest: Codable, Equatable, Sendable {
         }
     }
 
-    package func encode(to encoder: Encoder) throws {
+    public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(threadID, forKey: .threadID)
         try container.encode(turnID, forKey: .turnID)
@@ -258,21 +260,21 @@ package struct CodexMCPElicitationRequest: Codable, Equatable, Sendable {
     }
 }
 
-package enum CodexMCPElicitation: Equatable, Sendable {
+public enum CodexMCPElicitation: Equatable, Sendable {
     case form(meta: CodexJSONValue?, message: String, requestedSchema: CodexJSONValue)
     case openAIForm(meta: CodexJSONValue?, message: String, requestedSchema: CodexJSONValue)
     case url(meta: CodexJSONValue?, message: String, url: String, elicitationID: String)
 }
 
-package struct CodexPermissionsRequest: Codable, Equatable, Sendable {
-    package var threadID: String
-    package var turnID: String
-    package var itemID: String
-    package var environmentID: String?
-    package var startedAtMs: Int64
-    package var cwd: String
-    package var reason: String?
-    package var permissions: CodexJSONValue
+public struct CodexPermissionsRequest: Codable, Equatable, Sendable {
+    public let threadID: String
+    public let turnID: String
+    public let itemID: String
+    public let environmentID: String?
+    public let startedAtMs: Int64
+    public let cwd: String
+    public let reason: String?
+    public let permissions: CodexJSONValue
 
     private enum CodingKeys: String, CodingKey {
         case threadID = "threadId"
@@ -286,13 +288,13 @@ package struct CodexPermissionsRequest: Codable, Equatable, Sendable {
     }
 }
 
-package struct CodexDynamicToolCallRequest: Codable, Equatable, Sendable {
-    package var threadID: String
-    package var turnID: String
-    package var callID: String
-    package var namespace: String?
-    package var tool: String
-    package var arguments: CodexJSONValue
+public struct CodexDynamicToolCallRequest: Codable, Equatable, Sendable {
+    public let threadID: String
+    public let turnID: String
+    public let callID: String
+    public let namespace: String?
+    public let tool: String
+    public let arguments: CodexJSONValue
 
     private enum CodingKeys: String, CodingKey {
         case threadID = "threadId"
@@ -304,13 +306,13 @@ package struct CodexDynamicToolCallRequest: Codable, Equatable, Sendable {
     }
 }
 
-package enum CodexChatGPTAuthTokensRefreshReason: String, Codable, Equatable, Sendable {
+public enum CodexChatGPTAuthTokensRefreshReason: String, Codable, Equatable, Sendable {
     case unauthorized
 }
 
-package struct CodexChatGPTAuthTokensRefreshRequest: Codable, Equatable, Sendable {
-    package var reason: CodexChatGPTAuthTokensRefreshReason
-    package var previousAccountID: String?
+public struct CodexChatGPTAuthTokensRefreshRequest: Codable, Equatable, Sendable {
+    public let reason: CodexChatGPTAuthTokensRefreshReason
+    public let previousAccountID: String?
 
     private enum CodingKeys: String, CodingKey {
         case reason
@@ -318,22 +320,23 @@ package struct CodexChatGPTAuthTokensRefreshRequest: Codable, Equatable, Sendabl
     }
 }
 
-package struct CodexAttestationGenerateRequest: Codable, Equatable, Sendable {}
+public struct CodexAttestationGenerateRequest: Codable, Equatable, Sendable {}
 
-package struct CodexCurrentTimeReadRequest: Codable, Equatable, Sendable {
-    package var threadID: String
+public struct CodexCurrentTimeReadRequest: Codable, Equatable, Sendable {
+    public let threadID: String
 
     private enum CodingKeys: String, CodingKey {
         case threadID = "threadId"
     }
 }
 
-package struct CodexRawServerRequest: Equatable, Sendable {
-    package var method: String
-    package var params: Data
+public struct CodexRawServerRequest: Equatable, Sendable {
+    public let method: String
+    public let params: Data
 }
 
-package enum CodexAppServerRequestResolution: Equatable, Sendable {
+/// The host's typed resolution for an app-server request.
+public enum CodexAppServerRequestResolution: Equatable, Sendable {
     case approval(CodexApprovalDecision)
     case userInput(CodexUserInputResponse)
     case permissions(CodexPermissionsResponse)
@@ -345,10 +348,11 @@ package enum CodexAppServerRequestResolution: Equatable, Sendable {
     case rejectUnknown(code: Int, message: String)
 }
 
-package typealias CodexAppServerRequestHandler =
+/// Handles app-server requests that require a host-side response.
+public typealias CodexAppServerRequestHandler =
     @Sendable (CodexAppServerRequest) async throws -> CodexAppServerRequestResolution
 
-package enum CodexApprovalDecision: Codable, Equatable, Sendable {
+public enum CodexApprovalDecision: Codable, Equatable, Sendable {
     case accept
     case acceptForSession
     case acceptWithExecpolicyAmendment(CodexExecPolicyAmendment)
@@ -376,7 +380,7 @@ package enum CodexApprovalDecision: Codable, Equatable, Sendable {
         case amendment = "network_policy_amendment"
     }
 
-    package init(from decoder: Decoder) throws {
+    public init(from decoder: Decoder) throws {
         if let scalar = try? Scalar(from: decoder) {
             self = switch scalar {
             case .accept: .accept
@@ -407,7 +411,7 @@ package enum CodexApprovalDecision: Codable, Equatable, Sendable {
         }
     }
 
-    package func encode(to encoder: Encoder) throws {
+    public func encode(to encoder: Encoder) throws {
         switch self {
         case .accept:
             try Scalar.accept.encode(to: encoder)
@@ -444,59 +448,87 @@ package enum CodexApprovalDecision: Codable, Equatable, Sendable {
     }
 }
 
-package struct CodexExecPolicyAmendment: Codable, Equatable, Sendable {
-    package var command: [String]
+public struct CodexExecPolicyAmendment: Codable, Equatable, Sendable {
+    public var command: [String]
 
-    package init(command: [String]) {
+    public init(command: [String]) {
         self.command = command
     }
 
-    package init(from decoder: Decoder) throws {
+    public init(from decoder: Decoder) throws {
         let container = try decoder.singleValueContainer()
         self.command = try container.decode([String].self)
     }
 
-    package func encode(to encoder: Encoder) throws {
+    public func encode(to encoder: Encoder) throws {
         var container = encoder.singleValueContainer()
         try container.encode(command)
     }
 }
 
-package enum CodexNetworkPolicyRuleAction: String, Codable, Equatable, Sendable {
+public enum CodexNetworkPolicyRuleAction: String, Codable, Equatable, Sendable {
     case allow
     case deny
 }
 
-package struct CodexNetworkPolicyAmendment: Codable, Equatable, Sendable {
-    package var host: String
-    package var action: CodexNetworkPolicyRuleAction
+public struct CodexNetworkPolicyAmendment: Codable, Equatable, Sendable {
+    public var host: String
+    public var action: CodexNetworkPolicyRuleAction
+
+    public init(host: String, action: CodexNetworkPolicyRuleAction) {
+        self.host = host
+        self.action = action
+    }
 }
 
-package struct CodexUserInputAnswer: Codable, Equatable, Sendable {
-    package var answers: [String]
+public struct CodexUserInputAnswer: Codable, Equatable, Sendable {
+    public var answers: [String]
+
+    public init(answers: [String]) {
+        self.answers = answers
+    }
 }
 
-package struct CodexUserInputResponse: Codable, Equatable, Sendable {
-    package var answers: [String: CodexUserInputAnswer]
+public struct CodexUserInputResponse: Codable, Equatable, Sendable {
+    public var answers: [String: CodexUserInputAnswer]
+
+    public init(answers: [String: CodexUserInputAnswer]) {
+        self.answers = answers
+    }
 }
 
-package struct CodexGrantedPermissionProfile: Codable, Equatable, Sendable {
-    package var network: CodexJSONValue?
-    package var fileSystem: CodexJSONValue?
+public struct CodexGrantedPermissionProfile: Codable, Equatable, Sendable {
+    public var network: CodexJSONValue?
+    public var fileSystem: CodexJSONValue?
+
+    public init(network: CodexJSONValue?, fileSystem: CodexJSONValue?) {
+        self.network = network
+        self.fileSystem = fileSystem
+    }
 }
 
-package enum CodexPermissionGrantScope: String, Codable, Equatable, Sendable {
+public enum CodexPermissionGrantScope: String, Codable, Equatable, Sendable {
     case turn
     case session
 }
 
-package struct CodexPermissionsResponse: Codable, Equatable, Sendable {
-    package var permissions: CodexGrantedPermissionProfile
-    package var scope: CodexPermissionGrantScope
-    package var strictAutoReview: Bool?
+public struct CodexPermissionsResponse: Codable, Equatable, Sendable {
+    public var permissions: CodexGrantedPermissionProfile
+    public var scope: CodexPermissionGrantScope
+    public var strictAutoReview: Bool?
+
+    public init(
+        permissions: CodexGrantedPermissionProfile,
+        scope: CodexPermissionGrantScope,
+        strictAutoReview: Bool? = nil
+    ) {
+        self.permissions = permissions
+        self.scope = scope
+        self.strictAutoReview = strictAutoReview
+    }
 }
 
-package enum CodexDynamicToolCallOutputContentItem: Codable, Equatable, Sendable {
+public enum CodexDynamicToolCallOutputContentItem: Codable, Equatable, Sendable {
     case inputText(text: String)
     case inputImage(imageURL: String)
 
@@ -511,7 +543,7 @@ package enum CodexDynamicToolCallOutputContentItem: Codable, Equatable, Sendable
         case inputImage
     }
 
-    package init(from decoder: Decoder) throws {
+    public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         switch try container.decode(Kind.self, forKey: .type) {
         case .inputText:
@@ -521,7 +553,7 @@ package enum CodexDynamicToolCallOutputContentItem: Codable, Equatable, Sendable
         }
     }
 
-    package func encode(to encoder: Encoder) throws {
+    public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         switch self {
         case .inputText(let text):
@@ -534,21 +566,36 @@ package enum CodexDynamicToolCallOutputContentItem: Codable, Equatable, Sendable
     }
 }
 
-package struct CodexDynamicToolCallResponse: Codable, Equatable, Sendable {
-    package var contentItems: [CodexDynamicToolCallOutputContentItem]
-    package var success: Bool
+public struct CodexDynamicToolCallResponse: Codable, Equatable, Sendable {
+    public var contentItems: [CodexDynamicToolCallOutputContentItem]
+    public var success: Bool
+
+    public init(contentItems: [CodexDynamicToolCallOutputContentItem], success: Bool) {
+        self.contentItems = contentItems
+        self.success = success
+    }
 }
 
-package enum CodexMCPElicitationAction: String, Codable, Equatable, Sendable {
+public enum CodexMCPElicitationAction: String, Codable, Equatable, Sendable {
     case accept
     case decline
     case cancel
 }
 
-package struct CodexMCPElicitationResponse: Codable, Equatable, Sendable {
-    package var action: CodexMCPElicitationAction
-    package var content: CodexJSONValue?
-    package var meta: CodexJSONValue?
+public struct CodexMCPElicitationResponse: Codable, Equatable, Sendable {
+    public var action: CodexMCPElicitationAction
+    public var content: CodexJSONValue?
+    public var meta: CodexJSONValue?
+
+    public init(
+        action: CodexMCPElicitationAction,
+        content: CodexJSONValue? = nil,
+        meta: CodexJSONValue? = nil
+    ) {
+        self.action = action
+        self.content = content
+        self.meta = meta
+    }
 
     private enum CodingKeys: String, CodingKey {
         case action
@@ -556,7 +603,7 @@ package struct CodexMCPElicitationResponse: Codable, Equatable, Sendable {
         case meta = "_meta"
     }
 
-    package func encode(to encoder: Encoder) throws {
+    public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(action, forKey: .action)
         try container.encode(content, forKey: .content)
@@ -564,10 +611,20 @@ package struct CodexMCPElicitationResponse: Codable, Equatable, Sendable {
     }
 }
 
-package struct CodexChatGPTAuthTokensRefreshResponse: Codable, Equatable, Sendable {
-    package var accessToken: String
-    package var chatGPTAccountID: String
-    package var chatGPTPlanType: String?
+public struct CodexChatGPTAuthTokensRefreshResponse: Codable, Equatable, Sendable {
+    public var accessToken: String
+    public var chatGPTAccountID: String
+    public var chatGPTPlanType: String?
+
+    public init(
+        accessToken: String,
+        chatGPTAccountID: String,
+        chatGPTPlanType: String? = nil
+    ) {
+        self.accessToken = accessToken
+        self.chatGPTAccountID = chatGPTAccountID
+        self.chatGPTPlanType = chatGPTPlanType
+    }
 
     private enum CodingKeys: String, CodingKey {
         case accessToken
@@ -575,7 +632,7 @@ package struct CodexChatGPTAuthTokensRefreshResponse: Codable, Equatable, Sendab
         case chatGPTPlanType = "chatgptPlanType"
     }
 
-    package func encode(to encoder: Encoder) throws {
+    public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(accessToken, forKey: .accessToken)
         try container.encode(chatGPTAccountID, forKey: .chatGPTAccountID)
@@ -583,10 +640,18 @@ package struct CodexChatGPTAuthTokensRefreshResponse: Codable, Equatable, Sendab
     }
 }
 
-package struct CodexAttestationGenerateResponse: Codable, Equatable, Sendable {
-    package var token: String
+public struct CodexAttestationGenerateResponse: Codable, Equatable, Sendable {
+    public var token: String
+
+    public init(token: String) {
+        self.token = token
+    }
 }
 
-package struct CodexCurrentTimeReadResponse: Codable, Equatable, Sendable {
-    package var currentTimeAt: Int64
+public struct CodexCurrentTimeReadResponse: Codable, Equatable, Sendable {
+    public var currentTimeAt: Int64
+
+    public init(currentTimeAt: Int64) {
+        self.currentTimeAt = currentTimeAt
+    }
 }

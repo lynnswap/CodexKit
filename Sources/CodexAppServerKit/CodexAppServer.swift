@@ -114,7 +114,11 @@ public actor CodexAppServer {
 
         package var deadlineClock: CodexDeadlineClock
         package var clock: CodexAppServerClock
-        package var serverRequestHandler: CodexAppServerRequestHandler?
+        /// Handles typed requests initiated by the app-server.
+        ///
+        /// A `nil` handler uses the built-in policy, which declines approvals,
+        /// cancels interactive requests, and rejects unsupported providers.
+        public var serverRequestHandler: CodexAppServerRequestHandler?
 
         /// Creates a configuration for a Codex app-server container.
         ///
@@ -122,11 +126,14 @@ public actor CodexAppServer {
         ///   - localProcess: Local process launch settings.
         ///   - clientName: Client name sent during app-server initialization.
         ///   - clientVersion: Client version sent during app-server initialization.
+        ///   - deadlines: Monotonic request and handshake deadlines.
+        ///   - serverRequestHandler: Optional host policy for app-server-initiated requests.
         public init(
             localProcess: LocalProcess = .init(),
             clientName: String = "CodexAppServerKit",
             clientVersion: String = "1",
-            deadlines: Deadlines = .init()
+            deadlines: Deadlines = .init(),
+            serverRequestHandler: CodexAppServerRequestHandler? = nil
         ) {
             self.localProcess = localProcess
             self.clientName = clientName
@@ -134,7 +141,7 @@ public actor CodexAppServer {
             self.deadlines = deadlines
             self.deadlineClock = .continuous
             self.clock = .init()
-            self.serverRequestHandler = nil
+            self.serverRequestHandler = serverRequestHandler
         }
 
         package init(
@@ -153,6 +160,18 @@ public actor CodexAppServer {
             self.deadlineClock = deadlineClock
             self.clock = clock
             self.serverRequestHandler = serverRequestHandler
+        }
+
+        /// Applies CodexAppServerKit's built-in policy to a server request.
+        ///
+        /// Custom handlers can call this for requests they do not override.
+        public static func defaultServerRequestHandler(
+            request: CodexAppServerRequest
+        ) async throws -> CodexAppServerRequestResolution {
+            CodexAppServerRequestCodec.builtInResolution(
+                for: request,
+                clock: .init()
+            )
         }
 
         package static func defaultServerRequestHandler(
@@ -1109,7 +1128,7 @@ public actor CodexAppServer {
     private nonisolated static func interruptLateReviewSession(
         _ review: CodexReviewSession
     ) async throws {
-        try await interruptAndAwaitTerminal(review.response)
+        _ = try await interruptAndAwaitTerminal(review.response)
     }
 
     private nonisolated static func orderedReviewCleanupThreadIDs(
