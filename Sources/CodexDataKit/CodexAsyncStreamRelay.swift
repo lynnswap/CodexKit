@@ -8,6 +8,13 @@ final class CodexAsyncStreamRelay<Element: Sendable>: Sendable {
     }
 
     private let state = Mutex(State())
+    private let bufferingPolicy: AsyncStream<Element>.Continuation.BufferingPolicy
+
+    init(
+        bufferingPolicy: AsyncStream<Element>.Continuation.BufferingPolicy = .unbounded
+    ) {
+        self.bufferingPolicy = bufferingPolicy
+    }
 
     var hasContinuations: Bool {
         state.withLock { state in
@@ -17,7 +24,7 @@ final class CodexAsyncStreamRelay<Element: Sendable>: Sendable {
 
     func makeStream() -> AsyncStream<Element> {
         let id = UUID()
-        let pair = AsyncStream<Element>.makeStream(bufferingPolicy: .unbounded)
+        let pair = AsyncStream<Element>.makeStream(bufferingPolicy: bufferingPolicy)
         let shouldFinish = state.withLock { state in
             guard state.isFinished == false else {
                 return true
@@ -83,8 +90,6 @@ private func codexAsyncStreamRelayTermination<Element: Sendable>(
     id: UUID
 ) -> @Sendable (AsyncStream<Element>.Continuation.Termination) -> Void {
     { @Sendable _ in
-        Task {
-            owner.value?.removeStream(id)
-        }
+        owner.value?.removeStream(id)
     }
 }

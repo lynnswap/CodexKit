@@ -32,25 +32,133 @@ package enum CodexSortPath: Sendable, Hashable {
     }
 }
 
+public enum CodexFetchValidationError: Error, Hashable, LocalizedError, Sendable {
+    case unsupportedModel(String)
+    case unsupportedPredicate(String)
+    case unsupportedSort(String)
+    case unsupportedSection(String)
+    case invalidArchiveScope(String)
+    case negativeFetchLimit(Int)
+    case negativeFetchOffset(Int)
+
+    public var errorDescription: String? {
+        switch self {
+        case .unsupportedModel(let model):
+            "CodexDataKit does not support fetching \(model)."
+        case .unsupportedPredicate(let predicate):
+            "CodexDataKit does not support predicate \(predicate)."
+        case .unsupportedSort(let sort):
+            "CodexDataKit does not support sort descriptor \(sort)."
+        case .unsupportedSection(let section):
+            "CodexDataKit does not support section descriptor \(section)."
+        case .invalidArchiveScope(let scope):
+            "CodexDataKit cannot represent archive scope \(scope)."
+        case .negativeFetchLimit(let limit):
+            "CodexDataKit fetchLimit must be non-negative; received \(limit)."
+        case .negativeFetchOffset(let offset):
+            "CodexDataKit fetchOffset must be non-negative; received \(offset)."
+        }
+    }
+}
+
+public enum CodexFetchFailure: Error, Equatable, LocalizedError, Sendable {
+    case validation(CodexFetchValidationError)
+    case appServer(CodexAppServerError)
+
+    public var errorDescription: String? {
+        switch self {
+        case .validation(let error):
+            error.localizedDescription
+        case .appServer(let error):
+            error.localizedDescription
+        }
+    }
+}
+
+public enum CodexFetchPhase: Equatable, Sendable {
+    case idle
+    case loading
+    case loaded
+    case failed(CodexFetchFailure)
+}
+
+public struct CodexSortDescriptor<Model: CodexPersistentModel>: Hashable, @unchecked Sendable {
+    package let keyPath: PartialKeyPath<Model>
+    package let stringComparator: String.StandardComparator?
+    public let order: SortOrder
+
+    public init<Value: Comparable>(
+        _ keyPath: any KeyPath<Model, Value> & Sendable,
+        order: SortOrder = .forward
+    ) {
+        self.keyPath = keyPath
+        self.stringComparator = nil
+        self.order = order
+    }
+
+    public init<Value: Comparable>(
+        _ keyPath: any KeyPath<Model, Value?> & Sendable,
+        order: SortOrder = .forward
+    ) {
+        self.keyPath = keyPath
+        self.stringComparator = nil
+        self.order = order
+    }
+
+    public init(
+        _ keyPath: any KeyPath<Model, String> & Sendable,
+        comparator: String.StandardComparator = .localizedStandard,
+        order: SortOrder = .forward
+    ) {
+        self.keyPath = keyPath
+        self.stringComparator = comparator
+        self.order = order
+    }
+
+    public init(
+        _ keyPath: any KeyPath<Model, String?> & Sendable,
+        comparator: String.StandardComparator = .localizedStandard,
+        order: SortOrder = .forward
+    ) {
+        self.keyPath = keyPath
+        self.stringComparator = comparator
+        self.order = order
+    }
+}
+
 package struct CodexSortPlan<Model: CodexPersistentModel>: Sendable, Hashable {
     package var path: CodexSortPath
     package var key: CodexSortKey {
         path.sortKey
     }
     package var order: SortOrder
-    package var comparisonSignature: String?
+    package var stringComparator: String.StandardComparator?
 
-    package init(descriptor: SortDescriptor<Model>) {
-        guard let keyPath = descriptor.keyPath,
-            let path = CodexKnownKeyPaths.sortPath(for: Model.self, keyPath: keyPath)
+    package init(descriptor: CodexSortDescriptor<Model>) throws {
+        guard let path = CodexKnownKeyPaths.sortPath(
+            for: Model.self,
+            keyPath: descriptor.keyPath
+        )
         else {
-            preconditionFailure(
-                "CodexFetchDescriptor does not support sorting \(Model.self) by descriptor \(descriptor)."
+            throw CodexFetchValidationError.unsupportedSort(
+                "\(Model.self).\(descriptor.keyPath)"
             )
         }
         self.path = path
         self.order = descriptor.order
-        self.comparisonSignature = Self.comparisonSignature(for: descriptor)
+        self.stringComparator = descriptor.stringComparator
+    }
+
+    package static func afterValidation(
+        _ descriptor: CodexSortDescriptor<Model>
+    ) -> Self {
+        do {
+            return try Self(descriptor: descriptor)
+        } catch {
+            preconditionFailure(
+                "CodexSortDescriptor was used before successful validation: \(error)"
+            )
+        }
     }
 
     package var threadSortDirection: CodexSortDirection {
@@ -75,11 +183,97 @@ package struct CodexSortPlan<Model: CodexPersistentModel>: Sendable, Hashable {
         }
     }
 
-    private static func comparisonSignature(for descriptor: SortDescriptor<Model>) -> String? {
-        Mirror(reflecting: descriptor).children.first { child in
-            child.label == "comparison"
-        }.map { child in
-            String(describing: child.value)
+    package func compare(_ lhs: Model, _ rhs: Model) -> ComparisonResult {
+        let result: ComparisonResult
+        switch path {
+        case .workspaceGroupName:
+            result = compareStrings(
+                (lhs as! CodexWorkspaceGroup).name,
+                (rhs as! CodexWorkspaceGroup).name
+            )
+        case .workspaceName:
+            result = compareStrings(
+                (lhs as! CodexWorkspace).name,
+                (rhs as! CodexWorkspace).name
+            )
+        case .chatTitle:
+            result = compareStrings(
+                (lhs as! CodexChat).title,
+                (rhs as! CodexChat).title
+            )
+        case .chatName:
+            result = compareOptional(
+                (lhs as! CodexChat).name,
+                (rhs as! CodexChat).name,
+                compare: compareStrings
+            )
+        case .chatCreatedAt:
+            result = compareOptional(
+                (lhs as! CodexChat).createdAt,
+                (rhs as! CodexChat).createdAt,
+                compare: compareComparable
+            )
+        case .chatUpdatedAt:
+            result = compareOptional(
+                (lhs as! CodexChat).updatedAt,
+                (rhs as! CodexChat).updatedAt,
+                compare: compareComparable
+            )
+        case .chatRecencyAt:
+            result = compareOptional(
+                (lhs as! CodexChat).recencyAt,
+                (rhs as! CodexChat).recencyAt,
+                compare: compareComparable
+            )
+        }
+        return order == .forward ? result : result.reversed
+    }
+
+    private func compareStrings(_ lhs: String, _ rhs: String) -> ComparisonResult {
+        (stringComparator ?? .localizedStandard).compare(lhs, rhs)
+    }
+
+    private func compareComparable<Value: Comparable>(
+        _ lhs: Value,
+        _ rhs: Value
+    ) -> ComparisonResult {
+        if lhs < rhs {
+            return .orderedAscending
+        }
+        if rhs < lhs {
+            return .orderedDescending
+        }
+        return .orderedSame
+    }
+
+    private func compareOptional<Value>(
+        _ lhs: Value?,
+        _ rhs: Value?,
+        compare: (Value, Value) -> ComparisonResult
+    ) -> ComparisonResult {
+        switch (lhs, rhs) {
+        case (.none, .none):
+            .orderedSame
+        case (.none, .some):
+            .orderedAscending
+        case (.some, .none):
+            .orderedDescending
+        case (.some(let lhs), .some(let rhs)):
+            compare(lhs, rhs)
+        }
+    }
+
+}
+
+private extension ComparisonResult {
+    var reversed: ComparisonResult {
+        switch self {
+        case .orderedAscending:
+            .orderedDescending
+        case .orderedSame:
+            .orderedSame
+        case .orderedDescending:
+            .orderedAscending
         }
     }
 }
@@ -89,29 +283,28 @@ package enum CodexSectionKey: Sendable, Hashable {
     case workspace
 }
 
-public struct CodexSectionDescriptor<Model: CodexPersistentModel>: Sendable, Hashable {
-    package var key: CodexSectionKey
+public struct CodexSectionDescriptor<Model: CodexPersistentModel>: Hashable, @unchecked Sendable {
+    package let keyPath: PartialKeyPath<Model>
 
-    package init(key: CodexSectionKey) {
-        self.key = key
+    public init<SectionIdentifier: Hashable & Sendable>(
+        _ keyPath: any KeyPath<Model, SectionIdentifier> & Sendable
+    ) {
+        self.keyPath = keyPath
     }
 
     public init<SectionIdentifier: Hashable & Sendable>(
-        _ keyPath: KeyPath<Model, SectionIdentifier>
+        _ keyPath: any KeyPath<Model, SectionIdentifier?> & Sendable
     ) {
-        self.init(key: Self.requireKnownSectionKey(for: keyPath))
+        self.keyPath = keyPath
     }
 
-    public init<SectionIdentifier: Hashable & Sendable>(
-        _ keyPath: KeyPath<Model, SectionIdentifier?>
-    ) {
-        self.init(key: Self.requireKnownSectionKey(for: keyPath))
-    }
-
-    private static func requireKnownSectionKey(for keyPath: AnyKeyPath) -> CodexSectionKey {
-        guard let key = CodexKnownKeyPaths.sectionKey(for: Model.self, keyPath: keyPath) else {
-            preconditionFailure(
-                "CodexSectionDescriptor does not support sectioning \(Model.self) by key path \(keyPath)."
+    package func resolveKey() throws -> CodexSectionKey {
+        guard let key = CodexKnownKeyPaths.sectionKey(
+            for: Model.self,
+            keyPath: keyPath
+        ) else {
+            throw CodexFetchValidationError.unsupportedSection(
+                "\(Model.self).\(keyPath)"
             )
         }
         return key
@@ -120,81 +313,69 @@ public struct CodexSectionDescriptor<Model: CodexPersistentModel>: Sendable, Has
 
 extension CodexSectionDescriptor where Model == CodexWorkspace {
     public static var workspaceGroup: Self {
-        .init(key: .workspaceGroup)
+        .init(\CodexWorkspace.workspaceGroupID)
     }
 }
 
 extension CodexSectionDescriptor where Model == CodexChat {
     public static var workspaceGroup: Self {
-        .init(key: .workspaceGroup)
+        .init(\CodexChat.workspaceGroupID)
     }
 
     public static var workspace: Self {
-        .init(key: .workspace)
+        .init(\CodexChat.workspaceID)
     }
 }
 
-public struct CodexFetchDescriptor<Model: CodexPersistentModel>: Sendable {
-    public var predicate: Predicate<Model>? {
-        didSet {
-            Self.validate(predicate: predicate)
-        }
-    }
-    public var sortBy: [SortDescriptor<Model>]
-    public var fetchLimit: Int? {
-        didSet {
-            Self.validate(fetchLimit: fetchLimit)
-        }
-    }
-    public var fetchOffset: Int? {
-        didSet {
-            Self.validate(fetchOffset: fetchOffset)
-        }
-    }
-    public var includePendingChanges: Bool
+public struct CodexFetchDescriptor<Model: CodexPersistentModel>: Equatable, Sendable {
+    public var predicate: Predicate<Model>?
+    public var sortBy: [CodexSortDescriptor<Model>]
+    public var fetchLimit: Int?
+    public var fetchOffset: Int?
+    public var includeContextChanges: Bool
 
     public init(
         predicate: Predicate<Model>? = nil,
-        sortBy: [SortDescriptor<Model>] = [],
+        sortBy: [CodexSortDescriptor<Model>] = [],
         fetchLimit: Int? = nil,
         fetchOffset: Int? = nil,
-        includePendingChanges: Bool = true
+        includeContextChanges: Bool = true
     ) {
-        Self.validate(predicate: predicate)
-        Self.validate(fetchLimit: fetchLimit)
-        Self.validate(fetchOffset: fetchOffset)
         self.predicate = predicate
         self.sortBy = sortBy
         self.fetchLimit = fetchLimit
         self.fetchOffset = fetchOffset
-        self.includePendingChanges = includePendingChanges
+        self.includeContextChanges = includeContextChanges
+    }
+
+    public static func == (
+        lhs: CodexFetchDescriptor<Model>,
+        rhs: CodexFetchDescriptor<Model>
+    ) -> Bool {
+        lhs.querySignature == rhs.querySignature
     }
 
     package var normalizedFetchOffset: Int {
         fetchOffset ?? 0
     }
 
-    package var sortPlans: [CodexSortPlan<Model>] {
-        sortBy.map(CodexSortPlan.init(descriptor:))
+    package func validatedSortPlans() throws -> [CodexSortPlan<Model>] {
+        try sortBy.map(CodexSortPlan.init(descriptor:))
     }
 
-    private static func validate(fetchLimit: Int?) {
-        if let fetchLimit {
-            precondition(fetchLimit >= 0, "CodexFetchDescriptor fetchLimit must be non-negative.")
+    package func validate(
+        sectionBy: CodexSectionDescriptor<Model>? = nil
+    ) throws {
+        if let fetchLimit, fetchLimit < 0 {
+            throw CodexFetchValidationError.negativeFetchLimit(fetchLimit)
         }
-    }
-
-    private static func validate(fetchOffset: Int?) {
-        if let fetchOffset {
-            precondition(fetchOffset >= 0, "CodexFetchDescriptor fetchOffset must be non-negative.")
+        if let fetchOffset, fetchOffset < 0 {
+            throw CodexFetchValidationError.negativeFetchOffset(fetchOffset)
         }
-    }
-
-    private static func validate(predicate: Predicate<Model>?) {
-        guard predicate != nil, Model.self != CodexChat.self else {
-            return
+        if let failure = querySignature.validationFailure {
+            throw failure
         }
-        preconditionFailure("CodexFetchDescriptor does not support predicates for \(Model.self).")
+        _ = try sectionBy?.resolveKey()
     }
 }
 
@@ -270,95 +451,6 @@ package enum CodexKnownKeyPaths {
     }
 }
 
-public final class CodexFetchRequest<Model: CodexPersistentModel> {
-    public var predicate: Predicate<Model>? {
-        didSet {
-            Self.validate(predicate: predicate)
-        }
-    }
-    public var sortDescriptors: [SortDescriptor<Model>]
-    public var fetchLimit: Int? {
-        didSet {
-            Self.validate(fetchLimit: fetchLimit)
-        }
-    }
-    public var fetchOffset: Int? {
-        didSet {
-            Self.validate(fetchOffset: fetchOffset)
-        }
-    }
-    public var includePendingChanges: Bool
-
-    public var fetchDescriptor: CodexFetchDescriptor<Model> {
-        get {
-            CodexFetchDescriptor(
-                predicate: predicate,
-                sortBy: sortDescriptors,
-                fetchLimit: fetchLimit,
-                fetchOffset: fetchOffset,
-                includePendingChanges: includePendingChanges
-            )
-        }
-        set {
-            predicate = newValue.predicate
-            sortDescriptors = newValue.sortBy
-            fetchLimit = newValue.fetchLimit
-            fetchOffset = newValue.fetchOffset
-            includePendingChanges = newValue.includePendingChanges
-        }
-    }
-
-    public init(
-        predicate: Predicate<Model>? = nil,
-        sortDescriptors: [SortDescriptor<Model>] = [],
-        fetchLimit: Int? = nil,
-        fetchOffset: Int? = nil,
-        includePendingChanges: Bool = true
-    ) {
-        Self.validate(predicate: predicate)
-        Self.validate(fetchLimit: fetchLimit)
-        Self.validate(fetchOffset: fetchOffset)
-        self.predicate = predicate
-        self.sortDescriptors = sortDescriptors
-        self.fetchLimit = fetchLimit
-        self.fetchOffset = fetchOffset
-        self.includePendingChanges = includePendingChanges
-    }
-
-    public convenience init(_ descriptor: CodexFetchDescriptor<Model>) {
-        self.init(
-            predicate: descriptor.predicate,
-            sortDescriptors: descriptor.sortBy,
-            fetchLimit: descriptor.fetchLimit,
-            fetchOffset: descriptor.fetchOffset,
-            includePendingChanges: descriptor.includePendingChanges
-        )
-    }
-
-    package func copy() -> CodexFetchRequest<Model> {
-        CodexFetchRequest(fetchDescriptor)
-    }
-
-    private static func validate(fetchLimit: Int?) {
-        if let fetchLimit {
-            precondition(fetchLimit >= 0, "CodexFetchRequest fetchLimit must be non-negative.")
-        }
-    }
-
-    private static func validate(fetchOffset: Int?) {
-        if let fetchOffset {
-            precondition(fetchOffset >= 0, "CodexFetchRequest fetchOffset must be non-negative.")
-        }
-    }
-
-    private static func validate(predicate: Predicate<Model>?) {
-        guard predicate != nil, Model.self != CodexChat.self else {
-            return
-        }
-        preconditionFailure("CodexFetchRequest does not support predicates for \(Model.self).")
-    }
-}
-
 extension CodexFetchDescriptor where Model == CodexWorkspaceGroup {
     public static var workspaceGroups: Self {
         .init(sortBy: codexDefaultWorkspaceGroupSortDescriptors())
@@ -371,7 +463,7 @@ extension CodexFetchDescriptor where Model == CodexWorkspace {
     }
 
     public static func workspaces(
-        sortBy: [SortDescriptor<CodexWorkspace>] = codexDefaultWorkspaceSortDescriptors()
+        sortBy: [CodexSortDescriptor<CodexWorkspace>] = codexDefaultWorkspaceSortDescriptors()
     ) -> Self {
         .init(sortBy: sortBy)
     }
@@ -394,7 +486,7 @@ extension CodexFetchDescriptor where Model == CodexChat {
 
     public static func chats(
         in workspace: CodexWorkspace,
-        sortBy: [SortDescriptor<CodexChat>],
+        sortBy: [CodexSortDescriptor<CodexChat>],
         fetchLimit: Int? = nil
     ) -> Self {
         let scopedWorkspaceID: CodexWorkspaceID? = workspace.id
@@ -408,69 +500,21 @@ extension CodexFetchDescriptor where Model == CodexChat {
     }
 }
 
-extension CodexFetchRequest where Model == CodexWorkspaceGroup {
-    public static var workspaceGroups: Self {
-        Self(.workspaceGroups)
-    }
-}
-
-extension CodexFetchRequest where Model == CodexWorkspace {
-    public static var workspaces: Self {
-        Self(.workspaces)
-    }
-
-    public static func workspaces(
-        sortDescriptors: [SortDescriptor<CodexWorkspace>] =
-            codexDefaultWorkspaceSortDescriptors()
-    ) -> Self {
-        Self(.workspaces(sortBy: sortDescriptors))
-    }
-}
-
-extension CodexFetchRequest where Model == CodexChat {
-    public static var recentChats: Self {
-        Self(.recentChats)
-    }
-
-    public static func chats(
-        in workspace: CodexWorkspace,
-        fetchLimit: Int? = nil
-    ) -> Self {
-        chats(
-            in: workspace,
-            sortDescriptors: codexDefaultChatSortDescriptors(),
-            fetchLimit: fetchLimit
-        )
-    }
-
-    public static func chats(
-        in workspace: CodexWorkspace,
-        sortDescriptors: [SortDescriptor<CodexChat>],
-        fetchLimit: Int? = nil
-    ) -> Self {
-        Self(.chats(
-            in: workspace,
-            sortBy: sortDescriptors,
-            fetchLimit: fetchLimit
-        ))
-    }
-}
-
 @usableFromInline
 func codexDefaultWorkspaceGroupSortDescriptors()
-    -> [SortDescriptor<CodexWorkspaceGroup>]
+    -> [CodexSortDescriptor<CodexWorkspaceGroup>]
 {
-    [SortDescriptor(\.name)]
+    [CodexSortDescriptor(\.name)]
 }
 
 @usableFromInline
-func codexDefaultWorkspaceSortDescriptors() -> [SortDescriptor<CodexWorkspace>] {
-    [SortDescriptor(\.name)]
+func codexDefaultWorkspaceSortDescriptors() -> [CodexSortDescriptor<CodexWorkspace>] {
+    [CodexSortDescriptor(\.name)]
 }
 
 @usableFromInline
-func codexDefaultChatSortDescriptors() -> [SortDescriptor<CodexChat>] {
-    [SortDescriptor(\.updatedAt, order: .reverse)]
+func codexDefaultChatSortDescriptors() -> [CodexSortDescriptor<CodexChat>] {
+    [CodexSortDescriptor(\.updatedAt, order: .reverse)]
 }
 
 public enum CodexFetchSectionID: Sendable, Hashable, CustomStringConvertible {
@@ -628,14 +672,21 @@ public final class CodexFetchedResults<Model: CodexPersistentModel> {
     public private(set) var sections: [CodexFetchSection<Model>] = []
     public private(set) var nextCursor: String?
     public private(set) var backwardsCursor: String?
-    public var phase: CodexDataPhase = .idle
-    public var lastErrorDescription: String?
+    public private(set) var phase: CodexFetchPhase
+
+    @ObservationIgnored
+    private let validationFailure: CodexFetchValidationError?
 
     @ObservationIgnored
     private var hasPerformedFetch = false
 
     @ObservationIgnored
-    private let transactionRelay = CodexAsyncStreamRelay<CodexFetchedResultsTransaction<Model>>()
+    private let loadCoordinator = FetchedResultsLoadCoordinator()
+
+    @ObservationIgnored
+    private let transactionRelay = CodexAsyncStreamRelay<CodexFetchedResultsTransaction<Model>>(
+        bufferingPolicy: .bufferingNewest(1)
+    )
 
     package init(
         modelContext: CodexModelContext,
@@ -646,22 +697,44 @@ public final class CodexFetchedResults<Model: CodexPersistentModel> {
         self.fetchDescriptor = fetchDescriptor
         self.querySignature = fetchDescriptor.querySignature
         self.sectionBy = sectionBy
+        do {
+            try fetchDescriptor.validate(sectionBy: sectionBy)
+            self.validationFailure = nil
+            self.phase = .idle
+        } catch let failure as CodexFetchValidationError {
+            self.validationFailure = failure
+            self.phase = .failed(.validation(failure))
+        } catch {
+            preconditionFailure("Unexpected fetch descriptor validation error: \(error)")
+        }
     }
 
     deinit {
         transactionRelay.finish()
     }
 
-    package func makeTransactionStream()
-        -> AsyncStream<CodexFetchedResultsTransaction<Model>>
-    {
+    public var transactions: AsyncStream<CodexFetchedResultsTransaction<Model>> {
         transactionRelay.makeStream()
     }
 
+    public var snapshot: CodexFetchedResultsSnapshot<Model.ID> {
+        CodexFetchedResultsSnapshot(sections: sections)
+    }
+
+    package func waitUntilPendingLoad() async {
+        await loadCoordinator.waitUntilPendingLoad()
+    }
+
     public nonisolated(nonsending) func performFetch() async throws {
-        let reason: CodexFetchedResultsTransactionReason =
-            hasPerformedFetch ? .refresh : .initialFetch
-        try await load(fetchDescriptor, appending: false, reason: reason)
+        try await loadCoordinator.withPermit {
+            let reason: CodexFetchedResultsTransactionReason =
+                hasPerformedFetch ? .refresh : .initialFetch
+            try await executeLoad(
+                fetchDescriptor,
+                appending: false,
+                reason: reason
+            )
+        }
     }
 
     public nonisolated(nonsending) func refresh() async throws {
@@ -669,32 +742,56 @@ public final class CodexFetchedResults<Model: CodexPersistentModel> {
     }
 
     public nonisolated(nonsending) func loadNextPage() async throws {
-        guard let nextCursor else {
-            return
+        try await loadCoordinator.withPermit {
+            guard let nextCursor else {
+                return
+            }
+            try await executeLoad(
+                fetchDescriptor,
+                cursor: nextCursor,
+                appending: true,
+                reason: .pageAppend
+            )
         }
-        try await load(
-            fetchDescriptor,
-            cursor: nextCursor,
-            appending: true,
-            reason: .pageAppend
-        )
     }
 
     private func load(
         _ descriptor: CodexFetchDescriptor<Model>,
         cursor: String? = nil,
         appending: Bool,
-        reason: CodexFetchedResultsTransactionReason
+        reason: CodexFetchedResultsTransactionReason,
+        targetWindowCount: Int? = nil
     ) async throws {
-        phase = .loading
-        lastErrorDescription = nil
-        let previousBackwardsCursor = backwardsCursor
-        do {
-            let page = try await modelContext.fetchPage(
+        try await loadCoordinator.withPermit {
+            try await executeLoad(
                 descriptor,
                 cursor: cursor,
-                excluding: self
+                appending: appending,
+                reason: reason,
+                targetWindowCount: targetWindowCount
             )
+        }
+    }
+
+    private func executeLoad(
+        _ descriptor: CodexFetchDescriptor<Model>,
+        cursor: String? = nil,
+        appending: Bool,
+        reason: CodexFetchedResultsTransactionReason,
+        targetWindowCount: Int? = nil
+    ) async throws {
+        let stablePhase = phase
+        phase = .loading
+        let previousBackwardsCursor = backwardsCursor
+        do {
+            try descriptor.validate(sectionBy: sectionBy)
+            let page = try await stagedPage(
+                descriptor,
+                cursor: cursor,
+                appending: appending,
+                targetWindowCount: targetWindowCount
+            )
+            try Task.checkCancellation()
             let newItems = loadedItems(from: page, appending: appending)
             let relationshipDescriptor = appending ? fetchDescriptor : descriptor
             await modelContext.syncLoadedRelationships(
@@ -704,6 +801,7 @@ public final class CodexFetchedResults<Model: CodexPersistentModel> {
                 cursor: cursor,
                 excluding: self
             )
+            try Task.checkCancellation()
             nextCursor = page.nextCursor
             backwardsCursor = appending ? previousBackwardsCursor : page.backwardsCursor
             phase = .loaded
@@ -713,12 +811,75 @@ public final class CodexFetchedResults<Model: CodexPersistentModel> {
                 sections: modelContext.sections(for: newItems, sectionBy: sectionBy),
                 reason: reason
             )
+        } catch is CancellationError {
+            phase = stablePhase
+            throw CancellationError()
+        } catch let validation as CodexFetchValidationError {
+            let failure = CodexFetchFailure.validation(validation)
+            phase = .failed(failure)
+            throw failure
+        } catch let failure as CodexFetchFailure {
+            phase = .failed(failure)
+            throw failure
+        } catch let appServer as CodexAppServerError {
+            let failure = CodexFetchFailure.appServer(appServer)
+            phase = .failed(failure)
+            throw failure
         } catch {
-            let message = error.localizedDescription
-            lastErrorDescription = message
-            phase = .failed(message)
-            throw error
+            preconditionFailure("Unexpected CodexDataKit fetch error: \(error)")
         }
+    }
+
+    private func stagedPage(
+        _ descriptor: CodexFetchDescriptor<Model>,
+        cursor: String?,
+        appending: Bool,
+        targetWindowCount: Int?
+    ) async throws -> CodexFetchPage<Model> {
+        var page = try await modelContext.fetchPage(
+            descriptor,
+            cursor: cursor,
+            excluding: self
+        )
+        guard appending == false, hasPerformedFetch else {
+            return page
+        }
+
+        let targetCount = targetWindowCount ?? items.count
+        var stagedItems = page.items
+        var stagedIDs = Set(stagedItems.map(\.id))
+        var nextCursor = page.nextCursor
+        let firstBackwardsCursor = page.backwardsCursor
+        var relationshipItems = page.relationshipItems
+        var relationshipIsComplete = page.relationshipIsComplete
+
+        while stagedItems.count < targetCount, let cursor = nextCursor {
+            try Task.checkCancellation()
+            let nextPage = try await modelContext.fetchPage(
+                descriptor,
+                cursor: cursor,
+                excluding: self
+            )
+            for item in nextPage.items where stagedIDs.insert(item.id).inserted {
+                stagedItems.append(item)
+            }
+            nextCursor = nextPage.nextCursor
+            if let nextRelationshipItems = nextPage.relationshipItems {
+                relationshipItems = nextRelationshipItems
+            }
+            if let nextRelationshipIsComplete = nextPage.relationshipIsComplete {
+                relationshipIsComplete = nextRelationshipIsComplete
+            }
+        }
+
+        page = CodexFetchPage(
+            items: stagedItems,
+            nextCursor: nextCursor,
+            backwardsCursor: firstBackwardsCursor,
+            relationshipItems: relationshipItems,
+            relationshipIsComplete: relationshipIsComplete
+        )
+        return page
     }
 
     private func loadedItems(
@@ -770,17 +931,13 @@ public final class CodexFetchedResults<Model: CodexPersistentModel> {
         return result
     }
 
-    private var currentSnapshot: CodexFetchedResultsSnapshot<Model.ID> {
-        CodexFetchedResultsSnapshot(sections: sections)
-    }
-
     private func updateItemsAndSections(
         items newItems: [Model],
         sections newSections: [CodexFetchSection<Model>],
         reason: CodexFetchedResultsTransactionReason,
         updatedItemIDs: Set<Model.ID> = []
     ) {
-        let oldSnapshot = currentSnapshot
+        let oldSnapshot = snapshot
         items = newItems
         sections = newSections
         yieldTransaction(
@@ -801,7 +958,7 @@ public final class CodexFetchedResults<Model: CodexPersistentModel> {
         let transaction = CodexFetchedResultsTransaction<Model>(
             reason: reason,
             oldSnapshot: oldSnapshot,
-            newSnapshot: currentSnapshot,
+            newSnapshot: snapshot,
             updatedItemIDs: updatedItemIDs
         )
         guard transaction.hasChanges
@@ -816,7 +973,13 @@ public final class CodexFetchedResults<Model: CodexPersistentModel> {
 
 extension CodexFetchedResults: CodexFetchedResultsRegistration {
     package func insert(_ chat: CodexChat, archived: Bool) async {
-        if membershipRequiresServerRefresh {
+        guard validationFailure == nil else {
+            return
+        }
+        if mutationStrategy(for: .insert) == .refreshLoadedWindow {
+            if let model = insertionModel(for: chat, archived: archived) {
+                _ = upsert(model, reason: .insert)
+            }
             await refreshAfterMutation(reason: .insert)
             return
         }
@@ -831,7 +994,11 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         workspace: CodexWorkspace?,
         group: CodexWorkspaceGroup?
     ) async {
-        if requiresServerRefreshAfterMutation {
+        guard validationFailure == nil else {
+            return
+        }
+        if mutationStrategy(for: .archive) == .refreshLoadedWindow {
+            let targetWindowCount = items.count
             _ = applyLocalRevalidation([
                 CodexFetchedChatRevalidation(
                     chat: chat,
@@ -840,7 +1007,10 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
                     archived: true
                 )
             ], reason: .archive)
-            await refreshAfterMutation(reason: .archive)
+            await refreshAfterMutation(
+                reason: .archive,
+                targetWindowCount: targetWindowCount
+            )
             return
         }
         if let model = insertionModel(for: chat, archived: true) {
@@ -851,18 +1021,28 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
     }
 
     package func revalidate(_ changes: [CodexFetchedChatRevalidation]) async {
+        guard validationFailure == nil else {
+            return
+        }
         guard changes.isEmpty == false else {
             return
         }
-        if requiresServerRefreshAfterMutation {
+        let affectsMembership = changes.contains {
+            shouldInclude($0.chat, archived: $0.archived)
+        }
+        if mutationStrategy(for: .revalidate(
+            affectsMembership: affectsMembership,
+            hasNextPage: nextCursor != nil
+        )) == .refreshLoadedWindow {
+            let targetWindowCount = items.count
             _ = applyLocalRevalidation(changes, reason: .revalidate)
-            await refreshAfterMutation(reason: .revalidate)
+            await refreshAfterMutation(
+                reason: .revalidate,
+                targetWindowCount: targetWindowCount
+            )
             return
         }
         let originalCount = applyLocalRevalidation(changes, reason: .revalidate)
-        if await refreshAfterPagedRevalidationIfNeeded(changes) {
-            return
-        }
         if canEvaluateFilterLocally {
             for change in changes {
                 guard let model = insertionModel(for: change.chat, archived: change.archived) else {
@@ -873,7 +1053,15 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
                 }
             }
         }
-        await backfillAfterLocalRemovalIfNeeded(originalCount: originalCount, reason: .revalidate)
+        if items.count < originalCount,
+            mutationStrategy(for: .remove(hasNextPage: nextCursor != nil))
+                == .refreshLoadedWindow
+        {
+            await refreshAfterMutation(
+                reason: .revalidate,
+                targetWindowCount: originalCount
+            )
+        }
     }
 
     package func remove(
@@ -881,6 +1069,9 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         workspace: CodexWorkspace?,
         group: CodexWorkspaceGroup?
     ) async {
+        guard validationFailure == nil else {
+            return
+        }
         await remove(chat, workspace: workspace, group: group, reason: .remove)
     }
 
@@ -890,24 +1081,27 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         group: CodexWorkspaceGroup?,
         reason: CodexFetchedResultsTransactionReason
     ) async {
+        guard validationFailure == nil else {
+            return
+        }
         let originalCount = applyLocalRemoval(
             of: chat,
             workspace: workspace,
             group: group,
             reason: reason
         )
-        if fetchDescriptor.normalizedFetchOffset > 0 {
-            await refreshAfterMutation(reason: reason)
-            return
-        }
-        if requiresServerRefreshAfterMutation {
-            await refreshAfterMutation(reason: reason)
+        if mutationStrategy(for: .remove(hasNextPage: nextCursor != nil))
+            == .refreshLoadedWindow
+        {
+            await refreshAfterMutation(
+                reason: reason,
+                targetWindowCount: originalCount
+            )
             return
         }
         guard items.count != originalCount else {
             return
         }
-        await backfillAfterLocalRemovalIfNeeded(originalCount: originalCount, reason: reason)
     }
 
     package func refresh(
@@ -915,12 +1109,18 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         archived: Bool,
         removedChats: [CodexChat]
     ) async {
+        guard validationFailure == nil else {
+            return
+        }
         let originalCount = items.count
         let refreshed = refreshItems(archived: archived, keeping: {
             shouldKeep($0, afterRefreshing: workspace, removedChats: removedChats)
         }, reason: .refresh)
-        if requiresServerRefreshAfterMutation {
-            await refreshAfterMutation(reason: .refresh)
+        if mutationStrategy(for: .relationshipRefresh) == .refreshLoadedWindow {
+            await refreshAfterMutation(
+                reason: .refresh,
+                targetWindowCount: originalCount
+            )
             return
         }
         guard refreshed else {
@@ -930,7 +1130,15 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             await refreshAfterMutation(reason: .refresh)
             return
         }
-        await backfillAfterLocalRemovalIfNeeded(originalCount: originalCount, reason: .refresh)
+        if items.count < originalCount,
+            mutationStrategy(for: .remove(hasNextPage: nextCursor != nil))
+                == .refreshLoadedWindow
+        {
+            await refreshAfterMutation(
+                reason: .refresh,
+                targetWindowCount: originalCount
+            )
+        }
     }
 
     package func refresh(
@@ -938,12 +1146,18 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         archived: Bool,
         removedChats: [CodexChat]
     ) async {
+        guard validationFailure == nil else {
+            return
+        }
         let originalCount = items.count
         let refreshed = refreshItems(archived: archived, keeping: {
             shouldKeep($0, afterRefreshing: group, removedChats: removedChats)
         }, reason: .refresh)
-        if requiresServerRefreshAfterMutation {
-            await refreshAfterMutation(reason: .refresh)
+        if mutationStrategy(for: .relationshipRefresh) == .refreshLoadedWindow {
+            await refreshAfterMutation(
+                reason: .refresh,
+                targetWindowCount: originalCount
+            )
             return
         }
         guard refreshed else {
@@ -953,7 +1167,15 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             await refreshAfterMutation(reason: .refresh)
             return
         }
-        await backfillAfterLocalRemovalIfNeeded(originalCount: originalCount, reason: .refresh)
+        if items.count < originalCount,
+            mutationStrategy(for: .remove(hasNextPage: nextCursor != nil))
+                == .refreshLoadedWindow
+        {
+            await refreshAfterMutation(
+                reason: .refresh,
+                targetWindowCount: originalCount
+            )
+        }
     }
 
     private func insertionModel(for chat: CodexChat, archived: Bool) -> Model? {
@@ -1036,7 +1258,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
 
     private var canInsertLiveModel: Bool {
         canEvaluateFilterLocally
-            && fetchDescriptor.includePendingChanges
+            && fetchDescriptor.includeContextChanges
             && fetchDescriptor.normalizedFetchOffset == 0
             && (nextCursor == nil || fetchDescriptor.fetchLimit == nil)
     }
@@ -1046,88 +1268,67 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
             return models
         }
         let loadedCount = items.count
-        let targetCount: Int
-        if insertedModel && (loadedCount < fetchLimit || loadedCount > fetchLimit) {
-            targetCount = loadedCount + 1
-        } else {
-            targetCount = loadedCount
-        }
+        let targetCount = insertedModel
+            && loadedCount < fetchLimit
+            ? loadedCount + 1
+            : loadedCount
         return Array(models.prefix(max(targetCount, 0)))
-    }
-
-    private var shouldRefreshAfterLocalRemoval: Bool {
-        nextCursor != nil
     }
 
     private var canEvaluateFilterLocally: Bool {
         membershipRequiresServerRefresh == false
     }
 
-    private var requiresServerRefreshAfterMutation: Bool {
-        membershipRequiresServerRefresh || usesServerOwnedOrdering
-    }
-
     private var membershipRequiresServerRefresh: Bool {
         chatQueryPlan?.membershipRequiresServerRefresh ?? false
     }
 
-    private var usesServerOwnedOrdering: Bool {
-        chatQueryPlan?.usesServerOwnedOrdering ?? false
+    private func mutationStrategy(
+        for operation: CodexFetchedResultsMutationOperation
+    ) -> CodexFetchedResultsMutationStrategy {
+        if let chatQueryPlan {
+            return chatQueryPlan.mutationStrategy(for: operation)
+        }
+        switch operation {
+        case .remove(let hasNextPage):
+            return fetchDescriptor.normalizedFetchOffset > 0 || hasNextPage
+                ? .refreshLoadedWindow
+                : .removeLocally
+        case .revalidate(let affectsMembership, let hasNextPage):
+            return affectsMembership
+                && (fetchDescriptor.normalizedFetchOffset > 0 || hasNextPage)
+                ? .refreshLoadedWindow
+                : .applyLocally
+        case .insert, .archive, .relationshipRefresh:
+            return .applyLocally
+        }
     }
 
     private var chatQueryPlan: CodexThreadQueryPlan? {
         guard Model.self == CodexChat.self else {
             return nil
         }
-        return CodexThreadQueryPlan(descriptor: fetchDescriptor as! CodexFetchDescriptor<CodexChat>)
+        guard querySignature.validationFailure == nil else {
+            return nil
+        }
+        return try? CodexThreadQueryPlan(
+            descriptor: fetchDescriptor as! CodexFetchDescriptor<CodexChat>
+        )
     }
 
-    private func backfillAfterLocalRemovalIfNeeded(
-        originalCount: Int,
-        reason: CodexFetchedResultsTransactionReason
+    private func refreshAfterMutation(
+        reason: CodexFetchedResultsTransactionReason,
+        targetWindowCount: Int? = nil
     ) async {
-        let missingCount = originalCount - items.count
-        guard missingCount > 0, shouldRefreshAfterLocalRemoval else {
-            return
-        }
-        let backfillOffset = fetchDescriptor.normalizedFetchOffset + items.count
-        var descriptor = fetchDescriptor
-        descriptor.fetchLimit = missingCount
         do {
             try await load(
-                descriptor,
-                cursor: modelContext.backfillCursor(after: backfillOffset, currentCursor: nextCursor),
-                appending: true,
-                reason: reason
+                fetchDescriptor,
+                appending: false,
+                reason: reason,
+                targetWindowCount: targetWindowCount
             )
         } catch {
-            // load records the failed phase; the server mutation has already succeeded.
-        }
-    }
-
-    private func refreshAfterMutation(reason: CodexFetchedResultsTransactionReason) async {
-        do {
-            try await load(fetchDescriptor, appending: false, reason: reason)
-        } catch {
             // performFetch records the failed phase; the server mutation has already succeeded.
-        }
-    }
-
-    private func refreshAfterPagedRevalidationIfNeeded(
-        _ changes: [CodexFetchedChatRevalidation]
-    ) async -> Bool {
-        guard Model.self == CodexChat.self,
-            (nextCursor != nil || fetchDescriptor.normalizedFetchOffset > 0),
-            changes.contains(where: { shouldInclude($0.chat, archived: $0.archived) })
-        else {
-            return false
-        }
-        do {
-            try await load(fetchDescriptor, appending: false, reason: .revalidate)
-            return true
-        } catch {
-            // performFetch records the failed phase; the server mutation has already succeeded.
-            return false
         }
     }
 

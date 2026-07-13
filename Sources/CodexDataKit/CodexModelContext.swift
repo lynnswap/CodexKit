@@ -2,13 +2,13 @@ import AsyncAlgorithms
 import CodexAppServerKit
 import Foundation
 import OSLog
+import Synchronization
 
 private let logger = Logger(subsystem: "CodexDataKit", category: "model-context")
 
 public enum CodexModelContextError: Error, Equatable, Sendable {
     case unsupportedModelType(String)
     case modelIsDetached
-    case chatObservationAlreadyActive(CodexThreadID)
 }
 
 package struct CodexModelContextID: Hashable, Sendable {
@@ -50,80 +50,83 @@ package struct CodexModelContextTransaction: Sendable {
     }
 }
 
-public final class CodexModelContainer: @unchecked Sendable {
-    public let appServer: CodexAppServer
+@MainActor
+package final class CodexModelContextCoordinator {
+    package nonisolated let appServer: CodexAppServer
+    private weak var mainContext: CodexModelContext?
 
-    @MainActor
-    public var mainContext: CodexModelContext {
-        if let context = _mainContext {
-            return context
-        }
-        let context = CodexModelContext(self)
-        _mainContext = context
-        if pendingMainContextTransactions.isEmpty == false {
-            Task { @MainActor in
-                await self.deliverPendingMainContextTransactions(to: context)
-            }
-        }
-        return context
-    }
-
-    @MainActor
-    private var _mainContext: CodexModelContext?
-
-    private struct PendingMainContextTransaction {
-        var transaction: CodexModelContextTransaction
-        var sourceContextID: CodexModelContextID
-    }
-
-    // Transactions multicast before the main context is materialized; replayed
-    // once it exists so early actor-side changes are not dropped.
-    @MainActor
-    private var pendingMainContextTransactions: [PendingMainContextTransaction] = []
-
-    public init(appServer: CodexAppServer) {
+    package init(appServer: CodexAppServer) {
         self.appServer = appServer
     }
 
-    public convenience init(
-        configuration: CodexAppServer.Configuration = .init()
-    ) async throws {
-        let appServer = try await CodexAppServer(configuration: configuration)
-        self.init(appServer: appServer)
+    package func attachMainContext(_ context: CodexModelContext) {
+        precondition(mainContext == nil, "A model coordinator can have one main context.")
+        precondition(context.appServer === appServer)
+        mainContext = context
     }
 
-    @MainActor
     package func multicast(
         _ transaction: CodexModelContextTransaction,
         from sourceContextID: CodexModelContextID
     ) async {
-        guard transaction.isEmpty == false else {
+        guard transaction.isEmpty == false,
+            let mainContext,
+            sourceContextID != mainContext.contextID
+        else {
             return
         }
-        pendingMainContextTransactions.append(.init(
-            transaction: transaction,
-            sourceContextID: sourceContextID
-        ))
-        guard let context = _mainContext else {
-            return
-        }
-        await deliverPendingMainContextTransactions(to: context)
-    }
-
-    @MainActor
-    private func deliverPendingMainContextTransactions(to context: CodexModelContext) async {
-        while pendingMainContextTransactions.isEmpty == false {
-            let pending = pendingMainContextTransactions.removeFirst()
-            guard pending.sourceContextID != context.contextID else {
-                continue
-            }
-            await context.merge(pending.transaction)
-        }
+        await mainContext.merge(transaction)
     }
 }
 
-public final class CodexModelContext {
+public final class CodexModelContainer: Equatable, Sendable {
+    public let appServer: CodexAppServer
+    package let coordinator: CodexModelContextCoordinator
+
+    @MainActor
+    public let mainContext: CodexModelContext
+
+    @MainActor
+    public init(appServer: CodexAppServer) {
+        let coordinator = CodexModelContextCoordinator(appServer: appServer)
+        let mainContext = CodexModelContext(coordinator: coordinator)
+        self.appServer = appServer
+        self.coordinator = coordinator
+        self.mainContext = mainContext
+        coordinator.attachMainContext(mainContext)
+    }
+
+    public nonisolated static func == (
+        lhs: CodexModelContainer,
+        rhs: CodexModelContainer
+    ) -> Bool {
+        lhs === rhs
+    }
+
+}
+
+public final class CodexModelContext: Equatable, SendableMetatype {
     private static let localCursorPrefix = "codexkit-ui-offset:"
+
+    private final class WeakActorReference: Sendable {
+        private final class Storage {
+            weak var value: (any Actor)?
+
+            init(_ value: any Actor) {
+                self.value = value
+            }
+        }
+
+        private let storage: Mutex<Storage>
+
+        init(_ value: any Actor) {
+            storage = Mutex(Storage(value))
+        }
+
+        func load() -> (any Actor)? {
+            storage.withLock { $0.value }
+        }
+    }
 
     private struct ChatFetchedResultState: Equatable {
         var name: String?
@@ -140,27 +143,143 @@ public final class CodexModelContext {
         var workspaceGroupID: CodexWorkspaceGroupID?
     }
 
-    private struct RefreshedThreadSnapshot {
+    private struct RefreshedThreadSnapshot: Sendable {
         var snapshot: CodexThreadSnapshot
         var metadataReadCompleted: Bool
     }
 
+    private enum ChatObservationStartSnapshot: Sendable {
+        case loaded(RefreshedThreadSnapshot)
+        case failed(CodexAppServerError)
+    }
+
+    private struct ChatObservationStartLoad: Sendable {
+        var thread: CodexThread
+        var source: String
+        var usesPreparedThread: Bool
+        var includesTurns: Bool
+        var eventStream: CodexThreadEventSequence?
+        var snapshot: ChatObservationStartSnapshot
+    }
+
+    private enum ChatObservationStartOutcome: Sendable {
+        case loaded(ChatObservationStartLoad)
+        case failed(CodexAppServerError)
+    }
+
     private final class ActiveChatObservation {
+        let generation: UInt64
+        let stablePhase: CodexChatPhase
+        let isolation: WeakActorReference
+        let releaseSignal = ChatObservationReleaseSignal()
         var eventThread: CodexThread?
-        var eventStream: AsyncThrowingStream<CodexThreadEvent, Error>?
+        var eventStream: CodexThreadEventSequence?
         var includesTurns = false
         var isFinished = false
+        var isClosing = false
+        var finishSnapshotReason: CodexChatSnapshotReason?
         var isBufferingEvents = false
         var bufferedEvents: [CodexThreadEvent] = []
-        let updateRelay = CodexAsyncStreamRelay<CodexChatUpdate>()
+        var subscribers: [UUID: CodexChatObservationChannel] = [:]
+        var sequence: UInt64 = 0
         var hasAppliedLiveUpdates = false
+        var isStarting = true
+        var isCommittingStart = false
+        var startWasCancelled = false
+        var startWaiters: [ChatObservationStartWaiter] = []
+        var pendingRegistrationCount = 0
+        var startOperation: ChatObservationStartOperation<ChatObservationStartOutcome>?
+        var isUpgrading = false
+        var upgradeWaiters: [CheckedContinuation<Void, any Error>] = []
+        var closeWaiters: [CheckedContinuation<Void, Never>] = []
+
+        init(
+            generation: UInt64,
+            stablePhase: CodexChatPhase,
+            isolation: any Actor
+        ) {
+            self.generation = generation
+            self.stablePhase = stablePhase
+            self.isolation = WeakActorReference(isolation)
+        }
 
         func cancel() {
             isFinished = true
+            startOperation?.cancel()
+            releaseSignal.terminate()
             eventPump?.cancel()
             discardBufferedEvents()
-            updateRelay.finish()
+            for channel in subscribers.values {
+                channel.finish()
+            }
+            subscribers.removeAll(keepingCapacity: false)
             eventStream = nil
+            finishClosing()
+        }
+
+        func waitUntilStarted() async throws {
+            if startWasCancelled { throw CancellationError() }
+            guard isStarting else { return }
+            let waiter = ChatObservationStartWaiter()
+            if startWasCancelled {
+                waiter.resolve(cancelled: true)
+            } else if isStarting {
+                startWaiters.append(waiter)
+            } else {
+                waiter.resolve(cancelled: false)
+            }
+            try await waiter.wait()
+        }
+
+        func finishStarting(cancelled: Bool = false) {
+            precondition(isStarting)
+            isStarting = false
+            startWasCancelled = cancelled
+            let waiters = startWaiters
+            startWaiters.removeAll(keepingCapacity: false)
+            for waiter in waiters {
+                waiter.resolve(cancelled: cancelled)
+            }
+        }
+
+        func waitUntilUpgradeFinishes() async throws {
+            guard isUpgrading else { return }
+            try await withCheckedThrowingContinuation {
+                (continuation: CheckedContinuation<Void, any Error>) in
+                if isUpgrading { upgradeWaiters.append(continuation) }
+                else { continuation.resume() }
+            }
+        }
+
+        func finishUpgrade(with error: (any Error)? = nil) {
+            precondition(isUpgrading)
+            isUpgrading = false
+            let waiters = upgradeWaiters
+            upgradeWaiters.removeAll(keepingCapacity: false)
+            for waiter in waiters {
+                if let error { waiter.resume(throwing: error) }
+                else { waiter.resume() }
+            }
+        }
+
+        func waitUntilClosed() async {
+            guard isFinished == false else { return }
+            await withCheckedContinuation { continuation in
+                if isFinished {
+                    continuation.resume()
+                } else {
+                    closeWaiters.append(continuation)
+                }
+            }
+        }
+
+        func finishClosing() {
+            isClosing = false
+            let waiters = closeWaiters
+            closeWaiters.removeAll(keepingCapacity: false)
+            for waiter in waiters {
+                waiter.resume()
+            }
         }
 
         var eventPump: ThreadEventPump?
@@ -198,47 +317,187 @@ public final class CodexModelContext {
             bufferedEvents.removeAll(keepingCapacity: true)
         }
 
-        func yield(_ updates: [CodexChatUpdate]) {
+        func yield(_ mutations: [CodexChatMutation], chat: CodexChat) {
+            let updates = chat.observationUpdates(for: mutations)
             guard updates.isEmpty == false else {
                 return
             }
-            for update in updates {
-                updateRelay.yield(update)
+            let firstSequence = sequence &+ 1
+            sequence &+= UInt64(updates.count)
+            let events = updates.enumerated().map { offset, update in
+                CodexChatObservationEvent(
+                    generation: generation,
+                    sequence: firstSequence &+ UInt64(offset),
+                    payload: .update(update)
+                )
             }
+            let overflow = snapshotEvent(chat: chat, reason: .bufferOverflow)
+            for channel in subscribers.values {
+                channel.yield(events, overflowSnapshot: overflow)
+            }
+        }
+
+        func makeSubscriber(chat: CodexChat) -> (UUID, CodexChatUpdates) {
+            let id = UUID()
+            let channel = CodexChatObservationChannel(
+                releaseSignal: releaseSignal,
+                leaseID: id
+            )
+            channel.seed(snapshotEvent(
+                chat: chat,
+                reason: finishSnapshotReason
+                    ?? (generation == 1 ? .initial : .generationRestart)
+            ))
+            if isFinished {
+                channel.finish()
+            } else {
+                subscribers[id] = channel
+            }
+            return (id, CodexChatUpdates(channel: channel))
+        }
+
+        func removeSubscriber(_ id: UUID) {
+            subscribers.removeValue(forKey: id)?.finish()
+        }
+
+        func broadcastSnapshot(
+            chat: CodexChat,
+            reason: CodexChatSnapshotReason,
+            advancesSequence: Bool = true
+        ) {
+            if advancesSequence {
+                sequence &+= 1
+            }
+            let event = snapshotEvent(chat: chat, reason: reason)
+            for channel in subscribers.values {
+                channel.yield(event, overflowSnapshot: event)
+            }
+        }
+
+        func finishSubscribers() {
+            for channel in subscribers.values {
+                channel.finish()
+            }
+            subscribers.removeAll(keepingCapacity: false)
+        }
+
+        private func snapshotEvent(
+            chat: CodexChat,
+            reason: CodexChatSnapshotReason
+        ) -> CodexChatObservationEvent {
+            CodexChatObservationEvent(
+                generation: generation,
+                sequence: sequence,
+                payload: .snapshot(
+                    .init(thread: chat.observationSnapshot(), phase: chat.phase),
+                    reason: reason
+                )
+            )
         }
     }
 
     private final class ThreadEventPump {
+        private enum ChildResult: Sendable {
+            case upstreamFinished
+            case upstreamCancelled
+            case releaseReceiverFinished
+            case lastLeaseReleased(UUID)
+        }
+
         private let task: Task<Void, Never>
+        private let releaseSignal: ChatObservationReleaseSignal
 
         init(
             context: CodexModelContext,
             chatID: CodexThreadID,
             observation: ActiveChatObservation,
-            stream: AsyncThrowingStream<CodexThreadEvent, Error>,
-            isolation: (any Actor)?
+            stream: CodexThreadEventSequence,
+            releaseSignal: ChatObservationReleaseSignal,
+            isolation: WeakActorReference
         ) {
+            self.releaseSignal = releaseSignal
             let target = ThreadEventPumpTarget(
                 context: context,
                 chatID: chatID,
                 observation: observation
             )
             task = Task {
-                do {
-                    for try await event in stream {
-                        await target.process(event, isolation: isolation)
+                var lastReleasedLeaseID: UUID?
+                await withTaskGroup(of: ChildResult.self) { group in
+                    group.addTask {
+                        do {
+                            for try await event in stream {
+                                guard let actor = isolation.load() else {
+                                    return .upstreamCancelled
+                                }
+                                await target.process(event, isolation: actor)
+                            }
+                            if let actor = isolation.load() {
+                                await target.finish(isolation: actor)
+                            }
+                            releaseSignal.terminate()
+                            return .upstreamFinished
+                        } catch is CancellationError {
+                            return .upstreamCancelled
+                        } catch {
+                            if let actor = isolation.load() {
+                                await target.fail(with: error, isolation: actor)
+                            }
+                            releaseSignal.terminate()
+                            return .upstreamFinished
+                        }
                     }
-                    await target.finish(isolation: isolation)
-                } catch is CancellationError {
-                    await target.discard(isolation: isolation)
-                } catch {
-                    await target.fail(with: error, isolation: isolation)
+                    group.addTask {
+                        while let release = await releaseSignal.next() {
+                            guard let actor = isolation.load() else {
+                                return .lastLeaseReleased(release.leaseID)
+                            }
+                            let isLast = await target.release(
+                                leaseID: release.leaseID,
+                                isolation: actor
+                            )
+                            if isLast {
+                                return .lastLeaseReleased(release.leaseID)
+                            }
+                            releaseSignal.acknowledge(release.leaseID)
+                        }
+                        return .releaseReceiverFinished
+                    }
+                    while let result = await group.next() {
+                        switch result {
+                        case .lastLeaseReleased(let leaseID):
+                            lastReleasedLeaseID = leaseID
+                            releaseSignal.terminate()
+                            group.cancelAll()
+                        case .upstreamFinished, .upstreamCancelled:
+                            releaseSignal.terminate()
+                            group.cancelAll()
+                        case .releaseReceiverFinished:
+                            if Task.isCancelled {
+                                group.cancelAll()
+                            }
+                        }
+                    }
                 }
+                if let lastReleasedLeaseID {
+                    if let actor = isolation.load() {
+                        await target.completeLastRelease(isolation: actor)
+                    }
+                    releaseSignal.acknowledge(lastReleasedLeaseID)
+                }
+                releaseSignal.completeAllAcknowledgements()
             }
         }
 
         func cancel() {
+            releaseSignal.terminate()
             task.cancel()
+        }
+
+        func cancelAndWait() async {
+            releaseSignal.terminate()
+            task.cancel()
+            await task.value
         }
     }
 
@@ -261,36 +520,37 @@ public final class CodexModelContext {
             self.observation = observation
         }
 
-        func process(_ event: CodexThreadEvent, isolation: isolated (any Actor)?) async {
+        func process(_ event: CodexThreadEvent, isolation: isolated any Actor) async {
             await context?.processObservedEvent(event, chatID: chatID, observation: observation)
         }
 
-        func finish(isolation: isolated (any Actor)?) {
+        func finish(isolation: isolated any Actor) {
             context?.finishChatObservationIfIdle(chatID, observation: observation)
         }
 
-        func discard(isolation: isolated (any Actor)?) {
-            context?.discardChatObservation(chatID, observation: observation)
-        }
-
-        func fail(with error: Error, isolation: isolated (any Actor)?) async {
+        func fail(with error: Error, isolation: isolated any Actor) async {
             await context?.failChatObservation(chatID, observation: observation, error: error)
         }
-    }
 
-    private struct ObservationUpdates: AsyncSequence, Sendable {
-        typealias Element = CodexChatUpdate
-        typealias Failure = Never
+        func release(
+            leaseID: UUID,
+            isolation: isolated any Actor
+        ) -> Bool {
+            guard let context else { return true }
+            return context.releaseChatObservationLease(
+                chatID,
+                observation: observation,
+                subscriberID: leaseID
+            )
+        }
 
-        let relay: CodexAsyncStreamRelay<CodexChatUpdate>
-
-        func makeAsyncIterator() -> AsyncStream<CodexChatUpdate>.Iterator {
-            relay.makeStream().makeAsyncIterator()
+        func completeLastRelease(isolation: isolated any Actor) {
+            context?.completeChatObservationClose(chatID, observation: observation)
         }
     }
 
-    public private(set) weak var container: CodexModelContainer?
-    public let appServer: CodexAppServer
+    private let coordinator: CodexModelContextCoordinator
+    package let appServer: CodexAppServer
     package let contextID = CodexModelContextID()
 
     private var workspaceGroupsByID: [CodexWorkspaceGroupID: CodexWorkspaceGroup] = [:]
@@ -300,26 +560,41 @@ public final class CodexModelContext {
     private var itemsByID: [CodexChatItemID: CodexItem] = [:]
     private var fetchedResults: [WeakFetchedResultsRegistration] = []
     private var activeChatObservationsByID: [CodexThreadID: ActiveChatObservation] = [:]
+    private var chatObservationGenerationByID: [CodexThreadID: UInt64] = [:]
     private var preparedEventThreadsByID: [CodexThreadID: CodexThread] = [:]
 
-    public init(_ container: CodexModelContainer) {
-        self.container = container
-        self.appServer = container.appServer
+    public convenience init(_ container: CodexModelContainer) {
+        self.init(coordinator: container.coordinator)
+    }
+
+    package init(coordinator: CodexModelContextCoordinator) {
+        self.coordinator = coordinator
+        self.appServer = coordinator.appServer
+    }
+
+    public nonisolated static func == (
+        lhs: CodexModelContext,
+        rhs: CodexModelContext
+    ) -> Bool {
+        lhs === rhs
     }
 
     public nonisolated(nonsending) func fetch<Model: CodexPersistentModel>(
         _ descriptor: CodexFetchDescriptor<Model>
     ) async throws -> [Model] {
-        let page = try await fetchPage(descriptor)
-        let items = fetchedItemsIncludingPendingChanges(from: page, descriptor: descriptor)
-        await syncLoadedRelationships(from: page, descriptor: descriptor, loadedItems: items)
-        return items
-    }
-
-    public nonisolated(nonsending) func fetch<Model: CodexPersistentModel>(
-        _ request: CodexFetchRequest<Model>
-    ) async throws -> [Model] {
-        try await fetch(request.fetchDescriptor)
+        do {
+            try descriptor.validate()
+            let page = try await fetchPage(descriptor)
+            let items = fetchedItemsIncludingPendingChanges(from: page, descriptor: descriptor)
+            await syncLoadedRelationships(from: page, descriptor: descriptor, loadedItems: items)
+            return items
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let failure as CodexFetchValidationError {
+            throw CodexFetchFailure.validation(failure)
+        } catch let failure as CodexAppServerError {
+            throw CodexFetchFailure.appServer(failure)
+        }
     }
 
     public func fetchedResults<Model: CodexPersistentModel>(
@@ -335,29 +610,6 @@ public final class CodexModelContext {
         return results
     }
 
-    public func fetchedResults<Model: CodexPersistentModel>(
-        for request: CodexFetchRequest<Model>,
-        sectionedBy sectionBy: CodexSectionDescriptor<Model>? = nil
-    ) -> CodexFetchedResults<Model> {
-        fetchedResults(for: request.fetchDescriptor, sectionedBy: sectionBy)
-    }
-
-    public func fetchedResultsController<Model: CodexPersistentModel>(
-        for descriptor: CodexFetchDescriptor<Model>,
-        sectionedBy sectionBy: CodexSectionDescriptor<Model>? = nil
-    ) -> CodexFetchedResultsController<Model> {
-        CodexFetchedResultsController(
-            fetchedResults: fetchedResults(for: descriptor, sectionedBy: sectionBy)
-        )
-    }
-
-    public func fetchedResultsController<Model: CodexPersistentModel>(
-        for request: CodexFetchRequest<Model>,
-        sectionedBy sectionBy: CodexSectionDescriptor<Model>? = nil
-    ) -> CodexFetchedResultsController<Model> {
-        fetchedResultsController(for: request.fetchDescriptor, sectionedBy: sectionBy)
-    }
-
     public func model(for id: CodexThreadID) -> CodexChat {
         chat(for: id)
     }
@@ -366,27 +618,42 @@ public final class CodexModelContext {
         chatsByID[id]
     }
 
-    public func model(for id: CodexWorkspaceID) -> CodexWorkspace? {
-        workspacesByID[id]
-    }
-
     public func registeredModel(for id: CodexWorkspaceID) -> CodexWorkspace? {
         workspacesByID[id]
-    }
-
-    public func model(for id: CodexWorkspaceGroupID) -> CodexWorkspaceGroup? {
-        workspaceGroupsByID[id]
     }
 
     public func registeredModel(for id: CodexWorkspaceGroupID) -> CodexWorkspaceGroup? {
         workspaceGroupsByID[id]
     }
 
+    private func requireAttached<Model: CodexPersistentModel>(_ model: Model) throws {
+        guard model.modelContext === self else {
+            throw CodexModelContextError.modelIsDetached
+        }
+        let isRegistered: Bool
+        switch model {
+        case let chat as CodexChat:
+            isRegistered = chatsByID[chat.id] === chat
+        case let workspace as CodexWorkspace:
+            isRegistered = workspacesByID[workspace.id] === workspace
+        case let group as CodexWorkspaceGroup:
+            isRegistered = workspaceGroupsByID[group.id] === group
+        case let turn as CodexTurn:
+            isRegistered = turnsByID[turn.id] === turn
+        case let item as CodexItem:
+            isRegistered = itemsByID[item.id] === item
+        default:
+            throw CodexModelContextError.unsupportedModelType(String(describing: Model.self))
+        }
+        guard isRegistered else {
+            throw CodexModelContextError.modelIsDetached
+        }
+    }
+
     package func turn(
         id: CodexTurnID,
         in chat: CodexChat,
-        status: CodexTurnStatus? = nil,
-        errorDescription: String? = nil,
+        state: CodexTurnSnapshot.State? = nil,
         itemsLoadState: CodexTurnItemsLoadState? = nil,
         usage: CodexTokenUsage? = nil
     ) -> CodexTurn {
@@ -398,8 +665,7 @@ public final class CodexModelContext {
             id: id,
             chat: chat,
             modelContext: self,
-            status: status,
-            errorDescription: errorDescription,
+            state: state,
             itemsLoadState: itemsLoadState,
             usage: usage
         )
@@ -451,12 +717,10 @@ public final class CodexModelContext {
     }
 
     public nonisolated(nonsending) func refresh(_ group: CodexWorkspaceGroup) async throws {
-        guard group.modelContext === self else {
-            throw CodexModelContextError.modelIsDetached
-        }
+        try requireAttached(group)
 
         let descriptor = CodexFetchDescriptor<CodexWorkspace>(
-            sortBy: [SortDescriptor(\.name)]
+            sortBy: [CodexSortDescriptor(\.name)]
         )
         let previousWorkspaces = group.workspaces
         let previousChats = group.workspaces.flatMap(\.chats)
@@ -511,9 +775,7 @@ public final class CodexModelContext {
     }
 
     public nonisolated(nonsending) func refresh(_ workspace: CodexWorkspace) async throws {
-        guard workspace.modelContext === self else {
-            throw CodexModelContextError.modelIsDetached
-        }
+        try requireAttached(workspace)
 
         let descriptor = CodexFetchDescriptor<CodexChat>.chats(in: workspace)
         let previousChats = workspace.chats
@@ -552,15 +814,16 @@ public final class CodexModelContext {
         _ chat: CodexChat,
         includeTurns: Bool = true
     ) async throws {
-        guard chat.modelContext === self else {
-            throw CodexModelContextError.modelIsDetached
-        }
+        try requireAttached(chat)
 
-        chat.phase = .loading
-        chat.lastErrorDescription = nil
+        let stablePhase = chat.phase
+        chat.beginLoading()
         do {
             let thread = try await eventThread(for: chat)
             try await refresh(chat, using: thread, includeTurns: includeTurns)
+        } catch is CancellationError {
+            chat.restorePhaseIfLoading(stablePhase)
+            throw CancellationError()
         } catch {
             chat.fail(with: error)
             throw error
@@ -574,13 +837,14 @@ public final class CodexModelContext {
         replaysBufferedEvents: Bool = true,
         emitsResynchronization: Bool = true
     ) async throws {
-        let previousWorkspace = chat.workspace
-        let previousGroup = previousWorkspace?.workspaceGroup
         let observation = activeChatObservationsByID[chat.id]
         observation?.beginBufferingEvents()
         let refreshedSnapshot: RefreshedThreadSnapshot
         do {
-            refreshedSnapshot = try await refreshedThreadSnapshot(for: thread, includeTurns: includeTurns)
+            refreshedSnapshot = try await Self.refreshedThreadSnapshot(
+                for: thread,
+                includeTurns: includeTurns
+            )
         } catch {
             if replaysBufferedEvents {
                 await flushBufferedEvents(from: observation, to: chat)
@@ -589,6 +853,26 @@ public final class CodexModelContext {
             }
             throw error
         }
+        await applyRefreshedThreadSnapshot(
+            refreshedSnapshot,
+            to: chat,
+            includeTurns: includeTurns,
+            observation: observation,
+            replaysBufferedEvents: replaysBufferedEvents,
+            emitsResynchronization: emitsResynchronization
+        )
+    }
+
+    private func applyRefreshedThreadSnapshot(
+        _ refreshedSnapshot: RefreshedThreadSnapshot,
+        to chat: CodexChat,
+        includeTurns: Bool,
+        observation: ActiveChatObservation?,
+        replaysBufferedEvents: Bool,
+        emitsResynchronization: Bool
+    ) async {
+        let previousWorkspace = chat.workspace
+        let previousGroup = previousWorkspace?.workspaceGroup
         let snapshot = refreshedSnapshot.snapshot
         let snapshotCanLagBehindLiveEvents = snapshotCanLagBehindLiveEvents(refreshedSnapshot)
         let chatShouldPreserveTurnItems = snapshotCanLagBehindLiveEvents
@@ -609,14 +893,9 @@ public final class CodexModelContext {
         if includeTurns {
             refreshedChat.resetLiveMergeStateFromCurrentItems()
         }
-        refreshedChat.syncPhaseAfterRefresh(
-            includeTurns: includeTurns,
-            refreshedStatus: snapshot.hasField(.status)
-        )
+        refreshedChat.syncPhaseAfterRefresh(includeTurns: includeTurns)
         if emitsResynchronization {
-            yield([
-                .resynchronized(reason: .refresh),
-            ], to: observation)
+            observation?.broadcastSnapshot(chat: refreshedChat, reason: .refresh)
         }
         if replaysBufferedEvents {
             await flushBufferedEvents(from: observation, to: refreshedChat)
@@ -649,7 +928,7 @@ public final class CodexModelContext {
         }
     }
 
-    private func refreshedThreadSnapshot(
+    private static func refreshedThreadSnapshot(
         for thread: CodexThread,
         includeTurns: Bool
     ) async throws -> RefreshedThreadSnapshot {
@@ -674,7 +953,7 @@ public final class CodexModelContext {
         }
     }
 
-    private func fullTurnList(for thread: CodexThread) async throws -> [CodexTurnSnapshot] {
+    private static func fullTurnList(for thread: CodexThread) async throws -> [CodexTurnSnapshot] {
         var cursor: String?
         var turns: [CodexTurnSnapshot] = []
         repeat {
@@ -689,7 +968,7 @@ public final class CodexModelContext {
         return turns
     }
 
-    private func threadSnapshot(
+    private static func threadSnapshot(
         for thread: CodexThread,
         withAuthoritativeTurns turns: [CodexTurnSnapshot]
     ) async throws -> RefreshedThreadSnapshot {
@@ -752,7 +1031,13 @@ public final class CodexModelContext {
     }
 
     private static func isThreadNotLoadedError(_ error: Error) -> Bool {
-        guard case JSONRPC.Error.responseError(_, let message) = error else {
+        let message: String
+        if case JSONRPC.Error.responseError(let serverError) = error {
+            message = serverError.message
+        } else if case CodexAppServerError.request(let failure) = error,
+                  case .server(let serverError) = failure.kind {
+            message = serverError.message
+        } else {
             return false
         }
         return message.lowercased().contains("thread not loaded")
@@ -766,31 +1051,32 @@ public final class CodexModelContext {
         for event in bufferedEvents {
             let changes = await apply(event, to: chat)
             observation?.markAppliedLiveUpdates()
-            yield(changes, to: observation)
+            yield(changes, from: chat, to: observation)
         }
     }
 
     private func yield(
-        _ updates: [CodexChatUpdate],
+        _ updates: [CodexChatMutation],
+        from chat: CodexChat,
         to observation: ActiveChatObservation?
     ) {
         guard let observation else {
             return
         }
-        observation.yield(updates)
+        observation.yield(updates, chat: chat)
     }
 
-    public nonisolated(nonsending) func observe(
+    public func observe(
         _ chat: CodexChat,
-        includeTurns: Bool = true
+        includeTurns: Bool = true,
+        isolation: isolated any Actor = #isolation
     ) async throws -> CodexChatObservation {
-        guard chat.modelContext === self else {
-            throw CodexModelContextError.modelIsDetached
-        }
+        try requireAttached(chat)
 
         let activeObservation = try await activeObservation(
             for: chat,
-            includeTurns: includeTurns
+            includeTurns: includeTurns,
+            isolation: isolation
         )
 
         return makeChatObservation(chat: chat, activeObservation: activeObservation)
@@ -799,109 +1085,295 @@ public final class CodexModelContext {
     private func activeObservation(
         for chat: CodexChat,
         includeTurns: Bool,
+        isolation: any Actor,
         resumedThread: CodexThread? = nil
     ) async throws -> ActiveChatObservation {
         if let observation = activeChatObservationsByID[chat.id] {
+            precondition(
+                observation.isolation.load() === isolation,
+                "A chat observation generation must remain on its owner actor."
+            )
             if observation.isFinished {
                 activeChatObservationsByID.removeValue(forKey: chat.id)
+            } else if observation.isClosing {
+                await observation.waitUntilClosed()
+                return try await activeObservation(
+                    for: chat,
+                    includeTurns: includeTurns,
+                    isolation: isolation,
+                    resumedThread: resumedThread
+                )
             } else {
-                throw CodexModelContextError.chatObservationAlreadyActive(chat.id)
+                return try await joinObservation(
+                    observation,
+                    for: chat,
+                    includeTurns: includeTurns
+                )
             }
         }
 
         let chatID = chat.id
-        let observation = ActiveChatObservation()
+        let generation = (chatObservationGenerationByID[chatID] ?? 0) &+ 1
+        chatObservationGenerationByID[chatID] = generation
+        let stablePhase = chat.phase
+        chat.beginLoading()
+        let observation = ActiveChatObservation(
+            generation: generation,
+            stablePhase: stablePhase,
+            isolation: isolation
+        )
         activeChatObservationsByID[chatID] = observation
-        do {
-            try await self.startObservation(
-                observation,
-                for: chat,
-                includeTurns: includeTurns,
-                resumedThread: resumedThread
-            )
-            return observation
-        } catch {
-            discardChatObservation(chatID, observation: observation)
-            throw error
+        let suppliedThread: CodexThread?
+        let suppliedSource: String?
+        let usesPreparedThread: Bool
+        if let resumedThread {
+            suppliedThread = resumedThread
+            suppliedSource = "resumedThread"
+            usesPreparedThread = false
+        } else if let preparedThread = takePreparedEventThread(for: chatID) {
+            suppliedThread = preparedThread
+            suppliedSource = "preparedEventThread"
+            usesPreparedThread = true
+        } else {
+            suppliedThread = nil
+            suppliedSource = nil
+            usesPreparedThread = false
         }
+        let appServer = appServer
+        observation.startOperation = ChatObservationStartOperation {
+            do {
+                let thread: CodexThread
+                let source: String
+                if let suppliedThread, let suppliedSource {
+                    thread = suppliedThread
+                    source = suppliedSource
+                } else {
+                    thread = try await appServer.resumeThread(chatID)
+                    source = "resumeThread"
+                }
+                try Task.checkCancellation()
+                let eventStream = usesPreparedThread
+                    ? nil
+                    : thread.makeCurrentGenerationEventStream()
+                let snapshot: ChatObservationStartSnapshot
+                do {
+                    snapshot = .loaded(try await Self.refreshedThreadSnapshot(
+                        for: thread,
+                        includeTurns: includeTurns
+                    ))
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch let error as CodexAppServerError {
+                    snapshot = .failed(error)
+                }
+                try Task.checkCancellation()
+                return .loaded(.init(
+                    thread: thread,
+                    source: source,
+                    usesPreparedThread: usesPreparedThread,
+                    includesTurns: includeTurns,
+                    eventStream: eventStream,
+                    snapshot: snapshot
+                ))
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch let error as CodexAppServerError {
+                return .failed(error)
+            }
+        }
+        return try await joinObservation(
+            observation,
+            for: chat,
+            includeTurns: includeTurns
+        )
     }
 
-    private func startObservation(
+    private func joinObservation(
         _ observation: ActiveChatObservation,
         for chat: CodexChat,
-        includeTurns: Bool,
-        resumedThread: CodexThread? = nil
-    ) async throws {
-        chat.phase = .loading
-        chat.lastErrorDescription = nil
-        let thread: CodexThread
-        let usesPreparedThread: Bool
+        includeTurns: Bool
+    ) async throws -> ActiveChatObservation {
+        observation.pendingRegistrationCount += 1
         do {
-            let threadSource: String
-            if let resumedThread {
-                thread = resumedThread
-                threadSource = "resumedThread"
-                usesPreparedThread = false
-            } else if let preparedThread = takePreparedEventThread(for: chat.id) {
-                thread = preparedThread
-                threadSource = "preparedEventThread"
-                usesPreparedThread = true
-            } else {
-                thread = try await appServer.resumeThread(chat.id)
-                threadSource = "resumeThread"
-                usesPreparedThread = false
+            guard let startOperation = observation.startOperation else {
+                preconditionFailure("A starting observation must own its start operation.")
             }
-            logger.debug(
-                "Starting chat observation chatID=\(chat.id.rawValue, privacy: .public) includeTurns=\(includeTurns, privacy: .public) source=\(threadSource, privacy: .public) turns=\(chat.turns.count, privacy: .public) items=\(chat.items.count, privacy: .public)"
+            let outcome = try await startOperation.value()
+            try await commitObservationStartIfNeeded(
+                outcome,
+                observation: observation,
+                chat: chat
             )
-            observation.eventThread = thread
             try Task.checkCancellation()
-            if usesPreparedThread == false {
-                await startEventPump(observation, thread: thread)
+            if observation.isFinished {
+                precondition(observation.pendingRegistrationCount > 0)
+                observation.pendingRegistrationCount -= 1
+                return observation
             }
-            do {
-                try await refresh(
-                    chat,
-                    using: thread,
-                    includeTurns: includeTurns,
-                    emitsResynchronization: false
-                )
-            } catch {
-                guard canObserveSeededSnapshotAfterInitialRefreshFailure(
-                    chat,
-                    usesPreparedThread: usesPreparedThread,
-                    includeTurns: includeTurns
-                ) else {
-                    throw error
-                }
-                chat.syncPhaseAfterRefresh(includeTurns: includeTurns)
-            }
-            if usesPreparedThread {
-                if shouldResetPreparedEventGenerationBeforeObserving(chat, includeTurns: includeTurns) {
-                    await thread.beginEventGeneration()
-                }
-                await startEventPump(observation, thread: thread)
+            if includeTurns, observation.includesTurns == false {
+                try await upgradeObservation(observation, for: chat)
             }
             try Task.checkCancellation()
-            observation.includesTurns = includeTurns
+            precondition(observation.pendingRegistrationCount > 0)
+            observation.pendingRegistrationCount -= 1
+            return observation
         } catch {
-            chat.fail(with: error)
-            discardChatObservation(chat.id, observation: observation)
+            precondition(observation.pendingRegistrationCount > 0)
+            observation.pendingRegistrationCount -= 1
+            await cancelUnclaimedObservationIfNeeded(
+                chat.id,
+                observation: observation
+            )
             throw error
         }
     }
 
-    private func startEventPump(_ observation: ActiveChatObservation, thread: CodexThread) async {
-        observation.eventStream = await thread.makeCurrentGenerationEventStream()
-        if let eventStream = observation.eventStream {
-            observation.eventPump = ThreadEventPump(
-                context: self,
-                chatID: thread.id,
-                observation: observation,
-                stream: eventStream,
-                isolation: #isolation
-            )
+    private func commitObservationStartIfNeeded(
+        _ outcome: ChatObservationStartOutcome,
+        observation: ActiveChatObservation,
+        chat: CodexChat
+    ) async throws {
+        if observation.isStarting == false {
+            return
         }
+        if observation.isCommittingStart {
+            try await observation.waitUntilStarted()
+            return
+        }
+        observation.isCommittingStart = true
+        defer { observation.isCommittingStart = false }
+
+        switch outcome {
+        case .failed(let error):
+            finishObservationStartWithFailure(
+                error,
+                observation: observation,
+                chat: chat
+            )
+        case .loaded(let load):
+            logger.debug(
+                "Starting chat observation chatID=\(chat.id.rawValue, privacy: .public) includeTurns=\(load.includesTurns, privacy: .public) source=\(load.source, privacy: .public) turns=\(chat.turns.count, privacy: .public) items=\(chat.items.count, privacy: .public)"
+            )
+            observation.eventThread = load.thread
+            switch load.snapshot {
+            case .loaded(let refreshedSnapshot):
+                await applyRefreshedThreadSnapshot(
+                    refreshedSnapshot,
+                    to: chat,
+                    includeTurns: load.includesTurns,
+                    observation: observation,
+                    replaysBufferedEvents: true,
+                    emitsResynchronization: false
+                )
+            case .failed(let error):
+                guard canObserveSeededSnapshotAfterInitialRefreshFailure(
+                    chat,
+                    usesPreparedThread: load.usesPreparedThread,
+                    includeTurns: load.includesTurns
+                ) else {
+                    finishObservationStartWithFailure(
+                        error,
+                        observation: observation,
+                        chat: chat
+                    )
+                    return
+                }
+                chat.syncPhaseAfterRefresh(includeTurns: load.includesTurns)
+            }
+            if load.usesPreparedThread,
+               shouldResetPreparedEventGenerationBeforeObserving(
+                   chat,
+                   includeTurns: load.includesTurns
+               ) {
+                load.thread.beginEventGeneration()
+            }
+            let eventStream = load.eventStream
+                ?? load.thread.makeCurrentGenerationEventStream()
+            startEventPump(
+                observation,
+                thread: load.thread,
+                eventStream: eventStream
+            )
+            observation.includesTurns = load.includesTurns
+            observation.finishStarting()
+        }
+    }
+
+    private func finishObservationStartWithFailure(
+        _ error: CodexAppServerError,
+        observation: ActiveChatObservation,
+        chat: CodexChat
+    ) {
+        chat.fail(with: error)
+        observation.finishSnapshotReason = .upstreamFailure
+        observation.isFinished = true
+        if observation.isStarting {
+            observation.finishStarting()
+        }
+        observation.releaseSignal.terminate()
+        activeChatObservationsByID.removeValue(forKey: chat.id)
+    }
+
+    private func cancelUnclaimedObservationIfNeeded(
+        _ chatID: CodexThreadID,
+        observation: ActiveChatObservation
+    ) async {
+        guard observation.pendingRegistrationCount == 0,
+              observation.subscribers.isEmpty,
+              activeChatObservationsByID[chatID] === observation
+        else {
+            return
+        }
+        chat(for: chatID).restorePhaseIfLoading(observation.stablePhase)
+        await observation.startOperation?.cancelAndWait()
+        observation.releaseSignal.terminate()
+        await observation.eventPump?.cancelAndWait()
+        discardChatObservation(chatID, observation: observation)
+    }
+
+    private func upgradeObservation(
+        _ observation: ActiveChatObservation,
+        for chat: CodexChat
+    ) async throws {
+        if observation.includesTurns { return }
+        if observation.isUpgrading {
+            try await observation.waitUntilUpgradeFinishes()
+            return
+        }
+        guard let thread = observation.eventThread else {
+            preconditionFailure("An active chat observation must own its event thread.")
+        }
+        observation.isUpgrading = true
+        do {
+            try await refresh(
+                chat,
+                using: thread,
+                includeTurns: true,
+                emitsResynchronization: false
+            )
+            observation.includesTurns = true
+            observation.broadcastSnapshot(chat: chat, reason: .includeTurnsUpgrade)
+            observation.finishUpgrade()
+        } catch {
+            observation.finishUpgrade(with: error)
+            throw error
+        }
+    }
+
+    private func startEventPump(
+        _ observation: ActiveChatObservation,
+        thread: CodexThread,
+        eventStream: CodexThreadEventSequence
+    ) {
+        observation.eventStream = eventStream
+        observation.eventPump = ThreadEventPump(
+            context: self,
+            chatID: thread.id,
+            observation: observation,
+            stream: eventStream,
+            releaseSignal: observation.releaseSignal,
+            isolation: observation.isolation
+        )
     }
 
     private func shouldResetPreparedEventGenerationBeforeObserving(
@@ -914,6 +1386,9 @@ public final class CodexModelContext {
         if chat.phase == .loading || chat.status?.isActive == true {
             return false
         }
+        if case .running = chat.phase {
+            return false
+        }
         return true
     }
 
@@ -921,7 +1396,7 @@ public final class CodexModelContext {
         _ event: CodexThreadEvent,
         to chat: CodexChat,
         observation: ActiveChatObservation
-    ) async -> [CodexChatUpdate] {
+    ) async -> [CodexChatMutation] {
         if observation.isBufferingEvents {
             observation.appendBufferedEvent(event)
             return []
@@ -944,7 +1419,7 @@ public final class CodexModelContext {
             return
         }
         let changes = await applyObservedEvent(event, to: chat, observation: observation)
-        yield(changes, to: observation)
+        yield(changes, from: chat, to: observation)
     }
 
     private func failChatObservation(
@@ -954,7 +1429,11 @@ public final class CodexModelContext {
     ) async {
         if let chat = registeredModel(for: chatID) {
             chat.fail(with: error)
-            yield([.phaseChanged(chat.phase)], to: observation)
+            observation.finishSnapshotReason = .upstreamFailure
+            observation.broadcastSnapshot(
+                chat: chat,
+                reason: .upstreamFailure
+            )
         }
         finishChatObservationIfIdle(chatID, observation: observation)
     }
@@ -969,15 +1448,32 @@ public final class CodexModelContext {
             && chat.turns.isEmpty == false
     }
 
-    private func releaseChatObservation(
+    private func releaseChatObservationLease(
+        _ chatID: CodexThreadID,
+        observation: ActiveChatObservation,
+        subscriberID: UUID
+    ) -> Bool {
+        guard activeChatObservationsByID[chatID] === observation else {
+            observation.removeSubscriber(subscriberID)
+            return observation.subscribers.isEmpty
+        }
+        observation.removeSubscriber(subscriberID)
+        if observation.subscribers.isEmpty == false {
+            return false
+        }
+        observation.isClosing = true
+        return true
+    }
+
+    private func completeChatObservationClose(
         _ chatID: CodexThreadID,
         observation: ActiveChatObservation
     ) {
-        guard activeChatObservationsByID[chatID] === observation else {
-            return
+        observation.isFinished = true
+        observation.finishClosing()
+        if activeChatObservationsByID[chatID] === observation {
+            activeChatObservationsByID.removeValue(forKey: chatID)
         }
-        observation.cancel()
-        activeChatObservationsByID.removeValue(forKey: chatID)
     }
 
     private func finishChatObservationIfIdle(
@@ -988,7 +1484,9 @@ public final class CodexModelContext {
             return
         }
         observation.isFinished = true
-        observation.updateRelay.finish()
+        observation.finishSubscribers()
+        observation.releaseSignal.terminate()
+        observation.finishClosing()
         activeChatObservationsByID.removeValue(forKey: chatID)
     }
 
@@ -1007,15 +1505,14 @@ public final class CodexModelContext {
         chat: CodexChat,
         activeObservation: ActiveChatObservation
     ) -> CodexChatObservation {
-        let chatID = chat.id
-        let updates: CodexChatUpdates = ObservationUpdates(relay: activeObservation.updateRelay)
-        return CodexChatObservation(chat: chat, updates: updates) {
-            [weak self, weak activeObservation] in
-            guard let activeObservation else {
-                return
-            }
-            self?.releaseChatObservation(chatID, observation: activeObservation)
-        }
+        let (subscriberID, updates) = activeObservation.makeSubscriber(chat: chat)
+        return CodexChatObservation(
+            chat: chat,
+            updates: updates,
+            leaseID: subscriberID,
+            modelContext: self,
+            releaseSignal: activeObservation.releaseSignal
+        )
     }
 
     private func prepareEventThread(_ thread: CodexThread, for chatID: CodexThreadID) {
@@ -1038,9 +1535,7 @@ public final class CodexModelContext {
     }
 
     private func eventThread(for chat: CodexChat) async throws -> CodexThread {
-        guard chat.modelContext === self else {
-            throw CodexModelContextError.modelIsDetached
-        }
+        try requireAttached(chat)
         if let thread = activeChatObservationsByID[chat.id]?.eventThread {
             return thread
         }
@@ -1056,9 +1551,7 @@ public final class CodexModelContext {
         in workspace: CodexWorkspace,
         input: CodexChatInput = .init()
     ) async throws -> CodexChat {
-        guard workspace.modelContext === self else {
-            throw CodexModelContextError.modelIsDetached
-        }
+        try requireAttached(workspace)
         let thread = try await appServer.startThread(
             in: workspace.url,
             instructions: input.instructions,
@@ -1093,8 +1586,7 @@ public final class CodexModelContext {
             target: input.target,
             instructions: input.instructions,
             options: input.options,
-            delivery: input.delivery,
-            transcriptErrorHandlingPolicy: input.transcriptErrorHandlingPolicy
+            delivery: input.delivery
         )
         return await applyStartedReview(
             review,
@@ -1108,9 +1600,7 @@ public final class CodexModelContext {
         in workspace: CodexWorkspace,
         input: CodexReviewInput
     ) async throws -> CodexStartedReview {
-        guard workspace.modelContext === self else {
-            throw CodexModelContextError.modelIsDetached
-        }
+        try requireAttached(workspace)
         return try await startReview(in: workspace.url, input: input)
     }
 
@@ -1119,12 +1609,16 @@ public final class CodexModelContext {
         workspaceURL: URL,
         input: CodexReviewInput
     ) async -> CodexStartedReview {
+        let eventThread = await appServer.reviewEventThread(
+            for: review,
+            workspace: workspaceURL
+        )
         let isExistingChat = chatsByID[review.activeTurnThreadID] != nil
         let now = Date()
         let change = CodexStartedReviewContextChange(
             snapshot: CodexThreadSnapshot(
                 id: review.activeTurnThreadID,
-                workspace: review.eventThread.workspace ?? workspaceURL,
+                workspace: eventThread.workspace ?? workspaceURL,
                 preview: input.target.dataKitPreview,
                 modelProvider: input.options.modelProvider,
                 sourceKind: .subAgentReview,
@@ -1136,17 +1630,15 @@ public final class CodexModelContext {
                 turns: [review.initialTurn],
                 turnItemsAreAuthoritative: false
             ),
-            eventThread: review.eventThread,
+            eventThread: eventThread,
             archived: false,
             provisionalSeedTurnID: review.initialTurn.id
         )
         let chat = await applyStartedReview(change)
-        if let container {
-            await container.multicast(
-                CodexModelContextTransaction(startedReviews: [change]),
-                from: contextID
-            )
-        }
+        await coordinator.multicast(
+            CodexModelContextTransaction(startedReviews: [change]),
+            from: contextID
+        )
         logger.debug(
             "Started review chat chatID=\(chat.id.rawValue, privacy: .public) reusedExistingChat=\(isExistingChat, privacy: .public) initialTurns=\(chat.turns.count, privacy: .public) initialItems=\(chat.items.count, privacy: .public)"
         )
@@ -1178,31 +1670,25 @@ public final class CodexModelContext {
     public nonisolated(nonsending) func send(
         _ input: CodexChatMessageInput,
         in chat: CodexChat
-    ) async throws -> CodexResponse {
+    ) async throws -> CodexTurnOutcome {
+        try requireAttached(chat)
         let thread = try await eventThread(for: chat)
-        do {
-            let response = try await thread.respond(to: input.prompt, options: input.options)
-            await apply(response, to: chat)
-            return response
-        } catch {
-            if input.options.transcriptErrorHandlingPolicy == .revertTranscript {
-                try? await refresh(
-                    chat,
-                    using: thread,
-                    includeTurns: true,
-                    replaysBufferedEvents: false
-                )
-            }
-            throw error
+        switch try await thread.collectResponse(to: input.prompt, options: input.options) {
+        case .outcome(let outcome):
+            await apply(outcome, to: chat)
+            return outcome
+        case .cancelled(let outcome):
+            await apply(outcome, to: chat)
+            throw CancellationError()
         }
     }
 
     @discardableResult
-    package func apply(_ response: CodexResponse, to chat: CodexChat) async -> [CodexChatUpdate] {
+    package func apply(_ outcome: CodexTurnOutcome, to chat: CodexChat) async -> [CodexChatMutation] {
         let previousWorkspace = chat.workspace
         let previousGroup = previousWorkspace?.workspaceGroup
         let previousUpdatedAt = chat.updatedAt
-        let changes = chat.apply(response)
+        let changes = chat.apply(outcome)
         if let workspace = chat.workspace,
             let updatedAt = chat.updatedAt,
             previousUpdatedAt.map({ updatedAt > $0 }) ?? true
@@ -1217,7 +1703,7 @@ public final class CodexModelContext {
         )
         let observation = activeChatObservationsByID[chat.id]
         observation?.markAppliedLiveUpdates()
-        yield(changes, to: observation)
+        yield(changes, from: chat, to: observation)
         return changes
     }
 
@@ -1225,11 +1711,11 @@ public final class CodexModelContext {
         guard let change = chat.syncPhaseWithTurnsAfterRefresh() else {
             return
         }
-        yield([change], to: activeChatObservationsByID[chat.id])
+        yield([change], from: chat, to: activeChatObservationsByID[chat.id])
     }
 
     @discardableResult
-    package func apply(_ event: CodexThreadEvent, to chat: CodexChat) async -> [CodexChatUpdate] {
+    package func apply(_ event: CodexThreadEvent, to chat: CodexChat) async -> [CodexChatMutation] {
         let previousWorkspace = chat.workspace
         let previousGroup = previousWorkspace?.workspaceGroup
         let previousState = fetchedResultState(for: chat)
@@ -1253,11 +1739,13 @@ public final class CodexModelContext {
     }
 
     public nonisolated(nonsending) func cancelActiveTurn(in chat: CodexChat) async throws {
+        try requireAttached(chat)
         let thread = try await eventThread(for: chat)
         _ = try await thread.cancelActiveTurn()
     }
 
     public nonisolated(nonsending) func archive(_ chat: CodexChat) async throws {
+        try requireAttached(chat)
         try await appServer.archiveThread(chat.id)
         let workspace = chat.workspace
         let group = workspace?.workspaceGroup
@@ -1270,6 +1758,7 @@ public final class CodexModelContext {
     }
 
     public nonisolated(nonsending) func unarchive(_ chat: CodexChat) async throws {
+        try requireAttached(chat)
         let previousWorkspace = chat.workspace
         let previousGroup = previousWorkspace?.workspaceGroup
         var snapshot = try await appServer.unarchiveThreadSnapshot(chat.id)
@@ -1288,6 +1777,7 @@ public final class CodexModelContext {
     }
 
     public nonisolated(nonsending) func delete(_ chat: CodexChat) async throws {
+        try requireAttached(chat)
         try await appServer.deleteThread(chat.id)
         await remove(chat)
     }
@@ -1297,6 +1787,7 @@ public final class CodexModelContext {
         cursor: String? = nil,
         excluding excludedRegistration: (any CodexFetchedResultsRegistration)? = nil
     ) async throws -> CodexFetchPage<Model> {
+        try descriptor.validate()
         if Model.self == CodexChat.self {
             let page = try await fetchChatPage(
                 descriptor as! CodexFetchDescriptor<CodexChat>,
@@ -1437,6 +1928,9 @@ public final class CodexModelContext {
             case (.none, .some):
                 return false
             case (.none, .none):
+                if descriptor.sortBy.isEmpty {
+                    return lhs.id.rawValue < rhs.id.rawValue
+                }
                 return liveChatShouldSortBefore(lhs, rhs, descriptor: descriptor)
             }
         }
@@ -1466,26 +1960,18 @@ public final class CodexModelContext {
         _ rhs: CodexChat,
         descriptor: CodexFetchDescriptor<CodexChat>
     ) -> Bool {
-        guard let sortDescriptor = descriptor.sortBy.first else {
-            return compare(lhs.recencyAt, rhs.recencyAt, order: .reverse)
+        guard descriptor.sortBy.isEmpty == false else {
+            return false
         }
-        return sortDescriptor.compare(lhs, rhs) == .orderedAscending
-    }
-
-    private func compare<Value: Comparable>(
-        _ lhs: Value?,
-        _ rhs: Value?,
-        order: SortOrder
-    ) -> Bool {
-        switch (lhs, rhs) {
-        case let (.some(lhs), .some(rhs)):
-            order == .forward ? lhs < rhs : lhs > rhs
-        case (.some, .none):
-            true
-        case (.none, .some):
-            false
-        case (.none, .none):
-            false
+        let plans = descriptor.sortBy.map(CodexSortPlan.afterValidation)
+        return shouldSortBefore(
+            lhs,
+            rhs,
+            using: plans,
+            stableID: { $0.id.rawValue },
+            tieBreakOrder: plans[0].order
+        ) { plan, lhs, rhs in
+            plan.compare(lhs, rhs)
         }
     }
 
@@ -1503,7 +1989,7 @@ public final class CodexModelContext {
     ) async throws
         -> CodexFetchPage<CodexChat>
     {
-        let plan = CodexThreadQueryPlan(descriptor: descriptor)
+        let plan = try CodexThreadQueryPlan(descriptor: descriptor)
         if canUseServerOrderedPages(for: descriptor, cursor: cursor) == false {
             let fetchedChats = filter(
                 try await fetchAllChats(
@@ -1582,7 +2068,7 @@ public final class CodexModelContext {
         let relationshipChats = chats + preservedLiveChatsForFetchedRelationships(
             omittedFrom: chats,
             descriptor: descriptor,
-            requiresIncludePendingChanges: true
+            requiresIncludeContextChanges: true
         )
         let removedChats = syncWorkspaceChats(
             chats,
@@ -1620,7 +2106,7 @@ public final class CodexModelContext {
         let relationshipChats = chats + preservedLiveChatsForFetchedRelationships(
             omittedFrom: chats,
             descriptor: descriptor,
-            requiresIncludePendingChanges: true
+            requiresIncludeContextChanges: true
         )
         let preservingGroupWorkspaces = workspaceFilters(for: descriptor) != nil
             || shouldPreserveExistingWorkspaceChats(
@@ -1795,7 +2281,7 @@ public final class CodexModelContext {
         if group.workspaces.contains(where: { $0 === workspace }) == false {
             group.replaceContextWorkspaces(sort(
                 group.workspaces + [workspace],
-                using: [SortDescriptor(\.name)]
+                using: [CodexSortDescriptor(\.name)]
             ))
         }
         return workspace
@@ -1981,7 +2467,7 @@ public final class CodexModelContext {
                 }
                 group.replaceContextWorkspaces(sort(
                     fetchedWorkspaces + remainingWorkspaces,
-                    using: [SortDescriptor(\.name)]
+                    using: [CodexSortDescriptor(\.name)]
                 ))
             } else {
                 let fetchedIDs = Set(fetchedWorkspaces.map(\.id))
@@ -1991,7 +2477,7 @@ public final class CodexModelContext {
                 }
                 group.replaceContextWorkspaces(sort(
                     fetchedWorkspaces + preservedWorkspaces,
-                    using: [SortDescriptor(\.name)]
+                    using: [CodexSortDescriptor(\.name)]
                 ))
             }
         }
@@ -2044,7 +2530,7 @@ public final class CodexModelContext {
         preservedLiveChats(
             omittedFrom: loadedItems,
             descriptor: descriptor,
-            requiresIncludePendingChanges: true
+            requiresIncludeContextChanges: true
         )
     }
 
@@ -2055,19 +2541,19 @@ public final class CodexModelContext {
         preservedLiveChats(
             omittedFrom: loadedItems,
             descriptor: descriptor,
-            requiresIncludePendingChanges: false
+            requiresIncludeContextChanges: false
         )
     }
 
     private func preservedLiveChats<Model: CodexPersistentModel>(
         omittedFrom loadedItems: [Model],
         descriptor: CodexFetchDescriptor<Model>,
-        requiresIncludePendingChanges: Bool
+        requiresIncludeContextChanges: Bool
     ) -> [CodexChat] {
         guard Model.self == CodexChat.self,
             canPreserveLiveChats(
                 for: descriptor,
-                requiresIncludePendingChanges: requiresIncludePendingChanges
+                requiresIncludeContextChanges: requiresIncludeContextChanges
             )
         else {
             return []
@@ -2075,18 +2561,18 @@ public final class CodexModelContext {
         return preservedLiveChatsForFetchedRelationships(
             omittedFrom: loadedItems as? [CodexChat] ?? [],
             descriptor: descriptor,
-            requiresIncludePendingChanges: requiresIncludePendingChanges
+            requiresIncludeContextChanges: requiresIncludeContextChanges
         )
     }
 
     private func preservedLiveChatsForFetchedRelationships<Model: CodexPersistentModel>(
         omittedFrom loadedChats: [CodexChat],
         descriptor: CodexFetchDescriptor<Model>,
-        requiresIncludePendingChanges: Bool
+        requiresIncludeContextChanges: Bool
     ) -> [CodexChat] {
         guard canPreserveLiveChats(
             for: descriptor,
-            requiresIncludePendingChanges: requiresIncludePendingChanges
+            requiresIncludeContextChanges: requiresIncludeContextChanges
         ) else {
             return []
         }
@@ -2116,10 +2602,10 @@ public final class CodexModelContext {
 
     private func canPreserveLiveChats<Model: CodexPersistentModel>(
         for descriptor: CodexFetchDescriptor<Model>,
-        requiresIncludePendingChanges: Bool
+        requiresIncludeContextChanges: Bool
     ) -> Bool {
         let plan = chatQueryPlan(for: descriptor)
-        return (requiresIncludePendingChanges == false || descriptor.includePendingChanges)
+        return (requiresIncludeContextChanges == false || descriptor.includeContextChanges)
             && descriptor.normalizedFetchOffset == 0
             && plan?.membershipRequiresServerRefresh != true
     }
@@ -2266,6 +2752,11 @@ public final class CodexModelContext {
         archived archiveScope: Bool? = nil
     ) async throws -> [CodexThreadSnapshot] {
         var query = threadQuery(from: descriptor, includePaging: false, archived: archiveScope)
+        // Created/updated cursors in the pinned app-server do not contain a thread-ID
+        // tie-breaker. Enumerate with its stable recency cursor, then apply the requested
+        // effective ordering locally.
+        query.sortDirection = .descending
+        query.sortKey = .recencyAt
         var threads: [CodexThreadSnapshot] = []
         var cursor: String?
 
@@ -2285,7 +2776,9 @@ public final class CodexModelContext {
         guard Model.self == CodexChat.self else {
             return nil
         }
-        return CodexThreadQueryPlan(descriptor: descriptor as! CodexFetchDescriptor<CodexChat>)
+        return try? CodexThreadQueryPlan(
+            descriptor: descriptor as! CodexFetchDescriptor<CodexChat>
+        )
     }
 
     private func archivedScope<Model: CodexPersistentModel>(
@@ -2351,18 +2844,16 @@ public final class CodexModelContext {
             return false
         }
         guard let plan = chatQueryPlan(for: descriptor) else {
-            return true
+            return false
+        }
+        guard plan.archived != nil else {
+            return false
         }
         guard plan.serverPredicateIsComplete else {
             return false
         }
-        guard let primarySort = plan.sortPlans.first else {
-            return true
-        }
-        if primarySort.key == .recencyAt {
-            return true
-        }
-        return plan.sortPlans.count == 1 && primarySort.threadSortKey != nil
+        return plan.sortPlans.isEmpty
+            || (plan.sortPlans.count == 1 && plan.sortPlans[0].key == .recencyAt)
     }
 
     package func localCursor(for offset: Int) -> String {
@@ -2398,7 +2889,7 @@ public final class CodexModelContext {
                 archived: archiveScope
             )
         }
-        let sortPlans = descriptor.sortPlans
+        let sortPlans = descriptor.sortBy.map(CodexSortPlan.afterValidation)
         let serverSort = sortPlans.first { sortDescriptor in
             switch sortDescriptor.key {
             case .createdAt, .updatedAt, .recencyAt:
@@ -2419,7 +2910,15 @@ public final class CodexModelContext {
         for item: Model,
         descriptor: CodexSectionDescriptor<Model>
     ) -> (id: CodexFetchSectionID, title: String) {
-        switch descriptor.key {
+        let sectionKey: CodexSectionKey
+        do {
+            sectionKey = try descriptor.resolveKey()
+        } catch {
+            preconditionFailure(
+                "CodexSectionDescriptor was used before successful validation: \(error)"
+            )
+        }
+        switch sectionKey {
         case .workspace:
             if let chat = item as? CodexChat, let workspace = chat.workspace {
                 return (.workspace(workspace.id), workspace.name)
@@ -2435,83 +2934,99 @@ public final class CodexModelContext {
         return (.unknown("unknown"), "Unknown")
     }
 
-    private func sort(_ chats: [CodexChat], using descriptors: [SortDescriptor<CodexChat>])
+    private func sort(
+        _ chats: [CodexChat],
+        using descriptors: [CodexSortDescriptor<CodexChat>]
+    )
         -> [CodexChat]
     {
-        let sortPlans = descriptors.map(CodexSortPlan<CodexChat>.init(descriptor:))
-        guard sortPlans.first?.key != .recencyAt else {
+        guard descriptors.isEmpty == false else {
             return chats
         }
-        let localSortPlans = sortPlans.filter { $0.key != .recencyAt }
-        guard localSortPlans.isEmpty == false else {
-            return chats
-        }
-        let localDescriptors = zip(descriptors, sortPlans).compactMap { descriptor, sortPlan in
-            sortPlan.key == .recencyAt ? nil : descriptor
-        }
-        return sortModels(chats, using: localDescriptors) { descriptor, lhs, rhs in
-            descriptor.compare(lhs, rhs)
+        let plans = descriptors.map(CodexSortPlan.afterValidation)
+        return sortModels(
+            chats,
+            using: plans,
+            stableID: { $0.id.rawValue },
+            tieBreakOrder: plans[0].order
+        ) { plan, lhs, rhs in
+            plan.compare(lhs, rhs)
         }
     }
 
     private func sort(
         _ workspaces: [CodexWorkspace],
-        using descriptors: [SortDescriptor<CodexWorkspace>]
+        using descriptors: [CodexSortDescriptor<CodexWorkspace>]
     ) -> [CodexWorkspace] {
-        _ = descriptors.map(CodexSortPlan<CodexWorkspace>.init(descriptor:))
-        return sortModels(workspaces, using: descriptors) { descriptor, lhs, rhs in
-            descriptor.compare(lhs, rhs)
+        let plans = descriptors.map(CodexSortPlan.afterValidation)
+        return sortModels(
+            workspaces,
+            using: plans,
+            stableID: { $0.id.rawValue },
+            tieBreakOrder: plans.first?.order ?? .forward
+        ) { plan, lhs, rhs in
+            plan.compare(lhs, rhs)
         }
     }
 
     private func sort(
         _ groups: [CodexWorkspaceGroup],
-        using descriptors: [SortDescriptor<CodexWorkspaceGroup>]
+        using descriptors: [CodexSortDescriptor<CodexWorkspaceGroup>]
     ) -> [CodexWorkspaceGroup] {
-        _ = descriptors.map(CodexSortPlan<CodexWorkspaceGroup>.init(descriptor:))
-        return sortModels(groups, using: descriptors) { descriptor, lhs, rhs in
-            descriptor.compare(lhs, rhs)
+        let plans = descriptors.map(CodexSortPlan.afterValidation)
+        return sortModels(
+            groups,
+            using: plans,
+            stableID: { $0.id.rawValue },
+            tieBreakOrder: plans.first?.order ?? .forward
+        ) { plan, lhs, rhs in
+            plan.compare(lhs, rhs)
         }
     }
 
     private func sortModels<Model, Descriptor>(
         _ models: [Model],
         using descriptors: [Descriptor],
+        stableID: (Model) -> String,
+        tieBreakOrder: SortOrder,
         compare: (Descriptor, Model, Model) -> ComparisonResult
     ) -> [Model] {
-        guard descriptors.isEmpty == false else {
-            return models
-        }
         return models.sorted { lhs, rhs in
-            for descriptor in descriptors {
-                switch compare(descriptor, lhs, rhs) {
-                case .orderedAscending:
-                    return true
-                case .orderedDescending:
-                    return false
-                case .orderedSame:
-                    continue
-                }
-            }
-            return false
+            shouldSortBefore(
+                lhs,
+                rhs,
+                using: descriptors,
+                stableID: stableID,
+                tieBreakOrder: tieBreakOrder,
+                compare: compare
+            )
         }
     }
 
-    private func compare(_ lhs: Date?, _ rhs: Date?, order: SortOrder) -> ComparisonResult {
-        switch (lhs, rhs) {
-        case (.some(let lhs), .some(let rhs)):
-            if lhs == rhs {
-                return .orderedSame
+    private func shouldSortBefore<Model, Descriptor>(
+        _ lhs: Model,
+        _ rhs: Model,
+        using descriptors: [Descriptor],
+        stableID: (Model) -> String,
+        tieBreakOrder: SortOrder,
+        compare: (Descriptor, Model, Model) -> ComparisonResult
+    ) -> Bool {
+        for descriptor in descriptors {
+            switch compare(descriptor, lhs, rhs) {
+            case .orderedAscending:
+                return true
+            case .orderedDescending:
+                return false
+            case .orderedSame:
+                continue
             }
-            let result: ComparisonResult = lhs < rhs ? .orderedAscending : .orderedDescending
-            return order == .forward ? result : result.reversed
-        case (.some, .none):
-            return .orderedAscending
-        case (.none, .some):
-            return .orderedDescending
-        case (.none, .none):
-            return .orderedSame
         }
+        let lhsID = stableID(lhs)
+        let rhsID = stableID(rhs)
+        guard lhsID != rhsID else {
+            return false
+        }
+        return tieBreakOrder == .forward ? lhsID < rhsID : lhsID > rhsID
     }
 
     private func unique<Model: CodexPersistentModel>(_ models: [Model]) -> [Model] {
@@ -2532,6 +3047,9 @@ public final class CodexModelContext {
         return name.isEmpty ? url.path : name
     }
 }
+
+@available(*, unavailable, message: "contexts cannot be shared across concurrency contexts")
+extension CodexModelContext: @unchecked Sendable {}
 
 private extension CodexReviewTarget {
     var dataKitPreview: String {

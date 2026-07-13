@@ -52,7 +52,6 @@ package enum AppServerAPI {
         }
         package enum Login {
             package enum Start {}
-            package enum Complete {}
             package enum Cancel {}
         }
     }
@@ -91,7 +90,7 @@ extension AppServerAPI.Review.Start {
 extension AppServerAPI.Review.Start {
     package struct Response: Codable, Equatable, Sendable {
         package var turn: AppServerAPI.Turn.Payload
-        package var reviewThreadID: String?
+        package var reviewThreadID: String
         package var turnID: String {
             turn.id
         }
@@ -101,13 +100,16 @@ extension AppServerAPI.Review.Start {
             case reviewThreadID = "reviewThreadId"
         }
 
-        package init(turnID: String, reviewThreadID: String? = nil) {
-            self.init(turn: AppServerAPI.Turn.Payload(id: turnID), reviewThreadID: reviewThreadID)
+        package init(turnID: String, reviewThreadID: String) {
+            self.init(
+                turn: AppServerAPI.Turn.Payload(id: turnID, status: "inProgress"),
+                reviewThreadID: reviewThreadID
+            )
         }
 
         package init(
             turn: AppServerAPI.Turn.Payload,
-            reviewThreadID: String? = nil
+            reviewThreadID: String
         ) {
             self.turn = turn
             self.reviewThreadID = reviewThreadID
@@ -116,14 +118,14 @@ extension AppServerAPI.Review.Start {
         package init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             self.turn = try container.decode(AppServerAPI.Turn.Payload.self, forKey: .turn)
-            self.reviewThreadID = try container.decodeIfPresent(
+            self.reviewThreadID = try container.decode(
                 String.self, forKey: .reviewThreadID)
         }
 
         package func encode(to encoder: Encoder) throws {
             var container = encoder.container(keyedBy: CodingKeys.self)
             try container.encode(turn, forKey: .turn)
-            try container.encodeIfPresent(reviewThreadID, forKey: .reviewThreadID)
+            try container.encode(reviewThreadID, forKey: .reviewThreadID)
         }
     }
 }
@@ -482,6 +484,79 @@ extension AppServerAPI.Thread.Start {
 }
 
 extension AppServerAPI.Thread {
+    package enum SessionSource: Equatable, Sendable {
+        package enum SubAgent: Equatable, Sendable {
+            package struct ThreadSpawn: Codable, Equatable, Sendable {
+                package var parentThreadID: String
+                package var depth: Int
+                package var agentPath: String?
+                package var agentNickname: String?
+                package var agentRole: String?
+
+                enum CodingKeys: String, CodingKey {
+                    case parentThreadID = "parent_thread_id"
+                    case depth
+                    case agentPath = "agent_path"
+                    case agentNickname = "agent_nickname"
+                    case agentRole = "agent_role"
+                }
+
+                package init(
+                    parentThreadID: String,
+                    depth: Int,
+                    agentPath: String? = nil,
+                    agentNickname: String? = nil,
+                    agentRole: String? = nil
+                ) {
+                    self.parentThreadID = parentThreadID
+                    self.depth = depth
+                    self.agentPath = agentPath
+                    self.agentNickname = agentNickname
+                    self.agentRole = agentRole
+                }
+            }
+
+            case review
+            case compact
+            case threadSpawn(ThreadSpawn)
+            case memoryConsolidation
+            case other(String)
+        }
+
+        case cli
+        case vscode
+        case exec
+        case appServer
+        case custom(String)
+        case subAgent(SubAgent)
+        case unknown
+
+        package var sourceKind: CodexThreadSourceKind {
+            switch self {
+            case .cli:
+                .cli
+            case .vscode:
+                .vscode
+            case .exec:
+                .exec
+            case .appServer:
+                .appServer
+            case .custom, .unknown:
+                .unknown
+            case .subAgent(.review):
+                .subAgentReview
+            case .subAgent(.compact):
+                .subAgentCompact
+            case .subAgent(.threadSpawn):
+                .subAgentThreadSpawn
+            case .subAgent(.memoryConsolidation):
+                .subAgent
+            case .subAgent(.other):
+                .subAgentOther
+            }
+        }
+    }
+
     package struct Snapshot: Codable, Equatable, Sendable {
         package enum Field: String, Hashable, Sendable {
             case cwd
@@ -512,7 +587,7 @@ extension AppServerAPI.Thread {
         package var name: String?
         package var preview: String?
         package var modelProvider: String?
-        package var sourceKind: String?
+        package var source: AppServerAPI.Thread.SessionSource?
         package var createdAt: Int?
         package var updatedAt: Int?
         package var recencyAt: Int?
@@ -521,13 +596,17 @@ extension AppServerAPI.Thread {
         package var turns: [AppServerAPI.Turn.Payload]?
         package var presentFields: Set<Field>
 
+        package var sourceKind: CodexThreadSourceKind? {
+            source?.sourceKind
+        }
+
         enum CodingKeys: String, CodingKey {
             case id
             case cwd
             case name
             case preview
             case modelProvider
-            case sourceKind
+            case source
             case createdAt
             case updatedAt
             case recencyAt
@@ -542,7 +621,7 @@ extension AppServerAPI.Thread {
             name: String? = nil,
             preview: String? = nil,
             modelProvider: String? = nil,
-            sourceKind: String? = nil,
+            source: AppServerAPI.Thread.SessionSource? = nil,
             createdAt: Int? = nil,
             updatedAt: Int? = nil,
             recencyAt: Int? = nil,
@@ -556,7 +635,7 @@ extension AppServerAPI.Thread {
             self.name = name
             self.preview = preview
             self.modelProvider = modelProvider
-            self.sourceKind = sourceKind
+            self.source = source
             self.createdAt = createdAt
             self.updatedAt = updatedAt
             self.recencyAt = recencyAt
@@ -568,7 +647,7 @@ extension AppServerAPI.Thread {
                 name: name,
                 preview: preview,
                 modelProvider: modelProvider,
-                sourceKind: sourceKind,
+                source: source,
                 createdAt: createdAt,
                 updatedAt: updatedAt,
                 recencyAt: recencyAt,
@@ -585,7 +664,10 @@ extension AppServerAPI.Thread {
             name = try container.decodeIfPresent(String.self, forKey: .name)
             preview = try container.decodeIfPresent(String.self, forKey: .preview)
             modelProvider = try container.decodeIfPresent(String.self, forKey: .modelProvider)
-            sourceKind = try container.decodeIfPresent(String.self, forKey: .sourceKind)
+            source = try container.decodeIfPresent(
+                AppServerAPI.Thread.SessionSource.self,
+                forKey: .source
+            )
             createdAt = try container.decodeIfPresent(Int.self, forKey: .createdAt)
             updatedAt = try container.decodeIfPresent(Int.self, forKey: .updatedAt)
             recencyAt = try container.decodeIfPresent(Int.self, forKey: .recencyAt)
@@ -602,7 +684,7 @@ extension AppServerAPI.Thread {
             try encode(name, forKey: .name, into: &container)
             try encode(preview, forKey: .preview, into: &container)
             try encode(modelProvider, forKey: .modelProvider, into: &container)
-            try encode(sourceKind, forKey: .sourceKind, into: &container)
+            try encode(source, forKey: .source, into: &container)
             try encode(createdAt, forKey: .createdAt, into: &container)
             try encode(updatedAt, forKey: .updatedAt, into: &container)
             try encode(recencyAt, forKey: .recencyAt, into: &container)
@@ -631,7 +713,7 @@ extension AppServerAPI.Thread {
             name: String?,
             preview: String?,
             modelProvider: String?,
-            sourceKind: String?,
+            source: AppServerAPI.Thread.SessionSource?,
             createdAt: Int?,
             updatedAt: Int?,
             recencyAt: Int?,
@@ -652,7 +734,7 @@ extension AppServerAPI.Thread {
             if modelProvider != nil {
                 fields.insert(.modelProvider)
             }
-            if sourceKind != nil {
+            if source != nil {
                 fields.insert(.sourceKind)
             }
             if createdAt != nil {
@@ -690,6 +772,139 @@ extension AppServerAPI.Thread {
     }
 }
 
+extension AppServerAPI.Thread.SessionSource: Codable {
+    private enum CodingKeys: String, CodingKey {
+        case custom
+        case subAgent
+    }
+
+    package init(from decoder: Decoder) throws {
+        if let value = try? decoder.singleValueContainer().decode(String.self) {
+            switch value {
+            case "cli":
+                self = .cli
+            case "vscode":
+                self = .vscode
+            case "exec":
+                self = .exec
+            case "appServer":
+                self = .appServer
+            case "unknown":
+                self = .unknown
+            default:
+                self = .unknown
+            }
+            return
+        }
+
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        if container.contains(.custom) {
+            self = .custom(try container.decode(String.self, forKey: .custom))
+            return
+        }
+        if container.contains(.subAgent) {
+            self = .subAgent(try container.decode(SubAgent.self, forKey: .subAgent))
+            return
+        }
+        throw DecodingError.dataCorrupted(
+            .init(
+                codingPath: decoder.codingPath,
+                debugDescription: "Unsupported current-v2 thread session source."
+            )
+        )
+    }
+
+    package func encode(to encoder: Encoder) throws {
+        switch self {
+        case .cli:
+            var container = encoder.singleValueContainer()
+            try container.encode("cli")
+        case .vscode:
+            var container = encoder.singleValueContainer()
+            try container.encode("vscode")
+        case .exec:
+            var container = encoder.singleValueContainer()
+            try container.encode("exec")
+        case .appServer:
+            var container = encoder.singleValueContainer()
+            try container.encode("appServer")
+        case .unknown:
+            var container = encoder.singleValueContainer()
+            try container.encode("unknown")
+        case .custom(let value):
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(value, forKey: .custom)
+        case .subAgent(let source):
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(source, forKey: .subAgent)
+        }
+    }
+}
+
+extension AppServerAPI.Thread.SessionSource.SubAgent: Codable {
+    private enum CodingKeys: String, CodingKey {
+        case threadSpawn = "thread_spawn"
+        case other
+    }
+
+    package init(from decoder: Decoder) throws {
+        if let value = try? decoder.singleValueContainer().decode(String.self) {
+            switch value {
+            case "review":
+                self = .review
+            case "compact":
+                self = .compact
+            case "memory_consolidation":
+                self = .memoryConsolidation
+            default:
+                throw DecodingError.dataCorrupted(
+                    .init(
+                        codingPath: decoder.codingPath,
+                        debugDescription: "Unsupported current-v2 sub-agent source \(value)."
+                    )
+                )
+            }
+            return
+        }
+
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        if container.contains(.threadSpawn) {
+            self = .threadSpawn(try container.decode(ThreadSpawn.self, forKey: .threadSpawn))
+            return
+        }
+        if container.contains(.other) {
+            self = .other(try container.decode(String.self, forKey: .other))
+            return
+        }
+        throw DecodingError.dataCorrupted(
+            .init(
+                codingPath: decoder.codingPath,
+                debugDescription: "Unsupported current-v2 sub-agent source."
+            )
+        )
+    }
+
+    package func encode(to encoder: Encoder) throws {
+        switch self {
+        case .review:
+            var container = encoder.singleValueContainer()
+            try container.encode("review")
+        case .compact:
+            var container = encoder.singleValueContainer()
+            try container.encode("compact")
+        case .memoryConsolidation:
+            var container = encoder.singleValueContainer()
+            try container.encode("memory_consolidation")
+        case .threadSpawn(let source):
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(source, forKey: .threadSpawn)
+        case .other(let value):
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(value, forKey: .other)
+        }
+    }
+}
+
 private extension AppServerAPI.Thread.Snapshot.Field {
     init?(_ key: AppServerAPI.Thread.Snapshot.CodingKeys) {
         switch key {
@@ -703,7 +918,7 @@ private extension AppServerAPI.Thread.Snapshot.Field {
             self = .preview
         case .modelProvider:
             self = .modelProvider
-        case .sourceKind:
+        case .source:
             self = .sourceKind
         case .createdAt:
             self = .createdAt
@@ -782,7 +997,7 @@ extension AppServerAPI.Thread.Fork {
 extension AppServerAPI.Turn {
     package struct Payload: Codable, Equatable, Sendable {
         package var id: String
-        package var status: String?
+        package var status: String
         package var error: AppServerAPI.Turn.Error?
         package var startedAt: Int?
         package var completedAt: Int?
@@ -803,7 +1018,7 @@ extension AppServerAPI.Turn {
 
         package init(
             id: String,
-            status: String? = nil,
+            status: String,
             error: AppServerAPI.Turn.Error? = nil,
             startedAt: Int? = nil,
             completedAt: Int? = nil,
@@ -819,6 +1034,42 @@ extension AppServerAPI.Turn {
             self.durationMS = durationMS
             self.itemsLoadState = itemsLoadState
             self.items = items
+        }
+
+        package init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            id = try container.decode(String.self, forKey: .id)
+            status = try container.decode(String.self, forKey: .status)
+            error = try container.decodeIfPresent(AppServerAPI.Turn.Error.self, forKey: .error)
+            startedAt = try container.decodeIfPresent(Int.self, forKey: .startedAt)
+            completedAt = try container.decodeIfPresent(Int.self, forKey: .completedAt)
+            durationMS = try container.decodeIfPresent(Int.self, forKey: .durationMS)
+            itemsLoadState = try container.decodeIfPresent(
+                CodexTurnItemsLoadState.self,
+                forKey: .itemsLoadState
+            )
+            items = try container.decodeIfPresent([AppServerJSONValue].self, forKey: .items)
+
+            switch CodexTurnStatus(rawValue: status) {
+            case .failed:
+                guard error != nil else {
+                    throw DecodingError.dataCorruptedError(
+                        forKey: .error,
+                        in: container,
+                        debugDescription: "A failed turn requires an error payload."
+                    )
+                }
+            case .inProgress, .completed, .interrupted:
+                guard error == nil else {
+                    throw DecodingError.dataCorruptedError(
+                        forKey: .error,
+                        in: container,
+                        debugDescription: "Known non-failed turn status \(status) cannot carry an error."
+                    )
+                }
+            case .unknown:
+                break
+            }
         }
     }
 }
@@ -1139,9 +1390,137 @@ extension AppServerAPI.Thread.Compact.Start {
 extension AppServerAPI.Turn {
     package struct Error: Codable, Equatable, Sendable {
         package var message: String
+        package var codexErrorInfo: AppServerAPI.CodexErrorInfo?
+        package var additionalDetails: String?
 
-        package init(message: String) {
+        package init(
+            message: String,
+            codexErrorInfo: AppServerAPI.CodexErrorInfo? = nil,
+            additionalDetails: String? = nil
+        ) {
             self.message = message
+            self.codexErrorInfo = codexErrorInfo
+            self.additionalDetails = additionalDetails
+        }
+    }
+}
+
+extension AppServerAPI {
+    package enum CodexErrorInfo: Codable, Equatable, Sendable {
+        case contextWindowExceeded
+        case sessionBudgetExceeded
+        case usageLimitExceeded
+        case serverOverloaded
+        case cyberPolicy
+        case httpConnectionFailed(httpStatusCode: UInt16?)
+        case responseStreamConnectionFailed(httpStatusCode: UInt16?)
+        case internalServerError
+        case unauthorized
+        case badRequest
+        case threadRollbackFailed
+        case sandboxError
+        case responseStreamDisconnected(httpStatusCode: UInt16?)
+        case responseTooManyFailedAttempts(httpStatusCode: UInt16?)
+        case activeTurnNotSteerable(turnKind: String)
+        case other
+        case unknown(rawValue: String)
+
+        package init(from decoder: Decoder) throws {
+            if let value = try? decoder.singleValueContainer().decode(String.self) {
+                self = Self(simpleRawValue: value)
+                return
+            }
+            let object = try decoder.singleValueContainer().decode([String: Payload].self)
+            guard object.count == 1, let (key, payload) = object.first else {
+                throw DecodingError.dataCorrupted(
+                    .init(codingPath: decoder.codingPath, debugDescription: "Invalid codexErrorInfo payload.")
+                )
+            }
+            switch key {
+            case "httpConnectionFailed":
+                self = .httpConnectionFailed(httpStatusCode: payload.httpStatusCode)
+            case "responseStreamConnectionFailed":
+                self = .responseStreamConnectionFailed(httpStatusCode: payload.httpStatusCode)
+            case "responseStreamDisconnected":
+                self = .responseStreamDisconnected(httpStatusCode: payload.httpStatusCode)
+            case "responseTooManyFailedAttempts":
+                self = .responseTooManyFailedAttempts(httpStatusCode: payload.httpStatusCode)
+            case "activeTurnNotSteerable":
+                guard let turnKind = payload.turnKind else {
+                    throw DecodingError.dataCorrupted(
+                        .init(codingPath: decoder.codingPath, debugDescription: "Missing turnKind.")
+                    )
+                }
+                self = .activeTurnNotSteerable(turnKind: turnKind)
+            default:
+                self = .unknown(rawValue: key)
+            }
+        }
+
+        package func encode(to encoder: Encoder) throws {
+            var container = encoder.singleValueContainer()
+            switch self {
+            case .httpConnectionFailed(let code):
+                try container.encode(["httpConnectionFailed": Payload(httpStatusCode: code)])
+            case .responseStreamConnectionFailed(let code):
+                try container.encode(["responseStreamConnectionFailed": Payload(httpStatusCode: code)])
+            case .responseStreamDisconnected(let code):
+                try container.encode(["responseStreamDisconnected": Payload(httpStatusCode: code)])
+            case .responseTooManyFailedAttempts(let code):
+                try container.encode(["responseTooManyFailedAttempts": Payload(httpStatusCode: code)])
+            case .activeTurnNotSteerable(let turnKind):
+                try container.encode(["activeTurnNotSteerable": Payload(turnKind: turnKind)])
+            default:
+                try container.encode(simpleRawValue)
+            }
+        }
+
+        private struct Payload: Codable, Equatable, Sendable {
+            var httpStatusCode: UInt16?
+            var turnKind: String?
+
+            init(httpStatusCode: UInt16? = nil, turnKind: String? = nil) {
+                self.httpStatusCode = httpStatusCode
+                self.turnKind = turnKind
+            }
+        }
+
+        private init(simpleRawValue: String) {
+            switch simpleRawValue {
+            case "contextWindowExceeded": self = .contextWindowExceeded
+            case "sessionBudgetExceeded": self = .sessionBudgetExceeded
+            case "usageLimitExceeded": self = .usageLimitExceeded
+            case "serverOverloaded": self = .serverOverloaded
+            case "cyberPolicy": self = .cyberPolicy
+            case "internalServerError": self = .internalServerError
+            case "unauthorized": self = .unauthorized
+            case "badRequest": self = .badRequest
+            case "threadRollbackFailed": self = .threadRollbackFailed
+            case "sandboxError": self = .sandboxError
+            case "other": self = .other
+            default: self = .unknown(rawValue: simpleRawValue)
+            }
+        }
+
+        private var simpleRawValue: String {
+            switch self {
+            case .contextWindowExceeded: "contextWindowExceeded"
+            case .sessionBudgetExceeded: "sessionBudgetExceeded"
+            case .usageLimitExceeded: "usageLimitExceeded"
+            case .serverOverloaded: "serverOverloaded"
+            case .cyberPolicy: "cyberPolicy"
+            case .internalServerError: "internalServerError"
+            case .unauthorized: "unauthorized"
+            case .badRequest: "badRequest"
+            case .threadRollbackFailed: "threadRollbackFailed"
+            case .sandboxError: "sandboxError"
+            case .other: "other"
+            case .unknown(let rawValue): rawValue
+            case .httpConnectionFailed, .responseStreamConnectionFailed,
+                 .responseStreamDisconnected, .responseTooManyFailedAttempts,
+                 .activeTurnNotSteerable:
+                preconditionFailure("Associated codexErrorInfo has no simple raw value.")
+            }
         }
     }
 }
@@ -1438,6 +1817,9 @@ extension AppServerAPI.Turn.Interrupt {
 
         package static let method = "turn/interrupt"
         package var params: AppServerAPI.Turn.Interrupt.Params
+        package var scope: AppServerAPI.RequestScope? {
+            .thread(params.threadID)
+        }
 
         package init(params: AppServerAPI.Turn.Interrupt.Params) {
             self.params = params
@@ -2141,36 +2523,19 @@ extension AppServerAPI.Account {
 }
 
 extension AppServerAPI.Account.Login {
-    package struct NativeWebAuthentication: Codable, Equatable, Sendable {
-        package var callbackURLScheme: String
-
-        enum CodingKeys: String, CodingKey {
-            case callbackURLScheme = "callbackUrlScheme"
-        }
-
-        package init(callbackURLScheme: String) {
-            self.callbackURLScheme = callbackURLScheme
-        }
-    }
-}
-
-extension AppServerAPI.Account.Login {
     package struct Params: Codable, Equatable, Sendable {
         package var type: String
         package var apiKey: String?
         package var codexStreamlinedLogin: Bool
-        package var nativeWebAuthentication: AppServerAPI.Account.Login.NativeWebAuthentication?
 
         package init(
             type: String = "chatgpt",
             apiKey: String? = nil,
-            codexStreamlinedLogin: Bool = true,
-            nativeWebAuthentication: AppServerAPI.Account.Login.NativeWebAuthentication? = nil
+            codexStreamlinedLogin: Bool = true
         ) {
             self.type = type
             self.apiKey = apiKey
             self.codexStreamlinedLogin = codexStreamlinedLogin
-            self.nativeWebAuthentication = nativeWebAuthentication
         }
     }
 }
@@ -2178,11 +2543,7 @@ extension AppServerAPI.Account.Login {
 extension AppServerAPI.Account.Login {
     package enum Response: Codable, Equatable, Sendable {
         case apiKey
-        case chatgpt(
-            loginID: String,
-            authURL: String,
-            nativeWebAuthentication: AppServerAPI.Account.Login.NativeWebAuthentication? = nil
-        )
+        case chatgpt(loginID: String, authURL: String)
         case chatgptDeviceCode(loginID: String, verificationURL: String, userCode: String)
         case chatgptAuthTokens
 
@@ -2190,7 +2551,6 @@ extension AppServerAPI.Account.Login {
             case type
             case loginID = "loginId"
             case authURL = "authUrl"
-            case nativeWebAuthentication
             case verificationURL = "verificationUrl"
             case userCode
         }
@@ -2203,11 +2563,7 @@ extension AppServerAPI.Account.Login {
             case "chatgpt":
                 self = .chatgpt(
                     loginID: try container.decode(String.self, forKey: .loginID),
-                    authURL: try container.decode(String.self, forKey: .authURL),
-                    nativeWebAuthentication: try container.decodeIfPresent(
-                        AppServerAPI.Account.Login.NativeWebAuthentication.self,
-                        forKey: .nativeWebAuthentication
-                    )
+                    authURL: try container.decode(String.self, forKey: .authURL)
                 )
             case "chatgptDeviceCode":
                 self = .chatgptDeviceCode(
@@ -2231,11 +2587,10 @@ extension AppServerAPI.Account.Login {
             switch self {
             case .apiKey:
                 try container.encode("apiKey", forKey: .type)
-            case .chatgpt(let loginID, let authURL, let nativeWebAuthentication):
+            case .chatgpt(let loginID, let authURL):
                 try container.encode("chatgpt", forKey: .type)
                 try container.encode(loginID, forKey: .loginID)
                 try container.encode(authURL, forKey: .authURL)
-                try container.encodeIfPresent(nativeWebAuthentication, forKey: .nativeWebAuthentication)
             case .chatgptDeviceCode(let loginID, let verificationURL, let userCode):
                 try container.encode("chatgptDeviceCode", forKey: .type)
                 try container.encode(loginID, forKey: .loginID)
@@ -2248,6 +2603,17 @@ extension AppServerAPI.Account.Login {
     }
 }
 
+extension AppServerAPI.Account.Login.Response {
+    package var pendingLoginID: String? {
+        switch self {
+        case .chatgpt(let loginID, _), .chatgptDeviceCode(let loginID, _, _):
+            loginID
+        case .apiKey, .chatgptAuthTokens:
+            nil
+        }
+    }
+}
+
 extension AppServerAPI.Account.Login.Start {
     package struct Request: AppServerAPI.Request {
         package typealias Response = AppServerAPI.Account.Login.Response
@@ -2256,36 +2622,6 @@ extension AppServerAPI.Account.Login.Start {
         package var params: AppServerAPI.Account.Login.Params
 
         package init(params: AppServerAPI.Account.Login.Params) {
-            self.params = params
-        }
-    }
-}
-
-extension AppServerAPI.Account.Login.Complete {
-    package struct Params: Codable, Equatable, Sendable {
-        package var loginID: String
-        package var callbackURL: String
-
-        enum CodingKeys: String, CodingKey {
-            case loginID = "loginId"
-            case callbackURL = "callbackUrl"
-        }
-
-        package init(loginID: String, callbackURL: String) {
-            self.loginID = loginID
-            self.callbackURL = callbackURL
-        }
-    }
-}
-
-extension AppServerAPI.Account.Login.Complete {
-    package struct Request: AppServerAPI.Request {
-        package typealias Response = EmptyResponse
-
-        package static let method = "account/login/complete"
-        package var params: AppServerAPI.Account.Login.Complete.Params
-
-        package init(params: AppServerAPI.Account.Login.Complete.Params) {
             self.params = params
         }
     }

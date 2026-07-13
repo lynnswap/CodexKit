@@ -5,8 +5,7 @@ CodexAppServerKit is a Swift library for working with a local
 
 The package hides JSON-RPC framing and app-server DTOs behind Swift domain
 types. Callers work with an app-server container, sessions, prompts,
-responses, response streams, transcript items, log entries, models, accounts,
-and login handles.
+typed turn outcomes, transcript items, models, accounts, and login handles.
 
 ## Container
 
@@ -18,8 +17,10 @@ import CodexAppServerKit
 let appServer = try await CodexAppServer()
 let thread = try await appServer.startThread(in: workspaceURL)
 
-let response = try await thread.respond(to: "Review this workspace.")
-print(response.finalAnswer ?? "")
+let outcome = try await thread.respond(to: "Review this workspace.")
+if case .completed(let response) = outcome {
+    print(response.transcript.finalAnswer ?? "")
+}
 
 await appServer.close()
 ```
@@ -28,6 +29,31 @@ await appServer.close()
 `initialize` / `initialized`, manages the process transport, routes
 notifications, retries app-server overload responses, and preserves schema-new
 notifications as unknown domain events.
+
+Use the root-bound connection sequence for diagnostics and the single typed
+termination reason:
+
+```swift
+let connectionEvents = await appServer.connectionEvents()
+for await event in connectionEvents {
+    switch event {
+    case .warning(let diagnostic):
+        print(diagnostic.message)
+    case .retrying(let retry):
+        print("Retrying \(retry.method), attempt \(retry.attempt)")
+    case .deprecation(let notice):
+        print(notice.summary)
+    case .unknown(let notification):
+        print("Future notification: \(notification.method)")
+    case .terminated(let reason):
+        print("Connection ended: \(reason)")
+    }
+}
+```
+
+The sequence does not retain the app-server connection. Each subscriber keeps
+the newest 32 pending diagnostics; the terminal event supersedes pending
+diagnostics and is the only event replayed to a late subscriber.
 
 ## Configuration
 
@@ -46,9 +72,31 @@ let configuration = CodexAppServer.Configuration(
 let appServer = try await CodexAppServer(configuration: configuration)
 ```
 
+Install a typed server-request handler when the host needs to answer approvals,
+user-input prompts, dynamic tool calls, or provider requests. Delegate request
+kinds the host does not override to the built-in policy:
+
+```swift
+let configuration = CodexAppServer.Configuration(
+    serverRequestHandler: { request in
+        switch request {
+        case .commandExecutionApproval:
+            return .approval(.accept)
+        case .userInput(let prompt):
+            return .userInput(.init(answers: prompt.questions.reduce(into: [:]) {
+                $0[$1.id] = .init(answers: [])
+            }))
+        default:
+            return try await CodexAppServer.Configuration
+                .defaultServerRequestHandler(request: request)
+        }
+    }
+)
+```
+
 ## Threads
 
-`CodexThread` is the long-lived session handle for a Codex conversation in a workspace. Use `respond` for a single final response, or `streamResponse` when the UI needs partial snapshots.
+`CodexThread` is the long-lived session handle for a Codex conversation in a workspace. Use `respond` to wait for an exhaustive terminal outcome.
 
 ```swift
 let thread = try await appServer.startThread(
@@ -57,7 +105,7 @@ let thread = try await appServer.startThread(
     options: .init(model: "gpt-5", approvalMode: .autoReview)
 )
 
-let response = try await thread.respond {
+let outcome = try await thread.respond {
     "Run the checks."
     "Focus on failing tests."
 }
@@ -71,13 +119,14 @@ try await thread.rename(to: "Release review")
 try await thread.compact()
 try await thread.archive()
 let restored = try await thread.unarchive()
-try await thread.rollback(turnCount: 1)
 try await thread.delete()
 ```
 
-## Streaming
+## Package-Internal Streaming
 
-Use `streamResponse` when callers need partial response state before the final `CodexResponse`. The stream yields snapshots of the accumulated response state and can be collected into the final result.
+`streamResponse` and the derived event sequences are package-level implementation
+details used by DataKit and package tests. Public consumers use `respond`, or a
+`CodexReviewSession` returned from `startReview`.
 
 ```swift
 let stream = try await thread.streamResponse(to: "Summarize the changes.")
@@ -99,43 +148,17 @@ try await stream.steer(with: "Prefer the smallest fix.")
 try await stream.cancel()
 ```
 
-If the task awaiting `stream.collect()` is cancelled, the stream also sends the
-same cancellation request to app-server.
+Cancelling a task that awaits `stream.collect()` only stops that local
+consumer. Explicit `stream.cancel()` owns the server-side interrupt.
 
-When a UI needs to accept another prompt while a response is in flight, submit
-it with an explicit follow-up mode:
-
-```swift
-let next = try await stream.submit(
-    "Now update the tests.",
-    mode: .queueAfterCurrentResponse
-)
-
-let urgent = try await stream.submit(
-    "Stop and try the shorter path.",
-    mode: .cancelCurrentResponse
-)
-```
-
-Use `steer(with:)` when the new input should modify the current turn.
-`.queueAfterCurrentResponse` waits for the current response to finish before
-starting the next turn. `.cancelCurrentResponse` sends `turn/interrupt`,
-waits for app-server's terminal event, and then starts the next turn in the
-same thread.
-
-`CodexGenerationOptions` includes `transcriptErrorHandlingPolicy` for controlling transcript handling after failed turns:
-
-```swift
-let stream = try await thread.streamResponse(
-    to: "Try the risky change.",
-    options: .init(transcriptErrorHandlingPolicy: .revertTranscript)
-)
-```
+Use `steer(with:)` when new input should modify the current turn. Start a
+follow-up from the reusable `CodexThread` handle; terminal response handles
+release their connection lease and do not start another generation.
 
 It also exposes reasoning controls with domain values instead of raw strings:
 
 ```swift
-let response = try await thread.respond(
+let outcome = try await thread.respond(
     to: "Find the risky part of this change.",
     options: .init(
         effort: .high,
@@ -144,13 +167,15 @@ let response = try await thread.respond(
     )
 )
 
-print(response.usage?.reasoningOutputTokens ?? 0)
+if case .completed(let response) = outcome {
+    print(response.usage?.reasoningOutputTokens ?? 0)
+}
 ```
 
 Structured final answers can be constrained with a JSON schema:
 
 ```swift
-let response = try await thread.respond(
+let outcome = try await thread.respond(
     to: "Summarize the change as JSON.",
     options: .init(outputSchema: .object([
         "type": .string("object"),
@@ -163,9 +188,8 @@ let response = try await thread.respond(
 )
 ```
 
-Threads also expose async sequences for chat, transcript updates, and log-style
-consumers. This is the API surface intended for higher-level products that need
-to render Codex output continuously outside a single response stream.
+The package-internal thread handle also exposes async sequences for chat,
+transcript updates, and log-style consumers.
 
 ```swift
 for try await message in thread.messages {
@@ -226,6 +250,17 @@ for try await event in thread.events {
 }
 ```
 
+The stream represents the thread's current generation, not an append-only
+connection history. A generation is registered before a scoped request is
+written and becomes current only after its response is accepted; attempts that
+fail or cancel before an accepted response leave the previous generation
+intact. Each subscriber has a
+bounded 256-event channel. A slow subscriber receives an authoritative turn
+snapshot plus the newest usage/status and bounded unknown diagnostics when its
+incremental queue overflows. Terminal and `thread/closed` events are never
+dropped, and cancelling one iterator synchronously removes only that
+subscriber.
+
 This lets review clients build logs from
 CodexAppServerKit domain events instead of parsing JSON-RPC notifications or
 string logs directly.
@@ -240,11 +275,8 @@ not yet model directly.
 `review/start` is part of the app-server surface, so CodexAppServerKit exposes
 it as a high-level `CodexAppServer` operation and as a lower-level thread
 operation for callers that already own a thread. App-server does not expose a
-separate review transport stream; review sessions project the normal thread
-event stream for the review turn. If app-server detaches the review into a
-separate thread, `events`, `progress`, and `transcriptUpdates` are bound to that
-review thread automatically through the same thread/turn notification routing
-used by regular turns.
+separate review transport stream. A review session owns the source, active
+review-thread, and turn identities and exposes one typed terminal outcome.
 
 ```swift
 let review = try await appServer.startReview(
@@ -253,26 +285,10 @@ let review = try await appServer.startReview(
     options: .init(model: "gpt-5")
 )
 
-for try await event in review.events {
-    switch event {
-    case .itemCompleted(let item, _):
-        renderReviewItem(item)
-    case .reasoningDelta(let delta, _):
-        renderReasoningDelta(delta)
-    default:
-        break
-    }
+let outcome = try await review.collect()
+if case .completed(let response) = outcome {
+    print(response.transcript.reviewOutputText ?? "")
 }
-
-for try await progress in review.progress {
-    renderReviewTranscript(progress.transcript)
-    if progress.phase == .completed {
-        break
-    }
-}
-
-let response = try await review.collect()
-print(response.transcript.reviewOutputText ?? "")
 ```
 
 Use `CodexThread.startReview` when a thread owner is already explicit:
@@ -290,16 +306,16 @@ try await appServer.startReview(in: workspaceURL, target: .commit(sha: sha, titl
 try await appServer.startReview(in: workspaceURL, target: .custom(instructions: instructions))
 ```
 
-`CodexReviewSession.events` yields `CodexReviewEvent`, preserving unknown
-schema-new notifications as `CodexRawNotification`. Review output is exposed as
-`CodexTranscript.reviewOutputText` from the `exitedReviewMode` item. Normal
-assistant-message final answers remain available through `finalAnswer` for
-regular turns and compatibility with app-server payloads that include an
-assistant review message. `progress` yields `CodexReviewProgress` snapshots
-until the review turn completes or fails.
-`transcriptUpdates` remains the transcript sequence for the review thread
-itself, which is useful when a UI wants thread-bound transcript snapshots rather
-than review progress phases.
+Review output is exposed as `CodexTranscript.reviewOutputText` from the
+`exitedReviewMode` item. Incremental review transport sequences stay inside the
+package; apps that render live thread content use CodexDataKit's context-owned
+chat observation instead of building a second review model graph.
+
+`terminalOutcomeIfKnown()` is a nonwaiting read of the same review-generation
+state used by `collect()`. It returns `nil` while the turn is live, never sends a
+request, and surfaces a committed connection termination as an error. This is
+primarily useful to arbitrate a caller-cancellation race without starting a
+second collector.
 
 `CodexReviewSession` also owns the app-server lifecycle identity for a review.
 Use `sourceThreadID`, `activeTurnThreadID`, `associatedThreadIDs`, and
@@ -311,9 +327,8 @@ let identity = review.identity
 persist(identity)
 
 let restored = try await appServer.resumeReview(identity)
-try await restored.cancel { cancellation in
-    noteActiveTurnThread(cancellation.threadID)
-}
+let cancellation = try await restored.cancel()
+noteActiveTurnThread(cancellation.threadID)
 ```
 
 `CodexReviewIdentity` is a `Codable` Swift value containing only CodexKit
@@ -323,8 +338,8 @@ review runs and does not depend on any higher-level review domain model.
 
 `CodexAppServer` also owns app-server review restart and cleanup lifecycle
 state. A host that needs to interrupt and restart a review can prepare a
-transient token, restart from it, then perform best-effort cleanup without
-tracking detached review thread IDs itself:
+transient token, restart from it, then perform cleanup without tracking
+detached review thread IDs itself:
 
 ```swift
 let token = try await appServer.prepareReviewRestart(identity)
@@ -333,13 +348,47 @@ let restarted = try await appServer.restartPreparedReview(
     target: .baseBranch("main"),
     delivery: .detached
 )
-await appServer.cleanupReview(restarted.identity)
+let cleanup = await appServer.cleanupReview(restarted.identity)
+if cleanup.succeeded == false {
+    persistForLaterCleanup(cleanup.attemptedThreadIDs)
+}
 ```
+
+Cleanup returns every attempted thread ID and its ordered failures. When any
+deletion fails, identities retained by restart preparation stay registered so
+the same app-server generation can retry without losing cleanup ownership.
+
+Preparation and restart are owned by one process-local coordinator. Concurrent
+restart calls with the same token, target, delivery, and thread options join one
+shared operation; a cancelled waiter does not cancel that operation. A token
+allows at most two restart invocations, and the deprecated rollback request is
+sent successfully at most once.
+
+When a host stops a run before consuming its prepared token, invalidate it and
+take ownership of every identity retained for that source thread:
+
+```swift
+let retained = await appServer.discardPreparedReviewRestart(token)
+persistForLaterCleanup(retained)
+```
+
+Runtime owners use `discardAllPreparedReviewRestarts()` before closing the
+app-server connection. It waits for in-flight preparation and restart work,
+interrupts any replacement session that arrives after invalidation, and returns
+an ordered identity list for each source thread. This is a terminal close of
+restart preparation for that `CodexAppServer` instance. Neither discard
+operation deletes review threads; the caller decides when durable ownership
+permits final cleanup.
 
 ## Responses
 
-`CodexResponse` is the final result from `respond` or `ResponseStream.collect()`.
-It carries the final answer, transcript, status, token usage, and `turnID`.
+`CodexThread.respond` and `CodexReviewSession.collect` return
+`CodexTurnOutcome`: `.completed`, `.interrupted`, `.failed`, or
+`.invalidTerminalStatus`. Every case carries a `CodexResponse`; failed turns
+also carry a non-optional `CodexTurnError`. Caller cancellation throws
+`CancellationError` and is not a terminal outcome.
+
+`CodexResponse` carries transcript, token usage, timing, and `turnID`.
 
 Final answers are derived from assistant messages whose phase is
 `.finalAnswer`. If no final-answer phase is present, the last normal assistant
@@ -364,7 +413,7 @@ try await thread.respond(to: "What changed?")
 ```
 
 For dynamic prompts, use the result-builder initializer or the builder overloads
-on `respond` and `streamResponse`:
+on `respond` and the package-level `streamResponse`:
 
 ```swift
 let response = try await thread.respond {
@@ -399,33 +448,9 @@ try await appServer.updateConfiguration(patch)
 Login flows return typed handles:
 
 ```swift
-let accountEvents = await appServer.accountEvents()
 let handle = try await appServer.loginChatGPT()
-
-for try await event in accountEvents {
-    if case .loginCompleted(let completion) = event, completion.loginID == handle.id {
-        break
-    }
-}
-```
-
-Native apps can ask the app-server to shape the ChatGPT login URL for an
-`ASWebAuthenticationSession`, then complete the login with the returned callback
-URL:
-
-```swift
-let login = try await appServer.loginChatGPT(
-    nativeWebAuthentication: .init(callbackURLScheme: "com.example.app.auth")
-)
-let callbackURL = try await webAuthenticationSession(login.authenticationURL)
-try await appServer.completeLogin(id: login.id, callbackURL: callbackURL)
-```
-
-API key and device-code login are also available:
-
-```swift
-try await appServer.loginAPIKey(apiKey)
-let deviceCode = try await appServer.loginChatGPTDeviceCode()
+openInBrowser(handle.authenticationURL)
+let outcome = try await handle.result()
 ```
 
 ## Testing
@@ -438,47 +463,52 @@ emit server notifications explicitly.
 ```swift
 import CodexAppServerKit
 import CodexAppServerKitTesting
+import Foundation
 import Testing
 
-@Test func startsThread() async throws {
+@Test func readsConfiguration() async throws {
     let runtime = try await CodexAppServerTestRuntime.start()
-    try await runtime.transport.enqueueThreadStart(
-        threadID: "thread-test",
-        model: "gpt-5"
+    let layer = try CodexAppServerTestConfigurationLayerMetadata(
+        source: .user(
+            file: URL(fileURLWithPath: "/tmp/codex/config.toml"),
+            profile: nil
+        ),
+        version: "test-config-v1"
     )
-
-    let thread = try await runtime.server.startThread(
-        in: URL(fileURLWithPath: "/tmp/project", isDirectory: true),
-        options: .init(model: "gpt-5")
+    let fixture = try CodexAppServerTestConfigurationReadResult(
+        configuration: .init(model: "gpt-5-codex"),
+        origins: ["model": layer],
+        layers: [try .init(
+            metadata: layer,
+            configuration: .object(["model": .string("gpt-5-codex")])
+        )]
     )
+    try await runtime.transport.enqueueConfiguration(fixture)
 
-    #expect(thread.id.rawValue == "thread-test")
-    #expect(await runtime.transport.recordedRequests().map(\.method) == [
-        "initialize",
-        "thread/start",
-    ])
+    let configuration = try await runtime.server.configuration()
+
+    #expect(configuration == fixture.configuration)
+    #expect(await runtime.transport.recordedRequests(for: .configurationRead).count == 1)
+    await runtime.close()
 }
 ```
 
-For concurrency-sensitive tests, hold a request with
+Tests can hold a typed operation with
 `CodexAppServerTestGate` and release it explicitly. This avoids depending on
 sleep duration or repeated `Task.yield()` calls.
 
 ```swift
-try await runtime.transport.enqueueTurnStart(turnID: "turn-1")
-try await runtime.transport.enqueueEmpty(for: "turn/interrupt")
-
-let stream = try await thread.streamResponse(to: "Run checks.")
 let gate = CodexAppServerTestGate()
-await runtime.transport.holdNext(method: "turn/interrupt", gate: gate)
+await runtime.transport.holdNext(.configurationRead, gate: gate)
+try await runtime.transport.enqueueConfiguration(fixture)
 
-let cancelTask = Task {
-    try await stream.cancel()
+let readTask = Task {
+    try await runtime.server.configuration()
 }
 
-await runtime.transport.waitForRequest(method: "turn/interrupt")
+await runtime.transport.waitForRequest(.configurationRead)
 await gate.open()
-try await cancelTask.value
+_ = try await readTask.value
 ```
 
 ## Boundary
@@ -495,24 +525,27 @@ The public boundary is:
 - `CodexReviewTarget`
 - `CodexReviewSession`
 - `CodexReviewIdentity`
+- `CodexReviewCleanupFailure`
+- `CodexReviewCleanupResult`
 - `CodexReviewRestartToken`
-- `CodexReviewResumeOptions`
-- `CodexReviewEvent`
-- `CodexReviewProgress`
-- `CodexReviewEventSequence`
-- `CodexReviewProgressSequence`
+- `CodexTurnSnapshot`
+- `CodexTurnStatus`
+- `CodexThreadStatus`
+- `CodexTurnOutcome`
+- `CodexFailedTurn`
+- `CodexTurnError`
+- `CodexErrorInfo`
 - `CodexResponse`
-- `CodexResponseStream`
+- `CodexAppServerError`
+- `CodexRequestFailure`
+- `CodexServerError`
 - `CodexGenerationOptions`
-- `CodexTranscriptErrorHandlingPolicy`
 - `CodexPrompt`
 - `CodexTranscript`
 - `CodexThreadItem`
-- `CodexThreadEvent`
 - `CodexModel`
 - `CodexAccount`
 - `CodexAccountEvent`
-- `CodexLoginCompletion`
 - `CodexLoginHandle`
 
 Unknown notifications and unknown item kinds are preserved so clients can keep

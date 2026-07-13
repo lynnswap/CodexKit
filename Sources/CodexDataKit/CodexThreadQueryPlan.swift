@@ -43,24 +43,24 @@ package struct CodexThreadQueryPlan: Sendable {
     package var sortPlans: [CodexSortPlan<CodexChat>]
     package var fetchLimit: Int?
     package var fetchOffset: Int
-    package var includePendingChanges: Bool
+    package var includeContextChanges: Bool
     private var serverFilter: CodexThreadServerFilter
 
-    package init(descriptor: CodexFetchDescriptor<CodexChat>) {
+    package init(descriptor: CodexFetchDescriptor<CodexChat>) throws {
         if let predicate = descriptor.predicate {
-            let lowered = makeCodexChatRecordPredicate(predicate)
+            let lowered = try makeCodexChatRecordPredicate(predicate)
             self.predicate = lowered.predicate
             self.predicateSignature = lowered.signature
-            self.serverFilter = CodexThreadServerFilter(signature: lowered.signature)
+            self.serverFilter = try CodexThreadServerFilter(signature: lowered.signature)
         } else {
             self.predicate = { $0.isArchived == false }
             self.predicateSignature = nil
             self.serverFilter = .defaultChatFilter
         }
-        self.sortPlans = descriptor.sortPlans
+        self.sortPlans = try descriptor.validatedSortPlans()
         self.fetchLimit = descriptor.fetchLimit
         self.fetchOffset = descriptor.normalizedFetchOffset
-        self.includePendingChanges = descriptor.includePendingChanges
+        self.includeContextChanges = descriptor.includeContextChanges
     }
 
     package var signature: CodexFetchDescriptorSignature {
@@ -70,7 +70,8 @@ package struct CodexThreadQueryPlan: Sendable {
             sortPlans: sortPlans.map(\.signature),
             fetchLimit: fetchLimit,
             fetchOffset: fetchOffset,
-            includePendingChanges: includePendingChanges
+            includeContextChanges: includeContextChanges,
+            validationFailure: nil
         )
     }
 
@@ -114,7 +115,27 @@ package struct CodexThreadQueryPlan: Sendable {
     }
 
     package var usesServerOwnedOrdering: Bool {
-        sortPlans.first?.key == .recencyAt || sortPlans.isEmpty
+        sortPlans.isEmpty || sortPlans.first?.key == .recencyAt
+    }
+
+    package func mutationStrategy(
+        for operation: CodexFetchedResultsMutationOperation
+    ) -> CodexFetchedResultsMutationStrategy {
+        let requiresAuthoritativeRefresh =
+            membershipRequiresServerRefresh || usesServerOwnedOrdering
+        switch operation {
+        case .insert, .archive, .relationshipRefresh:
+            return requiresAuthoritativeRefresh ? .refreshLoadedWindow : .applyLocally
+        case .revalidate(let affectsMembership, let hasNextPage):
+            return requiresAuthoritativeRefresh
+                || (affectsMembership && (hasNextPage || fetchOffset > 0))
+                ? .refreshLoadedWindow
+                : .applyLocally
+        case .remove(let hasNextPage):
+            return requiresAuthoritativeRefresh || fetchOffset > 0 || hasNextPage
+                ? .refreshLoadedWindow
+                : .removeLocally
+        }
     }
 
     package func matches(_ chat: CodexChat) -> Bool {
@@ -156,10 +177,25 @@ package struct CodexThreadQueryPlan: Sendable {
     }
 }
 
+package enum CodexFetchedResultsMutationOperation: Sendable, Equatable {
+    case insert
+    case archive
+    case revalidate(affectsMembership: Bool, hasNextPage: Bool)
+    case remove(hasNextPage: Bool)
+    case relationshipRefresh
+}
+
+package enum CodexFetchedResultsMutationStrategy: Sendable, Equatable {
+    case applyLocally
+    case removeLocally
+    case refreshLoadedWindow
+}
+
 package enum CodexFetchDescriptorModelKind: Hashable, Sendable {
     case chat
     case workspace
     case workspaceGroup
+    case unsupported(String)
 }
 
 package struct CodexFetchDescriptorSignature: Hashable, Sendable {
@@ -168,42 +204,70 @@ package struct CodexFetchDescriptorSignature: Hashable, Sendable {
     package var sortPlans: [CodexSortPlanSignature]
     package var fetchLimit: Int?
     package var fetchOffset: Int
-    package var includePendingChanges: Bool
+    package var includeContextChanges: Bool
+    package var validationFailure: CodexFetchValidationError?
 }
 
 package struct CodexSortPlanSignature: Hashable, Sendable {
     package var path: CodexSortPath
     package var order: SortOrder
-    package var comparison: String?
+    package var stringComparator: String.StandardComparator?
 }
 
 extension CodexSortPlan {
     package var signature: CodexSortPlanSignature {
-        .init(path: path, order: order, comparison: comparisonSignature)
+        .init(path: path, order: order, stringComparator: stringComparator)
     }
 }
 
 extension CodexFetchDescriptor {
     package var querySignature: CodexFetchDescriptorSignature {
-        let kind: CodexFetchDescriptorModelKind
-        if Model.self == CodexChat.self {
-            return CodexThreadQueryPlan(descriptor: self as! CodexFetchDescriptor<CodexChat>)
-                .signature
-        } else if Model.self == CodexWorkspace.self {
-            kind = .workspace
-        } else if Model.self == CodexWorkspaceGroup.self {
-            kind = .workspaceGroup
-        } else {
-            preconditionFailure("CodexFetchDescriptor does not support fetching \(Model.self).")
+        do {
+            if let fetchLimit, fetchLimit < 0 {
+                throw CodexFetchValidationError.negativeFetchLimit(fetchLimit)
+            }
+            if let fetchOffset, fetchOffset < 0 {
+                throw CodexFetchValidationError.negativeFetchOffset(fetchOffset)
+            }
+            if predicate != nil, Model.self != CodexChat.self {
+                throw CodexFetchValidationError.unsupportedPredicate(
+                    String(describing: Model.self)
+                )
+            }
+            let kind: CodexFetchDescriptorModelKind
+            if Model.self == CodexChat.self {
+                return try CodexThreadQueryPlan(
+                    descriptor: self as! CodexFetchDescriptor<CodexChat>
+                ).signature
+            } else if Model.self == CodexWorkspace.self {
+                kind = .workspace
+            } else if Model.self == CodexWorkspaceGroup.self {
+                kind = .workspaceGroup
+            } else {
+                throw CodexFetchValidationError.unsupportedModel(String(describing: Model.self))
+            }
+            return CodexFetchDescriptorSignature(
+                modelKind: kind,
+                predicate: nil,
+                sortPlans: try validatedSortPlans().map(\.signature),
+                fetchLimit: fetchLimit,
+                fetchOffset: normalizedFetchOffset,
+                includeContextChanges: includeContextChanges,
+                validationFailure: nil
+            )
+        } catch let failure as CodexFetchValidationError {
+            return CodexFetchDescriptorSignature(
+                modelKind: .unsupported(String(describing: Model.self)),
+                predicate: nil,
+                sortPlans: [],
+                fetchLimit: fetchLimit,
+                fetchOffset: normalizedFetchOffset,
+                includeContextChanges: includeContextChanges,
+                validationFailure: failure
+            )
+        } catch {
+            preconditionFailure("Unexpected fetch descriptor validation error: \(error)")
         }
-        return CodexFetchDescriptorSignature(
-            modelKind: kind,
-            predicate: nil,
-            sortPlans: sortPlans.map(\.signature),
-            fetchLimit: fetchLimit,
-            fetchOffset: normalizedFetchOffset,
-            includePendingChanges: includePendingChanges
-        )
     }
 }
 
@@ -282,7 +346,7 @@ private struct CodexThreadServerFilter: Hashable, Sendable {
 
     init() {}
 
-    init(signature: CodexChatPredicateSignature) {
+    init(signature: CodexChatPredicateSignature) throws {
         let archiveScope = Self.archiveScope(from: signature)
         guard var filter = Self.filter(from: signature) else {
             switch archiveScope {
@@ -290,8 +354,7 @@ private struct CodexThreadServerFilter: Hashable, Sendable {
                 self = Self(isComplete: false)
                 self.archived = archived
             case .unscoped:
-                self = Self.defaultChatFilter
-                self.isComplete = false
+                self = Self(isComplete: false)
             case .ambiguous:
                 self = Self(isComplete: false)
             }
@@ -300,15 +363,13 @@ private struct CodexThreadServerFilter: Hashable, Sendable {
         switch archiveScope {
         case .scoped(let archived):
             if let filterArchived = filter.archived, filterArchived != archived {
-                preconditionFailure(
-                    "CodexChat predicates with isArchived must lower to one archived scope."
+                throw CodexFetchValidationError.invalidArchiveScope(
+                    String(describing: signature)
                 )
             }
             filter.archived = archived
         case .unscoped:
-            if filter.archived == nil {
-                filter.archived = false
-            }
+            break
         case .ambiguous:
             filter.archived = nil
             filter.isComplete = false
@@ -778,71 +839,73 @@ private extension CodexChatPredicateSignature {
 }
 
 extension PredicateExpressions.Value: CodexChatRecordPredicateExpression where Output == Bool {
-    fileprivate func codexChatRecordPredicate() -> CodexChatPredicateLowering {
-        let expression = codexChatBoolExpression()
+    fileprivate func codexChatRecordPredicate() throws -> CodexChatPredicateLowering {
+        let expression = try codexChatBoolExpression()
         return .init(predicate: expression.evaluate, signature: .bool(expression.signature))
     }
 }
 
 private protocol CodexChatRecordPredicateExpression {
-    func codexChatRecordPredicate() -> CodexChatPredicateLowering
+    func codexChatRecordPredicate() throws -> CodexChatPredicateLowering
 }
 
 private protocol CodexChatRecordBoolExpression {
-    func codexChatBoolExpression() -> CodexChatExpression<Bool>
+    func codexChatBoolExpression() throws -> CodexChatExpression<Bool>
 }
 
 private protocol CodexChatRecordStringExpression {
-    func codexChatStringExpression() -> CodexChatExpression<String>
+    func codexChatStringExpression() throws -> CodexChatExpression<String>
 }
 
 private protocol CodexChatRecordOptionalStringExpression {
-    func codexChatOptionalStringExpression() -> CodexChatExpression<String?>
+    func codexChatOptionalStringExpression() throws -> CodexChatExpression<String?>
 }
 
 private protocol CodexChatRecordWorkspaceIDExpression {
-    func codexChatWorkspaceIDExpression() -> CodexChatExpression<CodexWorkspaceID>
+    func codexChatWorkspaceIDExpression() throws -> CodexChatExpression<CodexWorkspaceID>
 }
 
 private protocol CodexChatRecordOptionalWorkspaceIDExpression {
-    func codexChatOptionalWorkspaceIDExpression() -> CodexChatExpression<CodexWorkspaceID?>
+    func codexChatOptionalWorkspaceIDExpression() throws -> CodexChatExpression<CodexWorkspaceID?>
 }
 
 private protocol CodexChatRecordSourceKindExpression {
-    func codexChatSourceKindExpression() -> CodexChatExpression<CodexThreadSourceKind>
+    func codexChatSourceKindExpression() throws -> CodexChatExpression<CodexThreadSourceKind>
 }
 
 private protocol CodexChatRecordOptionalSourceKindExpression {
-    func codexChatOptionalSourceKindExpression() -> CodexChatExpression<CodexThreadSourceKind?>
+    func codexChatOptionalSourceKindExpression() throws -> CodexChatExpression<CodexThreadSourceKind?>
 }
 
 private protocol CodexChatRecordEquatableExpression {
-    func codexChatEquatableExpression() -> CodexChatExpression<CodexChatPredicateValue>
+    func codexChatEquatableExpression() throws -> CodexChatExpression<CodexChatPredicateValue>
 }
 
 private protocol CodexChatRecordSequenceExpression {
-    func codexChatSequenceExpression() -> CodexChatExpression<CodexChatSequenceValue>
+    func codexChatSequenceExpression() throws -> CodexChatExpression<CodexChatSequenceValue>
 }
 
 private protocol CodexChatRecordMembershipElementExpression {
-    func codexChatMembershipElementExpression() -> CodexChatExpression<CodexChatPredicateValue>
+    func codexChatMembershipElementExpression() throws -> CodexChatExpression<CodexChatPredicateValue>
 }
 
 private func makeCodexChatRecordPredicate(
     _ predicate: Predicate<CodexChat>
-) -> CodexChatPredicateLowering {
+) throws -> CodexChatPredicateLowering {
     guard let expression = predicate.expression as? any CodexChatRecordPredicateExpression else {
-        preconditionFailure("Unsupported CodexChat predicate expression: \(type(of: predicate.expression))")
+        throw CodexFetchValidationError.unsupportedPredicate(
+            String(reflecting: type(of: predicate.expression))
+        )
     }
-    return expression.codexChatRecordPredicate()
+    return try expression.codexChatRecordPredicate()
 }
 
 extension PredicateExpressions.Conjunction: CodexChatRecordPredicateExpression
     where LHS: CodexChatRecordPredicateExpression, RHS: CodexChatRecordPredicateExpression
 {
-    fileprivate func codexChatRecordPredicate() -> CodexChatPredicateLowering {
-        let lhsPredicate = lhs.codexChatRecordPredicate()
-        let rhsPredicate = rhs.codexChatRecordPredicate()
+    fileprivate func codexChatRecordPredicate() throws -> CodexChatPredicateLowering {
+        let lhsPredicate = try lhs.codexChatRecordPredicate()
+        let rhsPredicate = try rhs.codexChatRecordPredicate()
         return .init(
             predicate: { record in
                 lhsPredicate.predicate(record) && rhsPredicate.predicate(record)
@@ -855,9 +918,9 @@ extension PredicateExpressions.Conjunction: CodexChatRecordPredicateExpression
 extension PredicateExpressions.Disjunction: CodexChatRecordPredicateExpression
     where LHS: CodexChatRecordPredicateExpression, RHS: CodexChatRecordPredicateExpression
 {
-    fileprivate func codexChatRecordPredicate() -> CodexChatPredicateLowering {
-        let lhsPredicate = lhs.codexChatRecordPredicate()
-        let rhsPredicate = rhs.codexChatRecordPredicate()
+    fileprivate func codexChatRecordPredicate() throws -> CodexChatPredicateLowering {
+        let lhsPredicate = try lhs.codexChatRecordPredicate()
+        let rhsPredicate = try rhs.codexChatRecordPredicate()
         return .init(
             predicate: { record in
                 lhsPredicate.predicate(record) || rhsPredicate.predicate(record)
@@ -870,8 +933,8 @@ extension PredicateExpressions.Disjunction: CodexChatRecordPredicateExpression
 extension PredicateExpressions.Negation: CodexChatRecordPredicateExpression
     where Wrapped: CodexChatRecordPredicateExpression
 {
-    fileprivate func codexChatRecordPredicate() -> CodexChatPredicateLowering {
-        let predicate = wrapped.codexChatRecordPredicate()
+    fileprivate func codexChatRecordPredicate() throws -> CodexChatPredicateLowering {
+        let predicate = try wrapped.codexChatRecordPredicate()
         return .init(
             predicate: { record in
                 predicate.predicate(record) == false
@@ -884,9 +947,9 @@ extension PredicateExpressions.Negation: CodexChatRecordPredicateExpression
 extension PredicateExpressions.Equal: CodexChatRecordPredicateExpression
     where LHS: CodexChatRecordEquatableExpression, RHS: CodexChatRecordEquatableExpression
 {
-    fileprivate func codexChatRecordPredicate() -> CodexChatPredicateLowering {
-        let lhsExpression = lhs.codexChatEquatableExpression()
-        let rhsExpression = rhs.codexChatEquatableExpression()
+    fileprivate func codexChatRecordPredicate() throws -> CodexChatPredicateLowering {
+        let lhsExpression = try lhs.codexChatEquatableExpression()
+        let rhsExpression = try rhs.codexChatEquatableExpression()
         return .init(
             predicate: { record in
                 lhsExpression.evaluate(record)
@@ -900,9 +963,9 @@ extension PredicateExpressions.Equal: CodexChatRecordPredicateExpression
 extension PredicateExpressions.NotEqual: CodexChatRecordPredicateExpression
     where LHS: CodexChatRecordEquatableExpression, RHS: CodexChatRecordEquatableExpression
 {
-    fileprivate func codexChatRecordPredicate() -> CodexChatPredicateLowering {
-        let lhsExpression = lhs.codexChatEquatableExpression()
-        let rhsExpression = rhs.codexChatEquatableExpression()
+    fileprivate func codexChatRecordPredicate() throws -> CodexChatPredicateLowering {
+        let lhsExpression = try lhs.codexChatEquatableExpression()
+        let rhsExpression = try rhs.codexChatEquatableExpression()
         return .init(
             predicate: { record in
                 lhsExpression.evaluate(record)
@@ -916,9 +979,9 @@ extension PredicateExpressions.NotEqual: CodexChatRecordPredicateExpression
 extension PredicateExpressions.StringLocalizedStandardContains: CodexChatRecordPredicateExpression
     where Root: CodexChatRecordStringExpression, Other: CodexChatRecordStringExpression
 {
-    fileprivate func codexChatRecordPredicate() -> CodexChatPredicateLowering {
-        let rootExpression = root.codexChatStringExpression()
-        let otherExpression = other.codexChatStringExpression()
+    fileprivate func codexChatRecordPredicate() throws -> CodexChatPredicateLowering {
+        let rootExpression = try root.codexChatStringExpression()
+        let otherExpression = try other.codexChatStringExpression()
         return .init(
             predicate: { record in
                 rootExpression.evaluate(record).localizedStandardContains(otherExpression.evaluate(record))
@@ -931,9 +994,9 @@ extension PredicateExpressions.StringLocalizedStandardContains: CodexChatRecordP
 extension PredicateExpressions.SequenceContains: CodexChatRecordPredicateExpression
     where LHS: CodexChatRecordSequenceExpression, RHS: CodexChatRecordMembershipElementExpression
 {
-    fileprivate func codexChatRecordPredicate() -> CodexChatPredicateLowering {
-        let sequenceExpression = sequence.codexChatSequenceExpression()
-        let elementExpression = element.codexChatMembershipElementExpression()
+    fileprivate func codexChatRecordPredicate() throws -> CodexChatPredicateLowering {
+        let sequenceExpression = try sequence.codexChatSequenceExpression()
+        let elementExpression = try element.codexChatMembershipElementExpression()
         return .init(
             predicate: { record in
                 sequenceExpression.evaluate(record).contains(elementExpression.evaluate(record))
@@ -946,19 +1009,19 @@ extension PredicateExpressions.SequenceContains: CodexChatRecordPredicateExpress
 extension PredicateExpressions.KeyPath: CodexChatRecordBoolExpression
     where Root == PredicateExpressions.Variable<CodexChat>, Output == Bool
 {
-    fileprivate func codexChatBoolExpression() -> CodexChatExpression<Bool> {
+    fileprivate func codexChatBoolExpression() throws -> CodexChatExpression<Bool> {
         if keyPath == \CodexChat.isArchived {
             return .init(evaluate: { $0.isArchived }, signature: .key(.isArchived))
         }
-        preconditionFailure("Unsupported CodexChat Bool predicate key path: \(keyPath)")
+        throw CodexFetchValidationError.unsupportedPredicate(String(describing: keyPath))
     }
 }
 
 extension PredicateExpressions.KeyPath: CodexChatRecordPredicateExpression
     where Root == PredicateExpressions.Variable<CodexChat>, Output == Bool
 {
-    fileprivate func codexChatRecordPredicate() -> CodexChatPredicateLowering {
-        let expression = codexChatBoolExpression()
+    fileprivate func codexChatRecordPredicate() throws -> CodexChatPredicateLowering {
+        let expression = try codexChatBoolExpression()
         return .init(predicate: expression.evaluate, signature: .bool(expression.signature))
     }
 }
@@ -966,53 +1029,53 @@ extension PredicateExpressions.KeyPath: CodexChatRecordPredicateExpression
 extension PredicateExpressions.KeyPath: CodexChatRecordStringExpression
     where Root == PredicateExpressions.Variable<CodexChat>, Output == String
 {
-    fileprivate func codexChatStringExpression() -> CodexChatExpression<String> {
+    fileprivate func codexChatStringExpression() throws -> CodexChatExpression<String> {
         if keyPath == \CodexChat.searchableText {
             return .init(evaluate: { $0.searchableText }, signature: .key(.searchableText))
         }
-        preconditionFailure("Unsupported CodexChat String predicate key path: \(keyPath)")
+        throw CodexFetchValidationError.unsupportedPredicate(String(describing: keyPath))
     }
 }
 
 extension PredicateExpressions.KeyPath: CodexChatRecordOptionalStringExpression
     where Root == PredicateExpressions.Variable<CodexChat>, Output == String?
 {
-    fileprivate func codexChatOptionalStringExpression() -> CodexChatExpression<String?> {
+    fileprivate func codexChatOptionalStringExpression() throws -> CodexChatExpression<String?> {
         if keyPath == \CodexChat.modelProvider {
             return .init(evaluate: { $0.modelProvider }, signature: .key(.modelProvider))
         }
-        preconditionFailure("Unsupported CodexChat optional String predicate key path: \(keyPath)")
+        throw CodexFetchValidationError.unsupportedPredicate(String(describing: keyPath))
     }
 }
 
 extension PredicateExpressions.KeyPath: CodexChatRecordOptionalWorkspaceIDExpression
     where Root == PredicateExpressions.Variable<CodexChat>, Output == CodexWorkspaceID?
 {
-    fileprivate func codexChatOptionalWorkspaceIDExpression() -> CodexChatExpression<CodexWorkspaceID?> {
+    fileprivate func codexChatOptionalWorkspaceIDExpression() throws -> CodexChatExpression<CodexWorkspaceID?> {
         if keyPath == \CodexChat.workspaceID {
             return .init(evaluate: { $0.workspaceID }, signature: .key(.workspaceID))
         }
-        preconditionFailure("Unsupported CodexChat optional workspace ID predicate key path: \(keyPath)")
+        throw CodexFetchValidationError.unsupportedPredicate(String(describing: keyPath))
     }
 }
 
 extension PredicateExpressions.KeyPath: CodexChatRecordOptionalSourceKindExpression
     where Root == PredicateExpressions.Variable<CodexChat>, Output == CodexThreadSourceKind?
 {
-    fileprivate func codexChatOptionalSourceKindExpression() -> CodexChatExpression<CodexThreadSourceKind?> {
+    fileprivate func codexChatOptionalSourceKindExpression() throws -> CodexChatExpression<CodexThreadSourceKind?> {
         if keyPath == \CodexChat.sourceKind {
             return .init(evaluate: { $0.sourceKind }, signature: .key(.sourceKind))
         }
-        preconditionFailure("Unsupported CodexChat optional source kind predicate key path: \(keyPath)")
+        throw CodexFetchValidationError.unsupportedPredicate(String(describing: keyPath))
     }
 }
 
 extension PredicateExpressions.KeyPath: CodexChatRecordEquatableExpression
     where Root == PredicateExpressions.Variable<CodexChat>
 {
-    fileprivate func codexChatEquatableExpression() -> CodexChatExpression<CodexChatPredicateValue> {
+    fileprivate func codexChatEquatableExpression() throws -> CodexChatExpression<CodexChatPredicateValue> {
         if Output.self == Bool.self {
-            let expression = (self as! PredicateExpressions.KeyPath<Root, Bool>)
+            let expression = try (self as! PredicateExpressions.KeyPath<Root, Bool>)
                 .codexChatBoolExpression()
             return .init(
                 evaluate: { .bool(expression.evaluate($0)) },
@@ -1020,7 +1083,7 @@ extension PredicateExpressions.KeyPath: CodexChatRecordEquatableExpression
             )
         }
         if Output.self == String?.self {
-            let expression = (self as! PredicateExpressions.KeyPath<Root, String?>)
+            let expression = try (self as! PredicateExpressions.KeyPath<Root, String?>)
                 .codexChatOptionalStringExpression()
             return .init(
                 evaluate: { .optionalString(expression.evaluate($0)) },
@@ -1028,7 +1091,7 @@ extension PredicateExpressions.KeyPath: CodexChatRecordEquatableExpression
             )
         }
         if Output.self == CodexWorkspaceID?.self {
-            let expression = (self as! PredicateExpressions.KeyPath<Root, CodexWorkspaceID?>)
+            let expression = try (self as! PredicateExpressions.KeyPath<Root, CodexWorkspaceID?>)
                 .codexChatOptionalWorkspaceIDExpression()
             return .init(
                 evaluate: { .optionalWorkspaceID(expression.evaluate($0)) },
@@ -1036,22 +1099,22 @@ extension PredicateExpressions.KeyPath: CodexChatRecordEquatableExpression
             )
         }
         if Output.self == CodexThreadSourceKind?.self {
-            let expression = (self as! PredicateExpressions.KeyPath<Root, CodexThreadSourceKind?>)
+            let expression = try (self as! PredicateExpressions.KeyPath<Root, CodexThreadSourceKind?>)
                 .codexChatOptionalSourceKindExpression()
             return .init(
                 evaluate: { .optionalSourceKind(expression.evaluate($0)) },
                 signature: expression.signature
             )
         }
-        preconditionFailure("Unsupported CodexChat equatable predicate key path: \(keyPath)")
+        throw CodexFetchValidationError.unsupportedPredicate(String(describing: keyPath))
     }
 }
 
 extension PredicateExpressions.ForcedUnwrap: CodexChatRecordStringExpression
     where Inner: CodexChatRecordOptionalStringExpression, Wrapped == String
 {
-    fileprivate func codexChatStringExpression() -> CodexChatExpression<String> {
-        let expression = inner.codexChatOptionalStringExpression()
+    fileprivate func codexChatStringExpression() throws -> CodexChatExpression<String> {
+        let expression = try inner.codexChatOptionalStringExpression()
         return .init(
             evaluate: { record in
                 guard let value = expression.evaluate(record) else {
@@ -1067,8 +1130,8 @@ extension PredicateExpressions.ForcedUnwrap: CodexChatRecordStringExpression
 extension PredicateExpressions.ForcedUnwrap: CodexChatRecordMembershipElementExpression
     where Inner: CodexChatRecordEquatableExpression
 {
-    fileprivate func codexChatMembershipElementExpression() -> CodexChatExpression<CodexChatPredicateValue> {
-        let expression = inner.codexChatEquatableExpression()
+    fileprivate func codexChatMembershipElementExpression() throws -> CodexChatExpression<CodexChatPredicateValue> {
+        let expression = try inner.codexChatEquatableExpression()
         return .init(
             evaluate: { record in
                 switch expression.evaluate(record) {
@@ -1094,8 +1157,8 @@ extension PredicateExpressions.ForcedUnwrap: CodexChatRecordMembershipElementExp
 extension PredicateExpressions.ForcedUnwrap: CodexChatRecordWorkspaceIDExpression
     where Inner: CodexChatRecordOptionalWorkspaceIDExpression, Wrapped == CodexWorkspaceID
 {
-    fileprivate func codexChatWorkspaceIDExpression() -> CodexChatExpression<CodexWorkspaceID> {
-        let expression = inner.codexChatOptionalWorkspaceIDExpression()
+    fileprivate func codexChatWorkspaceIDExpression() throws -> CodexChatExpression<CodexWorkspaceID> {
+        let expression = try inner.codexChatOptionalWorkspaceIDExpression()
         return .init(
             evaluate: { record in
                 guard let value = expression.evaluate(record) else {
@@ -1111,8 +1174,8 @@ extension PredicateExpressions.ForcedUnwrap: CodexChatRecordWorkspaceIDExpressio
 extension PredicateExpressions.ForcedUnwrap: CodexChatRecordSourceKindExpression
     where Inner: CodexChatRecordOptionalSourceKindExpression, Wrapped == CodexThreadSourceKind
 {
-    fileprivate func codexChatSourceKindExpression() -> CodexChatExpression<CodexThreadSourceKind> {
-        let expression = inner.codexChatOptionalSourceKindExpression()
+    fileprivate func codexChatSourceKindExpression() throws -> CodexChatExpression<CodexThreadSourceKind> {
+        let expression = try inner.codexChatOptionalSourceKindExpression()
         return .init(
             evaluate: { record in
                 guard let value = expression.evaluate(record) else {
@@ -1126,14 +1189,14 @@ extension PredicateExpressions.ForcedUnwrap: CodexChatRecordSourceKindExpression
 }
 
 extension PredicateExpressions.Value: CodexChatRecordBoolExpression where Output == Bool {
-    fileprivate func codexChatBoolExpression() -> CodexChatExpression<Bool> {
+    fileprivate func codexChatBoolExpression() throws -> CodexChatExpression<Bool> {
         let value = value
         return .init(evaluate: { _ in value }, signature: .bool(value))
     }
 }
 
 extension PredicateExpressions.Value: CodexChatRecordStringExpression where Output == String {
-    fileprivate func codexChatStringExpression() -> CodexChatExpression<String> {
+    fileprivate func codexChatStringExpression() throws -> CodexChatExpression<String> {
         let value = value
         return .init(evaluate: { _ in value }, signature: .string(value))
     }
@@ -1142,7 +1205,7 @@ extension PredicateExpressions.Value: CodexChatRecordStringExpression where Outp
 extension PredicateExpressions.Value: CodexChatRecordOptionalStringExpression
     where Output == String?
 {
-    fileprivate func codexChatOptionalStringExpression() -> CodexChatExpression<String?> {
+    fileprivate func codexChatOptionalStringExpression() throws -> CodexChatExpression<String?> {
         let value = value
         return .init(evaluate: { _ in value }, signature: .optionalString(value))
     }
@@ -1151,7 +1214,7 @@ extension PredicateExpressions.Value: CodexChatRecordOptionalStringExpression
 extension PredicateExpressions.Value: CodexChatRecordOptionalWorkspaceIDExpression
     where Output == CodexWorkspaceID?
 {
-    fileprivate func codexChatOptionalWorkspaceIDExpression() -> CodexChatExpression<CodexWorkspaceID?> {
+    fileprivate func codexChatOptionalWorkspaceIDExpression() throws -> CodexChatExpression<CodexWorkspaceID?> {
         let value = value
         return .init(evaluate: { _ in value }, signature: .optionalWorkspaceID(value))
     }
@@ -1160,14 +1223,14 @@ extension PredicateExpressions.Value: CodexChatRecordOptionalWorkspaceIDExpressi
 extension PredicateExpressions.Value: CodexChatRecordOptionalSourceKindExpression
     where Output == CodexThreadSourceKind?
 {
-    fileprivate func codexChatOptionalSourceKindExpression() -> CodexChatExpression<CodexThreadSourceKind?> {
+    fileprivate func codexChatOptionalSourceKindExpression() throws -> CodexChatExpression<CodexThreadSourceKind?> {
         let value = value
         return .init(evaluate: { _ in value }, signature: .optionalSourceKind(value))
     }
 }
 
 extension PredicateExpressions.Value: CodexChatRecordEquatableExpression {
-    fileprivate func codexChatEquatableExpression() -> CodexChatExpression<CodexChatPredicateValue> {
+    fileprivate func codexChatEquatableExpression() throws -> CodexChatExpression<CodexChatPredicateValue> {
         if Output.self == Bool.self {
             let value = value as! Bool
             return .init(evaluate: { _ in .bool(value) }, signature: .bool(value))
@@ -1202,12 +1265,12 @@ extension PredicateExpressions.Value: CodexChatRecordEquatableExpression {
             let value = value as! CodexThreadSourceKind
             return .init(evaluate: { _ in .sourceKind(value) }, signature: .sourceKind(value))
         }
-        preconditionFailure("Unsupported CodexChat predicate value: \(value)")
+        throw CodexFetchValidationError.unsupportedPredicate(String(describing: value))
     }
 }
 
 extension PredicateExpressions.Value: CodexChatRecordSequenceExpression {
-    fileprivate func codexChatSequenceExpression() -> CodexChatExpression<CodexChatSequenceValue> {
+    fileprivate func codexChatSequenceExpression() throws -> CodexChatExpression<CodexChatSequenceValue> {
         if let value = value as? [String] {
             return .init(evaluate: { _ in .strings(value) }, signature: .stringArray(value))
         }
@@ -1217,12 +1280,12 @@ extension PredicateExpressions.Value: CodexChatRecordSequenceExpression {
         if let value = value as? [CodexThreadSourceKind] {
             return .init(evaluate: { _ in .sourceKinds(value) }, signature: .sourceKindArray(value))
         }
-        preconditionFailure("Unsupported CodexChat predicate sequence value: \(value)")
+        throw CodexFetchValidationError.unsupportedPredicate(String(describing: value))
     }
 }
 
 extension PredicateExpressions.NilLiteral: CodexChatRecordEquatableExpression {
-    fileprivate func codexChatEquatableExpression() -> CodexChatExpression<CodexChatPredicateValue> {
+    fileprivate func codexChatEquatableExpression() throws -> CodexChatExpression<CodexChatPredicateValue> {
         .init(
             evaluate: { _ in .nilLiteral(String(describing: Wrapped.self)) },
             signature: .nilLiteral(String(describing: Wrapped.self))

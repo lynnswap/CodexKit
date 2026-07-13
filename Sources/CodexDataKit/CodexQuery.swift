@@ -21,19 +21,16 @@ public struct CodexQueryResults<Model: CodexPersistentModel>: RandomAccessCollec
 
     public var items: [Model]
     public var sections: [CodexFetchSection<Model>]
-    public var phase: CodexDataPhase
-    public var lastErrorDescription: String?
+    public var phase: CodexFetchPhase
 
     public init(
         items: [Model] = [],
         sections: [CodexFetchSection<Model>] = [],
-        phase: CodexDataPhase = .idle,
-        lastErrorDescription: String? = nil
+        phase: CodexFetchPhase = .idle
     ) {
         self.items = items
         self.sections = sections
         self.phase = phase
-        self.lastErrorDescription = lastErrorDescription
     }
 
     public var startIndex: Index {
@@ -59,7 +56,6 @@ public struct CodexQuery<Model: CodexPersistentModel>: @preconcurrency DynamicPr
 
     public init(
         _ descriptor: CodexFetchDescriptor<Model> = .init(),
-        animation _: Animation? = nil,
         sectionBy: CodexSectionDescriptor<Model>? = nil
     ) {
         self.fetchDescriptor = descriptor
@@ -67,21 +63,8 @@ public struct CodexQuery<Model: CodexPersistentModel>: @preconcurrency DynamicPr
     }
 
     public init(
-        _ request: CodexFetchRequest<Model>,
-        animation: Animation? = nil,
-        sectionBy: CodexSectionDescriptor<Model>? = nil
-    ) {
-        self.init(
-            request.fetchDescriptor,
-            animation: animation,
-            sectionBy: sectionBy
-        )
-    }
-
-    public init(
         filter: Predicate<Model>? = nil,
-        sort: [SortDescriptor<Model>] = [],
-        animation _: Animation? = nil,
+        sort: [CodexSortDescriptor<Model>] = [],
         sectionBy: CodexSectionDescriptor<Model>? = nil
     ) {
         self.fetchDescriptor = CodexFetchDescriptor(
@@ -95,13 +78,11 @@ public struct CodexQuery<Model: CodexPersistentModel>: @preconcurrency DynamicPr
         filter: Predicate<Model>? = nil,
         sort keyPath: KeyPath<Model, Value> & Sendable,
         order: SortOrder = .forward,
-        animation: Animation? = nil,
         sectionBy: CodexSectionDescriptor<Model>? = nil
     ) {
         self.init(
             filter: filter,
-            sort: [SortDescriptor(keyPath, order: order)],
-            animation: animation,
+            sort: [CodexSortDescriptor(keyPath, order: order)],
             sectionBy: sectionBy
         )
     }
@@ -110,13 +91,47 @@ public struct CodexQuery<Model: CodexPersistentModel>: @preconcurrency DynamicPr
         filter: Predicate<Model>? = nil,
         sort keyPath: KeyPath<Model, Value?> & Sendable,
         order: SortOrder = .forward,
-        animation: Animation? = nil,
         sectionBy: CodexSectionDescriptor<Model>? = nil
     ) {
         self.init(
             filter: filter,
-            sort: [SortDescriptor(keyPath, order: order)],
-            animation: animation,
+            sort: [CodexSortDescriptor(keyPath, order: order)],
+            sectionBy: sectionBy
+        )
+    }
+
+    public init(
+        filter: Predicate<Model>? = nil,
+        sort keyPath: any KeyPath<Model, String> & Sendable,
+        comparator: String.StandardComparator = .localizedStandard,
+        order: SortOrder = .forward,
+        sectionBy: CodexSectionDescriptor<Model>? = nil
+    ) {
+        self.init(
+            filter: filter,
+            sort: [CodexSortDescriptor(
+                keyPath,
+                comparator: comparator,
+                order: order
+            )],
+            sectionBy: sectionBy
+        )
+    }
+
+    public init(
+        filter: Predicate<Model>? = nil,
+        sort keyPath: any KeyPath<Model, String?> & Sendable,
+        comparator: String.StandardComparator = .localizedStandard,
+        order: SortOrder = .forward,
+        sectionBy: CodexSectionDescriptor<Model>? = nil
+    ) {
+        self.init(
+            filter: filter,
+            sort: [CodexSortDescriptor(
+                keyPath,
+                comparator: comparator,
+                order: order
+            )],
             sectionBy: sectionBy
         )
     }
@@ -128,15 +143,15 @@ public struct CodexQuery<Model: CodexPersistentModel>: @preconcurrency DynamicPr
         return CodexQueryResults(
             items: fetchedResults.items,
             sections: fetchedResults.sections,
-            phase: fetchedResults.phase,
-            lastErrorDescription: fetchedResults.lastErrorDescription
+            phase: fetchedResults.phase
         )
     }
 
     public mutating func update() {
         guard let modelContext else {
-            fetchedResults = nil
-            return
+            preconditionFailure(
+                "CodexQuery requires a CodexModelContext in the SwiftUI environment."
+            )
         }
 
         if let fetchedResults,

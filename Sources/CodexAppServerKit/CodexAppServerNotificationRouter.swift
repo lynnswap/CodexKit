@@ -1,605 +1,722 @@
 import Foundation
+import OSLog
+
+private let notificationRouterLogger = Logger(
+    subsystem: "CodexAppServerKit",
+    category: "notification-router"
+)
 
 package actor CodexAppServerNotificationRouter {
-    private struct TurnSubscriber {
-        var continuation: AsyncThrowingStream<CodexTurnEvent, Error>.Continuation
+    private typealias NotificationContext = AppServerNotificationDecoder.Context
+
+    private enum Phase {
+        case open
+        case terminating(CodexAppServerError)
+        case terminated(CodexAppServerError)
+
+        var terminationError: CodexAppServerError? {
+            switch self {
+            case .open:
+                nil
+            case .terminating(let error), .terminated(let error):
+                error
+            }
+        }
     }
 
-    private struct ThreadSubscriber {
-        var continuation: AsyncThrowingStream<CodexThreadEvent, Error>.Continuation
-        var replayPolicy: ThreadEventReplayPolicy
+    package struct DetachedReviewRoutingSnapshot: Equatable, Sendable {
+        package var attemptCount: Int
+        package var candidateCount: Int
+        package var drainCount: Int
     }
 
-    private struct NotificationContext {
-        var threadID: CodexThreadID?
-        var turnID: CodexTurnID?
+    private struct DetachedReviewRoutingAttempt {
+        var candidateThreadIDs: Set<CodexThreadID> = []
     }
 
-    private let client: AppServerClient
-    private var routerTask: Task<Void, Never>?
+    // A detached review's response is the first value that identifies its fresh event thread.
+    // Keep otherwise-unowned notifications intact until that request attempt can claim them;
+    // classifying a turn/started by arrival order discards unrelated concurrent work. The
+    // upstream fresh-thread contract means a later attempt cannot reuse an existing candidate.
+    private struct DetachedReviewRoutingCandidate {
+        var waitingAttempts: Set<TurnReplayPendingToken>
+        var notifications: [AppServerNotificationDecoder.DecodedNotification] = []
+    }
+
+    private enum NotificationDrainMode {
+        case claimedReview(CodexTurnID)
+        case unclaimed
+    }
+
+    private struct NotificationDrain {
+        var queuedNotifications: [AppServerNotificationDecoder.DecodedNotification] = []
+    }
+
     private var threadIDByTurnID: [CodexTurnID: CodexThreadID] = [:]
-    private var turnHistoryByTurnID: [CodexTurnID: [CodexTurnEvent]] = [:]
-    private var threadHistoryByThreadID: [CodexThreadID: [CodexThreadEvent]] = [:]
-    private var threadGenerationStartByThreadID: [CodexThreadID: ThreadGenerationStart] = [:]
-    private var unscopedDiagnosticRouting = UnscopedDiagnosticRoutingState()
-    private var turnSubscribersByTurnID: [CodexTurnID: [UUID: TurnSubscriber]] = [:]
-    private var threadSubscribersByThreadID: [CodexThreadID: [UUID: ThreadSubscriber]] = [:]
+    private var detachedReviewAttempts: [
+        TurnReplayPendingToken: DetachedReviewRoutingAttempt
+    ] = [:]
+    private var detachedReviewCandidatesByThreadID: [
+        CodexThreadID: DetachedReviewRoutingCandidate
+    ] = [:]
+    private var notificationDrainsByThreadID: [CodexThreadID: NotificationDrain] = [:]
+    private var notificationDrainPauseForTesting: (@Sendable () async -> Void)?
+    private var terminalReplayPublicationPauseForTesting: (@Sendable () async -> Void)?
+    private var phase = Phase.open
+    private var itemReducer = CodexItemReducer()
+    private let accountEventHub: AccountEventHub
+    package nonisolated let loginRegistry: LoginRegistry
+    package nonisolated let turnReplayStore: TurnReplayStore
+    package nonisolated let threadEventHub: ThreadEventHub
 
-    private enum ThreadEventReplayPolicy {
-        case currentGeneration
-        case none
+    package init(
+        client: AppServerClient,
+        turnReplayStore: TurnReplayStore,
+        threadEventHub: ThreadEventHub,
+        accountEventHub: AccountEventHub = .init(),
+        loginRegistry: LoginRegistry = .init()
+    ) {
+        _ = client
+        self.turnReplayStore = turnReplayStore
+        self.threadEventHub = threadEventHub
+        self.accountEventHub = accountEventHub
+        self.loginRegistry = loginRegistry
     }
 
-    private enum ThreadGenerationStart {
-        case cursor(Int)
-        case includingTurn(CodexTurnID, fallbackCursor: Int)
-    }
-
-    private struct UnscopedDiagnosticRoutingState {
-        private var startupThreadIDs: Set<CodexThreadID> = []
-        private var turnIDByThreadID: [CodexThreadID: CodexTurnID] = [:]
-
-        mutating func beginStartup(in threadID: CodexThreadID) {
-            startupThreadIDs.insert(threadID)
-        }
-
-        mutating func activate(in threadID: CodexThreadID, until turnID: CodexTurnID) {
-            startupThreadIDs.remove(threadID)
-            turnIDByThreadID[threadID] = turnID
-        }
-
-        mutating func stop(in threadID: CodexThreadID) {
-            startupThreadIDs.remove(threadID)
-            turnIDByThreadID.removeValue(forKey: threadID)
-        }
-
-        mutating func stopActive(in threadID: CodexThreadID) {
-            turnIDByThreadID.removeValue(forKey: threadID)
-        }
-
-        func activeTurnID(in threadID: CodexThreadID) -> CodexTurnID? {
-            turnIDByThreadID[threadID]
-        }
-
-        mutating func activeThreadIDs(
-            isStillActive: (CodexThreadID, CodexTurnID) -> Bool
-        ) -> [CodexThreadID] {
-            turnIDByThreadID = turnIDByThreadID.filter {
-                isStillActive($0.key, $0.value)
-            }
-            return Array(Set(turnIDByThreadID.keys).union(startupThreadIDs))
-        }
-
-        mutating func reset() {
-            startupThreadIDs.removeAll()
-            turnIDByThreadID.removeAll()
-        }
-    }
-    private let decoder = JSONDecoder()
-
-    package init(client: AppServerClient) {
-        self.client = client
-    }
-
-    package func start() async {
-        guard routerTask == nil else {
-            return
-        }
-        let notifications = await client.notificationStream()
-        routerTask = Task {
-            do {
-                for try await notification in notifications {
-                    self.route(notification)
-                }
-            } catch {
-                self.finishAll(throwing: error)
-            }
-        }
-    }
-
-    package func events(for turnID: CodexTurnID) -> AsyncThrowingStream<CodexTurnEvent, Error> {
-        let (stream, continuation) = AsyncThrowingStream<CodexTurnEvent, Error>.makeStream(
-            bufferingPolicy: .unbounded
-        )
-        let subscriptionID = UUID()
-        continuation.onTermination = { _ in
-            Task { await self.removeTurnSubscriber(subscriptionID, turnID: turnID) }
-        }
-        addTurnSubscriber(subscriptionID, turnID: turnID, continuation: continuation)
-        return stream
-    }
-
-    package func events(for threadID: CodexThreadID) -> AsyncThrowingStream<
-        CodexThreadEvent, Error
-    > {
-        threadEventStream(for: threadID, replayPolicy: .currentGeneration)
-    }
-
-    package func liveEvents(for threadID: CodexThreadID) -> AsyncThrowingStream<
-        CodexThreadEvent, Error
-    > {
-        threadEventStream(for: threadID, replayPolicy: .none)
-    }
-
-    package func observationEvents(for threadID: CodexThreadID) -> AsyncThrowingStream<
-        CodexThreadEvent, Error
-    > {
-        threadEventStream(for: threadID, replayPolicy: .currentGeneration)
-    }
-
-    private func threadEventStream(
-        for threadID: CodexThreadID,
-        replayPolicy: ThreadEventReplayPolicy
-    ) -> AsyncThrowingStream<CodexThreadEvent, Error> {
-        let (stream, continuation) = AsyncThrowingStream<CodexThreadEvent, Error>.makeStream(
-            bufferingPolicy: .unbounded
-        )
-        let subscriptionID = UUID()
-        continuation.onTermination = { _ in
-            Task { await self.removeThreadSubscriber(subscriptionID, threadID: threadID) }
-        }
-        addThreadSubscriber(
-            subscriptionID,
-            threadID: threadID,
-            continuation: continuation,
-            replayPolicy: replayPolicy
-        )
-        return stream
+    package nonisolated func events(for threadID: CodexThreadID) -> CodexThreadEventSequence {
+        threadEventHub.events(for: threadID)
     }
 
     package func seedTurn(_ turnID: CodexTurnID, threadID: CodexThreadID) {
-        threadIDByTurnID[turnID] = threadID
-        guard let turnHistory = turnHistoryByTurnID[turnID] else {
-            return
-        }
-        for turnEvent in turnHistory {
-            let threadEvent = Self.threadEvent(
-                from: turnEvent,
-                turnID: turnID,
-                threadID: threadID
+        if let existingThreadID = installTurnAssociation(turnID, threadID: threadID) {
+            precondition(
+                existingThreadID == threadID,
+                "A turn cannot move between thread associations."
             )
-            if (threadHistoryByThreadID[threadID] ?? []).contains(threadEvent) {
-                continue
-            }
-            appendThreadEvent(threadEvent, threadID: threadID)
         }
     }
 
-    package func stop() {
-        routerTask?.cancel()
-        routerTask = nil
-        finishAll(throwing: JSONRPC.Error.closed)
-    }
-
-    package func turnSubscriberCountForTesting(for turnID: CodexTurnID) -> Int {
-        turnSubscribersByTurnID[turnID]?.count ?? 0
-    }
-
-    package func threadSubscriberCountForTesting(for threadID: CodexThreadID) -> Int {
-        threadSubscribersByThreadID[threadID]?.count ?? 0
-    }
-
-    package func beginThreadEventGeneration(_ threadID: CodexThreadID) {
-        threadGenerationStartByThreadID[threadID] = .cursor(
-            threadHistoryByThreadID[threadID]?.count ?? 0
-        )
-    }
-
-    package func threadEventGenerationCursor(_ threadID: CodexThreadID) -> Int {
-        threadHistoryByThreadID[threadID]?.count ?? 0
-    }
-
-    package func beginThreadEventGeneration(_ threadID: CodexThreadID, at cursor: Int) {
-        let historyCount = threadHistoryByThreadID[threadID]?.count ?? 0
-        threadGenerationStartByThreadID[threadID] = .cursor(min(cursor, historyCount))
-    }
-
-    package func beginThreadEventGeneration(_ threadID: CodexThreadID, including turnID: CodexTurnID) {
-        threadGenerationStartByThreadID[threadID] = .includingTurn(
-            turnID,
-            fallbackCursor: threadHistoryByThreadID[threadID]?.count ?? 0
-        )
-    }
-
-    package func beginUnscopedDiagnosticRouting(in threadID: CodexThreadID) {
-        unscopedDiagnosticRouting.beginStartup(in: threadID)
-    }
-
-    package func activateUnscopedDiagnosticRouting(
-        in threadID: CodexThreadID,
-        until turnID: CodexTurnID
-    ) {
-        unscopedDiagnosticRouting.activate(in: threadID, until: turnID)
-    }
-
-    package func stopUnscopedDiagnosticRouting(in threadID: CodexThreadID) {
-        unscopedDiagnosticRouting.stop(in: threadID)
-    }
-
-    package func beginDetachedThreadEventGeneration(
-        _ threadID: CodexThreadID,
-        including turnID: CodexTurnID,
-        replacingUnscopedDiagnosticsIn sourceThreadID: CodexThreadID
-    ) {
-        threadGenerationStartByThreadID[threadID] = .includingTurn(
-            turnID,
-            fallbackCursor: threadHistoryByThreadID[threadID]?.count ?? 0
-        )
-        unscopedDiagnosticRouting.activate(in: threadID, until: turnID)
-        moveUnscopedDiagnostics(from: sourceThreadID, to: threadID)
-        seedTurn(turnID, threadID: threadID)
-        if sourceThreadID != threadID {
-            unscopedDiagnosticRouting.stop(in: sourceThreadID)
+    private func installTurnAssociation(
+        _ turnID: CodexTurnID,
+        threadID: CodexThreadID
+    ) -> CodexThreadID? {
+        if let existingThreadID = threadIDByTurnID[turnID] {
+            return existingThreadID
         }
+        threadIDByTurnID[turnID] = threadID
+        return nil
     }
 
-    private func moveUnscopedDiagnostics(
-        from sourceThreadID: CodexThreadID,
-        to destinationThreadID: CodexThreadID
-    ) {
-        guard sourceThreadID != destinationThreadID else {
+    private func associateNotificationTurn(
+        _ turnID: CodexTurnID,
+        threadID: CodexThreadID
+    ) throws {
+        guard let existingThreadID = installTurnAssociation(turnID, threadID: threadID) else {
             return
         }
-        let sourceHistory = threadHistoryByThreadID[sourceThreadID] ?? []
-        var movedEventIndices: [Array<CodexThreadEvent>.Index] = []
-        for eventIndex in currentGenerationEventIndices(in: sourceHistory, threadID: sourceThreadID) {
-            let event = sourceHistory[eventIndex]
-            guard case .unknown(var raw) = event,
-                raw.turnID == nil,
-                Self.isUnscopedDiagnosticNotification(raw.method)
-            else {
-                continue
-            }
-            raw.threadID = destinationThreadID
-            let replayedEvent = CodexThreadEvent.unknown(raw)
-            movedEventIndices.append(eventIndex)
-            appendThreadEvent(replayedEvent, threadID: destinationThreadID)
-        }
-        if movedEventIndices.isEmpty == false {
-            var updatedSourceHistory = threadHistoryByThreadID[sourceThreadID] ?? []
-            for eventIndex in movedEventIndices.sorted(by: >) {
-                updatedSourceHistory.remove(at: eventIndex)
-            }
-            threadHistoryByThreadID[sourceThreadID] = updatedSourceHistory
+        guard existingThreadID == threadID else {
+            throw CodexTransportFailure.contractViolation(
+                message: "Turn \(turnID.rawValue) is already associated with thread "
+                    + "\(existingThreadID.rawValue) and cannot move to thread "
+                    + "\(threadID.rawValue)."
+            )
         }
     }
 
-    private func route(_ notification: JSONRPC.Notification) {
-        var context = Self.context(from: notification.params)
-        if let threadID = context.threadID, let turnID = context.turnID {
-            threadIDByTurnID[turnID] = threadID
-        } else if let turnID = context.turnID, let threadID = threadIDByTurnID[turnID] {
-            context.threadID = threadID
+    package func discardTurnAssociation(
+        _ turnID: CodexTurnID,
+        threadID: CodexThreadID
+    ) {
+        guard let registeredThreadID = threadIDByTurnID[turnID] else {
+            return
         }
-        if context.threadID == nil,
-            context.turnID == nil,
-            Self.isUnscopedDiagnosticNotification(notification.method)
-        {
-            for threadID in activeUnscopedDiagnosticThreadIDs() {
-                routeNotification(
-                    method: notification.method,
-                    params: notification.params,
-                    context: .init(threadID: threadID)
+        precondition(
+            registeredThreadID == threadID,
+            "Only the thread that owns a turn association may discard it."
+        )
+        threadIDByTurnID.removeValue(forKey: turnID)
+    }
+
+    package func seedTurns(
+        _ turns: [CodexTurnSnapshot]?,
+        threadID: CodexThreadID
+    ) {
+        itemReducer.seed(turns)
+        for turn in turns ?? [] {
+            seedTurn(turn.id, threadID: threadID)
+        }
+    }
+
+    package func accountEvents() async -> CodexAccountEvents {
+        return await accountEventHub.events()
+    }
+
+    package func replaceRateLimits(
+        with response: AppServerAPI.Account.RateLimits.Response
+    ) async {
+        await accountEventHub.replaceRateLimits(with: response)
+    }
+    package nonisolated func threadSubscriberCountForTesting(for threadID: CodexThreadID) -> Int {
+        threadEventHub.snapshotForTesting(threadID: threadID).subscriberCount
+    }
+
+    package func detachedReviewRoutingSnapshotForTesting() -> DetachedReviewRoutingSnapshot {
+        .init(
+            attemptCount: detachedReviewAttempts.count,
+            candidateCount: detachedReviewCandidatesByThreadID.count,
+            drainCount: notificationDrainsByThreadID.count
+        )
+    }
+
+    package func itemSnapshotForTesting(
+        turnID: CodexTurnID,
+        itemID: String
+    ) -> CodexThreadItem? {
+        itemReducer.item(turnID: turnID, itemID: itemID)
+    }
+
+    package nonisolated func resetThreadEventGeneration(_ threadID: CodexThreadID) {
+        threadEventHub.resetGeneration(for: threadID)
+    }
+
+    package func adoptThreadEventGeneration(
+        _ threadID: CodexThreadID,
+        including turnID: CodexTurnID
+    ) {
+        threadEventHub.beginGeneration(for: threadID, including: turnID)
+        seedTurn(turnID, threadID: threadID)
+    }
+
+    package func registerDetachedReviewRoutingAttempt(
+        _ pending: TurnReplayPendingToken
+    ) {
+        precondition(
+            detachedReviewAttempts[pending] == nil,
+            "A detached review routing attempt may be registered exactly once."
+        )
+        detachedReviewAttempts[pending] = .init()
+    }
+
+    package func reconcileReviewStartResponse(
+        _ pending: TurnReplayPendingToken,
+        reviewThreadID: CodexThreadID,
+        initialSnapshot: CodexTurnSnapshot,
+        generation: ThreadEventGenerationAttempt
+    ) async throws {
+        try requireOpen()
+        await turnReplayStore.bind(
+            pending,
+            to: initialSnapshot.id,
+            initialSnapshot: initialSnapshot
+        )
+        try requireOpen()
+        try generation.resolveReviewStartResponse(
+            eventThreadID: reviewThreadID,
+            responseSnapshot: initialSnapshot
+        )
+        seedTurn(initialSnapshot.id, threadID: reviewThreadID)
+        try await resolveDetachedReviewRoutingAttempt(
+            pending,
+            reviewThreadID: reviewThreadID,
+            turnID: initialSnapshot.id
+        )
+        try requireOpen()
+    }
+
+    package func rejectDetachedReviewRoutingAttemptResponse(
+        _ pending: TurnReplayPendingToken
+    ) async throws {
+        try requireOpen()
+        guard var attempt = detachedReviewAttempts[pending] else {
+            return
+        }
+        var candidatesToDrain: [
+            (CodexThreadID, DetachedReviewRoutingCandidate, NotificationDrainMode)
+        ] = []
+        for threadID in attempt.candidateThreadIDs {
+            guard var candidate = detachedReviewCandidatesByThreadID[threadID] else {
+                continue
+            }
+            candidate.waitingAttempts.remove(pending)
+            if candidate.waitingAttempts.isEmpty {
+                detachedReviewCandidatesByThreadID.removeValue(forKey: threadID)
+                candidatesToDrain.append((threadID, candidate, .unclaimed))
+            } else {
+                detachedReviewCandidatesByThreadID[threadID] = candidate
+            }
+        }
+        attempt.candidateThreadIDs.removeAll(keepingCapacity: true)
+        detachedReviewAttempts[pending] = attempt
+        try await drainCandidates(candidatesToDrain)
+        try requireOpen()
+    }
+
+    package func cancelDetachedReviewRoutingAttempt(
+        _ pending: TurnReplayPendingToken
+    ) async throws {
+        guard let attempt = detachedReviewAttempts.removeValue(forKey: pending) else {
+            return
+        }
+        var candidatesToDrain: [
+            (CodexThreadID, DetachedReviewRoutingCandidate, NotificationDrainMode)
+        ] = []
+        for threadID in attempt.candidateThreadIDs {
+            guard var candidate = detachedReviewCandidatesByThreadID[threadID] else {
+                continue
+            }
+            candidate.waitingAttempts.remove(pending)
+            if candidate.waitingAttempts.isEmpty {
+                detachedReviewCandidatesByThreadID.removeValue(forKey: threadID)
+                candidatesToDrain.append((
+                    threadID,
+                    candidate,
+                    .unclaimed
+                ))
+            } else {
+                detachedReviewCandidatesByThreadID[threadID] = candidate
+            }
+        }
+        try await drainCandidates(candidatesToDrain)
+    }
+
+    private func resolveDetachedReviewRoutingAttempt(
+        _ pending: TurnReplayPendingToken,
+        reviewThreadID: CodexThreadID,
+        turnID: CodexTurnID
+    ) async throws {
+        guard let attempt = detachedReviewAttempts.removeValue(forKey: pending) else {
+            return
+        }
+        var candidatesToDrain: [
+            (CodexThreadID, DetachedReviewRoutingCandidate, NotificationDrainMode)
+        ] = []
+        for candidateThreadID in attempt.candidateThreadIDs {
+            guard var candidate = detachedReviewCandidatesByThreadID[candidateThreadID] else {
+                continue
+            }
+            if candidateThreadID == reviewThreadID {
+                detachedReviewCandidatesByThreadID.removeValue(forKey: candidateThreadID)
+                for waitingAttempt in candidate.waitingAttempts where waitingAttempt != pending {
+                    detachedReviewAttempts[waitingAttempt]?.candidateThreadIDs.remove(
+                        candidateThreadID
+                    )
+                }
+                candidatesToDrain.append((
+                    candidateThreadID,
+                    candidate,
+                    .claimedReview(turnID)
+                ))
+                continue
+            }
+
+            candidate.waitingAttempts.remove(pending)
+            if candidate.waitingAttempts.isEmpty {
+                detachedReviewCandidatesByThreadID.removeValue(forKey: candidateThreadID)
+                candidatesToDrain.append((
+                    candidateThreadID,
+                    candidate,
+                    .unclaimed
+                ))
+            } else {
+                detachedReviewCandidatesByThreadID[candidateThreadID] = candidate
+            }
+        }
+        try await drainCandidates(candidatesToDrain)
+    }
+
+    private func drainCandidates(
+        _ candidates: [(
+            CodexThreadID,
+            DetachedReviewRoutingCandidate,
+            NotificationDrainMode
+        )]
+    ) async throws {
+        try requireOpen()
+        beginNotificationDrains(candidates)
+        do {
+            for (threadID, candidate, mode) in candidates {
+                try await drainNotifications(
+                    candidate.notifications,
+                    threadID: threadID,
+                    mode: mode
                 )
             }
+        } catch {
+            for (threadID, _, _) in candidates {
+                notificationDrainsByThreadID.removeValue(forKey: threadID)
+            }
+            throw error
+        }
+    }
+
+    private func beginNotificationDrains(
+        _ candidates: [(
+            CodexThreadID,
+            DetachedReviewRoutingCandidate,
+            NotificationDrainMode
+        )]
+    ) {
+        for (threadID, _, _) in candidates {
+            precondition(
+                notificationDrainsByThreadID[threadID] == nil,
+                "A thread may drain only one notification sequence at a time."
+            )
+            notificationDrainsByThreadID[threadID] = .init()
+        }
+    }
+
+    private func drainNotifications(
+        _ initialNotifications: [AppServerNotificationDecoder.DecodedNotification],
+        threadID: CodexThreadID,
+        mode: NotificationDrainMode
+    ) async throws {
+        guard phase.terminationError == nil else {
             return
         }
-        routeNotification(method: notification.method, params: notification.params, context: context)
+        guard notificationDrainsByThreadID[threadID] != nil else {
+            preconditionFailure("A notification drain must install its routing gate first.")
+        }
+        if let notificationDrainPauseForTesting {
+            await notificationDrainPauseForTesting()
+        }
+        defer {
+            notificationDrainsByThreadID.removeValue(forKey: threadID)
+        }
+        var notifications = initialNotifications
+        while true {
+            for notification in notifications {
+                guard phase.terminationError == nil else {
+                    return
+                }
+                try await routeDrainedNotification(notification, mode: mode)
+            }
+            guard phase.terminationError == nil else {
+                return
+            }
+            guard var drain = notificationDrainsByThreadID[threadID] else {
+                preconditionFailure("An active notification drain lost its routing gate.")
+            }
+            if drain.queuedNotifications.isEmpty {
+                return
+            }
+            notifications = drain.queuedNotifications
+            drain.queuedNotifications.removeAll(keepingCapacity: true)
+            notificationDrainsByThreadID[threadID] = drain
+        }
+    }
+
+    private func routeDrainedNotification(
+        _ notification: AppServerNotificationDecoder.DecodedNotification,
+        mode: NotificationDrainMode
+    ) async throws {
+        try requireOpen()
+        if case .claimedReview(let turnID) = mode,
+           case .turnStarted(let startedTurnID) = notification.payload,
+           (notification.context.turnID ?? startedTurnID) != turnID {
+            return
+        }
+        if let threadID = notification.context.threadID,
+           let turnID = notification.context.turnID {
+            try associateNotificationTurn(turnID, threadID: threadID)
+        }
+        let replayRouting: ReplayRouting
+        switch mode {
+        case .claimedReview:
+            replayRouting = .boundOnly
+        case .unclaimed:
+            replayRouting = .boundOnly
+        }
+        try await routeNotification(
+            notification,
+            replayRouting: replayRouting
+        )
+    }
+
+    package func route(
+        _ decoded: AppServerNotificationDecoder.DecodedNotification
+    ) async throws {
+        guard phase.terminationError == nil else {
+            return
+        }
+        guard decoded.disposition != .explicitIgnore else {
+            return
+        }
+
+        var context = decoded.context
+        if context.threadID == nil, let turnID = context.turnID {
+            context.threadID = threadIDByTurnID[turnID]
+                ?? detachedReviewCandidatesByThreadID.first { _, candidate in
+                    candidate.notifications.contains { $0.context.turnID == turnID }
+                }?.key
+        }
+        var routed = decoded
+        routed.context = context
+        var replayRouting = ReplayRouting.unboundAllowed
+
+        if let threadID = context.threadID,
+           var drain = notificationDrainsByThreadID[threadID] {
+            drain.queuedNotifications.append(routed)
+            notificationDrainsByThreadID[threadID] = drain
+            return
+        }
+
+        if let threadID = context.threadID {
+            if var candidate = detachedReviewCandidatesByThreadID[threadID] {
+                candidate.notifications.append(routed)
+                detachedReviewCandidatesByThreadID[threadID] = candidate
+                return
+            }
+
+            let localDisposition = threadEventHub.turnStartDisposition(for: threadID)
+            if let turnID = context.turnID, case .turnStarted = decoded.payload {
+                switch await reviewSubturnStartDisposition(turnID, threadID: threadID) {
+                case .route:
+                    break
+                case .suppress:
+                    return
+                case .deferUntilOwned:
+                    break
+                }
+            }
+
+            let hasWriteAcceptedNonDetachedOperation = await turnReplayStore
+                .hasWriteAcceptedNonDetachedOperation(for: threadID)
+            let waitingAttempts = activeDetachedReviewRoutingAttempts()
+            if waitingAttempts.isEmpty == false,
+               hasWriteAcceptedNonDetachedOperation == false {
+                replayRouting = .boundOnly
+            }
+            let hasKnownOwner = context.turnID.flatMap { threadIDByTurnID[$0] } != nil
+                || localDisposition != .deferUntilOwned
+                || hasWriteAcceptedNonDetachedOperation
+            if hasKnownOwner == false {
+                if waitingAttempts.isEmpty == false {
+                    bufferNotification(
+                        routed,
+                        threadID: threadID,
+                        waitingAttempts: waitingAttempts
+                    )
+                    return
+                }
+            }
+        } else if activeDetachedReviewRoutingAttempts().isEmpty == false {
+            replayRouting = .boundOnly
+        }
+        if let threadID = context.threadID, let turnID = context.turnID {
+            try associateNotificationTurn(turnID, threadID: threadID)
+        }
+        try await routeNotification(routed, replayRouting: replayRouting)
+    }
+
+    private enum ReplayRouting {
+        case unboundAllowed
+        case boundOnly
+    }
+
+    private func reviewSubturnStartDisposition(
+        _ turnID: CodexTurnID,
+        threadID: CodexThreadID
+    ) async -> ThreadEventTurnStartDisposition {
+        // Codex reviews can forward the internal reviewer's turn/started with a child ID
+        // while every substantive item and terminal belongs to the response's outer turn.
+        // Only that advisory start is ignored; other cross-turn events remain fail-fast.
+        let associatedTurnIDs = threadIDByTurnID.compactMap { associatedTurnID, associatedThreadID in
+            associatedThreadID == threadID && associatedTurnID != turnID ? associatedTurnID : nil
+        }
+        for associatedTurnID in associatedTurnIDs {
+            if await turnReplayStore.isActiveReviewGeneration(associatedTurnID) {
+                return .suppress
+            }
+        }
+        return threadEventHub.turnStartDisposition(for: threadID)
+    }
+
+    private func activeDetachedReviewRoutingAttempts() -> Set<TurnReplayPendingToken> {
+        Set(detachedReviewAttempts.keys.filter(\.isWriteAccepted))
+    }
+
+    private func bufferNotification(
+        _ notification: AppServerNotificationDecoder.DecodedNotification,
+        threadID: CodexThreadID,
+        waitingAttempts: Set<TurnReplayPendingToken>
+    ) {
+        detachedReviewCandidatesByThreadID[threadID] = .init(
+            waitingAttempts: waitingAttempts,
+            notifications: [notification]
+        )
+        for pending in waitingAttempts {
+            detachedReviewAttempts[pending]?.candidateThreadIDs.insert(threadID)
+        }
     }
 
     private func routeNotification(
-        method: String,
-        params: Data,
-        context: NotificationContext
-    ) {
-        if let threadID = context.threadID {
-            let event = decodeThreadEvent(method: method, params: params, context: context)
-            appendThreadEvent(event, threadID: threadID)
-        }
+        _ notification: AppServerNotificationDecoder.DecodedNotification,
+        replayRouting: ReplayRouting = .unboundAllowed
+    ) async throws {
+        let context = notification.context
+        switch notification.payload {
+        case .turnCompleted(let turn):
+            let outcome = try terminalOutcome(from: turn, context: context)
+            let turnID = context.turnID ?? outcome.response.turnID
+            if let threadID = context.threadID ?? threadIDByTurnID[turnID] {
+                try routeThreadEvent(.terminal(outcome), threadID: threadID)
+            }
+            threadIDByTurnID.removeValue(forKey: turnID)
+            itemReducer.release(turnID: turnID)
+            if let terminalReplayPublicationPauseForTesting {
+                await terminalReplayPublicationPauseForTesting()
+            }
+            await finishReplay(
+                outcome,
+                replayRouting: replayRouting
+            )
 
-        if let turnID = context.turnID {
-            let event = decodeTurnEvent(method: method, params: params, context: context)
-            turnHistoryByTurnID[turnID, default: []].append(event)
-            if let subscribers = turnSubscribersByTurnID[turnID] {
-                for subscriber in subscribers.values {
-                    subscriber.continuation.yield(event)
-                }
+        case .item(let mutation):
+            guard let turnID = context.turnID else {
+                preconditionFailure("Validated item notification lost turnId.")
             }
-            if Self.isTerminalTurnEvent(event) {
-                finishTurnSubscribers(turnID: turnID)
+            let event = try itemReducer.reduce(mutation, turnID: turnID)
+            if let threadID = context.threadID ?? threadIDByTurnID[turnID] {
+                try routeThreadEvent(
+                    Self.threadEvent(from: event, turnID: turnID, threadID: threadID),
+                    threadID: threadID
+                )
             }
+            await routeReplay(
+                event,
+                turnID: turnID,
+                replayRouting: replayRouting
+            )
+
+        case .turnStarted(let payloadTurnID):
+            let turnID = context.turnID ?? payloadTurnID
+            if let threadID = context.threadID ?? threadIDByTurnID[turnID] {
+                try routeThreadEvent(.turnStarted(turnID), threadID: threadID)
+            }
+            let event = CodexTurnEvent.started(turnID)
+            await routeReplay(
+                event,
+                turnID: turnID,
+                replayRouting: replayRouting
+            )
+
+        case .threadStatus(let status):
+            if let threadID = context.threadID {
+                try routeThreadEvent(.statusChanged(status), threadID: threadID)
+            }
+
+        case .tokenUsage(let usage):
+            if let threadID = context.threadID {
+                try routeThreadEvent(
+                    .tokenUsageUpdated(usage, turnID: context.turnID),
+                    threadID: threadID
+                )
+            }
+            if let turnID = context.turnID {
+                let event = CodexTurnEvent.tokenUsageUpdated(usage)
+                await routeReplay(
+                    event,
+                    turnID: turnID,
+                    replayRouting: replayRouting
+                )
+            }
+
+        case .threadClosed:
+            if let threadID = context.threadID {
+                try routeThreadEvent(.closed, threadID: threadID)
+            }
+
+        case .serverRequestResolved, .connectionDiagnostic:
+            preconditionFailure("A connection-owned notification reached the domain router.")
+
+        case .account(let mutation):
+            switch mutation {
+            case .updated(let update):
+                await loginRegistry.applyAccountUpdate(update)
+                await accountEventHub.apply(.updated(update))
+            case .rateLimitsUpdated(let update):
+                await accountEventHub.apply(.rateLimitsUpdated(update))
+            case .loginCompleted(let completion):
+                await loginRegistry.apply(completion)
+            }
+
+        case .raw:
+            let raw = CodexRawNotification(
+                method: notification.methodName,
+                params: notification.rawData,
+                threadID: context.threadID,
+                turnID: context.turnID
+            )
+            if let threadID = context.threadID {
+                try routeThreadEvent(.unknown(raw), threadID: threadID)
+            }
+            if let turnID = context.turnID {
+                let event = CodexTurnEvent.unknown(raw)
+                await routeReplay(
+                    event,
+                    turnID: turnID,
+                    replayRouting: replayRouting
+                )
+            }
+
+        case .ignored:
+            preconditionFailure("Explicit-ignore notification reached the router.")
         }
     }
 
-    private func appendThreadEvent(_ event: CodexThreadEvent, threadID: CodexThreadID) {
-        threadHistoryByThreadID[threadID, default: []].append(event)
-        let history = threadHistoryByThreadID[threadID] ?? []
-        let eventIndex = history.index(before: history.endIndex)
-        if let subscribers = threadSubscribersByThreadID[threadID] {
-            for subscriber in subscribers.values {
-                guard
-                    shouldYieldThreadEvent(
-                        at: eventIndex,
-                        in: history,
-                        threadID: threadID,
-                        replayPolicy: subscriber.replayPolicy
-                    )
-                else {
-                    continue
-                }
-                subscriber.continuation.yield(event)
-            }
-        }
-        if case .closed = event {
-            unscopedDiagnosticRouting.stop(in: threadID)
-            finishThreadSubscribers(threadID: threadID)
-        } else if let trackedTurnID = unscopedDiagnosticRouting.activeTurnID(in: threadID),
-            Self.isTerminalThreadEvent(event, for: trackedTurnID)
-        {
-            unscopedDiagnosticRouting.stopActive(in: threadID)
-        }
-    }
-
-    private func addTurnSubscriber(
-        _ subscriptionID: UUID,
+    private func routeReplay(
+        _ event: CodexTurnEvent,
         turnID: CodexTurnID,
-        continuation: AsyncThrowingStream<CodexTurnEvent, Error>.Continuation
-    ) {
-        let history = turnHistoryByTurnID[turnID] ?? []
-        for event in history {
-            continuation.yield(event)
-        }
-        if history.contains(where: Self.isTerminalTurnEvent) {
-            continuation.finish()
-            return
-        }
-        turnSubscribersByTurnID[turnID, default: [:]][subscriptionID] = .init(
-            continuation: continuation
-        )
-    }
-
-    private func addThreadSubscriber(
-        _ subscriptionID: UUID,
-        threadID: CodexThreadID,
-        continuation: AsyncThrowingStream<CodexThreadEvent, Error>.Continuation,
-        replayPolicy: ThreadEventReplayPolicy = .currentGeneration
-    ) {
-        let history = threadHistoryByThreadID[threadID] ?? []
-        let replayedHistory: [CodexThreadEvent]
-        switch replayPolicy {
-        case .currentGeneration:
-            replayedHistory = currentGenerationEvents(in: history, threadID: threadID)
-        case .none:
-            replayedHistory = []
-        }
-        for event in replayedHistory {
-            continuation.yield(event)
-        }
-        if isCurrentThreadEventGenerationFinished(threadID) {
-            continuation.finish()
-            return
-        }
-        threadSubscribersByThreadID[threadID, default: [:]][subscriptionID] = .init(
-            continuation: continuation,
-            replayPolicy: replayPolicy
-        )
-    }
-
-    private func isCurrentThreadEventGenerationFinished(_ threadID: CodexThreadID) -> Bool {
-        let history = threadHistoryByThreadID[threadID] ?? []
-        return currentGenerationEvents(in: history, threadID: threadID)
-            .contains(where: Self.isTerminalThreadEvent)
-    }
-
-    private func currentGenerationEvents(
-        in history: [CodexThreadEvent],
-        threadID: CodexThreadID
-    ) -> [CodexThreadEvent] {
-        currentGenerationEventIndices(in: history, threadID: threadID).map { history[$0] }
-    }
-
-    private func currentGenerationEventIndices(
-        in history: [CodexThreadEvent],
-        threadID: CodexThreadID
-    ) -> [Array<CodexThreadEvent>.Index] {
-        guard let generationStart = threadGenerationStartByThreadID[threadID] else {
-            return Array(history.indices)
-        }
-
-        let startIndex = currentGenerationStartIndex(generationStart, in: history)
-        let eventIndices = Array(history.indices.filter { $0 >= startIndex })
-        if case .includingTurn(let turnID, _) = generationStart,
-            eventIndices.contains(where: { Self.threadEvent(history[$0], matches: turnID) }) == false
-        {
-            return eventIndices.filter {
-                Self.threadEventTurnID(history[$0]).map { $0 == turnID } ?? true
-            }
-        }
-        return eventIndices
-    }
-
-    private func shouldYieldThreadEvent(
-        at eventIndex: Int,
-        in history: [CodexThreadEvent],
-        threadID: CodexThreadID,
-        replayPolicy: ThreadEventReplayPolicy
-    ) -> Bool {
-        switch replayPolicy {
-        case .none:
-            return true
-        case .currentGeneration:
-            guard let generationStart = threadGenerationStartByThreadID[threadID] else {
-                return true
-            }
-            if case .includingTurn(let turnID, _) = generationStart,
-                history[...eventIndex].contains(where: { Self.threadEvent($0, matches: turnID) })
-                    == false,
-                Self.threadEventTurnID(history[eventIndex]).map({ $0 != turnID }) == true
-            {
-                return false
-            }
-            return eventIndex >= currentGenerationStartIndex(generationStart, in: history)
-        }
-    }
-
-    private nonisolated func currentGenerationStartIndex(
-        _ generationStart: ThreadGenerationStart,
-        in history: [CodexThreadEvent]
-    ) -> Int {
-        switch generationStart {
-        case .cursor(let cursor):
-            return min(cursor, history.count)
-        case .includingTurn(let turnID, let fallbackCursor):
-            return Self.generationStartIndex(
-                in: history,
-                including: turnID,
-                fallbackCursor: fallbackCursor
+        replayRouting: ReplayRouting
+    ) async {
+        switch replayRouting {
+        case .unboundAllowed:
+            recordReplayDisposition(
+                await turnReplayStore.routeIfTracked(event, for: turnID),
+                turnID: turnID
+            )
+        case .boundOnly:
+            recordReplayDisposition(
+                await turnReplayStore.routeIfTracked(
+                    event,
+                    for: turnID,
+                    allowsOrphanGeneration: false
+                ),
+                turnID: turnID
             )
         }
     }
 
-    private nonisolated static func generationStartIndex(
-        in history: [CodexThreadEvent],
-        including turnID: CodexTurnID,
-        fallbackCursor: Int
-    ) -> Int {
-        if let firstTurnEventIndex = history.firstIndex(where: { threadEvent($0, matches: turnID) }) {
-            let precedingHistory = history[..<firstTurnEventIndex]
-            if let boundaryIndex = precedingHistory.lastIndex(where: isThreadEventGenerationBoundary) {
-                return history.index(after: boundaryIndex)
-            }
-            let clampedFallback = min(fallbackCursor, history.count)
-            return min(clampedFallback, firstTurnEventIndex)
-        }
-
-        let clampedFallback = min(fallbackCursor, history.count)
-        let fallbackHistory = history[clampedFallback...]
-        if let boundaryIndex = fallbackHistory.lastIndex(where: isPendingTurnGenerationBoundary) {
-            return history.index(after: boundaryIndex)
-        }
-        return clampedFallback
-    }
-
-    private nonisolated static func isPendingTurnGenerationBoundary(_ event: CodexThreadEvent) -> Bool {
-        switch event {
-        case .turnCompleted, .turnFailed:
-            true
-        case .closed, .turnStarted, .statusChanged, .itemStarted, .itemUpdated, .itemCompleted,
-             .message, .messageDelta, .reasoningSummaryPartAdded, .reasoningDelta,
-             .tokenUsageUpdated, .unknown:
-            false
+    private func finishReplay(
+        _ outcome: CodexTurnOutcome,
+        replayRouting: ReplayRouting
+    ) async {
+        switch replayRouting {
+        case .unboundAllowed:
+            _ = await turnReplayStore.finishIfTracked(outcome)
+        case .boundOnly:
+            _ = await turnReplayStore.finishIfTracked(
+                outcome,
+                allowsOrphanGeneration: false
+            )
         }
     }
 
-    private nonisolated static func threadEventTurnID(_ event: CodexThreadEvent) -> CodexTurnID? {
-        switch event {
-        case .turnStarted(let turnID):
-            turnID
-        case .turnCompleted(let response):
-            response.turnID
-        case .turnFailed(let turnID, _), .itemStarted(_, let turnID),
-             .itemUpdated(_, let turnID), .itemCompleted(_, let turnID), .message(_, let turnID),
-             .messageDelta(_, let turnID), .reasoningSummaryPartAdded(_, let turnID),
-             .reasoningDelta(_, let turnID), .tokenUsageUpdated(_, let turnID):
-            turnID
-        case .unknown(let raw):
-            raw.turnID
-        case .statusChanged, .closed:
-            nil
+    private func routeThreadEvent(_ event: CodexThreadEvent, threadID: CodexThreadID) throws {
+        let overflowCount = try threadEventHub.route(event, for: threadID)
+        if overflowCount > 0 {
+            notificationRouterLogger.warning(
+                "Compacted \(overflowCount, privacy: .public) slow thread event subscriber(s) for \(threadID.rawValue, privacy: .public)"
+            )
         }
-    }
-
-    private nonisolated static func isTerminalTurnEvent(_ event: CodexTurnEvent) -> Bool {
-        switch event {
-        case .completed, .failed:
-            true
-        case .started, .itemStarted, .itemUpdated, .itemCompleted, .message, .messageDelta,
-            .reasoningSummaryPartAdded, .reasoningDelta, .tokenUsageUpdated, .unknown:
-            false
-        }
-    }
-
-    private nonisolated static func isTerminalThreadEvent(_ event: CodexThreadEvent) -> Bool {
         if case .closed = event {
-            return true
-        }
-        return false
-    }
-
-    private func activeUnscopedDiagnosticThreadIDs() -> [CodexThreadID] {
-        unscopedDiagnosticRouting.activeThreadIDs { threadID, turnID in
-            isCurrentThreadEventGenerationFinished(threadID) == false
-                && hasTerminalTurnEvent(threadID: threadID, turnID: turnID) == false
-        }
-    }
-
-    private nonisolated static func isUnscopedDiagnosticNotification(
-        _ method: String
-    ) -> Bool {
-        switch method {
-        case "warning", "deprecationNotice", "configWarning", "error":
-            true
-        default:
-            false
-        }
-    }
-
-    private nonisolated static func isThreadEventGenerationBoundary(_ event: CodexThreadEvent) -> Bool {
-        switch event {
-        case .closed, .turnCompleted, .turnFailed:
-            true
-        case .turnStarted, .statusChanged, .itemStarted, .itemUpdated, .itemCompleted,
-            .message, .messageDelta, .reasoningSummaryPartAdded, .reasoningDelta,
-            .tokenUsageUpdated, .unknown:
-            false
-        }
-    }
-
-    private func hasTerminalTurnEvent(threadID: CodexThreadID, turnID: CodexTurnID) -> Bool {
-        if turnHistoryByTurnID[turnID]?.contains(where: Self.isTerminalTurnEvent) == true {
-            return true
-        }
-        return threadHistoryByThreadID[threadID]?.contains {
-            Self.isTerminalThreadEvent($0, for: turnID)
-        } == true
-    }
-
-    private nonisolated static func isTerminalThreadEvent(
-        _ event: CodexThreadEvent,
-        for turnID: CodexTurnID
-    ) -> Bool {
-        switch event {
-        case .turnCompleted(let response):
-            response.turnID == turnID
-        case .turnFailed(let eventTurnID, _):
-            eventTurnID == turnID
-        case .turnStarted, .statusChanged, .closed, .itemStarted, .itemUpdated, .itemCompleted,
-             .message, .messageDelta, .reasoningSummaryPartAdded, .reasoningDelta,
-             .tokenUsageUpdated, .unknown:
-            false
-        }
-    }
-
-    private nonisolated static func threadEvent(
-        _ event: CodexThreadEvent,
-        matches turnID: CodexTurnID
-    ) -> Bool {
-        switch event {
-        case .turnStarted(let eventTurnID):
-            eventTurnID == turnID
-        case .turnCompleted(let response):
-            response.turnID == turnID
-        case .turnFailed(let eventTurnID, _), .itemStarted(_, let eventTurnID),
-             .itemUpdated(_, let eventTurnID), .itemCompleted(_, let eventTurnID),
-             .message(_, let eventTurnID), .messageDelta(_, let eventTurnID),
-             .reasoningSummaryPartAdded(_, let eventTurnID),
-             .reasoningDelta(_, let eventTurnID),
-             .tokenUsageUpdated(_, let eventTurnID):
-            eventTurnID == turnID
-        case .unknown(let raw):
-            raw.turnID == turnID
-        case .statusChanged, .closed:
-            false
+            let turnIDs = threadIDByTurnID.compactMap { entry in
+                entry.value == threadID ? entry.key : nil
+            }
+            for turnID in turnIDs {
+                itemReducer.release(turnID: turnID)
+                threadIDByTurnID.removeValue(forKey: turnID)
+            }
         }
     }
 
@@ -611,6 +728,8 @@ package actor CodexAppServerNotificationRouter {
         switch event {
         case .started(let turnID):
             return .turnStarted(turnID)
+        case .snapshot(let snapshot):
+            return .snapshot(snapshot)
         case .itemStarted(let item):
             return .itemStarted(item, turnID: turnID)
         case .itemUpdated(let item):
@@ -618,22 +737,19 @@ package actor CodexAppServerNotificationRouter {
         case .itemCompleted(let item):
             return .itemCompleted(item, turnID: turnID)
         case .message(let message):
-            return .message(
-                CodexAgentMessageFallbackID.scopedMessage(message, turnID: turnID),
-                turnID: turnID
-            )
+            return .message(message, turnID: turnID)
         case .messageDelta(let delta):
             return .messageDelta(delta, turnID: turnID)
         case .reasoningSummaryPartAdded(let part):
             return .reasoningSummaryPartAdded(part, turnID: turnID)
         case .reasoningDelta(let delta):
             return .reasoningDelta(delta, turnID: turnID)
+        case .diagnostic(let diagnostic):
+            return .diagnostic(diagnostic, turnID: turnID)
         case .tokenUsageUpdated(let usage):
             return .tokenUsageUpdated(usage, turnID: turnID)
-        case .completed(let response):
-            return .turnCompleted(response)
-        case .failed(let message):
-            return .turnFailed(turnID: turnID, message: message)
+        case .terminal(let outcome):
+            return .terminal(outcome)
         case .unknown(let raw):
             var raw = raw
             raw.threadID = threadID
@@ -642,544 +758,109 @@ package actor CodexAppServerNotificationRouter {
         }
     }
 
-    private func decodeTurnEvent(
-        method: String,
-        params: Data,
-        context: NotificationContext
-    ) -> CodexTurnEvent {
-        let raw = CodexRawNotification(
-            method: method,
-            params: params,
-            threadID: context.threadID,
-            turnID: context.turnID
+    package func finishAll(with termination: CodexConnectionTermination) async {
+        let error = CodexAppServerError.connectionTerminated(termination)
+        guard case .open = phase else {
+            return
+        }
+        phase = .terminating(error)
+        detachedReviewAttempts.removeAll(keepingCapacity: false)
+        detachedReviewCandidatesByThreadID.removeAll(keepingCapacity: false)
+        threadIDByTurnID.removeAll(keepingCapacity: false)
+        itemReducer.releaseAll()
+        threadEventHub.finish(throwing: error)
+        await turnReplayStore.terminateAll(with: termination)
+        await accountEventHub.finish(throwing: error)
+        await loginRegistry.finish(throwing: error)
+        notificationDrainsByThreadID.removeAll(keepingCapacity: false)
+        phase = .terminated(error)
+    }
+
+    package func finishLogin(throwing error: CodexAppServerError) async {
+        await loginRegistry.finish(throwing: error)
+    }
+
+    package func setNotificationDrainPauseForTesting(
+        _ pause: (@Sendable () async -> Void)?
+    ) {
+        notificationDrainPauseForTesting = pause
+    }
+
+    package func setTerminalReplayPublicationPauseForTesting(
+        _ pause: (@Sendable () async -> Void)?
+    ) {
+        terminalReplayPublicationPauseForTesting = pause
+    }
+
+    package func turnAssociationForTesting(
+        _ turnID: CodexTurnID
+    ) -> CodexThreadID? {
+        threadIDByTurnID[turnID]
+    }
+
+    private nonisolated func recordReplayDisposition(
+        _ disposition: TurnReplayStore.RoutingDisposition,
+        turnID: CodexTurnID
+    ) {
+        guard case .routed(let count) = disposition else {
+            return
+        }
+        guard count > 0 else {
+            return
+        }
+        notificationRouterLogger.warning(
+            "Compacted \(count, privacy: .public) slow turn replay subscriber(s) for \(turnID.rawValue, privacy: .public)"
         )
-        switch method {
-        case "turn/started":
-            return .started(context.turnID ?? .init(rawValue: ""))
-        case "turn/completed":
-            return .completed(turnResult(from: params, context: context))
-        case "turn/failed", "turn/cancelled":
-            return .failed(turnFailureMessage(from: params) ?? method)
-        case "item/started":
-            if let item = item(from: params) {
-                return .itemStarted(item)
-            }
-            return .unknown(raw)
-        case "item/updated":
-            if let item = item(from: params) {
-                return .itemUpdated(item)
-            }
-            return .unknown(raw)
-        case "item/completed":
-            if let item = item(from: params) {
-                return .itemCompleted(item)
-            }
-            return .unknown(raw)
-        case "item/commandExecution/outputDelta":
-            if let item = itemUpdate(from: params, kind: .commandExecution) {
-                return .itemUpdated(item)
-            }
-            return .unknown(raw)
-        case "item/fileChange/outputDelta", "item/fileChange/patchUpdated":
-            if let item = itemUpdate(from: params, kind: .fileChange) {
-                return .itemUpdated(item)
-            }
-            return .unknown(raw)
-        case "item/mcpToolCall/progress":
-            if let item = itemUpdate(from: params, kind: .mcpToolCall) {
-                return .itemUpdated(item)
-            }
-            return .unknown(raw)
-        case "item/agentMessage/delta":
-            if let delta = messageDelta(from: params) {
-                return .messageDelta(delta)
-            }
-            return .unknown(raw)
-        case "agent/message":
-            if let message = agentMessage(
-                from: params,
-                context: context,
-                fallbackItemID: CodexAgentMessageFallbackID.unscoped
-            ) {
-                return .message(message)
-            }
-            return .unknown(raw)
-        case "item/reasoning/summaryPartAdded":
-            if let part = reasoningSummaryPart(from: params) {
-                return .reasoningSummaryPartAdded(part)
-            }
-            return .unknown(raw)
-        case "item/reasoning/summaryTextDelta":
-            if let delta = reasoningSummaryDelta(from: params) {
-                return .reasoningDelta(delta)
-            }
-            return .unknown(raw)
-        case "item/reasoning/textDelta":
-            if let delta = reasoningTextDelta(from: params) {
-                return .reasoningDelta(delta)
-            }
-            return .unknown(raw)
-        case "thread/tokenUsage/updated":
-            if let usage = tokenUsage(from: params) {
-                return .tokenUsageUpdated(usage)
-            }
-            return .unknown(raw)
-        default:
-            return .unknown(raw)
+    }
+
+    private func requireOpen() throws {
+        if let error = phase.terminationError {
+            throw error
         }
     }
 
-    private func decodeThreadEvent(
-        method: String,
-        params: Data,
+    private func terminalOutcome(
+        from turn: AppServerAPI.Turn.Payload,
         context: NotificationContext
-    ) -> CodexThreadEvent {
-        let raw = CodexRawNotification(
-            method: method,
-            params: params,
-            threadID: context.threadID,
-            turnID: context.turnID
+    ) throws -> CodexTurnOutcome {
+        let turnID = CodexTurnID(rawValue: turn.id)
+        if let correlatedTurnID = context.turnID, correlatedTurnID != turnID {
+            throw CodexAppServerError.malformedNotification(.init(
+                method: "turn/completed",
+                message: "Correlated turn id \(correlatedTurnID.rawValue) does not match payload turn id \(turnID.rawValue).",
+                rawData: nil
+            ))
+        }
+        let snapshot = CodexAppServer.turnSnapshots(from: [turn])[0]
+        let response = CodexResponse(
+            turnID: snapshot.id,
+            transcript: .init(items: snapshot.items),
+            startedAt: snapshot.startedAt,
+            completedAt: snapshot.completedAt,
+            duration: snapshot.duration
         )
-        switch method {
-        case "turn/started":
-            return .turnStarted(context.turnID ?? .init(rawValue: ""))
-        case "turn/completed":
-            return .turnCompleted(turnResult(from: params, context: context))
-        case "turn/failed", "turn/cancelled":
-            return .turnFailed(
-                turnID: context.turnID,
-                message: turnFailureMessage(from: params) ?? method
+        switch snapshot.state {
+        case .completed:
+            return .completed(response)
+        case .interrupted:
+            return .interrupted(response)
+        case .failed(let error):
+            return .failed(.init(response: response, error: error))
+        case .inProgress:
+            return .invalidTerminalStatus(
+                rawStatus: CodexTurnStatus.inProgress.rawValue,
+                error: nil,
+                response: response
             )
-        case "item/started":
-            if let item = item(from: params) {
-                return .itemStarted(item, turnID: context.turnID)
-            }
-            return .unknown(raw)
-        case "item/updated":
-            if let item = item(from: params) {
-                return .itemUpdated(item, turnID: context.turnID)
-            }
-            return .unknown(raw)
-        case "item/completed":
-            if let item = item(from: params) {
-                return .itemCompleted(item, turnID: context.turnID)
-            }
-            return .unknown(raw)
-        case "item/commandExecution/outputDelta":
-            if let item = itemUpdate(from: params, kind: .commandExecution) {
-                return .itemUpdated(item, turnID: context.turnID)
-            }
-            return .unknown(raw)
-        case "item/fileChange/outputDelta", "item/fileChange/patchUpdated":
-            if let item = itemUpdate(from: params, kind: .fileChange) {
-                return .itemUpdated(item, turnID: context.turnID)
-            }
-            return .unknown(raw)
-        case "item/mcpToolCall/progress":
-            if let item = itemUpdate(from: params, kind: .mcpToolCall) {
-                return .itemUpdated(item, turnID: context.turnID)
-            }
-            return .unknown(raw)
-        case "item/agentMessage/delta":
-            if let delta = messageDelta(from: params) {
-                return .messageDelta(delta, turnID: context.turnID)
-            }
-            return .unknown(raw)
-        case "agent/message":
-            if let message = agentMessage(
-                from: params,
-                context: context,
-                fallbackItemID: CodexAgentMessageFallbackID.scoped(turnID: context.turnID)
-            ) {
-                return .message(message, turnID: context.turnID)
-            }
-            return .unknown(raw)
-        case "item/reasoning/summaryPartAdded":
-            if let part = reasoningSummaryPart(from: params) {
-                return .reasoningSummaryPartAdded(part, turnID: context.turnID)
-            }
-            return .unknown(raw)
-        case "item/reasoning/summaryTextDelta":
-            if let delta = reasoningSummaryDelta(from: params) {
-                return .reasoningDelta(delta, turnID: context.turnID)
-            }
-            return .unknown(raw)
-        case "item/reasoning/textDelta":
-            if let delta = reasoningTextDelta(from: params) {
-                return .reasoningDelta(delta, turnID: context.turnID)
-            }
-            return .unknown(raw)
-        case "thread/tokenUsage/updated":
-            if let usage = tokenUsage(from: params) {
-                return .tokenUsageUpdated(usage, turnID: context.turnID)
-            }
-            return .unknown(raw)
-        case "thread/status/changed":
-            if let status = threadStatus(from: params) {
-                return .statusChanged(status)
-            }
-            return .unknown(raw)
-        case "thread/closed":
-            return .closed
-        default:
-            return .unknown(raw)
+        case .unknown(let rawValue, let error):
+            return .invalidTerminalStatus(
+                rawStatus: rawValue,
+                error: error,
+                response: response
+            )
         }
     }
 
-    private func removeTurnSubscriber(_ subscriptionID: UUID, turnID: CodexTurnID) {
-        turnSubscribersByTurnID[turnID]?.removeValue(forKey: subscriptionID)
-        if turnSubscribersByTurnID[turnID]?.isEmpty == true {
-            turnSubscribersByTurnID.removeValue(forKey: turnID)
-        }
-    }
-
-    private func removeThreadSubscriber(_ subscriptionID: UUID, threadID: CodexThreadID) {
-        threadSubscribersByThreadID[threadID]?.removeValue(forKey: subscriptionID)
-        if threadSubscribersByThreadID[threadID]?.isEmpty == true {
-            threadSubscribersByThreadID.removeValue(forKey: threadID)
-        }
-    }
-
-    private func finishTurnSubscribers(turnID: CodexTurnID) {
-        let subscribers =
-            turnSubscribersByTurnID.removeValue(forKey: turnID).map {
-                Array($0.values)
-            } ?? []
-        for subscriber in subscribers {
-            subscriber.continuation.finish()
-        }
-    }
-
-    private func finishThreadSubscribers(threadID: CodexThreadID) {
-        let subscribers =
-            threadSubscribersByThreadID.removeValue(forKey: threadID).map {
-                Array($0.values)
-            } ?? []
-        for subscriber in subscribers {
-            subscriber.continuation.finish()
-        }
-    }
-
-    private func finishAll(throwing error: Error) {
-        let turnSubscribers = turnSubscribersByTurnID.values.flatMap(\.values)
-        let threadSubscribers = threadSubscribersByThreadID.values.flatMap(\.values)
-        unscopedDiagnosticRouting.reset()
-        turnSubscribersByTurnID.removeAll()
-        threadSubscribersByThreadID.removeAll()
-        for subscriber in turnSubscribers {
-            subscriber.continuation.finish(throwing: error)
-        }
-        for subscriber in threadSubscribers {
-            subscriber.continuation.finish(throwing: error)
-        }
-    }
-
-    private func item(from data: Data) -> CodexThreadItem? {
-        guard let payload = try? decoder.decode(ItemPayload.self, from: data) else {
-            return nil
-        }
-        return payload.item.makeThreadItem(
-            startedAt: payload.startedAtMS.map(Self.date(millisecondsSince1970:)),
-            completedAt: payload.completedAtMS.map(Self.date(millisecondsSince1970:))
-        )
-    }
-
-    private func itemUpdate(from data: Data, kind: CodexThreadItem.Kind) -> CodexThreadItem? {
-        guard let payload = try? decoder.decode(ItemProgressPayload.self, from: data) else {
-            return nil
-        }
-        let output = payload.delta ?? payload.message ?? payload.changes?.displayText
-        let itemID = payload.itemID ?? UUID().uuidString
-        let content: CodexThreadItem.Content
-        switch kind {
-        case .commandExecution:
-            content = .command(.init(command: "", output: output))
-        case .fileChange:
-            content = .fileChange(.init(output: output))
-        case .mcpToolCall:
-            content = .toolCall(.init(result: output))
-        case let kind:
-            content = .unknown(.init(rawType: kind.rawValue, text: output, payload: data))
-        }
-        return .init(id: itemID, kind: kind, content: content, rawPayload: data)
-    }
-
-    private func messageDelta(from data: Data) -> CodexMessageDelta? {
-        guard let payload = try? decoder.decode(AgentMessageDeltaPayload.self, from: data) else {
-            return nil
-        }
-        let text = payload.delta ?? payload.text ?? ""
-        guard text.isEmpty == false else {
-            return nil
-        }
-        return .init(
-            text: text,
-            itemID: payload.itemID,
-            phase: payload.phase.map(CodexMessagePhase.init(rawValue:))
-        )
-    }
-
-    private func agentMessage(
-        from data: Data,
-        context: NotificationContext,
-        fallbackItemID: String
-    ) -> CodexMessage? {
-        guard let payload = try? decoder.decode(AgentMessagePayload.self, from: data),
-              let text = nonEmpty(payload.message ?? payload.text)
-        else {
-            return nil
-        }
-        return .init(
-            id: agentMessageID(payload.itemID, fallbackItemID: fallbackItemID),
-            role: .assistant,
-            phase: payload.phase.map(CodexMessagePhase.init(rawValue:)),
-            text: text
-        )
-    }
-
-    private func agentMessageID(_ itemID: String?, fallbackItemID: String) -> String {
-        if let itemID = nonEmpty(itemID) {
-            return itemID
-        }
-        return fallbackItemID
-    }
-
-    private func nonEmpty(_ value: String?) -> String? {
-        guard let value, value.isEmpty == false else {
-            return nil
-        }
-        return value
-    }
-
-    private func reasoningSummaryPart(from data: Data) -> CodexReasoningPart? {
-        guard let payload = try? decoder.decode(
-            ReasoningSummaryPartPayload.self,
-            from: data
-        ) else {
-            return nil
-        }
-        return .init(itemID: payload.itemID, kind: .summary, index: payload.summaryIndex)
-    }
-
-    private func reasoningSummaryDelta(from data: Data) -> CodexReasoningDelta? {
-        guard let payload = try? decoder.decode(
-            ReasoningSummaryTextDeltaPayload.self,
-            from: data
-        ) else {
-            return nil
-        }
-        let part = CodexReasoningPart(
-            itemID: payload.itemID,
-            kind: .summary,
-            index: payload.summaryIndex
-        )
-        return .init(part: part, delta: payload.delta)
-    }
-
-    private func reasoningTextDelta(from data: Data) -> CodexReasoningDelta? {
-        guard let payload = try? decoder.decode(
-            ReasoningTextDeltaPayload.self,
-            from: data
-        ) else {
-            return nil
-        }
-        let part = CodexReasoningPart(
-            itemID: payload.itemID,
-            kind: .text,
-            index: payload.contentIndex
-        )
-        return .init(part: part, delta: payload.delta)
-    }
-
-    private func tokenUsage(from data: Data) -> CodexTokenUsage? {
-        guard let payload = try? decoder.decode(TokenUsagePayload.self, from: data) else {
-            return nil
-        }
-        return payload.tokenUsage.codexUsage
-    }
-
-    private func threadStatus(from data: Data) -> CodexThreadStatus? {
-        guard
-            let payload = try? decoder.decode(ThreadStatusPayload.self, from: data),
-            let type = payload.status?.type
-        else {
-            return nil
-        }
-        return .init(type: type, activeFlags: payload.status?.activeFlags)
-    }
-
-    private func turnResult(from data: Data, context: NotificationContext) -> CodexResponse {
-        let payload = try? decoder.decode(TurnCompletedPayload.self, from: data)
-        let turn = payload?.turn
-        let status = turn?.status.map(CodexTurnStatus.init(rawValue:))
-        let transcript = CodexTranscript(items: threadItems(from: turn?.items))
-        return .init(
-            turnID: turn.map { .init(rawValue: $0.id) } ?? context.turnID ?? .init(rawValue: ""),
-            status: status,
-            errorMessage: turn?.error?.message,
-            finalAnswer: transcript.finalAnswer,
-            transcript: transcript,
-            startedAt: turn?.startedAt.map { Date(timeIntervalSince1970: TimeInterval($0)) },
-            completedAt: turn?.completedAt.map { Date(timeIntervalSince1970: TimeInterval($0)) },
-            duration: turn?.durationMS.map { .milliseconds(Int64($0)) }
-        )
-    }
-
-    private func threadItems(from values: [AppServerJSONValue]?) -> [CodexThreadItem] {
-        AppServerThreadItemMapping.threadItems(from: values)
-    }
-
-    private func turnFailureMessage(from data: Data) -> String? {
-        if let payload = try? decoder.decode(TurnCompletedPayload.self, from: data) {
-            return payload.turn.error?.message
-        }
-        if let payload = try? decoder.decode(ErrorPayload.self, from: data) {
-            return payload.error?.message ?? payload.message
-        }
-        return nil
-    }
-
-    private static func context(from data: Data) -> NotificationContext {
-        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return .init()
-        }
-        let threadID =
-            stringValue(named: "threadId", in: object)
-            ?? objectValue(named: "thread", in: object).flatMap { stringValue(named: "id", in: $0) }
-        let turnID =
-            stringValue(named: "turnId", in: object)
-            ?? objectValue(named: "turn", in: object).flatMap { stringValue(named: "id", in: $0) }
-        return .init(
-            threadID: threadID.map(CodexThreadID.init(rawValue:)),
-            turnID: turnID.map(CodexTurnID.init(rawValue:))
-        )
-    }
-
-    private static func stringValue(named name: String, in object: [String: Any]) -> String? {
-        object[name] as? String
-    }
-
-    private static func objectValue(named name: String, in object: [String: Any]) -> [String: Any]? {
-        object[name] as? [String: Any]
-    }
-
-    private nonisolated static func date(millisecondsSince1970 milliseconds: Int64) -> Date {
-        Date(timeIntervalSince1970: TimeInterval(milliseconds) / 1_000)
-    }
-}
-
-private struct TurnCompletedPayload: Decodable {
-    var turn: AppServerAPI.Turn.Payload
-}
-
-private struct ErrorPayload: Decodable {
-    struct ErrorBody: Decodable {
-        var message: String?
-    }
-
-    var message: String?
-    var error: ErrorBody?
-}
-
-private struct AgentMessageDeltaPayload: Decodable {
-    var itemID: String?
-    var delta: String?
-    var text: String?
-    var phase: String?
-
-    enum CodingKeys: String, CodingKey {
-        case itemID = "itemId"
-        case delta
-        case text
-        case phase
-    }
-}
-
-private struct AgentMessagePayload: Decodable {
-    var itemID: String?
-    var message: String?
-    var text: String?
-    var phase: String?
-
-    enum CodingKeys: String, CodingKey {
-        case itemID = "itemId"
-        case message
-        case text
-        case phase
-    }
-}
-
-private struct ReasoningSummaryPartPayload: Decodable {
-    var itemID: String
-    var summaryIndex: Int
-
-    enum CodingKeys: String, CodingKey {
-        case itemID = "itemId"
-        case summaryIndex
-    }
-}
-
-private struct ReasoningSummaryTextDeltaPayload: Decodable {
-    var itemID: String
-    var summaryIndex: Int
-    var delta: String
-
-    enum CodingKeys: String, CodingKey {
-        case itemID = "itemId"
-        case summaryIndex
-        case delta
-    }
-}
-
-private struct ReasoningTextDeltaPayload: Decodable {
-    var itemID: String
-    var contentIndex: Int
-    var delta: String
-
-    enum CodingKeys: String, CodingKey {
-        case itemID = "itemId"
-        case contentIndex
-        case delta
-    }
-}
-
-private struct ItemPayload: Decodable {
-    var item: RawThreadItem
-    var startedAtMS: Int64?
-    var completedAtMS: Int64?
-
-    enum CodingKeys: String, CodingKey {
-        case item
-        case startedAtMS = "startedAtMs"
-        case completedAtMS = "completedAtMs"
-    }
-}
-
-private struct ItemProgressPayload: Decodable {
-    var itemID: String?
-    var delta: String?
-    var message: String?
-    var changes: AppServerJSONValue?
-
-    enum CodingKeys: String, CodingKey {
-        case itemID = "itemId"
-        case delta
-        case message
-        case changes
-    }
-}
-
-private struct ThreadStatusPayload: Decodable {
-    struct Status: Decodable {
-        var type: String?
-        var activeFlags: [String]?
-    }
-
-    var status: Status?
-}
-
-private struct TokenUsagePayload: Decodable {
-    var tokenUsage: RawTokenUsage
 }
 
 package enum AppServerThreadItemMapping {
@@ -1197,31 +878,7 @@ package enum AppServerThreadItemMapping {
     }
 }
 
-private struct RawTokenUsage: Decodable {
-    var total: RawTokenUsageBreakdown?
-    var modelContextWindow: Int?
-
-    var codexUsage: CodexTokenUsage {
-        .init(
-            inputTokens: total?.inputTokens,
-            outputTokens: total?.outputTokens,
-            totalTokens: total?.totalTokens,
-            cachedInputTokens: total?.cachedInputTokens,
-            reasoningOutputTokens: total?.reasoningOutputTokens,
-            modelContextWindow: modelContextWindow
-        )
-    }
-}
-
-private struct RawTokenUsageBreakdown: Decodable {
-    var cachedInputTokens: Int?
-    var inputTokens: Int?
-    var outputTokens: Int?
-    var reasoningOutputTokens: Int?
-    var totalTokens: Int?
-}
-
-private struct RawCommandAction: Decodable {
+struct RawCommandAction: Decodable {
     var kind: String
     var command: String?
     var name: String?
@@ -1272,7 +929,55 @@ private struct RawCommandAction: Decodable {
     }
 }
 
-private struct RawThreadItem: Decodable {
+private struct RawFileUpdateChange: Decodable {
+    var path: String
+    var kind: CodexFileUpdateChange.Kind
+    var diff: String
+
+    private enum CodingKeys: String, CodingKey {
+        case path
+        case kind
+        case diff
+    }
+
+    private enum KindCodingKeys: String, CodingKey {
+        case type
+        case movePath = "move_path"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        path = try container.decode(String.self, forKey: .path)
+        diff = try container.decode(String.self, forKey: .diff)
+
+        let kindContainer = try container.nestedContainer(
+            keyedBy: KindCodingKeys.self,
+            forKey: .kind
+        )
+        switch try kindContainer.decode(String.self, forKey: .type) {
+        case "add":
+            kind = .add
+        case "delete":
+            kind = .delete
+        case "update":
+            kind = .update(
+                movePath: try kindContainer.decodeIfPresent(String.self, forKey: .movePath)
+            )
+        case let type:
+            throw DecodingError.dataCorruptedError(
+                forKey: .type,
+                in: kindContainer,
+                debugDescription: "Unsupported file update change kind: \(type)"
+            )
+        }
+    }
+
+    var domainValue: CodexFileUpdateChange {
+        .init(path: path, kind: kind, diff: diff)
+    }
+}
+
+struct RawThreadItem: Decodable {
     var id: String?
     var type: String?
     var kind: String?
@@ -1302,7 +1007,7 @@ private struct RawThreadItem: Decodable {
     var input: AppServerJSONValue?
     var result: AppServerJSONValue?
     var error: AppServerJSONValue?
-    var changes: AppServerJSONValue?
+    private var changes: [RawFileUpdateChange]?
     var rawValue: AppServerJSONValue?
 
     enum CodingKeys: String, CodingKey {
@@ -1370,7 +1075,7 @@ private struct RawThreadItem: Decodable {
         input = try? container.decodeIfPresent(AppServerJSONValue.self, forKey: .input)
         result = try? container.decodeIfPresent(AppServerJSONValue.self, forKey: .result)
         error = try? container.decodeIfPresent(AppServerJSONValue.self, forKey: .error)
-        changes = try? container.decodeIfPresent(AppServerJSONValue.self, forKey: .changes)
+        changes = try container.decodeIfPresent([RawFileUpdateChange].self, forKey: .changes)
     }
 
     var threadItem: CodexThreadItem? {
@@ -1387,16 +1092,19 @@ private struct RawThreadItem: Decodable {
         guard let itemID = id ?? fallbackItemID(rawType: rawType, allowed: allowsFallbackID) else {
             return nil
         }
+        guard let content = content(
+            kind: kind,
+            id: itemID,
+            rawType: rawType,
+            startedAt: startedAt,
+            completedAt: completedAt
+        ) else {
+            return nil
+        }
         return .init(
             id: itemID,
             kind: kind,
-            content: content(
-                kind: kind,
-                id: itemID,
-                rawType: rawType,
-                startedAt: startedAt,
-                completedAt: completedAt
-            ),
+            content: content,
             rawPayload: rawPayload
         )
     }
@@ -1414,7 +1122,7 @@ private struct RawThreadItem: Decodable {
         rawType: String,
         startedAt: Date?,
         completedAt: Date?
-    ) -> CodexThreadItem.Content {
+    ) -> CodexThreadItem.Content? {
         switch kind {
         case .userMessage:
             return .message(.init(id: id, role: .user, text: messageText))
@@ -1453,10 +1161,13 @@ private struct RawThreadItem: Decodable {
                     commandActions: commandActions.map(\.codexCommandAction)
                 ))
         case .fileChange:
+            guard let changes = changes?.map(\.domainValue) else {
+                return nil
+            }
             return .fileChange(
                 .init(
-                    path: path,
-                    output: aggregatedOutput ?? output ?? changes?.displayText ?? text,
+                    path: changes.first?.path,
+                    output: changes.isEmpty ? nil : changes.map(\.diff).joined(separator: "\n"),
                     status: status.map(CodexTurnStatus.init(rawValue:))
                 ))
         case .mcpToolCall, .dynamicToolCall, .collabAgentToolCall, .subAgentActivity,
@@ -1549,7 +1260,7 @@ private extension Array where Element == String {
 }
 
 extension AppServerJSONValue {
-    fileprivate var displayText: String? {
+    var displayText: String? {
         switch self {
         case .string(let value):
             value
@@ -1562,11 +1273,18 @@ extension AppServerJSONValue {
         case .object(let value):
             value["displayText"]?.displayText
                 ?? value["text"]?.displayText
-                ?? (try? JSONEncoder().encode(self)).flatMap { String(data: $0, encoding: .utf8) }
+                ?? value["message"]?.displayText
+                ?? canonicalJSONString
         case .array:
-            (try? JSONEncoder().encode(self)).flatMap { String(data: $0, encoding: .utf8) }
+            canonicalJSONString
         case .null:
             nil
         }
+    }
+
+    private var canonicalJSONString: String? {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return (try? encoder.encode(self)).flatMap { String(data: $0, encoding: .utf8) }
     }
 }

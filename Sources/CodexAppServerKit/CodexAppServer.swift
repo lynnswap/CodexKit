@@ -8,6 +8,19 @@ import Foundation
 public actor CodexAppServer {
     /// Options for creating a Codex app-server container.
     public struct Configuration: Sendable {
+        public struct Deadlines: Equatable, Sendable {
+            public var handshake: Duration?
+            public var request: Duration?
+
+            public init(
+                handshake: Duration? = nil,
+                request: Duration? = nil
+            ) {
+                self.handshake = handshake
+                self.request = request
+            }
+        }
+
         /// Options for launching a local `codex app-server` process.
         public struct LocalProcess: Sendable {
             /// The `codex` executable path or command name.
@@ -95,11 +108,17 @@ public actor CodexAppServer {
         /// The client version sent in the app-server `initialize` request.
         public var clientVersion: String
 
-        /// Handles JSON-RPC requests initiated by the app-server.
+        /// Monotonic request and handshake deadlines. `nil` disables the
+        /// corresponding deadline.
+        public var deadlines: Deadlines
+
+        package var deadlineClock: CodexDeadlineClock
+        package var clock: CodexAppServerClock
+        /// Handles typed requests initiated by the app-server.
         ///
-        /// App-server uses these requests for host-side decisions such as
-        /// command approvals, file-change approvals, and user-input prompts.
-        public var serverRequestHandler: CodexAppServerRequestHandler
+        /// A `nil` handler uses the built-in policy, which declines approvals,
+        /// cancels interactive requests, and rejects unsupported providers.
+        public var serverRequestHandler: CodexAppServerRequestHandler?
 
         /// Creates a configuration for a Codex app-server container.
         ///
@@ -107,41 +126,70 @@ public actor CodexAppServer {
         ///   - localProcess: Local process launch settings.
         ///   - clientName: Client name sent during app-server initialization.
         ///   - clientVersion: Client version sent during app-server initialization.
-        ///   - serverRequestHandler: Handler for app-server-initiated JSON-RPC requests.
+        ///   - deadlines: Monotonic request and handshake deadlines.
+        ///   - serverRequestHandler: Optional host policy for app-server-initiated requests.
         public init(
             localProcess: LocalProcess = .init(),
             clientName: String = "CodexAppServerKit",
             clientVersion: String = "1",
-            serverRequestHandler: @escaping CodexAppServerRequestHandler =
-                Self.defaultServerRequestHandler
+            deadlines: Deadlines = .init(),
+            serverRequestHandler: CodexAppServerRequestHandler? = nil
         ) {
             self.localProcess = localProcess
             self.clientName = clientName
             self.clientVersion = clientVersion
+            self.deadlines = deadlines
+            self.deadlineClock = .continuous
+            self.clock = .init()
             self.serverRequestHandler = serverRequestHandler
         }
 
-        private struct ApprovalDeclineResponse: Encodable {
-            var decision: String
+        package init(
+            localProcess: LocalProcess = .init(),
+            clientName: String = "CodexAppServerKit",
+            clientVersion: String = "1",
+            deadlines: Deadlines = .init(),
+            deadlineClock: CodexDeadlineClock,
+            clock: CodexAppServerClock = .init(),
+            serverRequestHandler: CodexAppServerRequestHandler? = nil
+        ) {
+            self.localProcess = localProcess
+            self.clientName = clientName
+            self.clientVersion = clientVersion
+            self.deadlines = deadlines
+            self.deadlineClock = deadlineClock
+            self.clock = clock
+            self.serverRequestHandler = serverRequestHandler
         }
 
+        /// Applies CodexAppServerKit's built-in policy to a server request.
+        ///
+        /// Custom handlers can call this for requests they do not override.
         public static func defaultServerRequestHandler(
             request: CodexAppServerRequest
-        ) async throws -> CodexAppServerResponse {
-            switch request.method {
-            case "item/commandExecution/requestApproval",
-                 "item/fileChange/requestApproval":
-                try .result(ApprovalDeclineResponse(decision: "decline"))
-            default:
-                try .emptyResult()
+        ) async throws -> CodexAppServerRequestResolution {
+            CodexAppServerRequestCodec.builtInResolution(
+                for: request,
+                clock: .init()
+            )
+        }
+
+        package static func defaultServerRequestHandler(
+            clock: CodexAppServerClock
+        ) -> CodexAppServerRequestHandler {
+            { request in
+                CodexAppServerRequestCodec.builtInResolution(for: request, clock: clock)
             }
         }
     }
 
     private let client: AppServerClient
     private let router: CodexAppServerNotificationRouter
-    private var retainedReviewCleanupIdentitiesBySourceThreadID: [CodexThreadID: [CodexReviewIdentity]] = [:]
-    private var reviewRestartContextsByTokenID: [CodexReviewRestartToken.ID: CodexReviewRestartContext] = [:]
+    private let turnReplayStore: TurnReplayStore
+    private let connectionEventHub: ConnectionEventHub
+    private let connectionLease: AppServerConnectionLease
+    private let loginRegistry: LoginRegistry
+    private let reviewRestartCoordinator: ReviewRestartCoordinator
 
     package nonisolated var appServerClient: AppServerClient {
         client
@@ -159,52 +207,139 @@ public actor CodexAppServer {
             executable: configuration.localProcess.executable,
             arguments: configuration.localProcess.arguments,
             environment: configuration.localProcess.environment,
-            codexHomeURL: configuration.localProcess.codexHomeURL,
-            serverRequestHandler: configuration.serverRequestHandler
+            codexHomeURL: configuration.localProcess.codexHomeURL
         )
-        let transport = try AppServerProcessTransport(configuration: transportConfiguration)
-        let client = AppServerClient(transport: transport)
+        let transport: AppServerProcessTransport
+        let connectionEventHub = ConnectionEventHub()
+        do {
+            transport = try AppServerProcessTransport(
+                configuration: transportConfiguration,
+                connectionEventHub: connectionEventHub
+            )
+        } catch let failure as CodexLaunchFailure {
+            throw CodexAppServerError.launch(failure)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw CodexAppServerError.launch(.spawn(
+                executable: transportConfiguration.executable,
+                errno: (error as? POSIXError)?.code.rawValue,
+                message: error.localizedDescription
+            ))
+        }
+        let connectionCloseAction = ConnectionCloseAction()
+        let client = AppServerClient(
+            transport: transport,
+            deadlines: configuration.deadlines,
+            deadlineClock: configuration.deadlineClock,
+            connectionCloseAction: connectionCloseAction
+        )
+        let turnReplayStore = TurnReplayStore()
+        let threadEventHub = ThreadEventHub()
+        let loginRegistry = LoginRegistry(sleep: configuration.deadlineClock.sleep)
+        let router = CodexAppServerNotificationRouter(
+            client: client,
+            turnReplayStore: turnReplayStore,
+            threadEventHub: threadEventHub,
+            loginRegistry: loginRegistry
+        )
+        let connection = AppServerConnection(
+            transport: transport,
+            client: client,
+            router: router,
+            turnReplayStore: turnReplayStore,
+            serverRequestHandler: configuration.serverRequestHandler
+                ?? Configuration.defaultServerRequestHandler(clock: configuration.clock)
+        )
+        let supervisor = ConnectionSupervisor(connection: connection)
+        connectionCloseAction.bind(to: supervisor)
+        let connectionLease = AppServerConnectionLease(
+            supervisor: supervisor,
+            processTerminationToken: transport.processTerminationToken
+        )
+        await supervisor.start()
         do {
             _ = try await client.initialize(
                 clientName: configuration.clientName,
                 clientVersion: configuration.clientVersion
             )
         } catch {
-            await client.close()
+            await supervisor.closeConnection()
             throw error
         }
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
         self.client = client
         self.router = router
-    }
-
-    package init(
-        client: AppServerClient,
-        router: CodexAppServerNotificationRouter
-    ) {
-        self.client = client
-        self.router = router
+        self.turnReplayStore = turnReplayStore
+        self.connectionEventHub = client.connectionEventHub
+        self.connectionLease = connectionLease
+        self.loginRegistry = loginRegistry
+        self.reviewRestartCoordinator = ReviewRestartCoordinator()
     }
 
     package init(
         transport: any JSONRPC.Transport
     ) async throws {
-        let client = AppServerClient(transport: transport)
+        let connectionCloseAction = ConnectionCloseAction()
+        let client = AppServerClient(
+            transport: transport,
+            connectionCloseAction: connectionCloseAction
+        )
         let configuration = Configuration()
+        let turnReplayStore = TurnReplayStore()
+        let threadEventHub = ThreadEventHub()
+        let loginRegistry = LoginRegistry(sleep: configuration.deadlineClock.sleep)
+        let router = CodexAppServerNotificationRouter(
+            client: client,
+            turnReplayStore: turnReplayStore,
+            threadEventHub: threadEventHub,
+            loginRegistry: loginRegistry
+        )
+        let connection = AppServerConnection(
+            transport: transport,
+            client: client,
+            router: router,
+            turnReplayStore: turnReplayStore,
+            serverRequestHandler: Configuration.defaultServerRequestHandler(
+                clock: configuration.clock
+            )
+        )
+        let supervisor = ConnectionSupervisor(connection: connection)
+        connectionCloseAction.bind(to: supervisor)
+        let connectionLease = AppServerConnectionLease(
+            supervisor: supervisor,
+            processTerminationToken: ProcessTerminationToken()
+        )
+        await supervisor.start()
         do {
             _ = try await client.initialize(
                 clientName: configuration.clientName,
                 clientVersion: configuration.clientVersion
             )
         } catch {
-            await client.close()
+            await supervisor.closeConnection()
             throw error
         }
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
         self.client = client
         self.router = router
+        self.turnReplayStore = turnReplayStore
+        self.connectionEventHub = client.connectionEventHub
+        self.connectionLease = connectionLease
+        self.loginRegistry = loginRegistry
+        self.reviewRestartCoordinator = ReviewRestartCoordinator()
+    }
+
+    package init(
+        client: AppServerClient,
+        router: CodexAppServerNotificationRouter,
+        connectionLease: AppServerConnectionLease
+    ) {
+        self.client = client
+        self.router = router
+        self.turnReplayStore = router.turnReplayStore
+        self.connectionEventHub = client.connectionEventHub
+        self.connectionLease = connectionLease
+        self.loginRegistry = router.loginRegistry
+        self.reviewRestartCoordinator = ReviewRestartCoordinator()
     }
 
     package static func testing(
@@ -218,42 +353,27 @@ public actor CodexAppServer {
     /// Call this when the container is no longer needed. Closing is idempotent
     /// from the perspective of public callers.
     public func close() async {
-        await router.stop()
-        await client.close()
+        _ = await reviewRestartCoordinator.invalidateAllAndWait()
+        await connectionLease.closeConnection()
     }
 
-    package func notificationStream() async -> AsyncThrowingStream<JSONRPC.Notification, Error> {
-        await client.notificationStream()
+    /// Returns connection-scoped diagnostics and the compact terminal event.
+    ///
+    /// This subscription does not retain the app-server connection or its lease.
+    /// Call ``CodexConnectionEvents/cancel()`` to release only this subscriber.
+    public func connectionEvents() -> CodexConnectionEvents {
+        connectionEventHub.events()
     }
 
     /// Returns account-related app-server notifications as typed domain events.
     ///
-    /// The stream includes login completion, account update, and Codex
-    /// rate-limit update notifications. Notifications with newer account
-    /// methods are preserved as `.unknown`; malformed known notifications are
-    /// reported as `.malformed` without terminating the stream.
-    ///
-    /// - Returns: A stream of account domain events.
-    public func accountEvents() async -> AsyncThrowingStream<CodexAccountEvent, Error> {
-        let notifications = await client.notificationStream()
-        return AsyncThrowingStream(bufferingPolicy: .unbounded) { continuation in
-            let task = Task {
-                do {
-                    for try await notification in notifications {
-                        guard let event = Self.accountEvent(from: notification) else {
-                            continue
-                        }
-                        continuation.yield(event)
-                    }
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
-                }
-            }
-            continuation.onTermination = { _ in
-                task.cancel()
-            }
-        }
+    /// A malformed known current-v2 notification terminates connection-wide routing, including
+    /// this sequence and active thread or turn sequences, with a typed
+    /// ``CodexAppServerError/connectionTerminated(_:)`` protocol violation. Call
+    /// ``CodexAccountEvents/cancel()``
+    /// to release only this subscription without closing other routing.
+    public func accountEvents() async -> CodexAccountEvents {
+        await router.accountEvents()
     }
 
     /// Creates a new Codex thread in a workspace.
@@ -290,13 +410,22 @@ public actor CodexAppServer {
                     sessionStartSource: options.sessionStartSource?.appServerSource,
                     threadSource: options.threadSource?.appServerSource
                 )
-            ))
+            ),
+            onPostWriteCancellation: { [client] response in
+                let _: EmptyResponse = try await client.send(
+                    AppServerAPI.Thread.Delete.Request(
+                        params: .init(threadID: response.threadID)
+                    )
+                )
+            }
+        )
         return CodexThread(
             id: .init(rawValue: response.threadID),
             workspace: workspace,
             model: response.model ?? options.model,
             client: client,
-            router: router
+            router: router,
+            connectionLease: connectionLease
         )
     }
 
@@ -312,7 +441,6 @@ public actor CodexAppServer {
     ///   - instructions: Optional base and developer instructions for the source thread.
     ///   - options: Thread creation options, including model, approval, and sandbox settings.
     ///   - delivery: Whether the app-server should run the review inline or in a detached review thread.
-    ///   - transcriptErrorHandlingPolicy: How collection should treat transcript errors.
     /// - Returns: A live review session.
     /// - Throws: A transport, JSON-RPC, or app-server request error.
     public func startReview(
@@ -320,11 +448,10 @@ public actor CodexAppServer {
         target: CodexReviewTarget,
         instructions: CodexInstructions? = nil,
         options: CodexThread.Options = .init(),
-        delivery: CodexReviewDelivery = .inline,
-        transcriptErrorHandlingPolicy: CodexTranscriptErrorHandlingPolicy = .preserveTranscript
+        delivery: CodexReviewDelivery = .inline
     ) async throws -> CodexReviewSession {
         try Task.checkCancellation()
-        let thread = try await startThreadIgnoringCallerCancellation(
+        let thread = try await startThread(
             in: workspace,
             instructions: instructions,
             options: options
@@ -338,11 +465,9 @@ public actor CodexAppServer {
 
         let review: CodexReviewSession
         do {
-            review = try await startReviewIgnoringCallerCancellation(
-                thread: thread,
+            review = try await thread.startReview(
                 target: target,
-                delivery: delivery,
-                transcriptErrorHandlingPolicy: transcriptErrorHandlingPolicy
+                delivery: delivery
             )
         } catch {
             await deleteThreadIgnoringCallerCancellation(thread.id)
@@ -356,6 +481,20 @@ public actor CodexAppServer {
             await cleanupReviewIgnoringCallerCancellation(review.identity)
             throw error
         }
+    }
+
+    package func reviewEventThread(
+        for review: CodexReviewSession,
+        workspace: URL
+    ) -> CodexThread {
+        CodexThread(
+            id: review.activeTurnThreadID,
+            workspace: workspace,
+            model: review.model,
+            client: client,
+            router: router,
+            connectionLease: connectionLease
+        )
     }
 
     /// Resumes an existing Codex thread.
@@ -372,14 +511,26 @@ public actor CodexAppServer {
         let response: AppServerAPI.Thread.Resume.Response = try await withThreadEventGeneration(
             id,
             router: router
-        ) {
+        ) { generation in
             try await client.send(
                 AppServerAPI.Thread.Resume.Request(
                     threadID: id.rawValue,
                     params: threadStartParams(options: options)
-                ))
+                ),
+                reconcileResponse: { response in
+                    if let latestTurn = response.thread.turns?.last {
+                        let snapshot = Self.turnSnapshots(from: [latestTurn])[0]
+                        if snapshot.state == .inProgress {
+                            generation.seedProvisionalResumeSnapshot(snapshot)
+                        }
+                    }
+                },
+                onWriteAccepted: generation.acceptWrite,
+                onResponseRejected: generation.rejectResponse,
+                onResponseAccepted: generation.acceptResponse
+            )
         }
-        return thread(from: response.thread, model: response.model ?? options.model)
+        return await thread(from: response.thread, model: response.model ?? options.model)
     }
 
     /// Restores a persisted app-server review run as a live review session handle.
@@ -390,33 +541,55 @@ public actor CodexAppServer {
     ///
     /// - Parameters:
     ///   - identity: Persisted review run identity.
-    ///   - options: Options for the restored review response stream.
     ///   - threadOptions: Resume options for the active turn thread. When `model` is
     ///     `nil`, `identity.model` is used.
     /// - Returns: A live review session handle for the persisted run.
     /// - Throws: A transport, JSON-RPC, or app-server request error.
     public func resumeReview(
         _ identity: CodexReviewIdentity,
-        options: CodexReviewResumeOptions = .init(),
         threadOptions: CodexThread.ResumeOptions = .init()
     ) async throws -> CodexReviewSession {
         var threadOptions = threadOptions
         if threadOptions.model == nil {
             threadOptions.model = identity.model
         }
-        await router.beginUnscopedDiagnosticRouting(in: identity.activeTurnThreadID)
-        let activeThread: CodexThread
+        let activeTurnThreadID = identity.activeTurnThreadID
+        let initialTurn = CodexTurnSnapshot(id: identity.turnID, state: .inProgress)
+        let reservation = await turnReplayStore.reserveRestoredGeneration(
+            turnID: identity.turnID,
+            initialSnapshot: initialTurn,
+            connectionLease: connectionLease
+        )
+        let state = reservation.state
+        await router.seedTurn(identity.turnID, threadID: activeTurnThreadID)
         do {
-            activeThread = try await resumeThread(identity.activeTurnThreadID, options: threadOptions)
+            let activeThread = try await resumeThread(
+                activeTurnThreadID,
+                options: threadOptions
+            )
+            await turnReplayStore.commitRestoredGeneration(reservation)
+            if await state.snapshot() != .live {
+                await router.discardTurnAssociation(
+                    identity.turnID,
+                    threadID: activeTurnThreadID
+                )
+            }
+            return await activeThread.reviewSession(
+                identity,
+                model: activeThread.model ?? identity.model,
+                initialTurn: initialTurn,
+                state: state
+            )
         } catch {
-            await router.stopUnscopedDiagnosticRouting(in: identity.activeTurnThreadID)
+            let removedGeneration = await turnReplayStore.discardRestoredGeneration(reservation)
+            if removedGeneration {
+                await router.discardTurnAssociation(
+                    identity.turnID,
+                    threadID: activeTurnThreadID
+                )
+            }
             throw error
         }
-        return await activeThread.reviewSession(
-            identity,
-            model: activeThread.model ?? identity.model,
-            transcriptErrorHandlingPolicy: options.transcriptErrorHandlingPolicy
-        )
     }
 
     /// Cancels a running review and prepares it for a later restart.
@@ -428,146 +601,180 @@ public actor CodexAppServer {
     ///
     /// - Parameters:
     ///   - identity: Persisted review run identity to interrupt.
-    ///   - options: Options for the restored review response stream used during cancellation.
     ///   - threadOptions: Resume options for the active turn thread. When `model` is
     ///     `nil`, `identity.model` is used.
-    /// - Returns: A token that can be passed to ``restartPreparedReview(_:target:delivery:threadOptions:transcriptErrorHandlingPolicy:)``.
+    /// - Returns: A token that can be passed to ``restartPreparedReview(_:target:delivery:threadOptions:)``.
     /// - Throws: A transport, JSON-RPC, or app-server request error.
     public func prepareReviewRestart(
         _ identity: CodexReviewIdentity,
-        options: CodexReviewResumeOptions = .init(),
         threadOptions: CodexThread.ResumeOptions = .init()
     ) async throws -> CodexReviewRestartToken {
-        let review = try await resumeReview(identity, options: options, threadOptions: threadOptions)
-        let cancellation = try await review.cancel { retryCancellation in
-            if retryCancellation.turnID != Optional(identity.turnID) {
-                await self.rememberReviewCleanupIdentity(
-                    for: retryCancellation,
+        try await reviewRestartCoordinator.prepare(
+            identity,
+            operations: .init { [self] identities in
+                let review = try await resumeReview(
+                    identity,
+                    threadOptions: threadOptions
+                )
+                let acknowledgement = try await review.response.turn
+                    .interruptAndAwaitTerminalAcknowledgement {
+                    retryCancellation in
+                    if retryCancellation.turnID != Optional(identity.turnID) {
+                        identities.record(Self.reviewCleanupIdentity(
+                            for: retryCancellation,
+                            sourceIdentity: identity,
+                            model: review.model
+                        ))
+                    }
+                }
+                guard case .interrupted = acknowledgement.outcome else {
+                    throw CodexTransportFailure.contractViolation(
+                        message: "Preparing a review restart requires an interrupted terminal acknowledgement."
+                    )
+                }
+                let cancellation = acknowledgement.cancellation
+                identities.record(identity)
+                identities.record(Self.reviewCleanupIdentity(
+                    for: cancellation,
                     sourceIdentity: identity,
                     model: review.model
+                ))
+                return .init(
+                    rollbackThreadID: cancellation.threadID,
+                    rollbackModel: review.model
                 )
             }
-        }
-        try await review.response.waitForCancelledResponse(cancellation)
-        rememberReviewCleanupIdentity(identity)
-        rememberReviewCleanupIdentity(
-            for: cancellation,
-            sourceIdentity: identity,
-            model: review.model
         )
-        discardReviewRestartContexts(sourceThreadID: identity.sourceThreadID)
-
-        let token = CodexReviewRestartToken(
-            id: UUID().uuidString,
-            interruptedIdentity: identity
-        )
-        reviewRestartContextsByTokenID[token.id] = CodexReviewRestartContext(
-            interruptedIdentity: identity,
-            rollbackThreadID: cancellation.threadID,
-            rollbackModel: review.model
-        )
-        return token
     }
 
-    /// Restarts a review that was previously prepared by ``prepareReviewRestart(_:options:threadOptions:)``.
+    /// Restarts a review that was previously prepared by ``prepareReviewRestart(_:threadOptions:)``.
     ///
     /// The restart first reloads and rolls back the thread that owned the
     /// interrupted active turn, then reloads the source thread and starts a new
     /// review from that source.
     ///
     /// - Parameters:
-    ///   - token: Token returned by ``prepareReviewRestart(_:options:threadOptions:)``.
+    ///   - token: Token returned by ``prepareReviewRestart(_:threadOptions:)``.
     ///   - target: The repository changes or custom instructions to review.
     ///   - delivery: Whether the app-server should run the review inline or in a detached review thread.
     ///   - threadOptions: Resume options for the source thread. For inline
     ///     reviews, `token.interruptedIdentity.model` is used when `model` is
     ///     `nil`; detached review restarts leave source-thread model selection
     ///     to app-server unless the caller supplies an explicit model.
-    ///   - transcriptErrorHandlingPolicy: How collection should treat transcript errors for the new review.
     /// - Returns: A live review session for the restarted review.
     /// - Throws: ``CodexAppServerError/reviewRestartUnavailable(_:)`` when the token is stale.
     public func restartPreparedReview(
         _ token: CodexReviewRestartToken,
         target: CodexReviewTarget,
         delivery: CodexReviewDelivery = .inline,
-        threadOptions: CodexThread.ResumeOptions = .init(),
-        transcriptErrorHandlingPolicy: CodexTranscriptErrorHandlingPolicy = .preserveTranscript
+        threadOptions: CodexThread.ResumeOptions = .init()
     ) async throws -> CodexReviewSession {
-        try Task.checkCancellation()
-        guard var context = reviewRestartContextsByTokenID[token.id],
-              context.isRestarting == false else {
-            throw CodexAppServerError.reviewRestartUnavailable(token.id)
-        }
-        context.isRestarting = true
-        reviewRestartContextsByTokenID[token.id] = context
-
-        do {
-            if context.rollbackCompleted == false {
-                let rollbackThread = try await resumeThread(
-                    context.rollbackThreadID,
-                    options: .init(model: context.rollbackModel)
-                )
-                try await rollbackThread.rollback(turnCount: 1)
-                context.rollbackCompleted = true
-                reviewRestartContextsByTokenID[token.id] = context
-            }
-
-            try Task.checkCancellation()
-            var sourceThreadOptions = threadOptions
-            if sourceThreadOptions.model == nil,
-               context.interruptedIdentity.activeTurnThreadID == context.interruptedIdentity.sourceThreadID {
-                sourceThreadOptions.model = context.interruptedIdentity.model
-            }
-            let sourceThread = try await resumeThread(
-                context.interruptedIdentity.sourceThreadID,
-                options: sourceThreadOptions
+        let signature = ReviewRestartCoordinator.RestartInvocationSignature(
+            target: target,
+            delivery: delivery,
+            threadOptions: threadOptions
+        )
+        return try await reviewRestartCoordinator.restart(
+            token,
+            signature: signature,
+            operations: .init(
+                loadRollbackThread: { [self] context in
+                    try await resumeThread(
+                        context.rollbackThreadID,
+                        options: .init(model: context.rollbackModel)
+                    )
+                },
+                rollback: { thread in
+                    try await thread.rollback(turnCount: 1)
+                },
+                loadSourceThread: { [self] context in
+                    var sourceThreadOptions = threadOptions
+                    if sourceThreadOptions.model == nil,
+                       context.interruptedIdentity.activeTurnThreadID
+                        == context.interruptedIdentity.sourceThreadID {
+                        sourceThreadOptions.model = context.interruptedIdentity.model
+                    }
+                    return try await resumeThread(
+                        context.interruptedIdentity.sourceThreadID,
+                        options: sourceThreadOptions
+                    )
+                },
+                startReview: { sourceThread, identities in
+                    try await sourceThread.startReview(
+                        target: target,
+                        delivery: delivery,
+                        onPostWriteCancellation: { review in
+                            identities.record(review.identity)
+                            try await Self.interruptLateReviewSession(review)
+                        }
+                    )
+                },
+                cleanupLateSession: Self.interruptLateReviewSession
             )
-            try Task.checkCancellation()
-
-            let review = try await startReviewIgnoringCallerCancellation(
-                thread: sourceThread,
-                target: target,
-                delivery: delivery,
-                transcriptErrorHandlingPolicy: transcriptErrorHandlingPolicy
-            )
-            do {
-                try Task.checkCancellation()
-            } catch {
-                await cleanupReviewIgnoringCallerCancellation(review.identity)
-                throw error
-            }
-
-            reviewRestartContextsByTokenID.removeValue(forKey: token.id)
-            return review
-        } catch {
-            context.isRestarting = false
-            if reviewRestartContextsByTokenID[token.id]?.isRestarting == true {
-                reviewRestartContextsByTokenID[token.id] = context
-            }
-            throw error
-        }
+        )
     }
 
-    /// Deletes all app-server threads owned by a review lifecycle.
+    /// Invalidates one prepared restart and returns every review identity whose
+    /// cleanup ownership was retained for its source thread.
+    ///
+    /// If preparation or restart is in flight, this operation cancels and
+    /// awaits it. A replacement session that arrives after invalidation is
+    /// interrupted before its identity is returned.
+    public func discardPreparedReviewRestart(
+        _ token: CodexReviewRestartToken
+    ) async -> [CodexReviewIdentity] {
+        await reviewRestartCoordinator.invalidate(token)
+    }
+
+    /// Invalidates all prepared restarts and transfers their retained cleanup
+    /// identities grouped by source thread.
+    ///
+    /// This terminally closes restart preparation for this app-server instance.
+    /// Call it while stopping the owning runtime, before ``close()``.
+    public func discardAllPreparedReviewRestarts()
+        async -> [CodexThreadID: [CodexReviewIdentity]] {
+        await reviewRestartCoordinator.invalidateAllAndWait()
+    }
+
+    package func waitForReviewRestartWaiterCountForTesting(
+        tokenID: CodexReviewRestartToken.ID,
+        atLeast minimumCount: Int
+    ) async {
+        await reviewRestartCoordinator.waitForRestartWaiterCountForTesting(
+            tokenID: tokenID,
+            atLeast: minimumCount
+        )
+    }
+
+    package func waitForReviewRestartInvalidationRequestForTesting(
+        tokenID: CodexReviewRestartToken.ID
+    ) async {
+        await reviewRestartCoordinator.waitForInvalidationRequestForTesting(
+            tokenID: tokenID
+        )
+    }
+
+    /// Deletes all app-server threads owned by a review lifecycle and reports
+    /// each failed deletion in source-last attempt order.
     ///
     /// Retained cleanup identities from prepared restarts are included, duplicate
     /// thread identifiers are removed, and the source thread is deleted last.
-    /// Delete failures are intentionally ignored to match best-effort cleanup
-    /// behavior.
+    /// Retained restart identities remain registered when any deletion fails so
+    /// the caller can retry without losing thread identities known only to this
+    /// app-server generation.
     ///
     /// - Parameters:
     ///   - identity: Review identity whose source thread owns the lifecycle.
     ///   - additionalCleanupThreadIDs: Extra cleanup ID sequences, in preferred
     ///     per-sequence order, to merge with retained review cleanup IDs.
+    @discardableResult
     public func cleanupReview(
         _ identity: CodexReviewIdentity,
         additionalCleanupThreadIDs: [[CodexThreadID]] = []
-    ) async {
+    ) async -> CodexReviewCleanupResult {
         let sourceThreadID = identity.sourceThreadID
-        let retainedIdentities = retainedReviewCleanupIdentitiesBySourceThreadID.removeValue(
-            forKey: sourceThreadID
-        ) ?? []
-        discardReviewRestartContexts(sourceThreadID: sourceThreadID)
+        let retainedIdentities = await reviewRestartCoordinator
+            .invalidateAndTakeRetainedIdentities(sourceThreadID: sourceThreadID)
 
         let cleanupThreadIDs = Self.orderedReviewCleanupThreadIDs(
             sourceThreadID: sourceThreadID,
@@ -575,9 +782,26 @@ public actor CodexAppServer {
                 + [identity.cleanupThreadIDs]
                 + additionalCleanupThreadIDs
         )
+        var failures: [CodexReviewCleanupFailure] = []
         for threadID in cleanupThreadIDs {
-            try? await deleteThread(threadID)
+            do {
+                try await deleteThread(threadID)
+            } catch {
+                failures.append(.init(
+                    threadID: threadID,
+                    message: error.localizedDescription
+                ))
+            }
         }
+        if failures.isEmpty == false {
+            await reviewRestartCoordinator.restoreRetainedIdentities(
+                retainedIdentities
+            )
+        }
+        return .init(
+            attemptedThreadIDs: cleanupThreadIDs,
+            failures: failures
+        )
     }
 
     /// Forks an existing Codex thread into a new thread.
@@ -595,8 +819,16 @@ public actor CodexAppServer {
             AppServerAPI.Thread.Fork.Request(
                 threadID: id.rawValue,
                 params: threadStartParams(options: options)
-            ))
-        return thread(from: response.thread)
+            ),
+            onPostWriteCancellation: { [client] response in
+                let _: EmptyResponse = try await client.send(
+                    AppServerAPI.Thread.Delete.Request(
+                        params: .init(threadID: response.thread.id)
+                    )
+                )
+            }
+        )
+        return await thread(from: response.thread)
     }
 
     /// Restores an archived Codex thread.
@@ -606,12 +838,14 @@ public actor CodexAppServer {
     /// - Throws: A transport, JSON-RPC, or app-server request error.
     public func unarchiveThread(_ id: CodexThreadID) async throws -> CodexThread {
         let response = try await sendUnarchiveThread(id)
-        return thread(from: response.thread)
+        return await thread(from: response.thread)
     }
 
     package func unarchiveThreadSnapshot(_ id: CodexThreadID) async throws -> CodexThreadSnapshot {
         let response = try await sendUnarchiveThread(id)
-        return Self.threadSnapshot(from: response.thread, includesTurns: false)
+        let snapshot = Self.threadSnapshot(from: response.thread, includesTurns: false)
+        await router.seedTurns(snapshot.turns, threadID: id)
+        return snapshot
     }
 
     private func sendUnarchiveThread(
@@ -665,8 +899,12 @@ public actor CodexAppServer {
                     sourceKinds: query.sourceKinds?.map(\.rawValue),
                     useStateDbOnly: query.useStateDBOnly
                 )))
+        let snapshots = response.data.map { Self.threadSnapshot(from: $0, includesTurns: false) }
+        for snapshot in snapshots {
+            await router.seedTurns(snapshot.turns, threadID: snapshot.id)
+        }
         return .init(
-            threads: response.data.map { Self.threadSnapshot(from: $0, includesTurns: false) },
+            threads: snapshots,
             nextCursor: response.nextCursor,
             backwardsCursor: response.backwardsCursor
         )
@@ -761,104 +999,61 @@ public actor CodexAppServer {
     /// - Throws: A transport, JSON-RPC, or app-server request error.
     public func rateLimits() async throws -> CodexRateLimits {
         let response = try await client.send(AppServerAPI.Account.RateLimits.Read.Request())
+        await router.replaceRateLimits(with: response)
         return .init(appServer: response)
-    }
-
-    /// Starts an API-key login flow.
-    ///
-    /// - Parameter apiKey: The OpenAI API key to register with Codex.
-    /// - Returns: The login handle reported by the app-server.
-    /// - Throws: A transport, JSON-RPC, or app-server login error.
-    @discardableResult
-    public func loginAPIKey(_ apiKey: String) async throws -> CodexLoginHandle {
-        let response = try await client.send(
-            AppServerAPI.Account.Login.Start.Request(
-                params: .init(type: "apiKey", apiKey: apiKey)
-            ))
-        return try Self.loginHandle(from: response)
     }
 
     /// Starts a ChatGPT browser login flow.
     ///
     /// - Returns: A login handle containing the browser authentication URL.
     /// - Throws: A transport, JSON-RPC, or app-server login error.
-    public func loginChatGPT() async throws -> CodexLoginHandle {
-        let response = try await client.send(
-            AppServerAPI.Account.Login.Start.Request(
-                params: .init(type: "chatgpt")
-            ))
-        return try Self.loginHandle(from: response)
-    }
-
-    /// Starts a ChatGPT browser login flow with native web-authentication support.
-    ///
-    /// - Parameter nativeWebAuthentication: The native callback scheme the host can receive.
-    /// - Returns: A ChatGPT login result containing the browser authentication URL and any
-    ///   native web-authentication information accepted by the app-server.
-    /// - Throws: A transport, JSON-RPC, or app-server login error.
     public func loginChatGPT(
-        nativeWebAuthentication: CodexNativeWebAuthentication
-    ) async throws -> CodexChatGPTLogin {
-        let response = try await client.send(
-            AppServerAPI.Account.Login.Start.Request(
-                params: .init(
-                    type: "chatgpt",
-                    nativeWebAuthentication: .init(
-                        callbackURLScheme: nativeWebAuthentication.callbackURLScheme
-                    )
+        accountReadinessTimeout: Duration? = nil
+    ) async throws -> CodexLoginHandle {
+        let state = try await loginRegistry.reserve(
+            readinessTimeout: accountReadinessTimeout,
+            cancel: { [client] id, deadline in
+                let response: AppServerAPI.Account.Login.Cancel.Response = try await client.send(
+                    method: AppServerAPI.Account.Login.Cancel.Request.method,
+                    params: AppServerAPI.Account.Login.Cancel.Params(loginID: id.rawValue),
+                    responseType: AppServerAPI.Account.Login.Cancel.Response.self,
+                    purpose: .operation(AppServerAPI.Account.Login.Cancel.Request.method),
+                    deadline: deadline
                 )
-            ))
-        return try Self.chatGPTLogin(from: response)
-    }
-
-    /// Starts a ChatGPT device-code login flow.
-    ///
-    /// - Returns: A login handle containing device-code instructions.
-    /// - Throws: A transport, JSON-RPC, or app-server login error.
-    public func loginChatGPTDeviceCode() async throws -> CodexLoginHandle {
-        let response = try await client.send(
-            AppServerAPI.Account.Login.Start.Request(
-                params: .init(type: "chatgptDeviceCode")
-            ))
-        return try Self.loginHandle(from: response)
-    }
-
-    /// Cancels a pending login flow.
-    ///
-    /// Handles without an app-server login identifier are treated as already complete.
-    ///
-    /// - Parameter handle: The login handle returned from a login-start method.
-    /// - Throws: A transport, JSON-RPC, or app-server login error.
-    public func cancelLogin(_ handle: CodexLoginHandle) async throws {
-        guard let id = handle.id else {
-            return
+                switch response.status {
+                case "canceled", "notFound":
+                    return .cancelled
+                default:
+                    throw CodexAppServerError.malformedNotification(.init(
+                        method: "account/login/cancel response",
+                        message: "Unknown cancel status \(response.status).",
+                        rawData: nil
+                    ))
+                }
+            },
+            closeConnection: { [connectionLease] in
+                await connectionLease.closeConnection()
+            }
+        )
+        do {
+            let response = try await client.send(
+                AppServerAPI.Account.Login.Start.Request(params: .init(type: "chatgpt")),
+                onPostWriteCancellation: { [loginRegistry] response in
+                    let (id, url) = try Self.chatGPTLoginIdentity(from: response)
+                    let handle = try await loginRegistry.bind(
+                        state,
+                        id: id,
+                        authenticationURL: url
+                    )
+                    _ = try await handle.cancel()
+                }
+            )
+            let (id, url) = try Self.chatGPTLoginIdentity(from: response)
+            return try await loginRegistry.bind(state, id: id, authenticationURL: url)
+        } catch {
+            await loginRegistry.abandon(state)
+            throw error
         }
-        try await cancelLogin(id: id)
-    }
-
-    /// Cancels a pending login flow by identifier.
-    ///
-    /// - Parameter id: The app-server login identifier.
-    /// - Throws: A transport, JSON-RPC, or app-server login error.
-    public func cancelLogin(id: CodexLoginHandle.ID) async throws {
-        let _: AppServerAPI.Account.Login.Cancel.Response = try await client.send(
-            AppServerAPI.Account.Login.Cancel.Request(params: .init(loginID: id.rawValue))
-        )
-    }
-
-    /// Completes a native web-authentication login flow with the callback URL.
-    ///
-    /// - Parameters:
-    ///   - id: The app-server login identifier.
-    ///   - callbackURL: The callback URL returned by the native web-authentication session.
-    /// - Throws: A transport, JSON-RPC, or app-server login error.
-    public func completeLogin(id: CodexLoginHandle.ID, callbackURL: URL) async throws {
-        let _: EmptyResponse = try await client.send(
-            AppServerAPI.Account.Login.Complete.Request(params: .init(
-                loginID: id.rawValue,
-                callbackURL: callbackURL.absoluteString
-            ))
-        )
     }
 
     /// Logs out of the active Codex account.
@@ -886,80 +1081,33 @@ public actor CodexAppServer {
         )
     }
 
-    private func thread(from snapshot: AppServerAPI.Thread.Snapshot, model: String? = nil) -> CodexThread {
-        CodexThread(
-            id: .init(rawValue: snapshot.id),
+    private func thread(
+        from snapshot: AppServerAPI.Thread.Snapshot,
+        model: String? = nil
+    ) async -> CodexThread {
+        let threadID = CodexThreadID(rawValue: snapshot.id)
+        await router.seedTurns(
+            snapshot.turns.map(Self.turnSnapshots(from:)),
+            threadID: threadID
+        )
+        return CodexThread(
+            id: threadID,
             workspace: snapshot.cwd.map { URL(fileURLWithPath: $0, isDirectory: true) },
             model: model,
             client: client,
-            router: router
+            router: router,
+            connectionLease: connectionLease
         )
-    }
-
-    private func rememberReviewCleanupIdentity(_ identity: CodexReviewIdentity) {
-        let sourceThreadID = identity.sourceThreadID
-        if retainedReviewCleanupIdentitiesBySourceThreadID[sourceThreadID, default: []]
-            .contains(identity) == false {
-            retainedReviewCleanupIdentitiesBySourceThreadID[sourceThreadID, default: []].append(identity)
-        }
-    }
-
-    private func rememberReviewCleanupIdentity(
-        for cancellation: CodexTurnCancellation,
-        sourceIdentity: CodexReviewIdentity,
-        model: String?
-    ) {
-        let cancelledIdentity = Self.reviewCleanupIdentity(
-            for: cancellation,
-            sourceIdentity: sourceIdentity,
-            model: model
-        )
-        rememberReviewCleanupIdentity(cancelledIdentity)
-    }
-
-    private func discardReviewRestartContexts(sourceThreadID: CodexThreadID) {
-        reviewRestartContextsByTokenID = reviewRestartContextsByTokenID.filter { _, context in
-            context.interruptedIdentity.sourceThreadID != sourceThreadID
-        }
-    }
-
-    private func startThreadIgnoringCallerCancellation(
-        in workspace: URL,
-        instructions: CodexInstructions?,
-        options: CodexThread.Options
-    ) async throws -> CodexThread {
-        try await Task.detached { [self] in
-            try await startThread(
-                in: workspace,
-                instructions: instructions,
-                options: options
-            )
-        }.value
-    }
-
-    private func startReviewIgnoringCallerCancellation(
-        thread: CodexThread,
-        target: CodexReviewTarget,
-        delivery: CodexReviewDelivery,
-        transcriptErrorHandlingPolicy: CodexTranscriptErrorHandlingPolicy
-    ) async throws -> CodexReviewSession {
-        try await Task.detached {
-            try await thread.startReview(
-                target: target,
-                delivery: delivery,
-                transcriptErrorHandlingPolicy: transcriptErrorHandlingPolicy
-            )
-        }.value
     }
 
     private func deleteThreadIgnoringCallerCancellation(_ id: CodexThreadID) async {
-        await Task.detached { [self] in
+        await Task { [self] in
             try? await deleteThread(id)
         }.value
     }
 
     private func cleanupReviewIgnoringCallerCancellation(_ identity: CodexReviewIdentity) async {
-        await Task.detached { [self] in
+        _ = await Task { [self] in
             await cleanupReview(identity)
         }.value
     }
@@ -975,6 +1123,12 @@ public actor CodexAppServer {
             reviewThreadID: cancellation.threadID == sourceIdentity.sourceThreadID ? nil : cancellation.threadID,
             model: model ?? sourceIdentity.model
         )
+    }
+
+    private nonisolated static func interruptLateReviewSession(
+        _ review: CodexReviewSession
+    ) async throws {
+        _ = try await interruptAndAwaitTerminal(review.response)
     }
 
     private nonisolated static func orderedReviewCleanupThreadIDs(
@@ -1005,7 +1159,7 @@ public actor CodexAppServer {
             name: snapshot.name,
             preview: snapshot.preview,
             modelProvider: snapshot.modelProvider,
-            sourceKind: snapshot.sourceKind.map(CodexThreadSourceKind.init(rawValue:)),
+            sourceKind: snapshot.sourceKind,
             createdAt: snapshot.createdAt.map { Date(timeIntervalSince1970: TimeInterval($0)) },
             updatedAt: snapshot.updatedAt.map { Date(timeIntervalSince1970: TimeInterval($0)) },
             recencyAt: snapshot.recencyAt.map { Date(timeIntervalSince1970: TimeInterval($0)) },
@@ -1062,13 +1216,74 @@ public actor CodexAppServer {
         from turns: [AppServerAPI.Turn.Payload]
     ) -> [CodexTurnSnapshot] {
         turns.map {
-            CodexTurnSnapshot(
+            let status = CodexTurnStatus(rawValue: $0.status)
+            let state: CodexTurnSnapshot.State = switch status {
+            case .inProgress:
+                .inProgress
+            case .completed:
+                .completed
+            case .interrupted:
+                .interrupted
+            case .failed:
+                .failed(Self.requiredTurnError(from: $0))
+            case .unknown(let rawValue):
+                .unknown(rawValue: rawValue, error: $0.error.map(Self.turnError(from:)))
+            }
+            return CodexTurnSnapshot(
                 id: .init(rawValue: $0.id),
-                status: $0.status.map(CodexTurnStatus.init(rawValue:)),
-                errorMessage: $0.error?.message,
+                state: state,
                 itemsLoadState: $0.itemsLoadState ?? ($0.items == nil ? .notLoaded : .full),
-                items: AppServerThreadItemMapping.threadItems(from: $0.items)
+                items: AppServerThreadItemMapping.threadItems(from: $0.items),
+                startedAt: $0.startedAt.map { Date(timeIntervalSince1970: TimeInterval($0)) },
+                completedAt: $0.completedAt.map { Date(timeIntervalSince1970: TimeInterval($0)) },
+                duration: $0.durationMS.map { .milliseconds(Int64($0)) }
             )
+        }
+    }
+
+    private nonisolated static func requiredTurnError(
+        from turn: AppServerAPI.Turn.Payload
+    ) -> CodexTurnError {
+        guard let error = turn.error else {
+            preconditionFailure("Strict Turn.Payload decoding requires failed turns to carry an error.")
+        }
+        return turnError(from: error)
+    }
+
+    package nonisolated static func turnError(
+        from error: AppServerAPI.Turn.Error
+    ) -> CodexTurnError {
+        .init(
+            message: error.message,
+            info: error.codexErrorInfo.map(Self.errorInfo(from:)),
+            additionalDetails: error.additionalDetails
+        )
+    }
+
+    private nonisolated static func errorInfo(
+        from info: AppServerAPI.CodexErrorInfo
+    ) -> CodexErrorInfo {
+        switch info {
+        case .contextWindowExceeded: .contextWindowExceeded
+        case .sessionBudgetExceeded: .sessionBudgetExceeded
+        case .usageLimitExceeded: .usageLimitExceeded
+        case .serverOverloaded: .serverOverloaded
+        case .cyberPolicy: .cyberPolicy
+        case .httpConnectionFailed(let status): .httpConnectionFailed(httpStatusCode: status)
+        case .responseStreamConnectionFailed(let status):
+            .responseStreamConnectionFailed(httpStatusCode: status)
+        case .internalServerError: .internalServerError
+        case .unauthorized: .unauthorized
+        case .badRequest: .badRequest
+        case .threadRollbackFailed: .threadRollbackFailed
+        case .sandboxError: .sandboxError
+        case .responseStreamDisconnected(let status):
+            .responseStreamDisconnected(httpStatusCode: status)
+        case .responseTooManyFailedAttempts(let status):
+            .responseTooManyFailedAttempts(httpStatusCode: status)
+        case .activeTurnNotSteerable(let kind): .activeTurnNotSteerable(turnKind: kind)
+        case .other: .other
+        case .unknown(let rawValue): .unknown(rawValue: rawValue)
         }
     }
 
@@ -1085,7 +1300,9 @@ public actor CodexAppServer {
         return turnSnapshots(from: turns)
     }
 
-    private nonisolated static func account(from snapshot: AppServerAPI.Account.Snapshot) -> CodexAccount {
+    package nonisolated static func account(
+        from snapshot: AppServerAPI.Account.Snapshot
+    ) -> CodexAccount {
         .init(
             id: snapshot.id,
             kind: .init(rawValue: snapshot.kind.rawValue) ?? .chatGPT,
@@ -1094,121 +1311,24 @@ public actor CodexAppServer {
         )
     }
 
-    private nonisolated static func loginHandle(
+    private nonisolated static func chatGPTLoginIdentity(
         from response: AppServerAPI.Account.Login.Response
-    ) throws -> CodexLoginHandle {
-        switch response {
-        case .apiKey:
-            return .apiKey
-        case .chatgpt(let loginID, let authURL, _):
-            guard let url = URL(string: authURL) else {
-                throw CodexAppServerError.jsonRPC(
-                    code: -32602, message: "Invalid ChatGPT authentication URL.")
-            }
-            return .chatGPT(id: .init(rawValue: loginID), authenticationURL: url)
-        case .chatgptDeviceCode(let loginID, let verificationURL, let userCode):
-            guard let url = URL(string: verificationURL) else {
-                throw CodexAppServerError.jsonRPC(
-                    code: -32602, message: "Invalid ChatGPT device-code verification URL.")
-            }
-            return .chatGPTDeviceCode(
-                id: .init(rawValue: loginID),
-                verificationURL: url,
-                userCode: userCode
-            )
-        case .chatgptAuthTokens:
-            return .apiKey
-        }
-    }
-
-    private nonisolated static func chatGPTLogin(
-        from response: AppServerAPI.Account.Login.Response
-    ) throws -> CodexChatGPTLogin {
-        guard case .chatgpt(let loginID, let authURL, let nativeWebAuthentication) = response else {
-            throw CodexAppServerError.jsonRPC(
-                code: -32602, message: "Expected ChatGPT login response."
-            )
+    ) throws -> (CodexLoginHandle.ID, URL) {
+        guard case .chatgpt(let loginID, let authURL) = response else {
+            throw CodexAppServerError.malformedNotification(.init(
+                method: "account/login/start response",
+                message: "Expected ChatGPT login response.",
+                rawData: nil
+            ))
         }
         guard let url = URL(string: authURL) else {
-            throw CodexAppServerError.jsonRPC(
-                code: -32602, message: "Invalid ChatGPT authentication URL."
-            )
+            throw CodexAppServerError.malformedNotification(.init(
+                method: "account/login/start response",
+                message: "Invalid ChatGPT authentication URL.",
+                rawData: nil
+            ))
         }
-        return CodexChatGPTLogin(
-            id: .init(rawValue: loginID),
-            authenticationURL: url,
-            nativeWebAuthentication: nativeWebAuthentication.map {
-                CodexNativeWebAuthentication(callbackURLScheme: $0.callbackURLScheme)
-            }
-        )
+        return (.init(rawValue: loginID), url)
     }
 
-    private nonisolated static func accountEvent(
-        from notification: JSONRPC.Notification
-    ) -> CodexAccountEvent? {
-        switch notification.method {
-        case "account/login/completed":
-            do {
-                let payload = try JSONDecoder().decode(
-                    AppServerAccountLoginCompletedNotification.self,
-                    from: notification.params
-                )
-                return .loginCompleted(.init(
-                    loginID: payload.loginID.map(CodexLoginHandle.ID.init(rawValue:)),
-                    success: payload.success,
-                    error: payload.error
-                ))
-            } catch {
-                return .malformed(method: notification.method, message: error.localizedDescription)
-            }
-        case "account/updated":
-            return .accountUpdated
-        case "account/rateLimits/updated":
-            do {
-                let payload = try JSONDecoder().decode(
-                    AppServerAccountRateLimitsUpdatedNotification.self,
-                    from: notification.params
-                )
-                guard AppServerAPI.Account.RateLimits.Response
-                    .isCodexRateLimit(payload.rateLimits.limitID)
-                else {
-                    return nil
-                }
-                return .rateLimitsUpdated(.init(
-                    appServer: .init(rateLimits: payload.rateLimits)
-                ))
-            } catch {
-                return .malformed(method: notification.method, message: error.localizedDescription)
-            }
-        case let method where method.hasPrefix("account/"):
-            return .unknown(.init(method: notification.method, params: notification.params))
-        default:
-            return nil
-        }
-    }
-
-}
-
-private struct CodexReviewRestartContext: Sendable {
-    var interruptedIdentity: CodexReviewIdentity
-    var rollbackThreadID: CodexThreadID
-    var rollbackModel: String?
-    var rollbackCompleted: Bool = false
-    var isRestarting: Bool = false
-}
-
-private struct AppServerAccountLoginCompletedNotification: Decodable, Equatable, Sendable {
-    var error: String?
-    var loginID: String?
-    var success: Bool
-
-    enum CodingKeys: String, CodingKey {
-        case error
-        case loginID = "loginId"
-        case success
-    }
-}
-
-private struct AppServerAccountRateLimitsUpdatedNotification: Decodable, Equatable, Sendable {
-    var rateLimits: AppServerAPI.Account.RateLimits.Snapshot
 }

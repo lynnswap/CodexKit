@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import Testing
 
 import CodexAppServerKitTesting
@@ -109,7 +110,7 @@ struct CodexAppServerKitTests {
 
         try """
             #!/bin/sh
-            printf '%s\\n' '{"id":"approval-1","method":"item/commandExecution/requestApproval","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"item-1"}}'
+            printf '%s\\n' '{"id":"approval-1","method":"item/commandExecution/requestApproval","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"item-1","startedAtMs":123}}'
             IFS= read -r line
             printf '%s\\n' "$line" > "$RESPONSE_PATH"
             """
@@ -125,18 +126,18 @@ struct CodexAppServerKitTests {
                 executable: executableURL.path,
                 arguments: [],
                 environment: ["RESPONSE_PATH": responseURL.path],
-                codexHomeURL: rootURL.appendingPathComponent("codex-home", isDirectory: true),
-                serverRequestHandler: { request in
-                    await recorder.append(request)
-                    return try .result(["decision": "accept"])
-                }
-            )
+                codexHomeURL: rootURL.appendingPathComponent("codex-home", isDirectory: true)
+            ),
+            connectionEventHub: ConnectionEventHub()
         )
-        defer {
-            Task {
-                await transport.close()
+        let harness = await CodexAppServerTestConnectionHarness.start(
+            transport: transport,
+            processTerminationToken: transport.processTerminationToken,
+            handler: { request in
+                await recorder.append(request)
+                return .approval(.accept)
             }
-        }
+        )
 
         let wroteResponse = await eventually(attempts: 100) {
             FileManager.default.fileExists(atPath: responseURL.path)
@@ -144,12 +145,15 @@ struct CodexAppServerKitTests {
         #expect(wroteResponse)
 
         let request = try #require(await recorder.requests().first)
-        #expect(request.id == .string("approval-1"))
         #expect(request.method == "item/commandExecution/requestApproval")
-        let requestParams = try #require(
-            JSONSerialization.jsonObject(with: request.params) as? [String: Any]
-        )
-        #expect(requestParams["threadId"] as? String == "thread-1")
+        guard case .commandExecutionApproval(let approval) = request else {
+            Issue.record("Expected a command execution approval request.")
+            return
+        }
+        #expect(approval.threadID == "thread-1")
+        #expect(approval.turnID == "turn-1")
+        #expect(approval.itemID == "item-1")
+        #expect(approval.startedAtMs == 123)
 
         let responseData = try Data(contentsOf: responseURL)
         let response = try #require(
@@ -158,6 +162,7 @@ struct CodexAppServerKitTests {
         #expect(response["id"] as? String == "approval-1")
         let result = try #require(response["result"] as? [String: Any])
         #expect(result["decision"] as? String == "accept")
+        await harness.close()
     }
 
     @Test func processSpawnClosePlanPreservesStandardIOFileDescriptors() {
@@ -168,7 +173,11 @@ struct CodexAppServerKitTests {
     }
 
     @Test func testRuntimeStartsAppServerWithoutLaunchingProcess() async throws {
-        let runtime = try await CodexAppServerTestRuntime.start(codexHome: "/tmp/codex")
+        let runtime = try await CodexAppServerTestRuntime.start(configuration: .init(
+            localProcess: .init(
+                codexHomeURL: URL(fileURLWithPath: "/tmp/codex", isDirectory: true)
+            )
+        ))
         try await runtime.transport.enqueueThreadStart(threadID: "thread-test", model: "gpt-5")
 
         let thread = try await runtime.server.startThread(
@@ -184,13 +193,138 @@ struct CodexAppServerKitTests {
         #expect(await runtime.transport.recordedNotifications().map(\.method) == [
             "initialized"
         ])
+        await runtime.close()
+    }
+
+    @Test func publicConfigurationRoutesTypedServerRequestsToTheHost() async throws {
+        let configuration = CodexAppServer.Configuration { request in
+            guard case .commandExecutionApproval(let approval) = request else {
+                return try await CodexAppServer.Configuration.defaultServerRequestHandler(
+                    request: request
+                )
+            }
+            #expect(approval.command == "git status")
+            return .approval(.accept)
+        }
+        let runtime = try await CodexAppServerTestRuntime.start(configuration: configuration)
+        let requestID = CodexServerRequestID.string("approval-public-handler")
+
+        try await runtime.transport.emitServerRequest(
+            id: requestID,
+            method: "item/commandExecution/requestApproval",
+            params: Data(
+                #"{"threadId":"thread-1","turnId":"turn-1","itemId":"item-1","startedAtMs":123,"command":"git status"}"#.utf8
+            )
+        )
+
+        let response = await runtime.transport.serverRequestResponse(for: requestID)
+        #expect(response == .result(Data(#"{"decision":"accept"}"#.utf8)))
+        await runtime.close()
+    }
+
+    @Test func testRuntimeUsesTypedConfigurationFixtures() async throws {
+        let configURL = URL(fileURLWithPath: "/tmp/codex/config.toml")
+        let layerMetadata = try CodexAppServerTestConfigurationLayerMetadata(
+            source: .user(file: configURL, profile: nil),
+            version: "config-v1"
+        )
+        let result = try CodexAppServerTestConfigurationReadResult(
+            configuration: .init(
+                model: "gpt-5-codex",
+                reviewModel: "gpt-5-codex-review",
+                reasoningEffort: .high,
+                serviceTier: "flex"
+            ),
+            origins: ["model": layerMetadata],
+            layers: [try .init(
+                metadata: layerMetadata,
+                configuration: .object(["model": .string("gpt-5-codex")])
+            )]
+        )
+        let runtime = try await CodexAppServerTestRuntime.start()
+        try await runtime.transport.enqueueConfiguration(result)
+
+        let configuration = try await runtime.server.configuration()
+
+        #expect(configuration == result.configuration)
+        #expect(
+            await runtime.transport.recordedRequests(for: .configurationRead).map(\.request)
+                == [.configurationRead]
+        )
+        await runtime.close()
+    }
+
+    @Test func typedConfigurationWriteFixturePreservesOverrideContract() async throws {
+        let configURL = URL(fileURLWithPath: "/tmp/codex/config.toml")
+        let layerMetadata = try CodexAppServerTestConfigurationLayerMetadata(
+            source: .system(file: URL(fileURLWithPath: "/etc/codex/managed.toml")),
+            version: "managed-v1"
+        )
+        let writeResult = try CodexAppServerTestConfigurationWriteResult(
+            status: .okOverridden,
+            version: "config-v2",
+            fileURL: configURL,
+            overriddenMetadata: try .init(
+                message: "Managed configuration overrides this value.",
+                overridingLayer: layerMetadata,
+                effectiveValue: .string("gpt-5-codex")
+            )
+        )
+        let runtime = try await CodexAppServerTestRuntime.start()
+        try await runtime.transport.enqueueConfigurationWrite(writeResult)
+        var patch = CodexConfigurationPatch()
+        patch.setReviewModel("gpt-5-codex-review")
+
+        try await runtime.server.updateConfiguration(patch)
+
+        let request = try #require(
+            await runtime.transport.recordedRequests(for: .configurationUpdate).last
+        )
+        #expect(request.request == .configurationUpdate(patch))
+        await runtime.close()
+    }
+
+    @Test func configurationFixturesRejectInvalidOwnershipMetadata() throws {
+        #expect(throws: CodexAppServerTestError.invalidFixture(
+            "configuration layer file must be an absolute file URL"
+        )) {
+            _ = try CodexAppServerTestConfigurationLayerMetadata(
+                source: .system(file: URL(string: "https://example.com/config.toml")!),
+                version: "config-v1"
+            )
+        }
+
+        let configURL = URL(fileURLWithPath: "/tmp/codex/config.toml")
+        #expect(throws: CodexAppServerTestError.invalidFixture(
+            "an overridden configuration write requires override metadata"
+        )) {
+            _ = try CodexAppServerTestConfigurationWriteResult(
+                status: .okOverridden,
+                version: "config-v1",
+                fileURL: configURL
+            )
+        }
+    }
+
+    @Test func manualDeadlineClockResumesOnlyAfterExplicitAdvance() async throws {
+        let clock = CodexAppServerTestDeadlineClock()
+        let sleeper = Task {
+            try await clock.codexDeadlineClock.sleep(.seconds(5))
+        }
+
+        try await clock.waitForSleeperCount(1)
+        clock.advance(by: .seconds(5))
+        try await sleeper.value
+        clock.close()
     }
 
     @Test func testTransportHoldsRequestsAtExplicitGate() async throws {
         let transport = CodexAppServerTestTransport()
         let gate = CodexAppServerTestGate()
         await transport.holdNext(method: "ping", gate: gate)
-        let client = AppServerClient(transport: transport)
+        try await transport.enqueueEmpty(for: "ping")
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
 
         let task = Task {
             let _: EmptyResponse = try await client.send(
@@ -205,6 +339,55 @@ struct CodexAppServerKitTests {
 
         await gate.open()
         try await task.value
+        await harness.close()
+    }
+
+    @Test func testGateCancellationThrowsAndRemovesItsWaiter() async throws {
+        let gate = CodexAppServerTestGate()
+        let task = Task {
+            try await gate.wait()
+        }
+        await gate.waitUntilBlocked()
+
+        task.cancel()
+
+        await #expect(throws: CancellationError.self) {
+            try await task.value
+        }
+        await gate.open()
+
+        let closedGate = CodexAppServerTestGate()
+        await closedGate.close()
+        await #expect(throws: CancellationError.self) {
+            try await closedGate.wait()
+        }
+    }
+
+    @Test func unstubbedTestTransportRequestFailsWithRequestIdentity() async throws {
+        let transport = CodexAppServerTestTransport()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+
+        do {
+            let _: EmptyResponse = try await harness.client.send(
+                method: "unstubbed/probe",
+                params: EmptyResponse(),
+                responseType: EmptyResponse.self
+            )
+            Issue.record("Expected an unstubbed test transport request to fail.")
+        } catch let error as CodexAppServerError {
+            guard case .request(let failure) = error else {
+                Issue.record("Expected a typed request failure, got \(error).")
+                return
+            }
+            #expect(failure.requestID == 1)
+            #expect(failure.method == "unstubbed/probe")
+            #expect(failure.purpose == .operation("unstubbed/probe"))
+            #expect(failure.kind == .transport(.contractViolation(
+                message: "No test response is configured for unstubbed/probe."
+            )))
+        }
+
+        await harness.close()
     }
 
     @Test func testTransportReservesQueuedResponseBeforeGateWait() async throws {
@@ -217,7 +400,8 @@ struct CodexAppServerKitTests {
         try await transport.enqueue(PingResponse(value: "second"), for: "ping")
         let gate = CodexAppServerTestGate()
         await transport.holdNext(method: "ping", gate: gate)
-        let client = AppServerClient(transport: transport)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
 
         let first = Task {
             try await client.send(
@@ -239,13 +423,15 @@ struct CodexAppServerKitTests {
         #expect(try await second.value == PingResponse(value: "second"))
         await gate.open()
         #expect(try await first.value == PingResponse(value: "first"))
+        await harness.close()
     }
 
     @Test func initializeSendsHandshakeAndInitializedNotification() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueue(
             AppServerAPI.Initialize.Response(codexHome: "/tmp/codex"), for: "initialize")
-        let client = AppServerClient(transport: transport)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
 
         let response = try await client.initialize(clientName: "TestClient", clientVersion: "1")
 
@@ -256,6 +442,47 @@ struct CodexAppServerKitTests {
         let decoded = try JSONDecoder().decode(AppServerAPI.Initialize.Params.self, from: params)
         #expect(decoded.clientInfo.name == "TestClient")
         #expect(decoded.clientInfo.version == "1")
+        await harness.close()
+    }
+
+    @Test func concurrentInitializeCallsShareOneHandshake() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueue(
+            AppServerAPI.Initialize.Response(codexHome: "/tmp/codex"), for: "initialize")
+        let gate = CodexAppServerTestGate()
+        await transport.hold(method: "initialize", gate: gate)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+
+        let first = Task {
+            try await client.initialize(clientName: "TestClient", clientVersion: "1")
+        }
+        await transport.waitForRequest(method: "initialize")
+        let gateOpener = Task {
+            do {
+                try await withTimeout {
+                    while await client.initializationWaiterCountForTesting() == 0 {
+                        await Task.yield()
+                    }
+                }
+            } catch {
+                await gate.open()
+                throw error
+            }
+            await gate.open()
+        }
+
+        let secondResponse = try await client.initialize(
+            clientName: "TestClient",
+            clientVersion: "1"
+        )
+        let firstResponse = try await first.value
+        try await gateOpener.value
+
+        #expect(firstResponse == secondResponse)
+        #expect(await transport.recordedRequests(method: "initialize").count == 1)
+        #expect(await transport.recordedNotifications().map(\.method) == ["initialized"])
+        await harness.close()
     }
 
     @Test func appServerClosesTransportWhenInitializationFails() async throws {
@@ -276,11 +503,8 @@ struct CodexAppServerKitTests {
             AppServerAPI.Thread.Start.Response(threadID: "thread-1", model: "gpt-5"),
             for: "thread/start"
         )
-        let client = AppServerClient(transport: transport)
-        let server = CodexAppServer(
-            client: client,
-            router: CodexAppServerNotificationRouter(client: client)
-        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let server = harness.server
         let workspace = URL(fileURLWithPath: "/tmp/project", isDirectory: true)
 
         let thread = try await server.startThread(
@@ -348,10 +572,147 @@ struct CodexAppServerKitTests {
         #expect(params.model == nil)
     }
 
+    @Test func resumedThreadSeedsNestedTerminalReceivedBeforeResumeResponse() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let gate = CodexAppServerTestGate()
+        try await runtime.transport.enqueueThreadResume(.init(
+            id: "thread-resume-terminal",
+            turns: [.init(id: "turn-resume-terminal", state: .inProgress)]
+        ))
+        await runtime.transport.holdNext(method: "thread/resume", gate: gate)
+
+        let resumeTask = Task {
+            try await runtime.server.resumeThread("thread-resume-terminal")
+        }
+        await runtime.transport.waitForRequest(method: "thread/resume")
+        try await runtime.transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(
+                threadID: "thread-resume-terminal",
+                turn: .init(
+                    id: "turn-resume-terminal",
+                    status: "completed"
+                )
+            )
+        )
+        await gate.open()
+        let thread = try await resumeTask.value
+        try await runtime.transport.emitServerNotification(
+            method: "thread/closed",
+            params: ThreadIDParams(threadID: "thread-resume-terminal")
+        )
+
+        let events = try await collect(thread.events)
+        #expect(events.contains(.terminal(.completed(.init(turnID: "turn-resume-terminal")))))
+    }
+
+    @Test func resumedThreadTransfersNestedProtocolViolationAfterAssociation() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let gate = CodexAppServerTestGate()
+        try await runtime.transport.enqueueThreadResume(.init(
+            id: "thread-resume-malformed",
+            turns: [.init(id: "turn-resume-malformed", state: .inProgress)]
+        ))
+        await runtime.transport.holdNext(method: "thread/resume", gate: gate)
+
+        let resumeTask = Task {
+            try await runtime.server.resumeThread("thread-resume-malformed")
+        }
+        await runtime.transport.waitForRequest(method: "thread/resume")
+        try await runtime.transport.emitServerNotificationJSON(
+            method: "turn/completed",
+            json: #"{"turn":{"id":"turn-resume-malformed"}}"#
+        )
+        await gate.open()
+        let thread = try await resumeTask.value
+
+        do {
+            _ = try await collect(thread.events)
+            Issue.record("Expected associated malformed terminal failure.")
+        } catch let error as CodexAppServerError {
+            guard case .connectionTerminated(.transportFailure(
+                .protocolViolation(_, let rawData)
+            )) = error else {
+                Issue.record("Expected connection protocol violation, got \(error).")
+                return
+            }
+            #expect(rawData == Data(#"{"turn":{"id":"turn-resume-malformed"}}"#.utf8))
+        }
+    }
+
+    @Test func threadReadSeedsNestedTerminalReceivedBeforeReadResponse() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-read-terminal"))
+        let thread = try await runtime.server.resumeThread("thread-read-terminal")
+        let gate = CodexAppServerTestGate()
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: "thread-read-terminal",
+            turns: [.init(id: "turn-read-terminal", state: .inProgress)]
+        ))
+        await runtime.transport.holdNext(method: "thread/read", gate: gate)
+
+        let readTask = Task { try await thread.read(includeTurns: true) }
+        await runtime.transport.waitForRequest(method: "thread/read")
+        try await runtime.transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(
+                threadID: "thread-read-terminal",
+                turn: .init(id: "turn-read-terminal", status: "completed")
+            )
+        )
+        await gate.open()
+        _ = try await readTask.value
+        try await runtime.transport.emitServerNotification(
+            method: "thread/closed",
+            params: ThreadIDParams(threadID: "thread-read-terminal")
+        )
+
+        let events = try await collect(thread.events)
+        #expect(events.contains(.terminal(.completed(.init(turnID: "turn-read-terminal")))))
+    }
+
+    @Test func turnListSeedsNestedTerminalReceivedBeforeListResponse() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-list-turns-terminal"))
+        let thread = try await runtime.server.resumeThread("thread-list-turns-terminal")
+        let gate = CodexAppServerTestGate()
+        let listedTurn = try CodexAppServerTestTurn(
+            snapshot: .init(id: "turn-list-turns-terminal", state: .inProgress),
+            items: []
+        )
+        try await runtime.transport.enqueueThreadTurns(.init(turns: [listedTurn]))
+        await runtime.transport.holdNext(method: "thread/turns/list", gate: gate)
+
+        let listTask = Task { try await thread.listTurns() }
+        await runtime.transport.waitForRequest(method: "thread/turns/list")
+        try await runtime.transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(
+                threadID: "thread-list-turns-terminal",
+                turn: .init(
+                    id: "turn-list-turns-terminal",
+                    status: "completed"
+                )
+            )
+        )
+        await gate.open()
+        _ = try await listTask.value
+        try await runtime.transport.emitServerNotification(
+            method: "thread/closed",
+            params: ThreadIDParams(threadID: "thread-list-turns-terminal")
+        )
+
+        let events = try await collect(thread.events)
+        #expect(events.contains(.terminal(.completed(.init(turnID: "turn-list-turns-terminal")))))
+    }
+
     @Test func appServerStartReviewStartsThreadThenReview() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         try await runtime.transport.enqueueThreadStart(threadID: "thread-source", model: "gpt-5")
-        try await runtime.transport.enqueueReviewStart(turnID: "turn-review")
+        try await runtime.transport.enqueueReviewStart(
+            turnID: "turn-review",
+            reviewThreadID: "thread-source"
+        )
         let workspace = URL(fileURLWithPath: "/tmp/project", isDirectory: true)
 
         let review = try await runtime.server.startReview(
@@ -359,7 +720,7 @@ struct CodexAppServerKitTests {
             target: .baseBranch("main"),
             instructions: .init(base: "Base", developer: "Developer"),
             options: .init(model: "gpt-5"),
-            transcriptErrorHandlingPolicy: .revertTranscript
+            delivery: .inline
         )
 
         #expect(review.threadID == "thread-source")
@@ -398,9 +759,10 @@ struct CodexAppServerKitTests {
             ),
             for: "review/start"
         )
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        let thread = CodexThread(id: "thread-1", model: "gpt-5", client: client, router: router)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
+        let thread = CodexThread(id: "thread-1", model: "gpt-5", client: client, router: router, connectionLease: harness.lease)
 
         let review = try await thread.startReview(target: .baseBranch("main"))
 
@@ -409,6 +771,35 @@ struct CodexAppServerKitTests {
         #expect(review.model == "gpt-5")
         #expect(review.identity.reviewThreadID == nil)
         #expect(review.identity.model == "gpt-5")
+    }
+
+    @Test func reviewStartRequiresTheResponseEventThreadIdentity() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueJSON(
+            #"{"turn":{"id":"turn-review","status":"inProgress"}}"#,
+            for: "review/start"
+        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let thread = CodexThread(
+            id: "thread-1",
+            client: harness.client,
+            router: harness.router,
+            connectionLease: harness.lease
+        )
+
+        do {
+            _ = try await thread.startReview(target: .baseBranch("main"))
+            Issue.record("Expected a missing reviewThreadId to fail decoding.")
+        } catch let error as CodexAppServerError {
+            guard case .request(let failure) = error,
+                  case .invalidResponse = failure.kind else {
+                Issue.record("Expected a typed invalid response, got \(error).")
+                await harness.close()
+                return
+            }
+            #expect(failure.method == "review/start")
+        }
+        await harness.close()
     }
 
     @Test func appServerStartReviewDeletesSourceThreadWhenReviewStartFails() async throws {
@@ -533,6 +924,7 @@ struct CodexAppServerKitTests {
             turnID: "turn-review",
             reviewThreadID: "thread-review"
         )
+        try await runtime.transport.enqueueEmpty(for: "turn/interrupt")
         try await runtime.transport.enqueueEmpty(for: "thread/delete")
         try await runtime.transport.enqueueEmpty(for: "thread/delete")
         await runtime.transport.holdNextIgnoringCancellation(
@@ -551,6 +943,14 @@ struct CodexAppServerKitTests {
         await runtime.transport.waitForRequest(method: "review/start")
         task.cancel()
         await reviewStartGate.open()
+        await runtime.transport.waitForRequest(method: "turn/interrupt")
+        try await runtime.transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(
+                threadID: "thread-review",
+                turn: .init(id: "turn-review", status: "interrupted")
+            )
+        )
 
         do {
             _ = try await withTimeout {
@@ -563,6 +963,7 @@ struct CodexAppServerKitTests {
                 "initialize",
                 "thread/start",
                 "review/start",
+                "turn/interrupt",
                 "thread/delete",
                 "thread/delete",
             ])
@@ -573,6 +974,108 @@ struct CodexAppServerKitTests {
         } catch {
             Issue.record("Expected CancellationError, got \(error).")
         }
+        await runtime.close()
+    }
+
+    @Test func standaloneStartThreadDeletesLateIdentityBeforeCancellationReturns() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let startGate = CodexAppServerTestGate()
+        try await runtime.transport.enqueueThreadStart(threadID: "thread-late", model: "gpt-5")
+        try await runtime.transport.enqueueEmpty(for: "thread/delete")
+        await runtime.transport.holdNextIgnoringCancellation(method: "thread/start", gate: startGate)
+
+        let task = Task {
+            try await runtime.server.startThread(
+                in: URL(fileURLWithPath: "/tmp/project", isDirectory: true)
+            )
+        }
+        await runtime.transport.waitForRequest(method: "thread/start")
+        task.cancel()
+        await startGate.open()
+
+        await #expect(throws: CancellationError.self) {
+            try await task.value
+        }
+        #expect(await runtime.transport.recordedRequests().map(\.method) == [
+            "initialize",
+            "thread/start",
+            "thread/delete",
+        ])
+        let delete = try #require(await runtime.transport.recordedRequests().last)
+        #expect(
+            try delete.decodeParams(AppServerAPI.Thread.Delete.Params.self).threadID
+                == "thread-late"
+        )
+    }
+
+    @Test func forkThreadDeletesLateForkBeforeCancellationReturns() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let forkGate = CodexAppServerTestGate()
+        try await runtime.transport.enqueue(
+            AppServerAPI.Thread.Fork.Response(thread: .init(id: "thread-fork")),
+            for: "thread/fork"
+        )
+        try await runtime.transport.enqueueEmpty(for: "thread/delete")
+        await runtime.transport.holdNextIgnoringCancellation(method: "thread/fork", gate: forkGate)
+
+        let task = Task {
+            try await runtime.server.forkThread("thread-source")
+        }
+        await runtime.transport.waitForRequest(method: "thread/fork")
+        task.cancel()
+        await forkGate.open()
+
+        await #expect(throws: CancellationError.self) {
+            try await task.value
+        }
+        #expect(await runtime.transport.recordedRequests().map(\.method) == [
+            "initialize",
+            "thread/fork",
+            "thread/delete",
+        ])
+        let delete = try #require(await runtime.transport.recordedRequests().last)
+        #expect(
+            try delete.decodeParams(AppServerAPI.Thread.Delete.Params.self).threadID
+                == "thread-fork"
+        )
+    }
+
+    @Test func loginChatGPTCancelsLateLoginBeforeCancellationReturns() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let loginGate = CodexAppServerTestGate()
+        try await runtime.transport.enqueueChatGPTLogin(
+            loginID: "login-late",
+            authenticationURL: URL(string: "https://example.test/auth")!
+        )
+        try await runtime.transport.enqueue(
+            AppServerAPI.Account.Login.Cancel.Response(),
+            for: "account/login/cancel"
+        )
+        await runtime.transport.holdNextIgnoringCancellation(
+            method: "account/login/start",
+            gate: loginGate
+        )
+
+        let task = Task {
+            try await runtime.server.loginChatGPT()
+        }
+        await runtime.transport.waitForRequest(method: "account/login/start")
+        task.cancel()
+        await loginGate.open()
+
+        await #expect(throws: CancellationError.self) {
+            try await task.value
+        }
+        #expect(await runtime.transport.recordedRequests().map(\.method) == [
+            "initialize",
+            "account/login/start",
+            "account/login/cancel",
+        ])
+        let cancel = try #require(await runtime.transport.recordedRequests().last)
+        #expect(
+            try cancel.decodeParams(AppServerAPI.Account.Login.Cancel.Params.self).loginID
+                == "login-late"
+        )
     }
 
     @Test func appServerListThreadsSerializesQueryOptions() async throws {
@@ -581,11 +1084,8 @@ struct CodexAppServerKitTests {
             AppServerAPI.Thread.List.Response(data: [], nextCursor: "next"),
             for: "thread/list"
         )
-        let client = AppServerClient(transport: transport)
-        let server = CodexAppServer(
-            client: client,
-            router: CodexAppServerNotificationRouter(client: client)
-        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let server = harness.server
         let workspace = URL(fileURLWithPath: "/tmp/project", isDirectory: true)
 
         let page = try await server.listThreads(.init(
@@ -626,11 +1126,8 @@ struct CodexAppServerKitTests {
             AppServerAPI.Thread.List.Response(data: []),
             for: "thread/list"
         )
-        let client = AppServerClient(transport: transport)
-        let server = CodexAppServer(
-            client: client,
-            router: CodexAppServerNotificationRouter(client: client)
-        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let server = harness.server
         let app = URL(fileURLWithPath: "/tmp/project/App", isDirectory: true)
         let tools = URL(fileURLWithPath: "/tmp/project/Tools", isDirectory: true)
 
@@ -650,11 +1147,8 @@ struct CodexAppServerKitTests {
             AppServerAPI.Thread.List.Response(data: []),
             for: "thread/list"
         )
-        let client = AppServerClient(transport: transport)
-        let server = CodexAppServer(
-            client: client,
-            router: CodexAppServerNotificationRouter(client: client)
-        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let server = harness.server
         var query = CodexThreadQuery(
             workspaces: [URL(fileURLWithPath: "/tmp/project", isDirectory: true)]
         )
@@ -689,11 +1183,8 @@ struct CodexAppServerKitTests {
             """,
             for: "thread/list"
         )
-        let client = AppServerClient(transport: transport)
-        let server = CodexAppServer(
-            client: client,
-            router: CodexAppServerNotificationRouter(client: client)
-        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let server = harness.server
 
         let page = try await server.listThreads()
         let snapshot = try #require(page.threads.first)
@@ -712,11 +1203,8 @@ struct CodexAppServerKitTests {
             ]),
             for: "thread/list"
         )
-        let client = AppServerClient(transport: transport)
-        let server = CodexAppServer(
-            client: client,
-            router: CodexAppServerNotificationRouter(client: client)
-        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let server = harness.server
 
         let page = try await server.listThreads()
 
@@ -746,11 +1234,8 @@ struct CodexAppServerKitTests {
             ]),
             for: "thread/list"
         )
-        let client = AppServerClient(transport: transport)
-        let server = CodexAppServer(
-            client: client,
-            router: CodexAppServerNotificationRouter(client: client)
-        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let server = harness.server
 
         let page = try await server.listThreads()
 
@@ -760,7 +1245,7 @@ struct CodexAppServerKitTests {
     }
 
     @Test func threadSnapshotEqualityIgnoresTurnAuthorityFlag() {
-        let turns = [CodexTurnSnapshot(id: "turn-1", status: .completed)]
+        let turns = [CodexTurnSnapshot(id: "turn-1", state: .completed)]
         let publicSnapshot = CodexThreadSnapshot(id: "thread-1", turns: turns)
         let summarySnapshot = CodexThreadSnapshot(
             id: "thread-1",
@@ -775,10 +1260,10 @@ struct CodexAppServerKitTests {
         let partiallyLoadedSnapshot = CodexThreadSnapshot(
             id: "thread-1",
             turns: [
-                CodexTurnSnapshot(id: "turn-full", status: .completed),
+                CodexTurnSnapshot(id: "turn-full", state: .completed),
                 CodexTurnSnapshot(
                     id: "turn-summary",
-                    status: .completed,
+                    state: .completed,
                     itemsLoadState: .summary
                 ),
             ],
@@ -788,7 +1273,7 @@ struct CodexAppServerKitTests {
 
         let fullyLoadedSnapshot = CodexThreadSnapshot(
             id: "thread-1",
-            turns: [CodexTurnSnapshot(id: "turn-full", status: .completed)],
+            turns: [CodexTurnSnapshot(id: "turn-full", state: .completed)],
             turnItemsAreAuthoritative: true
         )
         #expect(fullyLoadedSnapshot.turnItemsAreAuthoritative)
@@ -805,10 +1290,263 @@ struct CodexAppServerKitTests {
         #expect(CodexThreadStatus(rawValue: "idle") == .idle)
         #expect(CodexThreadStatus(rawValue: "systemError") == .systemError)
         #expect(CodexThreadStatus(rawValue: "active") == .active(activeFlags: []))
-        #expect(CodexThreadStatus(rawValue: "loaded") == .unknown("loaded"))
+        #expect(CodexThreadStatus(rawValue: "loaded") == .unknown(rawValue: "loaded"))
         #expect(CodexThreadStatus(rawValue: "loaded").isActive == false)
-        #expect(CodexThreadStatus(rawValue: "running") == .unknown("running"))
+        #expect(CodexThreadStatus(rawValue: "running") == .unknown(rawValue: "running"))
         #expect(CodexThreadStatus(rawValue: "running").isActive == false)
+        #expect(CodexThreadStatus(rawValue: "closed") == .unknown(rawValue: "closed"))
+    }
+
+    @Test func turnStatusCanonicalizesActiveAliases() {
+        #expect(CodexTurnStatus.inProgress.rawValue == "inProgress")
+        for rawValue in ["inProgress", "started", "running"] {
+            #expect(CodexTurnStatus(rawValue: rawValue) == .inProgress)
+        }
+        for rawValue in ["success", "succeeded", "cancelled", "aborted"] {
+            #expect(CodexTurnStatus(rawValue: rawValue) == .unknown(rawValue: rawValue))
+        }
+    }
+
+    @Test func terminalClassifierPreservesEveryCurrentV2OutcomeAndTiming() async throws {
+        let transport = CodexAppServerTestTransport()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
+        await transport.waitForNotificationStreamCount(1)
+
+        func makeTurn(_ id: CodexTurnID) async -> CodexTurn {
+            let state = await harness.turnReplayStore.restoreGeneration(
+                turnID: id,
+                initialSnapshot: .init(id: id, state: .inProgress),
+                connectionLease: harness.lease
+            )
+            return CodexTurn(
+                id: id,
+                threadID: "thread-1",
+                client: client,
+                router: router,
+                turnReplayStore: harness.turnReplayStore,
+                state: state
+            )
+        }
+
+        let completed = await makeTurn("turn-completed")
+        let interrupted = await makeTurn("turn-interrupted")
+        let failed = await makeTurn("turn-failed")
+        let future = await makeTurn("turn-future")
+        let inProgress = await makeTurn("turn-in-progress")
+
+        let completedTask = Task { try await completed.result() }
+        let interruptedTask = Task { try await interrupted.result() }
+        let failedTask = Task { try await failed.result() }
+        let futureTask = Task { try await future.result() }
+        let inProgressTask = Task { try await inProgress.result() }
+
+        try await transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(
+                id: "turn-completed",
+                status: "completed",
+                startedAt: 1_700_000_000,
+                completedAt: 1_700_000_002,
+                durationMS: 2_000
+            ))
+        )
+        try await transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(id: "turn-interrupted", status: "interrupted"))
+        )
+        try await transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(
+                id: "turn-failed",
+                status: "failed",
+                error: .init(message: "failed", codexErrorInfo: .serverOverloaded)
+            ))
+        )
+        try await transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(
+                id: "turn-future",
+                status: "futureStatus",
+                error: .init(
+                    message: "future failure",
+                    codexErrorInfo: .httpConnectionFailed(httpStatusCode: 503),
+                    additionalDetails: "upstream detail"
+                )
+            ))
+        )
+        try await transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(id: "turn-in-progress", status: "inProgress"))
+        )
+
+        let completedOutcome = try await completedTask.value
+        guard case .completed(let response) = completedOutcome else {
+            Issue.record("Expected completed outcome.")
+            return
+        }
+        #expect(response.startedAt == Date(timeIntervalSince1970: 1_700_000_000))
+        #expect(response.completedAt == Date(timeIntervalSince1970: 1_700_000_002))
+        #expect(response.duration == .milliseconds(2_000))
+        let interruptedOutcome = try await interruptedTask.value
+        guard case .interrupted(let interruptedResponse) = interruptedOutcome else {
+            Issue.record("Expected interrupted outcome.")
+            return
+        }
+        #expect(interruptedResponse.turnID == "turn-interrupted")
+
+        guard case .failed(let failedTurn) = try await failedTask.value else {
+            Issue.record("Expected failed outcome.")
+            return
+        }
+        #expect(failedTurn.error == .init(message: "failed", info: .serverOverloaded))
+
+        guard case .invalidTerminalStatus(let rawStatus, let error, _) = try await futureTask.value else {
+            Issue.record("Expected future terminal status to remain invalid.")
+            return
+        }
+        #expect(rawStatus == "futureStatus")
+        #expect(error == .init(
+            message: "future failure",
+            info: .httpConnectionFailed(httpStatusCode: 503),
+            additionalDetails: "upstream detail"
+        ))
+
+        guard case .invalidTerminalStatus(let rawStatus, let error, _) = try await inProgressTask.value else {
+            Issue.record("Expected in-progress terminal status to remain invalid.")
+            return
+        }
+        #expect(rawStatus == "inProgress")
+        #expect(error == nil)
+    }
+
+    @Test func malformedTerminalPayloadsNeverBecomeOutcomes() async throws {
+        let cases: [(CodexTurnID, String)] = [
+            ("turn-missing-status", #"{"turn":{"id":"turn-missing-status"}}"#),
+            ("turn-failed-without-error", #"{"turn":{"id":"turn-failed-without-error","status":"failed"}}"#),
+            ("turn-completed-with-error", #"{"turn":{"id":"turn-completed-with-error","status":"completed","error":{"message":"illegal"}}}"#),
+            ("turn-malformed", #"{"turnId":"turn-malformed","turn":"not-an-object"}"#),
+        ]
+        for (turnID, json) in cases {
+            let transport = CodexAppServerTestTransport()
+            let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+            let connectionEvents = await harness.server.connectionEvents()
+            let terminal = Task { await firstConnectionTermination(in: connectionEvents) }
+            await connectionEvents.waitUntilNextSuspendsForTesting()
+            await transport.waitForNotificationStreamCount(1)
+            try await transport.emitServerNotificationJSON(method: "turn/completed", json: json)
+            let termination = try #require(await terminal.value)
+            guard case .transportFailure(.protocolViolation(_, let rawData)) = termination else {
+                Issue.record("Expected connection protocol violation for \(turnID.rawValue).")
+                continue
+            }
+            #expect(rawData == Data(json.utf8))
+        }
+    }
+
+    @Test func terminalOutcomeAndConnectionFailureReplayToLateSubscribers() async throws {
+        let transport = CodexAppServerTestTransport()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        await transport.waitForNotificationStreamCount(1)
+
+        let terminalTurnID = CodexTurnID(rawValue: "turn-terminal-replay")
+        let state = await harness.turnReplayStore.restoreGeneration(
+            turnID: terminalTurnID,
+            initialSnapshot: .init(id: terminalTurnID, state: .inProgress),
+            connectionLease: harness.lease
+        )
+        let firstTerminalStream = try await harness.turnReplayStore.events(
+            for: terminalTurnID,
+            state: state
+        )
+        try await transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(id: "turn-terminal-replay", status: "completed"))
+        )
+        let firstTerminalEvents = try await collect(firstTerminalStream)
+        let lateTerminalEvents = try await collect(
+            try await harness.turnReplayStore.events(for: terminalTurnID, state: state)
+        )
+        #expect(Array(firstTerminalEvents.suffix(lateTerminalEvents.count)) == lateTerminalEvents)
+        #expect(lateTerminalEvents.count == 2)
+        guard case .terminal(let terminalOutcome) = lateTerminalEvents.last else {
+            Issue.record("Expected a replayed terminal outcome.")
+            return
+        }
+        #expect(terminalOutcome.response.turnID == terminalTurnID)
+
+        let connectionEvents = await harness.server.connectionEvents()
+        let firstFailure = Task { await firstConnectionTermination(in: connectionEvents) }
+        await connectionEvents.waitUntilNextSuspendsForTesting()
+        try await transport.emitServerNotificationJSON(
+            method: "turn/completed",
+            json: #"{"turn":{"id":"turn-failure-replay"}}"#
+        )
+        let firstTermination = await firstFailure.value
+        let lateTermination = await firstConnectionTermination(
+            in: await harness.server.connectionEvents()
+        )
+        #expect(firstTermination == lateTermination)
+        guard case .transportFailure(.protocolViolation) = firstTermination else {
+            Issue.record("Expected replayed connection protocol violation.")
+            return
+        }
+    }
+
+    @Test func currentV2ThreadSessionSourcesRoundTripLosslessly() throws {
+        let sources: [AppServerAPI.Thread.SessionSource] = [
+            .cli,
+            .vscode,
+            .exec,
+            .appServer,
+            .custom("automation"),
+            .subAgent(.review),
+            .subAgent(.compact),
+            .subAgent(.threadSpawn(.init(
+                parentThreadID: "parent-thread",
+                depth: 2,
+                agentPath: "reviewer/worker",
+                agentNickname: "Scout",
+                agentRole: "reviewer"
+            ))),
+            .subAgent(.memoryConsolidation),
+            .subAgent(.other("custom-agent")),
+            .unknown,
+        ]
+
+        for source in sources {
+            let data = try JSONEncoder().encode(source)
+            #expect(try JSONDecoder().decode(AppServerAPI.Thread.SessionSource.self, from: data) == source)
+        }
+    }
+
+    @Test func threadListProjectsCanonicalSubAgentReviewSource() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueJSON(
+            #"{"data":[{"id":"thread-review","source":{"subAgent":"review"}}]}"#,
+            for: "thread/list"
+        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+
+        let snapshot = try #require(try await harness.server.listThreads().threads.first)
+
+        #expect(snapshot.sourceKind == .subAgentReview)
+        #expect(snapshot.hasField(.sourceKind))
+    }
+
+    @Test func threadListDoesNotUseLegacySourceKindFallback() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueJSON(
+            #"{"data":[{"id":"thread-legacy","sourceKind":"appServer"}]}"#,
+            for: "thread/list"
+        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+
+        let snapshot = try #require(try await harness.server.listThreads().threads.first)
+
+        #expect(snapshot.sourceKind == nil)
+        #expect(snapshot.hasField(.sourceKind) == false)
     }
 
     @Test func threadSnapshotsTrackOmittedAndNullFields() async throws {
@@ -827,11 +1565,8 @@ struct CodexAppServerKitTests {
             """,
             for: "thread/list"
         )
-        let client = AppServerClient(transport: transport)
-        let server = CodexAppServer(
-            client: client,
-            router: CodexAppServerNotificationRouter(client: client)
-        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let server = harness.server
 
         let page = try await server.listThreads()
         let snapshot = try #require(page.threads.first)
@@ -871,11 +1606,13 @@ struct CodexAppServerKitTests {
             AppServerAPI.Thread.Read.Response(thread: .init(id: "thread-empty", turns: [])),
             for: "thread/read"
         )
-        let client = AppServerClient(transport: transport)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
         let thread = CodexThread(
             id: .init(rawValue: "thread-empty"),
             client: client,
-            router: CodexAppServerNotificationRouter(client: client)
+            router: harness.router,
+            connectionLease: harness.lease
         )
 
         let metadataOnly = try await thread.read(includeTurns: false)
@@ -899,11 +1636,13 @@ struct CodexAppServerKitTests {
             """,
             for: "thread/read"
         )
-        let client = AppServerClient(transport: transport)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
         let thread = CodexThread(
             id: .init(rawValue: "thread-empty"),
             client: client,
-            router: CodexAppServerNotificationRouter(client: client)
+            router: harness.router,
+            connectionLease: harness.lease
         )
 
         let snapshot = try await thread.read(includeTurns: true)
@@ -922,6 +1661,7 @@ struct CodexAppServerKitTests {
                 "turns": [
                   {
                     "id": "turn-summary",
+                    "status": "completed",
                     "itemsView": "summary",
                     "items": [
                       {
@@ -937,11 +1677,13 @@ struct CodexAppServerKitTests {
             """,
             for: "thread/read"
         )
-        let client = AppServerClient(transport: transport)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
         let thread = CodexThread(
             id: .init(rawValue: "thread-summary"),
             client: client,
-            router: CodexAppServerNotificationRouter(client: client)
+            router: harness.router,
+            connectionLease: harness.lease
         )
 
         let snapshot = try await thread.read(includeTurns: true)
@@ -960,6 +1702,7 @@ struct CodexAppServerKitTests {
                 "turns": [
                   {
                     "id": "turn-missing-item-id",
+                    "status": "completed",
                     "items": [
                       {
                         "type": "diagnostic",
@@ -973,11 +1716,13 @@ struct CodexAppServerKitTests {
             """,
             for: "thread/read"
         )
-        let client = AppServerClient(transport: transport)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
         let thread = CodexThread(
             id: .init(rawValue: "thread-missing-item-id"),
             client: client,
-            router: CodexAppServerNotificationRouter(client: client)
+            router: harness.router,
+            connectionLease: harness.lease
         )
 
         let snapshot = try await thread.read(includeTurns: true)
@@ -990,50 +1735,61 @@ struct CodexAppServerKitTests {
 
     @Test func threadStoreDrivesRuntimeThreadStubsAfterStart() async throws {
         let workspace = URL(fileURLWithPath: "/tmp/project", isDirectory: true)
-        let initial = CodexThreadSnapshot(
+        let initial = try makeRuntimeStoredThreadFixture(
             id: "thread-a",
             workspace: workspace,
-            name: "A",
-            modelProvider: "openai"
+            name: "A"
         )
-        let store = CodexAppServerTestThreadStore(threads: [initial])
+        let store = try CodexAppServerTestThreadStore(threads: [initial])
         let runtime = try await CodexAppServerTestRuntime.start(threadStore: store)
 
         let firstPage = try await runtime.server.listThreads()
-        #expect(firstPage.threads == [initial])
+        #expect(firstPage.threads.map(\.id) == [initial.snapshot.id])
+        #expect(firstPage.threads.allSatisfy { $0.turns == nil })
         #expect(firstPage.nextCursor == nil)
         #expect(firstPage.backwardsCursor == nil)
 
-        let updated = CodexThreadSnapshot(
+        let updated = try makeRuntimeStoredThreadFixture(
             id: "thread-b",
             workspace: workspace,
             name: "B",
             preview: "Updated",
-            modelProvider: "openai",
-            turns: [CodexTurnSnapshot(id: "turn-b", status: .completed)]
+            turns: [try makeRuntimeTestTurnFixture(id: "turn-b")]
         )
         await store.upsert(updated)
 
-        #expect(await store.snapshot(id: "thread-b") == updated)
-        #expect(await store.snapshots().map(\.id.rawValue) == ["thread-b", "thread-a"])
+        #expect(await store.storedThread(id: "thread-b") == updated)
 
         let secondPage = try await runtime.server.listThreads()
-        #expect(secondPage.threads == [updated, initial])
+        #expect(secondPage.threads.map(\.id) == [updated.snapshot.id, initial.snapshot.id])
+        #expect(secondPage.threads.map(\.preview) == [updated.snapshot.preview, initial.snapshot.preview])
+        #expect(secondPage.threads.allSatisfy { $0.turns == nil })
 
         let resumed = try await runtime.server.resumeThread("thread-b")
         let read = try await resumed.read(includeTurns: true)
-        #expect(read == updated)
+        #expect(read == updated.snapshot)
 
         await store.remove(id: "thread-a")
         let removedPage = try await runtime.server.listThreads()
-        #expect(removedPage.threads == [updated])
+        #expect(removedPage.threads.map(\.id) == [updated.snapshot.id])
+        #expect(removedPage.threads.first?.turns == nil)
 
         let startedWorkspace = URL(fileURLWithPath: "/tmp/started", isDirectory: true)
+        let plannedStart = try makeRuntimeStoredThreadFixture(
+            id: "thread-started",
+            workspace: startedWorkspace,
+            model: "gpt-5",
+            createdAt: Date(timeIntervalSince1970: 100),
+            updatedAt: Date(timeIntervalSince1970: 100),
+            recencyAt: Date(timeIntervalSince1970: 100),
+            ephemeral: true
+        )
+        try await store.enqueueStart(plannedStart)
         let started = try await runtime.server.startThread(
             in: startedWorkspace,
             options: .init(model: "gpt-5", modelProvider: "openai", ephemeral: true)
         )
-        let startedSnapshot = try #require(await store.snapshot(id: started.id))
+        let startedSnapshot = try #require(await store.storedThread(id: started.id)).snapshot
         #expect(startedSnapshot.workspace == startedWorkspace)
         #expect(startedSnapshot.modelProvider == "openai")
         #expect(startedSnapshot.ephemeral == true)
@@ -1041,9 +1797,9 @@ struct CodexAppServerKitTests {
     }
 
     @Test func threadStoreThreadReadHonorsIncludeTurns() async throws {
-        let stored = CodexThreadSnapshot(
+        let stored = try makeRuntimeStoredThreadFixture(
             id: "thread-with-turns",
-            turns: [CodexTurnSnapshot(id: "turn-from-store", status: .completed)]
+            turns: [try makeRuntimeTestTurnFixture(id: "turn-from-store")]
         )
         let runtime = try await CodexAppServerTestRuntime.start(threads: [stored])
         let thread = try await runtime.server.resumeThread("thread-with-turns")
@@ -1058,10 +1814,10 @@ struct CodexAppServerKitTests {
     }
 
     @Test func threadStoreHonorsThreadListPagination() async throws {
-        let threads = [
-            CodexThreadSnapshot(id: "thread-a", name: "A"),
-            CodexThreadSnapshot(id: "thread-b", name: "B"),
-            CodexThreadSnapshot(id: "thread-c", name: "C"),
+        let threads = try [
+            makeRuntimeStoredThreadFixture(id: "thread-a", name: "A"),
+            makeRuntimeStoredThreadFixture(id: "thread-b", name: "B"),
+            makeRuntimeStoredThreadFixture(id: "thread-c", name: "C"),
         ]
         let runtime = try await CodexAppServerTestRuntime.start(threads: threads)
 
@@ -1079,14 +1835,147 @@ struct CodexAppServerKitTests {
         #expect(secondPage.backwardsCursor != nil)
     }
 
+    @Test func threadStoreOwnsArchiveMembershipSortingAndMutations() async throws {
+        let activeOld = try makeRuntimeStoredThreadFixture(
+            id: "active-old",
+            createdAt: Date(timeIntervalSince1970: 10),
+            updatedAt: Date(timeIntervalSince1970: 40),
+            recencyAt: Date(timeIntervalSince1970: 20)
+        )
+        let activeNew = try makeRuntimeStoredThreadFixture(
+            id: "active-new",
+            createdAt: Date(timeIntervalSince1970: 30),
+            updatedAt: Date(timeIntervalSince1970: 20),
+            recencyAt: Date(timeIntervalSince1970: 50)
+        )
+        let archived = try makeRuntimeStoredThreadFixture(
+            id: "archived",
+            createdAt: Date(timeIntervalSince1970: 60),
+            updatedAt: Date(timeIntervalSince1970: 60),
+            recencyAt: Date(timeIntervalSince1970: 60),
+            isArchived: true
+        )
+        let store = try CodexAppServerTestThreadStore(threads: [activeOld, activeNew, archived])
+        let runtime = try await CodexAppServerTestRuntime.start(threadStore: store)
+
+        #expect(try await runtime.server.listThreads().threads.map(\.id) == [
+            activeNew.snapshot.id,
+            activeOld.snapshot.id,
+        ])
+        #expect(try await runtime.server.listThreads(.init(
+            archived: true
+        )).threads.map(\.id) == [archived.snapshot.id])
+        #expect(try await runtime.server.listThreads(.init(
+            sortDirection: .ascending,
+            sortKey: .updatedAt
+        )).threads.map(\.id) == [activeNew.snapshot.id, activeOld.snapshot.id])
+
+        try await runtime.server.archiveThread(activeNew.snapshot.id)
+        #expect(try await runtime.server.listThreads().threads.map(\.id) == [activeOld.snapshot.id])
+        #expect(try await runtime.server.listThreads(.init(
+            archived: true,
+            sortDirection: .ascending,
+            sortKey: .createdAt
+        )).threads.map(\.id) == [activeNew.snapshot.id, archived.snapshot.id])
+
+        _ = try await runtime.server.unarchiveThread(activeNew.snapshot.id)
+        try await runtime.server.deleteThread(activeOld.snapshot.id)
+        #expect(try await runtime.server.listThreads().threads.map(\.id) == [activeNew.snapshot.id])
+        #expect(await store.storedThread(id: activeOld.snapshot.id) == nil)
+        await runtime.close()
+    }
+
+    @Test func threadStoreAndQueuedThreadResponsesAreMutuallyExclusive() async throws {
+        let storeRuntime = try await CodexAppServerTestRuntime.start(
+            threadStore: try CodexAppServerTestThreadStore()
+        )
+        await #expect(throws: CodexAppServerTestError.invalidFixture(
+            "Cannot enqueue thread/list while an authoritative thread store owns thread state."
+        )) {
+            try await storeRuntime.transport.enqueueThreadList(
+                CodexAppServerTestThreadPage(threads: [])
+            )
+        }
+        await storeRuntime.close()
+
+        let queuedTransport = CodexAppServerTestTransport()
+        try await queuedTransport.enqueueThreadList(CodexAppServerTestThreadPage(threads: []))
+        await #expect(throws: CodexAppServerTestError.invalidFixture(
+            "Queued thread responses and an authoritative thread store are mutually exclusive."
+        )) {
+            try await queuedTransport.stubThreads(try CodexAppServerTestThreadStore())
+        }
+        await queuedTransport.close()
+    }
+
+    @Test func authoritativeThreadStoreNeverFabricatesAnUnplannedStart() async throws {
+        let store = try CodexAppServerTestThreadStore()
+        let runtime = try await CodexAppServerTestRuntime.start(threadStore: store)
+
+        do {
+            _ = try await runtime.server.startThread(
+                in: URL(fileURLWithPath: "/tmp/unplanned", isDirectory: true)
+            )
+            Issue.record("Expected an unplanned thread/start to be rejected.")
+        } catch let error as CodexAppServerError {
+            guard case .request(let failure) = error,
+                  case .server(let serverError) = failure.kind else {
+                Issue.record("Expected a typed server rejection, got \(error).")
+                return
+            }
+            #expect(serverError.code == -32602)
+            #expect(serverError.message == "thread/start requires an explicitly planned test thread.")
+        }
+        #expect(await store.storedThread(id: "unplanned") == nil)
+        await runtime.close()
+    }
+
+    @Test func authoritativeThreadStoreConsumesPlannedForkWithoutMutatingSource() async throws {
+        let source = try makeRuntimeStoredThreadFixture(
+            id: "fork-source",
+            name: "Source"
+        )
+        let fork = try makeRuntimeStoredThreadFixture(
+            id: "fork-result",
+            name: "Fork",
+            ephemeral: false,
+            forkedFromID: source.snapshot.id
+        )
+        let store = try CodexAppServerTestThreadStore(threads: [source])
+        try await store.enqueueFork(fork, from: source.snapshot.id)
+        let runtime = try await CodexAppServerTestRuntime.start(threadStore: store)
+
+        let handle = try await runtime.server.forkThread(
+            source.snapshot.id,
+            options: .init(modelProvider: "openai", ephemeral: false)
+        )
+
+        #expect(handle.id == fork.snapshot.id)
+        #expect(await store.storedThread(id: source.snapshot.id) == source)
+        #expect(await store.storedThread(id: fork.snapshot.id) == fork)
+        do {
+            _ = try await runtime.server.forkThread(source.snapshot.id)
+            Issue.record("Expected an unplanned thread/fork to be rejected.")
+        } catch let error as CodexAppServerError {
+            guard case .request(let failure) = error,
+                  case .server(let serverError) = failure.kind else {
+                Issue.record("Expected a typed server rejection, got \(error).")
+                return
+            }
+            #expect(serverError.code == -32602)
+        }
+        #expect(await store.storedThread(id: source.snapshot.id) == source)
+        await runtime.close()
+    }
+
     @Test func threadStoreHonorsThreadTurnListPagination() async throws {
-        let turns = [
-            CodexTurnSnapshot(id: "turn-a", status: .completed),
-            CodexTurnSnapshot(id: "turn-b", status: .completed),
-            CodexTurnSnapshot(id: "turn-c", status: .completed),
+        let turns = try [
+            makeRuntimeTestTurnFixture(id: "turn-a"),
+            makeRuntimeTestTurnFixture(id: "turn-b"),
+            makeRuntimeTestTurnFixture(id: "turn-c"),
         ]
         let runtime = try await CodexAppServerTestRuntime.start(threads: [
-            CodexThreadSnapshot(id: "thread-turns", turns: turns)
+            makeRuntimeStoredThreadFixture(id: "thread-turns", turns: turns)
         ])
         let thread = try await runtime.server.resumeThread("thread-turns")
 
@@ -1105,26 +1994,28 @@ struct CodexAppServerKitTests {
     }
 
     @Test func transportStubThreadsAcceptsMutableThreadStore() async throws {
-        let store = CodexAppServerTestThreadStore()
+        let store = try CodexAppServerTestThreadStore()
         let transport = CodexAppServerTestTransport()
         try await transport.stubThreads(store)
         let runtime = try await CodexAppServerTestRuntime.start(transport: transport)
 
-        let snapshot = CodexThreadSnapshot(id: "thread-transport", name: "Transport")
-        await store.upsert(snapshot)
+        let stored = try makeRuntimeStoredThreadFixture(
+            id: "thread-transport",
+            name: "Transport"
+        )
+        await store.upsert(stored)
 
         let page = try await runtime.server.listThreads()
-        #expect(page.threads == [snapshot])
+        #expect(page.threads.map(\.id) == [stored.snapshot.id])
+        #expect(page.threads.first?.name == stored.snapshot.name)
+        #expect(page.threads.first?.turns == nil)
     }
 
     @Test func appServerArchiveThreadSerializesThreadID() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueueEmpty(for: "thread/archive")
-        let client = AppServerClient(transport: transport)
-        let server = CodexAppServer(
-            client: client,
-            router: CodexAppServerNotificationRouter(client: client)
-        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let server = harness.server
 
         try await server.archiveThread("thread-archive")
 
@@ -1146,17 +2037,16 @@ struct CodexAppServerKitTests {
             ),
             for: "review/start"
         )
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
 
         let review = try await thread.startReview(
             target: .baseBranch("main"),
             delivery: .detached
         )
-
         #expect(review.threadID == "thread-1")
         #expect(review.turnID == "turn-review")
         #expect(review.reviewThreadID == "thread-review")
@@ -1220,10 +2110,22 @@ struct CodexAppServerKitTests {
                 item: .init(
                     id: "file-1",
                     type: "fileChange",
-                    text: "updated",
                     status: "completed",
-                    path: "Sources/File.swift"
+                    changes: .array([
+                        .object([
+                            "path": .string("Sources/File.swift"),
+                            "kind": .object(["type": .string("update")]),
+                            "diff": .string("updated"),
+                        ]),
+                    ])
                 )
+            )
+        )
+        try await transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(
+                threadID: "thread-review",
+                turn: .init(id: "turn-review", status: "completed")
             )
         )
         try await transport.emitServerNotification(
@@ -1329,7 +2231,10 @@ struct CodexAppServerKitTests {
     @Test func inlineReviewIdentityKeepsDetachedReviewThreadNil() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         try await runtime.transport.enqueueThreadStart(threadID: "thread-source", model: "gpt-5")
-        try await runtime.transport.enqueueReviewStart(turnID: "turn-review")
+        try await runtime.transport.enqueueReviewStart(
+            turnID: "turn-review",
+            reviewThreadID: "thread-source"
+        )
 
         let thread = try await runtime.server.startThread(
             in: URL(fileURLWithPath: "/tmp/project", isDirectory: true),
@@ -1366,7 +2271,7 @@ struct CodexAppServerKitTests {
         let cancellation = try await review.cancel()
         try await runtime.transport.emitServerNotification(
             method: "turn/completed",
-            params: TurnCompletedParams(turn: .init(id: "turn-review", status: "completed"))
+            params: TurnCompletedParams(threadID: "thread-review", turn: .init(id: "turn-review", status: "completed"))
         )
 
         #expect(review.identity == identity)
@@ -1386,64 +2291,25 @@ struct CodexAppServerKitTests {
         #expect(interruptParams.turnID == "turn-review")
 
         var iterator = review.events.makeAsyncIterator()
-        let event = try await iterator.next()
-        if case .turnCompleted(let response) = event {
-            #expect(response.turnID == "turn-review")
+        var terminalResponse: CodexResponse?
+        while let event = try await iterator.next() {
+            if case .terminal(.completed(let response)) = event {
+                terminalResponse = response
+            }
+        }
+        if let terminalResponse {
+            #expect(terminalResponse.turnID == "turn-review")
         } else {
             Issue.record("Expected resumed review.events to receive turn-only completion.")
         }
-        #expect(try await iterator.next() == nil)
-    }
-
-    @Test func appServerResumeReviewRoutesThreadlessDiagnostics() async throws {
-        let runtime = try await CodexAppServerTestRuntime.start()
-        try await runtime.transport.emitServerNotification(
-            method: "thread/closed",
-            params: ThreadIDParams(threadID: "thread-review")
-        )
-        try await runtime.transport.enqueueThreadResume(.init(
-            id: "thread-review",
-            workspace: URL(fileURLWithPath: "/tmp/project", isDirectory: true)
-        ))
-        let gate = CodexAppServerTestGate()
-        await runtime.transport.holdNext(method: "thread/resume", gate: gate)
-        let identity = CodexReviewIdentity(
-            threadID: "thread-source",
-            turnID: "turn-review",
-            reviewThreadID: "thread-review",
-            model: "gpt-5"
-        )
-
-        let reviewTask = Task {
-            try await runtime.server.resumeReview(identity)
-        }
-        await runtime.transport.waitForRequest(method: "thread/resume")
-        try await runtime.transport.emitServerNotification(
-            method: "configWarning",
-            params: ThreadlessDiagnosticParams(message: "using defaults")
-        )
-        await gate.open()
-        let review = try await reviewTask.value
-        try await runtime.transport.emitServerNotification(
-            method: "turn/completed",
-            params: TurnCompletedParams(turn: .init(id: "turn-review", status: "completed"))
-        )
-
-        let events = try await collect(review.events)
-        #expect(
-            events.contains {
-                if case .unknown(let raw) = $0 {
-                    return raw.method == "configWarning"
-                        && raw.threadID == "thread-review"
-                        && raw.turnID == nil
-                }
-                return false
-            })
     }
 
     @Test func appServerResumeReviewUsesThreadOptionModelOverride() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
-        try await runtime.transport.enqueueThreadResume(.init(id: "thread-review"))
+        try await runtime.transport.enqueueThreadResume(
+            .init(id: "thread-review"),
+            model: "gpt-5.1"
+        )
         let identity = CodexReviewIdentity(
             threadID: "thread-source",
             turnID: "turn-review",
@@ -1462,6 +2328,56 @@ struct CodexAppServerKitTests {
         let params = try request.decodeParams(AppServerAPI.Thread.Resume.Params.self)
         #expect(params.threadID == "thread-review")
         #expect(params.model == "gpt-5.1")
+    }
+
+    @Test func appServerResumeReviewPromotesTheResponseBaselineToItsPersistedTurnIdentity() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        try await runtime.transport.enqueueThreadResume(.init(
+            id: "thread-review",
+            workspace: URL(fileURLWithPath: "/tmp/project", isDirectory: true),
+            turns: [
+                .init(
+                    id: "rollout-synthesized-turn",
+                    state: .inProgress,
+                    items: [
+                        .init(
+                            id: "response-message",
+                            kind: .agentMessage,
+                            content: .message(.init(
+                                id: "response-message",
+                                role: .assistant,
+                                text: "From resume response"
+                            ))
+                        ),
+                    ]
+                ),
+            ]
+        ))
+        let identity = CodexReviewIdentity(
+            threadID: "thread-source",
+            turnID: "turn-review",
+            reviewThreadID: "thread-review",
+            model: "gpt-5"
+        )
+
+        let review = try await runtime.server.resumeReview(identity)
+        let eventThread = await runtime.server.reviewEventThread(
+            for: review,
+            workspace: URL(fileURLWithPath: "/tmp/project", isDirectory: true)
+        )
+        try await runtime.transport.emitServerNotification(
+            method: "thread/closed",
+            params: ThreadIDParams(threadID: "thread-review")
+        )
+
+        let events = try await collect(eventThread.events)
+        #expect(events.containsThreadText("From resume response", turnID: "turn-review"))
+        #expect(events.contains { event in
+            if case .snapshot(let snapshot) = event {
+                return snapshot.id == "rollout-synthesized-turn"
+            }
+            return false
+        } == false)
     }
 
     @Test func reviewSessionCancelHookReceivesCurrentActiveTurn() async throws {
@@ -1498,247 +2414,6 @@ struct CodexAppServerKitTests {
         #expect(turnIDs == ["turn-review", "turn-new"])
     }
 
-    @Test func reviewSequencesFilterEventsOutsideTerminalTurn() async throws {
-        let oldMessage = CodexMessage(
-            id: "old-message",
-            role: .assistant,
-            text: "Old review"
-        )
-        let currentMessage = CodexMessage(
-            id: "current-message",
-            role: .assistant,
-            text: "Current review"
-        )
-        let followUpMessage = CodexMessage(
-            id: "follow-up-message",
-            role: .assistant,
-            text: "Follow-up turn"
-        )
-        let events = [
-            CodexThreadEvent.message(oldMessage, turnID: "turn-old"),
-            .statusChanged(.active(activeFlags: [])),
-            .message(currentMessage, turnID: "turn-current"),
-            .turnCompleted(.init(turnID: "turn-old", status: .completed)),
-            .turnCompleted(.init(turnID: "turn-current", status: .completed)),
-            .message(followUpMessage, turnID: "turn-follow-up"),
-        ]
-        let eventSequence = CodexThreadEventSequence {
-            AsyncThrowingStream { continuation in
-                for event in events {
-                    continuation.yield(event)
-                }
-                continuation.finish()
-            }
-        }
-
-        let reviewEvents = try await collect(CodexReviewEventSequence(
-            events: eventSequence,
-            terminalTurnID: "turn-current"
-        ))
-        let progress = try await collect(CodexReviewProgressSequence(
-            events: eventSequence,
-            terminalTurnID: "turn-current"
-        ))
-        let logs = try await collect(CodexThreadLogSequence(
-            events: eventSequence,
-            terminalTurnID: "turn-current"
-        ))
-
-        #expect(reviewEvents.count == 3)
-        #expect(reviewEvents.contains(.statusChanged(.active(activeFlags: []))))
-        #expect(progress.count == 3)
-        #expect(progress.last?.result?.turnID == "turn-current")
-        #expect(progress.last?.result?.finalAnswer == "Current review")
-        #expect(progress.last?.transcript.responseText == "Current review")
-        if case .turnCompleted(let response) = reviewEvents.last {
-            #expect(response.finalAnswer == "Current review")
-            #expect(response.transcript.responseText == "Current review")
-        } else {
-            Issue.record("Expected a terminal review response.")
-        }
-        #expect(logs.map(\.id) == ["current-message"])
-        #expect(logs.allSatisfy { $0.turnID == "turn-current" })
-    }
-
-    @Test func reviewEventSequenceFinalizesCompletedResponseFromMessageDelta() async throws {
-        let events = [
-            CodexThreadEvent.messageDelta(
-                .init(text: "Final", itemID: "message-1", phase: .finalAnswer),
-                turnID: "turn-review"
-            ),
-            .turnCompleted(.init(turnID: "turn-review", status: .completed)),
-        ]
-        let eventSequence = CodexThreadEventSequence {
-            AsyncThrowingStream { continuation in
-                for event in events {
-                    continuation.yield(event)
-                }
-                continuation.finish()
-            }
-        }
-
-        let reviewEvents = try await collect(CodexReviewEventSequence(
-            events: eventSequence,
-            terminalTurnID: "turn-review"
-        ))
-        let progress = try await collect(CodexReviewProgressSequence(
-            events: eventSequence,
-            terminalTurnID: "turn-review"
-        ))
-
-        if case .turnCompleted(let response) = reviewEvents.last {
-            #expect(response.finalAnswer == "Final")
-            #expect(response.transcript.finalAnswer == "Final")
-        } else {
-            Issue.record("Expected a terminal review response.")
-        }
-        #expect(progress.last?.result?.finalAnswer == "Final")
-        #expect(progress.last?.transcript.finalAnswer == "Final")
-    }
-
-    @Test func reviewEventSequenceIgnoresEmptyAssistantMessagesWhenFinalizing() async throws {
-        let finalMessage = CodexMessage(
-            id: "message-final",
-            role: .assistant,
-            text: "Final review"
-        )
-        let emptyMessage = CodexMessage(
-            id: "message-empty",
-            role: .assistant,
-            text: ""
-        )
-        let events = [
-            CodexThreadEvent.itemCompleted(
-                .init(id: finalMessage.id, kind: .agentMessage, content: .message(finalMessage)),
-                turnID: "turn-review"
-            ),
-            CodexThreadEvent.message(emptyMessage, turnID: "turn-review"),
-            .turnCompleted(.init(turnID: "turn-review", status: .completed, finalAnswer: "")),
-        ]
-        let eventSequence = CodexThreadEventSequence {
-            AsyncThrowingStream { continuation in
-                for event in events {
-                    continuation.yield(event)
-                }
-                continuation.finish()
-            }
-        }
-
-        let reviewEvents = try await collect(CodexReviewEventSequence(
-            events: eventSequence,
-            terminalTurnID: "turn-review"
-        ))
-        let progress = try await collect(CodexReviewProgressSequence(
-            events: eventSequence,
-            terminalTurnID: "turn-review"
-        ))
-
-        if case .turnCompleted(let response) = reviewEvents.last {
-            #expect(response.finalAnswer == "Final review")
-            #expect(response.transcript.finalAnswer == "Final review")
-        } else {
-            Issue.record("Expected a terminal review response.")
-        }
-        #expect(progress.last?.result?.finalAnswer == "Final review")
-        #expect(progress.last?.transcript.finalAnswer == "Final review")
-    }
-
-    @Test func reviewEventSequenceFinalizesCompletedResponseFromExitedReviewMode() async throws {
-        let events = [
-            CodexThreadEvent.itemCompleted(
-                .init(
-                    id: "review-output",
-                    kind: .exitedReviewMode,
-                    content: .log("No issues found.")
-                ),
-                turnID: "turn-review"
-            ),
-            .turnCompleted(.init(turnID: "turn-review", status: .completed)),
-        ]
-        let eventSequence = CodexThreadEventSequence {
-            AsyncThrowingStream { continuation in
-                for event in events {
-                    continuation.yield(event)
-                }
-                continuation.finish()
-            }
-        }
-
-        let reviewEvents = try await collect(CodexReviewEventSequence(
-            events: eventSequence,
-            terminalTurnID: "turn-review"
-        ))
-        let progress = try await collect(CodexReviewProgressSequence(
-            events: eventSequence,
-            terminalTurnID: "turn-review"
-        ))
-
-        if case .turnCompleted(let response) = reviewEvents.last {
-            #expect(response.finalAnswer == nil)
-            #expect(response.transcript.reviewOutputText == "No issues found.")
-        } else {
-            Issue.record("Expected a terminal review response.")
-        }
-        #expect(progress.last?.result?.finalAnswer == nil)
-        #expect(progress.last?.transcript.reviewOutputText == "No issues found.")
-    }
-
-    @Test func reviewEventSequencePreservesLiveReviewOutputWithSparseCompletionTranscript() async throws {
-        let terminalMessage = CodexMessage(
-            id: "terminal-message",
-            role: .assistant,
-            text: "Terminal summary"
-        )
-        let events = [
-            CodexThreadEvent.itemCompleted(
-                .init(
-                    id: "review-output",
-                    kind: .exitedReviewMode,
-                    content: .log("No issues found.")
-                ),
-                turnID: "turn-review"
-            ),
-            .turnCompleted(.init(
-                turnID: "turn-review",
-                status: .completed,
-                transcript: .init(items: [
-                    .init(
-                        id: terminalMessage.id,
-                        kind: .agentMessage,
-                        content: .message(terminalMessage)
-                    ),
-                ])
-            )),
-        ]
-        let eventSequence = CodexThreadEventSequence {
-            AsyncThrowingStream { continuation in
-                for event in events {
-                    continuation.yield(event)
-                }
-                continuation.finish()
-            }
-        }
-
-        let reviewEvents = try await collect(CodexReviewEventSequence(
-            events: eventSequence,
-            terminalTurnID: "turn-review"
-        ))
-        let progress = try await collect(CodexReviewProgressSequence(
-            events: eventSequence,
-            terminalTurnID: "turn-review"
-        ))
-
-        if case .turnCompleted(let response) = reviewEvents.last {
-            #expect(response.transcript.finalAnswer == "Terminal summary")
-            #expect(response.transcript.reviewOutputText == "No issues found.")
-            #expect(response.transcript.items.map(\.kind) == [.agentMessage, .exitedReviewMode])
-        } else {
-            Issue.record("Expected a terminal review response.")
-        }
-        #expect(progress.last?.result?.transcript.reviewOutputText == "No issues found.")
-        #expect(progress.last?.transcript.reviewOutputText == "No issues found.")
-    }
-
     @Test func threadTurnsListRequestUsesThreadScope() {
         let request = AppServerAPI.Thread.Turns.List.Request(params: .init(threadID: "thread-1"))
 
@@ -1756,6 +2431,7 @@ struct CodexAppServerKitTests {
             turnID: "turn-restarted",
             reviewThreadID: "thread-review-restarted"
         )
+        try await runtime.transport.enqueueEmpty(for: "turn/interrupt")
         let identity = CodexReviewIdentity(
             threadID: "thread-source",
             turnID: "turn-review",
@@ -1772,11 +2448,9 @@ struct CodexAppServerKitTests {
         await runtime.transport.waitForRequest(method: "turn/interrupt")
         try await runtime.transport.emitServerNotification(
             method: "turn/completed",
-            params: TurnCompletedParams(turn: .init(id: "turn-review", status: "interrupted"))
+            params: TurnCompletedParams(threadID: "thread-review", turn: .init(id: "turn-review", status: "interrupted"))
         )
-        let token = try await withTimeout {
-            try await prepareTask.value
-        }
+        let token = try await prepareTask.value
         let review = try await runtime.server.restartPreparedReview(
             token,
             target: .baseBranch("main"),
@@ -1820,6 +2494,46 @@ struct CodexAppServerKitTests {
         #expect(reviewStartParams.threadID == "thread-source")
         #expect(reviewStartParams.target == .baseBranch("main"))
         #expect(reviewStartParams.delivery == .detached)
+        await runtime.close()
+    }
+
+    @Test func prepareReviewRestartRejectsConcurrentPreparationForTheSameSource() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let interruptGate = CodexAppServerTestGate()
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-review"))
+        try await runtime.transport.enqueueEmpty(for: "turn/interrupt")
+        await runtime.transport.holdNextIgnoringCancellation(
+            method: "turn/interrupt",
+            gate: interruptGate
+        )
+        let identity = CodexReviewIdentity(
+            threadID: "thread-source",
+            turnID: "turn-review",
+            reviewThreadID: "thread-review"
+        )
+        let firstPreparation = Task {
+            try await runtime.server.prepareReviewRestart(identity)
+        }
+        defer {
+            firstPreparation.cancel()
+        }
+        await runtime.transport.waitForRequest(method: "turn/interrupt")
+
+        await #expect(throws: CodexAppServerError.self) {
+            try await runtime.server.prepareReviewRestart(identity)
+        }
+
+        await interruptGate.open()
+        try await runtime.transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(
+                threadID: "thread-review",
+                turn: .init(id: "turn-review", status: "interrupted")
+            )
+        )
+        #expect(try await firstPreparation.value.interruptedIdentity == identity)
+        #expect(await runtime.transport.recordedRequests(method: "turn/interrupt").count == 1)
+        await runtime.close()
     }
 
     @Test func cleanupReviewKeepsCancellationRetryCleanupForPreparedRestart() async throws {
@@ -1853,10 +2567,11 @@ struct CodexAppServerKitTests {
         await runtime.transport.waitForRequest(method: "turn/interrupt", count: 2)
         try await runtime.transport.emitServerNotification(
             method: "turn/completed",
-            params: TurnCompletedParams(turn: .init(id: "turn-new", status: "interrupted"))
+            params: TurnCompletedParams(threadID: "thread-review", turn: .init(id: "turn-new", status: "interrupted"))
         )
-        _ = try await withTimeout {
-            try await prepareTask.value
+        _ = try await prepareTask.value
+        for _ in 0..<3 {
+            try await runtime.transport.enqueueEmpty(for: "thread/delete")
         }
         await runtime.server.cleanupReview(restartedIdentity)
 
@@ -1872,6 +2587,7 @@ struct CodexAppServerKitTests {
             "thread-review-restarted",
             "thread-source",
         ])
+        await runtime.close()
     }
 
     @Test func cleanupReviewDeletesDetachedThreadsBeforeSourceAndDedupes() async throws {
@@ -1881,14 +2597,27 @@ struct CodexAppServerKitTests {
             turnID: "turn-review",
             reviewThreadID: "thread-review"
         )
+        for _ in 0..<4 {
+            try await runtime.transport.enqueueEmpty(for: "thread/delete")
+        }
 
-        await runtime.server.cleanupReview(
+        let result = await runtime.server.cleanupReview(
             identity,
             additionalCleanupThreadIDs: [
                 ["thread-source", "thread-extra", "thread-review"],
                 ["thread-extra", "thread-extra-2", "thread-source"],
             ]
         )
+
+        #expect(result == CodexReviewCleanupResult(
+            attemptedThreadIDs: [
+                "thread-review",
+                "thread-extra",
+                "thread-extra-2",
+                "thread-source",
+            ],
+            failures: []
+        ))
 
         let deletedThreadIDs = try await runtime.transport.recordedRequests(method: "thread/delete").map {
             try $0.decodeParams(AppServerAPI.Thread.Delete.Params.self).threadID
@@ -1899,6 +2628,66 @@ struct CodexAppServerKitTests {
             "thread-extra-2",
             "thread-source",
         ])
+        await runtime.close()
+    }
+
+    @Test func cleanupReviewRestoresRetainedIdentitiesAfterDeletionFailure() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-review"))
+        try await runtime.transport.enqueueEmpty(for: "turn/interrupt")
+        let identity = CodexReviewIdentity(
+            threadID: "thread-source",
+            turnID: "turn-review",
+            reviewThreadID: "thread-review"
+        )
+
+        let prepareTask = Task {
+            try await runtime.server.prepareReviewRestart(identity)
+        }
+        defer {
+            prepareTask.cancel()
+        }
+        await runtime.transport.waitForRequest(method: "turn/interrupt")
+        try await runtime.transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(
+                threadID: "thread-review",
+                turn: .init(id: "turn-review", status: "interrupted")
+            )
+        )
+        _ = try await prepareTask.value
+
+        await runtime.transport.enqueueFailure(
+            code: -32_000,
+            message: "delete failed",
+            for: "thread/delete"
+        )
+        for _ in 0..<3 {
+            try await runtime.transport.enqueueEmpty(for: "thread/delete")
+        }
+        let failedCleanup = await runtime.server.cleanupReview(identity)
+        #expect(failedCleanup.attemptedThreadIDs == ["thread-review", "thread-source"])
+        #expect(failedCleanup.failures.map(\.threadID) == ["thread-review"])
+        #expect(failedCleanup.failures.first?.message.contains("delete failed") == true)
+
+        let retriedCleanup = await runtime.server.cleanupReview(identity)
+        #expect(retriedCleanup == CodexReviewCleanupResult(
+            attemptedThreadIDs: ["thread-review", "thread-source"],
+            failures: []
+        ))
+
+        let deletedThreadIDs = try await runtime.transport
+            .recordedRequests(method: "thread/delete")
+            .map { request in
+                try request.decodeParams(AppServerAPI.Thread.Delete.Params.self).threadID
+            }
+        #expect(deletedThreadIDs == [
+            "thread-review",
+            "thread-source",
+            "thread-review",
+            "thread-source",
+        ])
+        await runtime.close()
     }
 
     @Test func restartPreparedReviewRejectsStaleTokenWithMeaningfulError() async throws {
@@ -1917,6 +2706,99 @@ struct CodexAppServerKitTests {
         } catch {
             Issue.record("Expected CodexAppServerError, got \(error).")
         }
+        await runtime.close()
+    }
+
+    @Test func discardPreparedReviewRestartRequiresTheFullTokenAndTransfersOnce() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let identity = CodexReviewIdentity(
+            threadID: "thread-source",
+            turnID: "turn-review",
+            reviewThreadID: "thread-review",
+            model: "gpt-5"
+        )
+        let token = try await prepareRestartToken(runtime: runtime, identity: identity)
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-review"))
+        try await runtime.transport.enqueueEmpty(for: "thread/rollback")
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-source"))
+        try await runtime.transport.enqueueReviewStart(
+            turnID: "turn-restarted",
+            reviewThreadID: "thread-source"
+        )
+        let restarted = try await runtime.server.restartPreparedReview(
+            token,
+            target: .baseBranch("main")
+        )
+        let forged = CodexReviewRestartToken(
+            id: token.id,
+            interruptedIdentity: .init(
+                threadID: "thread-source",
+                turnID: "forged-turn",
+                reviewThreadID: "thread-review",
+                model: "gpt-5"
+            )
+        )
+
+        #expect(await runtime.server.discardPreparedReviewRestart(forged).isEmpty)
+        #expect(await runtime.server.discardPreparedReviewRestart(token) == [
+            identity,
+            restarted.identity,
+        ])
+        #expect(await runtime.server.discardPreparedReviewRestart(token).isEmpty)
+        await runtime.close()
+    }
+
+    @Test func discardAllPreparedReviewRestartsReturnsOrderedSourceGroups() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let firstIdentity = CodexReviewIdentity(
+            threadID: "thread-source-a",
+            turnID: "turn-review-a",
+            reviewThreadID: "thread-review-a"
+        )
+        let firstToken = try await prepareRestartToken(
+            runtime: runtime,
+            identity: firstIdentity
+        )
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-review-a"))
+        try await runtime.transport.enqueueEmpty(for: "thread/rollback")
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-source-a"))
+        try await runtime.transport.enqueueReviewStart(
+            turnID: "turn-restarted-a",
+            reviewThreadID: "thread-review-restarted-a"
+        )
+        let restarted = try await runtime.server.restartPreparedReview(
+            firstToken,
+            target: .uncommittedChanges,
+            delivery: .detached
+        )
+
+        let secondIdentity = CodexReviewIdentity(
+            threadID: "thread-source-b",
+            turnID: "turn-review-b",
+            reviewThreadID: "thread-review-b"
+        )
+        _ = try await prepareRestartToken(
+            runtime: runtime,
+            identity: secondIdentity
+        )
+
+        let retainedBySource = await runtime.server.discardAllPreparedReviewRestarts()
+
+        #expect(retainedBySource == [
+            "thread-source-a": [firstIdentity, restarted.identity],
+            "thread-source-b": [secondIdentity],
+        ])
+        #expect(await runtime.server.discardAllPreparedReviewRestarts().isEmpty)
+        let resumeCount = await runtime.transport.recordedRequests(method: "thread/resume").count
+        await #expect(throws: CodexAppServerError.self) {
+            try await runtime.server.prepareReviewRestart(.init(
+                threadID: "thread-source-c",
+                turnID: "turn-review-c",
+                reviewThreadID: "thread-review-c"
+            ))
+        }
+        #expect(await runtime.transport.recordedRequests(method: "thread/resume").count == resumeCount)
+        await runtime.close()
     }
 
     @Test func restartPreparedReviewKeepsTokenForRetryAfterPartialFailure() async throws {
@@ -1938,11 +2820,9 @@ struct CodexAppServerKitTests {
         await runtime.transport.waitForRequest(method: "turn/interrupt")
         try await runtime.transport.emitServerNotification(
             method: "turn/completed",
-            params: TurnCompletedParams(turn: .init(id: "turn-review", status: "interrupted"))
+            params: TurnCompletedParams(threadID: "thread-review", turn: .init(id: "turn-review", status: "interrupted"))
         )
-        let token = try await withTimeout {
-            try await prepareTask.value
-        }
+        let token = try await prepareTask.value
 
         try await runtime.transport.enqueueThreadResume(.init(id: "thread-review"))
         try await runtime.transport.enqueueEmpty(for: "thread/rollback")
@@ -1959,16 +2839,17 @@ struct CodexAppServerKitTests {
         }
 
         try await runtime.transport.enqueueThreadResume(.init(id: "thread-source"))
-        try await runtime.transport.enqueueReviewStart(turnID: "turn-restarted")
+        try await runtime.transport.enqueueReviewStart(
+            turnID: "turn-restarted",
+            reviewThreadID: "thread-source"
+        )
         let review = try await runtime.server.restartPreparedReview(
             token,
             target: .baseBranch("main")
         )
 
-        #expect(review.identity == CodexReviewIdentity(
-            threadID: "thread-source",
-            turnID: "turn-restarted"
-        ))
+        #expect(review.identity.threadID == "thread-source")
+        #expect(review.identity.turnID == "turn-restarted")
         let requests = await runtime.transport.recordedRequests()
         #expect(requests.map(\.method) == [
             "initialize",
@@ -1992,7 +2873,93 @@ struct CodexAppServerKitTests {
         ])
     }
 
-    @Test func restartPreparedReviewKeepsTokenWhenCancelledAfterSourceResume() async throws {
+    @Test func restartPreparedReviewExhaustsItsTwoInvocationBudget() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let identity = CodexReviewIdentity(
+            threadID: "thread-source",
+            turnID: "turn-review",
+            reviewThreadID: "thread-review",
+            model: "gpt-5"
+        )
+        let token = try await prepareRestartToken(runtime: runtime, identity: identity)
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-review"))
+        try await runtime.transport.enqueueEmpty(for: "thread/rollback")
+        await runtime.transport.enqueueFailure(
+            code: -32000,
+            message: "first source resume failed",
+            for: "thread/resume"
+        )
+        await #expect(throws: CodexAppServerError.self) {
+            try await runtime.server.restartPreparedReview(
+                token,
+                target: .baseBranch("main")
+            )
+        }
+
+        await runtime.transport.enqueueFailure(
+            code: -32000,
+            message: "second source resume failed",
+            for: "thread/resume"
+        )
+        await #expect(throws: CodexAppServerError.reviewRestartUnavailable(token.id)) {
+            try await runtime.server.restartPreparedReview(
+                token,
+                target: .baseBranch("main")
+            )
+        }
+        await #expect(throws: CodexAppServerError.reviewRestartUnavailable(token.id)) {
+            try await runtime.server.restartPreparedReview(
+                token,
+                target: .baseBranch("main")
+            )
+        }
+
+        #expect(await runtime.transport.recordedRequests(method: "thread/rollback").count == 1)
+        let resumeThreadIDs = try await runtime.transport.recordedRequests(method: "thread/resume")
+            .map { request in
+                try request.decodeParams(AppServerAPI.Thread.Resume.Params.self).threadID
+            }
+        #expect(resumeThreadIDs == [
+            "thread-review",
+            "thread-review",
+            "thread-source",
+            "thread-source",
+        ])
+    }
+
+    @Test func restartPreparedReviewInvalidatesAfterAmbiguousRollbackResponse() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let identity = CodexReviewIdentity(
+            threadID: "thread-source",
+            turnID: "turn-review",
+            reviewThreadID: "thread-review",
+            model: "gpt-5"
+        )
+        let token = try await prepareRestartToken(runtime: runtime, identity: identity)
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-review"))
+        try await runtime.transport.enqueueJSON(
+            "\"not-an-empty-response\"",
+            for: "thread/rollback"
+        )
+
+        await #expect(throws: CodexAppServerError.self) {
+            try await runtime.server.restartPreparedReview(
+                token,
+                target: .baseBranch("main")
+            )
+        }
+        await #expect(throws: CodexAppServerError.reviewRestartUnavailable(token.id)) {
+            try await runtime.server.restartPreparedReview(
+                token,
+                target: .baseBranch("main")
+            )
+        }
+        #expect(await runtime.server.discardPreparedReviewRestart(token) == [identity])
+        #expect(await runtime.transport.recordedRequests(method: "thread/rollback").count == 1)
+    }
+
+    @Test func restartPreparedReviewCancellationOnlyRemovesTheWaitingCaller() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         let identity = CodexReviewIdentity(
             threadID: "thread-source",
@@ -2011,6 +2978,10 @@ struct CodexAppServerKitTests {
         try await runtime.transport.enqueueThreadResume(.init(id: "thread-review"))
         try await runtime.transport.enqueueEmpty(for: "thread/rollback")
         try await runtime.transport.enqueueThreadResume(.init(id: "thread-source"))
+        try await runtime.transport.enqueueReviewStart(
+            turnID: "turn-restarted",
+            reviewThreadID: "thread-source"
+        )
         let restart = Task {
             try await runtime.server.restartPreparedReview(token, target: .baseBranch("main"))
         }
@@ -2025,13 +2996,14 @@ struct CodexAppServerKitTests {
         )
         await rollbackGate.open()
         await runtime.transport.waitForRequest(method: "thread/resume", count: 3)
+        await runtime.server.waitForReviewRestartWaiterCountForTesting(
+            tokenID: token.id,
+            atLeast: 1
+        )
         restart.cancel()
-        await sourceResumeGate.open()
 
         do {
-            _ = try await withTimeout {
-                try await restart.value
-            }
+            _ = try await restart.value
             Issue.record("Expected cancelled source resume failure.")
         } catch is CancellationError {
             #expect(await runtime.transport.recordedRequests(method: "review/start").isEmpty)
@@ -2039,14 +3011,11 @@ struct CodexAppServerKitTests {
             Issue.record("Expected CancellationError, got \(error).")
         }
 
-        try await runtime.transport.enqueueThreadResume(.init(id: "thread-source"))
-        try await runtime.transport.enqueueReviewStart(turnID: "turn-restarted")
+        await sourceResumeGate.open()
         let review = try await runtime.server.restartPreparedReview(token, target: .baseBranch("main"))
 
-        #expect(review.identity == CodexReviewIdentity(
-            threadID: "thread-source",
-            turnID: "turn-restarted"
-        ))
+        #expect(review.identity.threadID == "thread-source")
+        #expect(review.identity.turnID == "turn-restarted")
         let requests = await runtime.transport.recordedRequests()
         #expect(requests.map(\.method) == [
             "initialize",
@@ -2055,13 +3024,12 @@ struct CodexAppServerKitTests {
             "thread/resume",
             "thread/rollback",
             "thread/resume",
-            "thread/resume",
             "review/start",
         ])
         #expect(requests.filter { $0.method == "thread/rollback" }.count == 1)
     }
 
-    @Test func restartPreparedReviewCleansDetachedReviewWhenCancelledDuringReviewStart() async throws {
+    @Test func discardPreparedReviewRestartCleansLateDetachedSessionWithoutDeletingThreads() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         let identity = CodexReviewIdentity(
             threadID: "thread-source",
@@ -2079,9 +3047,6 @@ struct CodexAppServerKitTests {
             turnID: "turn-restarted",
             reviewThreadID: "thread-review-restarted"
         )
-        try await runtime.transport.enqueueEmpty(for: "thread/delete")
-        try await runtime.transport.enqueueEmpty(for: "thread/delete")
-        try await runtime.transport.enqueueEmpty(for: "thread/delete")
         await runtime.transport.holdNextIgnoringCancellation(
             method: "review/start",
             gate: reviewStartGate
@@ -2098,15 +3063,25 @@ struct CodexAppServerKitTests {
             restart.cancel()
         }
         await runtime.transport.waitForRequest(method: "review/start")
-        restart.cancel()
+        let discard = Task {
+            await runtime.server.discardPreparedReviewRestart(token)
+        }
+        await runtime.server.waitForReviewRestartInvalidationRequestForTesting(
+            tokenID: token.id
+        )
         await reviewStartGate.open()
+        await runtime.transport.waitForRequest(method: "turn/interrupt", count: 2)
+        try await runtime.transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(id: "turn-restarted", status: "interrupted"))
+        )
+        let retainedIdentities = await discard.value
 
         do {
-            _ = try await withTimeout {
-                try await restart.value
-            }
-            Issue.record("Expected cancelled review start failure.")
-        } catch is CancellationError {
+            _ = try await restart.value
+            Issue.record("Expected invalidated review start failure.")
+        } catch let error as CodexAppServerError {
+            #expect(error == .reviewRestartUnavailable(token.id))
             let requests = await runtime.transport.recordedRequests()
             #expect(requests.map(\.method) == [
                 "initialize",
@@ -2116,21 +3091,19 @@ struct CodexAppServerKitTests {
                 "thread/rollback",
                 "thread/resume",
                 "review/start",
-                "thread/delete",
-                "thread/delete",
-                "thread/delete",
-            ])
-            let deletedThreadIDs = try requests.suffix(3).map {
-                try $0.decodeParams(AppServerAPI.Thread.Delete.Params.self).threadID
-            }
-            #expect(deletedThreadIDs == [
-                "thread-review",
-                "thread-review-restarted",
-                "thread-source",
+                "turn/interrupt",
             ])
         } catch {
-            Issue.record("Expected CancellationError, got \(error).")
+            Issue.record("Expected CodexAppServerError, got \(error).")
         }
+        #expect(retainedIdentities == [
+            identity,
+            CodexReviewIdentity(
+                threadID: "thread-source",
+                turnID: "turn-restarted",
+                reviewThreadID: "thread-review-restarted"
+            ),
+        ])
 
         do {
             _ = try await runtime.server.restartPreparedReview(token, target: .baseBranch("main"))
@@ -2142,37 +3115,25 @@ struct CodexAppServerKitTests {
         }
     }
 
-    @Test func restartPreparedReviewRejectsConcurrentTokenReuse() async throws {
+    @Test func restartPreparedReviewJoinsConcurrentMatchingInvocation() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
-        try await runtime.transport.enqueueThreadResume(.init(id: "thread-review"))
-        try await runtime.transport.enqueueEmpty(for: "turn/interrupt")
         let identity = CodexReviewIdentity(
             threadID: "thread-source",
             turnID: "turn-review",
             reviewThreadID: "thread-review",
             model: "gpt-5"
         )
-        let prepareTask = Task {
-            try await runtime.server.prepareReviewRestart(identity)
-        }
-        defer {
-            prepareTask.cancel()
-        }
-        await runtime.transport.waitForRequest(method: "turn/interrupt")
-        try await runtime.transport.emitServerNotification(
-            method: "turn/completed",
-            params: TurnCompletedParams(turn: .init(id: "turn-review", status: "interrupted"))
-        )
-        let token = try await withTimeout {
-            try await prepareTask.value
-        }
+        let token = try await prepareRestartToken(runtime: runtime, identity: identity)
 
         let resumeGate = CodexAppServerTestGate()
         await runtime.transport.holdNext(method: "thread/resume", gate: resumeGate)
         try await runtime.transport.enqueueThreadResume(.init(id: "thread-review"))
         try await runtime.transport.enqueueEmpty(for: "thread/rollback")
         try await runtime.transport.enqueueThreadResume(.init(id: "thread-source"))
-        try await runtime.transport.enqueueReviewStart(turnID: "turn-restarted")
+        try await runtime.transport.enqueueReviewStart(
+            turnID: "turn-restarted",
+            reviewThreadID: "thread-source"
+        )
         let firstRestart = Task {
             try await runtime.server.restartPreparedReview(token, target: .baseBranch("main"))
         }
@@ -2181,21 +3142,26 @@ struct CodexAppServerKitTests {
         }
         await runtime.transport.waitForRequest(method: "thread/resume", count: 2)
 
-        do {
-            _ = try await runtime.server.restartPreparedReview(token, target: .baseBranch("main"))
-            Issue.record("Expected concurrent token reuse to throw.")
-        } catch let error as CodexAppServerError {
-            #expect(error == .reviewRestartUnavailable(token.id))
-        } catch {
-            Issue.record("Expected CodexAppServerError, got \(error).")
+        let secondRestart = Task {
+            try await runtime.server.restartPreparedReview(
+                token,
+                target: .baseBranch("main")
+            )
         }
+        defer {
+            secondRestart.cancel()
+        }
+        await runtime.server.waitForReviewRestartWaiterCountForTesting(
+            tokenID: token.id,
+            atLeast: 2
+        )
 
         await resumeGate.open()
-        let review = try await withTimeout {
-            try await firstRestart.value
-        }
+        let firstReview = try await firstRestart.value
+        let secondReview = try await secondRestart.value
 
-        #expect(review.turnID == "turn-restarted")
+        #expect(firstReview.identity == secondReview.identity)
+        #expect(firstReview.turnID == "turn-restarted")
         let requests = await runtime.transport.recordedRequests()
         #expect(requests.filter { $0.method == "thread/rollback" }.count == 1)
         #expect(requests.filter { $0.method == "review/start" }.count == 1)
@@ -2203,6 +3169,52 @@ struct CodexAppServerKitTests {
             try $0.decodeParams(AppServerAPI.Thread.Resume.Params.self).threadID
         }
         #expect(resumeThreadIDs == ["thread-review", "thread-review", "thread-source"])
+    }
+
+    @Test func restartPreparedReviewRejectsConcurrentDifferentInvocation() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let identity = CodexReviewIdentity(
+            threadID: "thread-source",
+            turnID: "turn-review",
+            reviewThreadID: "thread-review",
+            model: "gpt-5"
+        )
+        let token = try await prepareRestartToken(runtime: runtime, identity: identity)
+        let resumeGate = CodexAppServerTestGate()
+        await runtime.transport.holdNext(method: "thread/resume", gate: resumeGate)
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-review"))
+        try await runtime.transport.enqueueEmpty(for: "thread/rollback")
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-source"))
+        try await runtime.transport.enqueueReviewStart(
+            turnID: "turn-restarted",
+            reviewThreadID: "thread-source"
+        )
+        let restart = Task {
+            try await runtime.server.restartPreparedReview(
+                token,
+                target: .baseBranch("main")
+            )
+        }
+        defer {
+            restart.cancel()
+        }
+        await runtime.transport.waitForRequest(method: "thread/resume", count: 2)
+        await runtime.server.waitForReviewRestartWaiterCountForTesting(
+            tokenID: token.id,
+            atLeast: 1
+        )
+
+        await #expect(throws: CodexAppServerError.reviewRestartUnavailable(token.id)) {
+            try await runtime.server.restartPreparedReview(
+                token,
+                target: .baseBranch("release")
+            )
+        }
+
+        await resumeGate.open()
+        #expect(try await restart.value.turnID == "turn-restarted")
+        #expect(await runtime.transport.recordedRequests(method: "thread/rollback").count == 1)
+        #expect(await runtime.transport.recordedRequests(method: "review/start").count == 1)
     }
 
     @Test func reviewStartSeedsDetachedTurnRoutingForTurnOnlyTerminalNotifications() async throws {
@@ -2214,34 +3226,61 @@ struct CodexAppServerKitTests {
             ),
             for: "review/start"
         )
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let gate = CodexAppServerTestGate()
+        await transport.holdNext(method: "review/start", gate: gate)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
 
-        let review = try await thread.startReview(
-            target: .baseBranch("main"),
-            delivery: .detached
+        let reviewTask = Task {
+            try await thread.startReview(
+                target: .baseBranch("main"),
+                delivery: .detached
+            )
+        }
+        await transport.waitForRequest(method: "review/start")
+        try await transport.emitServerNotification(
+            method: "turn/started",
+            params: TurnStartedParams(threadID: "thread-review", turnID: "turn-review")
+        )
+        try await transport.emitServerNotification(
+            method: "item/completed",
+            params: ThreadItemParams(
+                threadID: "thread-review",
+                turnID: "turn-review",
+                item: .init(id: "message-early", type: "agentMessage", text: "Buffered")
+            )
         )
         try await transport.emitServerNotification(
             method: "turn/completed",
-            params: TurnCompletedParams(turn: .init(id: "turn-review", status: "completed"))
+            params: TurnCompletedParams(threadID: "thread-review", turn: .init(id: "turn-review", status: "completed"))
         )
+        await gate.open()
+        let review = try await reviewTask.value
 
         var eventIterator = review.events.makeAsyncIterator()
-        let event = try await eventIterator.next()
-        if case .turnCompleted(let response) = event {
-            #expect(response.turnID == "turn-review")
+        var terminalResponse: CodexResponse?
+        while let event = try await eventIterator.next() {
+            if case .terminal(.completed(let response)) = event {
+                terminalResponse = response
+            }
+        }
+        if let terminalResponse {
+            #expect(terminalResponse.turnID == "turn-review")
+            #expect(terminalResponse.transcript.items.contains { $0.text == "Buffered" })
         } else {
             Issue.record("Expected review.events to receive turn-only completion.")
         }
-        #expect(try await eventIterator.next() == nil)
 
         var progressIterator = review.progress.makeAsyncIterator()
         let progress = try #require(try await progressIterator.next())
-        #expect(progress.phase == .completed)
-        #expect(progress.result?.turnID == "turn-review")
+        if case .terminal(let outcome) = progress {
+            #expect(outcome.response.turnID == "turn-review")
+        } else {
+            Issue.record("Expected terminal review progress.")
+        }
         #expect(try await progressIterator.next() == nil)
     }
 
@@ -2251,20 +3290,25 @@ struct CodexAppServerKitTests {
             AppServerAPI.Turn.Start.Response(turn: .init(id: "turn-1", status: "running")),
             for: "turn/start"
         )
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
         let eventTask = Task { () -> CodexThreadEvent? in
             var iterator = thread.events.makeAsyncIterator()
-            return try await iterator.next()
+            while let event = try await iterator.next() {
+                if case .terminal = event {
+                    return event
+                }
+            }
+            return nil
         }
         defer {
             eventTask.cancel()
         }
         #expect(await eventually {
-            await router.threadSubscriberCountForTesting(for: "thread-1") == 1
+            router.threadSubscriberCountForTesting(for: "thread-1") == 1
         })
 
         _ = try await thread.streamResponse(to: "Run checks.")
@@ -2276,14 +3320,14 @@ struct CodexAppServerKitTests {
         let event = try await withTimeout {
             try await eventTask.value
         }
-        if case .turnCompleted(let response) = event {
+        if case .terminal(.completed(let response)) = event {
             #expect(response.turnID == "turn-1")
         } else {
             Issue.record("Expected thread.events to receive turn-only completion.")
         }
     }
 
-    @Test func reviewEventsPreserveUnknownNotificationsAsRawDomainEvents() async throws {
+    @Test func reviewEventsAndLogsPreserveTurnDiagnosticsWithoutFabricatingTerminal() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueue(
             AppServerAPI.Review.Start.Response(
@@ -2292,166 +3336,117 @@ struct CodexAppServerKitTests {
             ),
             for: "review/start"
         )
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
 
         let review = try await thread.startReview(
             target: .baseBranch("main"),
             delivery: .detached
         )
-        try await transport.emitServerNotification(
-            method: "review/futureEvent",
-            params: TurnIDParams(turnID: "turn-review")
+        let reviewThread = CodexThread(
+            id: "thread-review",
+            client: client,
+            router: router,
+            connectionLease: harness.lease
         )
-
-        var iterator = review.events.makeAsyncIterator()
-        let event = try await iterator.next()
-        if case .unknown(let raw) = event {
-            #expect(raw.method == "review/futureEvent")
-            #expect(raw.threadID == "thread-review")
-            #expect(raw.turnID == "turn-review")
-        } else {
-            Issue.record("Expected unknown thread event to be preserved.")
-        }
-    }
-
-    @Test func reviewEventsRouteTurnIdentifiedUnknownNotificationsThroughTurnSeed() async throws {
-        let transport = CodexAppServerTestTransport()
-        try await transport.enqueue(
-            AppServerAPI.Review.Start.Response(
-                turnID: "turn-review",
-                reviewThreadID: "thread-review"
+        let expectedDiagnostics = [
+            CodexTurnDiagnostic(
+                error: .init(
+                    message: "recoverable",
+                    info: .serverOverloaded,
+                    additionalDetails: "retry scheduled"
+                ),
+                willRetry: true
             ),
-            for: "review/start"
-        )
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
-        await transport.waitForNotificationStreamCount(1)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
-
-        let review = try await thread.startReview(
-            target: .baseBranch("main"),
-            delivery: .detached
-        )
-        try await transport.emitServerNotification(
-            method: "error",
-            params: ReviewErrorParams(turnID: "turn-review", message: "recoverable")
-        )
-        try await transport.emitServerNotification(
-            method: "thread/closed",
-            params: ThreadIDParams(threadID: "thread-review")
-        )
-
-        let events = try await collect(review.events)
-        #expect(
-            events.contains {
-                if case .unknown(let raw) = $0 {
-                    return raw.method == "error"
-                        && raw.threadID == "thread-review"
-                        && raw.turnID == "turn-review"
+            CodexTurnDiagnostic(
+                error: .init(message: "not recoverable", info: .badRequest),
+                willRetry: false
+            ),
+        ]
+        let diagnosticEvents = Task { () throws -> [CodexTurnDiagnostic] in
+            var diagnostics: [CodexTurnDiagnostic] = []
+            for try await event in review.events {
+                if case .diagnostic(let diagnostic, turnID: "turn-review") = event {
+                    diagnostics.append(diagnostic)
+                    if diagnostics.count == expectedDiagnostics.count {
+                        return diagnostics
+                    }
                 }
-                return false
-            })
-    }
-
-    @Test func reviewEventsRouteThreadlessDiagnosticsToActiveReviewThreads() async throws {
-        let transport = CodexAppServerTestTransport()
-        try await transport.enqueue(
-            AppServerAPI.Review.Start.Response(
-                turnID: "turn-review",
-                reviewThreadID: "thread-review"
-            ),
-            for: "review/start"
-        )
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
-        await transport.waitForNotificationStreamCount(1)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
-
-        let review = try await thread.startReview(
-            target: .baseBranch("main"),
-            delivery: .detached
-        )
-        try await transport.emitServerNotification(
-            method: "deprecationNotice",
-            params: ThreadlessDiagnosticParams(message: "using defaults")
-        )
-        try await transport.emitServerNotification(
-            method: "turn/completed",
-            params: TurnCompletedParams(turn: .init(id: "turn-review", status: "completed"))
-        )
-        try await transport.emitServerNotification(
-            method: "deprecationNotice",
-            params: ThreadlessDiagnosticParams(message: "late warning")
-        )
-        try await transport.emitServerNotification(
-            method: "thread/closed",
-            params: ThreadIDParams(threadID: "thread-review")
-        )
-
-        let events = try await collect(review.events)
-        let diagnostics = events.filter {
-            if case .unknown(let raw) = $0 {
-                return raw.method == "deprecationNotice"
-                    && raw.threadID == "thread-review"
-                    && raw.turnID == nil
             }
-            return false
+            return diagnostics
         }
-        #expect(diagnostics.count == 1)
-    }
-
-    @Test func inlineReviewEventsRouteThreadlessDiagnosticsToSourceThread() async throws {
-        let transport = CodexAppServerTestTransport()
-        try await transport.enqueue(
-            AppServerAPI.Review.Start.Response(
-                turnID: "turn-review",
-                reviewThreadID: "thread-1"
-            ),
-            for: "review/start"
-        )
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
-        await transport.waitForNotificationStreamCount(1)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
-
-        let review = try await thread.startReview(
-            target: .baseBranch("main"),
-            delivery: .inline
-        )
-        try await transport.emitServerNotification(
-            method: "configWarning",
-            params: ThreadlessDiagnosticParams(message: "using defaults")
-        )
-        try await transport.emitServerNotification(
-            method: "turn/completed",
-            params: TurnCompletedParams(turn: .init(id: "turn-review", status: "completed"))
-        )
-        try await transport.emitServerNotification(
-            method: "configWarning",
-            params: ThreadlessDiagnosticParams(message: "late warning")
-        )
-        try await transport.emitServerNotification(
-            method: "thread/closed",
-            params: ThreadIDParams(threadID: "thread-1")
-        )
-
-        let events = try await collect(review.events)
-        let diagnostics = events.filter {
-            if case .unknown(let raw) = $0 {
-                return raw.method == "configWarning"
-                    && raw.threadID == "thread-1"
-                    && raw.turnID == nil
+        let turnDiagnosticLogs = Task { () throws -> [CodexThreadLogEntry] in
+            var entries: [CodexThreadLogEntry] = []
+            for try await entry in review.logEntries {
+                if case .diagnostic = entry {
+                    entries.append(entry)
+                    if entries.count == expectedDiagnostics.count {
+                        return entries
+                    }
+                }
             }
-            return false
+            return entries
         }
-        #expect(diagnostics.count == 1)
+        let threadDiagnosticLogs = Task { () throws -> [CodexThreadLogEntry] in
+            var entries: [CodexThreadLogEntry] = []
+            for try await entry in reviewThread.logEntries {
+                if case .diagnostic = entry {
+                    entries.append(entry)
+                    if entries.count == expectedDiagnostics.count {
+                        return entries
+                    }
+                }
+            }
+            return entries
+        }
+        defer {
+            diagnosticEvents.cancel()
+            turnDiagnosticLogs.cancel()
+            threadDiagnosticLogs.cancel()
+        }
+        #expect(await eventually {
+            let turnSubscriberCount = await harness.turnReplayStore.subscriberCountForTesting(
+                turnID: "turn-review"
+            )
+            return turnSubscriberCount == 2
+                && router.threadSubscriberCountForTesting(for: "thread-review") == 1
+        })
+        let emitter = CodexAppServerTestNotificationEmitter(transport: transport)
+        try await emitter.emitError(
+            threadID: "thread-review",
+            turnID: "turn-review",
+            error: expectedDiagnostics[0].error,
+            willRetry: expectedDiagnostics[0].willRetry
+        )
+        try await emitter.emitError(
+            threadID: "thread-review",
+            turnID: "turn-review",
+            error: expectedDiagnostics[1].error,
+            willRetry: expectedDiagnostics[1].willRetry
+        )
+
+        #expect(try await withTimeout { try await diagnosticEvents.value } == expectedDiagnostics)
+        let turnLogEntries = try await withTimeout { try await turnDiagnosticLogs.value }
+        let threadLogEntries = try await withTimeout { try await threadDiagnosticLogs.value }
+        for logEntries in [turnLogEntries, threadLogEntries] {
+            #expect(logEntries.map(\.diagnostic) == expectedDiagnostics.map(Optional.some))
+            #expect(logEntries.map(\.turnID) == ["turn-review", "turn-review"])
+            #expect(logEntries.map(\.phase) == [.diagnostic, .diagnostic])
+            #expect(Set(logEntries.map(\.id)).count == expectedDiagnostics.count)
+        }
+        #expect(try await review.response.turn.state.cachedOutcome() == nil)
+
+        var progress = review.progress.makeAsyncIterator()
+        guard case .running(let transcript, let usage) = try await progress.next() else {
+            Issue.record("A nonterminal diagnostic must preserve running progress.")
+            return
+        }
+        #expect(transcript.items.isEmpty)
+        #expect(usage == nil)
+        await harness.close()
     }
 
     @Test func promptPartsEncodeToAppServerInputItems() {
@@ -2488,11 +3483,12 @@ struct CodexAppServerKitTests {
         let transport = CodexAppServerTestTransport()
         await transport.enqueueFailure(code: -32001, message: "server busy", for: "ping")
         try await transport.enqueue(EmptyResponse(), for: "ping")
-        let client = AppServerClient(
+        let harness = await CodexAppServerTestConnectionHarness.start(
             transport: transport,
             overloadRetryDelay: { $0 == 0 ? .zero : nil },
             retrySleep: { _ in }
         )
+        let client = harness.client
 
         let _: EmptyResponse = try await client.send(
             method: "ping",
@@ -2500,7 +3496,500 @@ struct CodexAppServerKitTests {
             responseType: EmptyResponse.self
         )
 
-        #expect(await transport.recordedRequests().map(\.method) == ["ping", "ping"])
+        #expect(await transport.recordedRequests(method: "ping").count == 2)
+        await harness.close()
+    }
+
+    @Test func requestFailurePreservesCorrelationAndRawServerData() async throws {
+        let transport = CodexAppServerTestTransport()
+        let rawData = Data(
+            #"{"reason":"busy","message":"turn rejected","codexErrorInfo":"serverOverloaded"}"#.utf8
+        )
+        await transport.enqueueFailure(
+            .responseError(.init(
+                code: -32_000,
+                message: "rejected",
+                data: rawData
+            )),
+            for: "ping"
+        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+
+        do {
+            let _: EmptyResponse = try await client.send(
+                method: "ping",
+                params: EmptyResponse(),
+                responseType: EmptyResponse.self
+            )
+            Issue.record("Expected request failure.")
+        } catch let error as CodexAppServerError {
+            guard case .request(let failure) = error,
+                  case .server(let serverError) = failure.kind
+            else {
+                Issue.record("Expected typed server request failure, got \(error).")
+                return
+            }
+            #expect(failure.requestID == 1)
+            #expect(failure.method == "ping")
+            #expect(failure.purpose == .operation("ping"))
+            let serverData = try #require(serverError.data)
+            let serverDataObject = try #require(
+                JSONSerialization.jsonObject(with: serverData) as? [String: String]
+            )
+            #expect(serverDataObject == [
+                "reason": "busy",
+                "message": "turn rejected",
+                "codexErrorInfo": "serverOverloaded",
+            ])
+            #expect(serverError.turnError == .init(message: "turn rejected", info: .serverOverloaded))
+        }
+        await harness.close()
+    }
+
+    @Test func outboundWriterFailurePreservesRequestCorrelation() async throws {
+        let failure = CodexTransportFailure.io(errno: EPIPE, message: "broken pipe")
+        let transport = TestOutboundWriteFailureTransport(failure: failure)
+        let client = AppServerClient(
+            transport: transport,
+            connectionCloseAction: testConnectionCloseAction(for: transport)
+        )
+
+        do {
+            let _: EmptyResponse = try await client.send(
+                method: "ping",
+                params: EmptyResponse(),
+                responseType: EmptyResponse.self
+            )
+            Issue.record("Expected an outbound write failure.")
+        } catch let error as CodexAppServerError {
+            #expect(error == .request(.init(
+                requestID: 1,
+                method: "ping",
+                purpose: .operation("ping"),
+                kind: .write(failure)
+            )))
+        }
+    }
+
+    @Test func requestInvalidResponsePreservesCorrelationAndRawBytes() async throws {
+        struct RequiredResponse: Decodable, Sendable {
+            var value: String
+        }
+
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueJSON(#"{"unexpected":true}"#, for: "ping")
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+
+        do {
+            let _: RequiredResponse = try await client.send(
+                method: "ping",
+                params: EmptyResponse(),
+                responseType: RequiredResponse.self
+            )
+            Issue.record("Expected invalid response failure.")
+        } catch let error as CodexAppServerError {
+            guard case .request(let failure) = error,
+                  case .invalidResponse(_, _, let rawData) = failure.kind
+            else {
+                Issue.record("Expected typed invalid response, got \(error).")
+                return
+            }
+            #expect(failure.requestID == 1)
+            #expect(failure.method == "ping")
+            #expect(failure.purpose == .operation("ping"))
+            #expect(rawData == Data(#"{"unexpected":true}"#.utf8))
+        }
+        await harness.close()
+    }
+
+    @Test func responseReconciliationFailureTerminatesWithoutRejectingTheAcceptedWrite() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueEmpty(for: "ping")
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let failure = CodexTransportFailure.contractViolation(
+            message: "Response turn does not match the live generation."
+        )
+        let writeAcceptedCount = Mutex(0)
+        let responseRejectedCount = Mutex(0)
+        let responseAcceptedCount = Mutex(0)
+
+        do {
+            let _: EmptyResponse = try await harness.client.send(
+                method: "ping",
+                params: EmptyResponse(),
+                responseType: EmptyResponse.self,
+                reconcileResponse: { _ in throw failure },
+                onWriteAccepted: { writeAcceptedCount.withLock { $0 += 1 } },
+                onResponseRejected: { responseRejectedCount.withLock { $0 += 1 } },
+                onResponseAccepted: { responseAcceptedCount.withLock { $0 += 1 } }
+            )
+            Issue.record("Expected response reconciliation to terminate the connection.")
+        } catch let error as CodexAppServerError {
+            #expect(error == .connectionTerminated(.transportFailure(failure)))
+        }
+
+        #expect(writeAcceptedCount.withLock { $0 } == 1)
+        #expect(responseRejectedCount.withLock { $0 } == 0)
+        #expect(responseAcceptedCount.withLock { $0 } == 0)
+        #expect(
+            await harness.supervisor.terminationForTesting()
+                == .transportFailure(failure)
+        )
+    }
+
+    @Test func requestCancellationIsNeverWrapped() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.handle(method: "ping") { _ in
+            throw CancellationError()
+        }
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+
+        do {
+            let _: EmptyResponse = try await client.send(
+                method: "ping",
+                params: EmptyResponse(),
+                responseType: EmptyResponse.self
+            )
+            Issue.record("Expected CancellationError.")
+        } catch is CancellationError {
+        } catch {
+            Issue.record("Expected CancellationError, got \(error).")
+        }
+        await harness.close()
+    }
+
+    @Test func cancellationBeforeTransportAcceptsWriteHasNoWireEffect() async throws {
+        let transport = TestPreWriteSuspendingTransport(
+            response: try JSONEncoder().encode(EmptyResponse())
+        )
+        let client = AppServerClient(
+            transport: transport,
+            connectionCloseAction: testConnectionCloseAction(for: transport)
+        )
+        let scope = AppServerAPI.RequestScope.thread("thread-1")
+        let task = Task {
+            let _: EmptyResponse = try await client.send(
+                method: "ping",
+                params: EmptyResponse(),
+                responseType: EmptyResponse.self,
+                scope: scope
+            )
+        }
+        await transport.waitUntilSendEntered()
+        task.cancel()
+        await transport.allowWriteAcceptance()
+
+        await #expect(throws: CancellationError.self) {
+            try await task.value
+        }
+        #expect(transport.wireRequestCount() == 0)
+        #expect(await client.requestLaneCountForTesting() == 0)
+    }
+
+    @Test func transportClosureIsConnectionTerminationNotRequestFailure() async throws {
+        let transport = CodexAppServerTestTransport()
+        await transport.enqueueFailure(.closed, for: "ping")
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+
+        do {
+            let _: EmptyResponse = try await client.send(
+                method: "ping",
+                params: EmptyResponse(),
+                responseType: EmptyResponse.self
+            )
+            Issue.record("Expected connection termination.")
+        } catch let error as CodexAppServerError {
+            #expect(error == .connectionTerminated(.transportFailure(.closed)))
+        }
+        await harness.close()
+    }
+
+    @Test func requestDeadlineUsesInjectedMonotonicClockAndKeepsCorrelation() async throws {
+        let transport = TestSuspendingTransport(response: try JSONEncoder().encode(EmptyResponse()))
+        let deadlineGate = CodexAppServerTestGate()
+        let deadlineReturned = TestSignal()
+        let client = AppServerClient(
+            transport: transport,
+            deadlines: .init(request: .seconds(5)),
+            deadlineClock: .init { duration in
+                #expect(duration == .seconds(5))
+                await deadlineGate.waitIgnoringCancellation()
+                deadlineReturned.signal()
+            },
+            connectionCloseAction: testConnectionCloseAction(for: transport)
+        )
+
+        let task = Task {
+            let _: EmptyResponse = try await client.send(
+                method: "ping",
+                params: EmptyResponse(),
+                responseType: EmptyResponse.self,
+                purpose: .operation("ping"),
+                deadline: .seconds(5)
+            )
+        }
+        await transport.waitUntilStarted()
+        await deadlineGate.open()
+        await deadlineReturned.wait()
+        await transport.waitUntilCancelled()
+        do {
+            try await task.value
+            Issue.record("Expected request deadline.")
+        } catch let error as CodexAppServerError {
+            guard case .request(let failure) = error,
+                  case .deadlineExceeded(let duration) = failure.kind
+            else {
+                Issue.record("Expected request deadline, got \(error).")
+                return
+            }
+            #expect(failure.requestID == 1)
+            #expect(failure.method == "ping")
+            #expect(failure.purpose == .operation("ping"))
+            #expect(duration == .seconds(5))
+        }
+    }
+
+    @Test func requestDeadlineBoundsOverloadBackoffAndEntireRetryLoop() async throws {
+        let transport = CodexAppServerTestTransport()
+        await transport.enqueueFailure(code: -32_001, message: "busy", for: "ping")
+        let backoffStarted = TestSignal()
+        let backoffCancelled = TestSignal()
+        let backoffWaiter = TestCancellationWaiter {
+            backoffCancelled.signal()
+        }
+        let deadlineGate = CodexAppServerTestGate()
+        let deadlineReturned = TestSignal()
+        let harness = await CodexAppServerTestConnectionHarness.start(
+            transport: transport,
+            deadlineClock: .init { duration in
+                #expect(duration == .seconds(5))
+                await deadlineGate.waitIgnoringCancellation()
+                deadlineReturned.signal()
+            },
+            overloadRetryDelay: { attempt in
+                #expect(attempt == 0)
+                return .seconds(30)
+            },
+            retrySleep: { duration in
+                #expect(duration == .seconds(30))
+                backoffStarted.signal()
+                try await backoffWaiter.wait()
+            }
+        )
+        let client = harness.client
+        var connectionIterator = await harness.server.connectionEvents().makeAsyncIterator()
+
+        let task = Task {
+            let _: EmptyResponse = try await client.send(
+                method: "ping",
+                params: EmptyResponse(),
+                responseType: EmptyResponse.self,
+                purpose: .operation("ping"),
+                deadline: .seconds(5)
+            )
+        }
+        await backoffStarted.wait()
+        #expect(await connectionIterator.next() == .retrying(.init(
+            requestID: 1,
+            method: "ping",
+            attempt: 1,
+            delay: .seconds(30),
+            serverError: .init(code: -32_001, message: "busy")
+        )))
+        await deadlineGate.open()
+        await deadlineReturned.wait()
+        await backoffCancelled.wait()
+
+        do {
+            try await task.value
+            Issue.record("Expected request deadline during overload backoff.")
+        } catch let error as CodexAppServerError {
+            #expect(error == .request(.init(
+                requestID: 1,
+                method: "ping",
+                purpose: .operation("ping"),
+                kind: .deadlineExceeded(.seconds(5))
+            )))
+        }
+        #expect(await transport.recordedRequests(method: "ping").count == 1)
+        await harness.close()
+    }
+
+    @Test func overloadBackoffCancellationIsNeverWrapped() async throws {
+        let transport = CodexAppServerTestTransport()
+        await transport.enqueueFailure(code: -32_001, message: "busy", for: "ping")
+        let harness = await CodexAppServerTestConnectionHarness.start(
+            transport: transport,
+            overloadRetryDelay: { _ in .seconds(30) },
+            retrySleep: { _ in throw CancellationError() }
+        )
+        let client = harness.client
+
+        do {
+            let _: EmptyResponse = try await client.send(
+                method: "ping",
+                params: EmptyResponse(),
+                responseType: EmptyResponse.self
+            )
+            Issue.record("Expected CancellationError.")
+        } catch is CancellationError {
+        } catch {
+            Issue.record("Expected CancellationError, got \(error).")
+        }
+        await harness.close()
+    }
+
+    @Test func callerCancellationStopsShieldedOverloadBackoff() async throws {
+        let transport = CodexAppServerTestTransport()
+        await transport.enqueueFailure(code: -32_001, message: "busy", for: "ping")
+        let backoffStarted = TestSignal()
+        let backoffCancelled = TestSignal()
+        let backoffWaiter = TestCancellationWaiter {
+            backoffCancelled.signal()
+        }
+        let harness = await CodexAppServerTestConnectionHarness.start(
+            transport: transport,
+            overloadRetryDelay: { _ in .seconds(30) },
+            retrySleep: { _ in
+                backoffStarted.signal()
+                try await backoffWaiter.wait()
+            }
+        )
+        let client = harness.client
+        let task = Task {
+            let _: EmptyResponse = try await client.send(
+                method: "ping",
+                params: EmptyResponse(),
+                responseType: EmptyResponse.self
+            )
+        }
+        await backoffStarted.wait()
+        task.cancel()
+        await backoffCancelled.wait()
+
+        await #expect(throws: CancellationError.self) {
+            try await task.value
+        }
+        #expect(await transport.recordedRequests(method: "ping").count == 1)
+        await harness.close()
+    }
+
+    @Test func handshakeDeadlineTakesPrecedenceOverGenericRequestDeadline() async throws {
+        let transport = TestSuspendingTransport(response: try JSONEncoder().encode(
+            AppServerAPI.Initialize.Response(codexHome: "/tmp/codex")
+        ))
+        let deadlineGate = CodexAppServerTestGate()
+        let deadlineReturned = TestSignal()
+        let client = AppServerClient(
+            transport: transport,
+            deadlines: .init(handshake: .seconds(7), request: .seconds(2)),
+            deadlineClock: .init { duration in
+                #expect(duration == .seconds(7))
+                await deadlineGate.waitIgnoringCancellation()
+                deadlineReturned.signal()
+            },
+            connectionCloseAction: testConnectionCloseAction(for: transport)
+        )
+
+        let task = Task { try await client.initialize() }
+        await transport.waitUntilStarted()
+        await deadlineGate.open()
+        await deadlineReturned.wait()
+        await transport.waitUntilCancelled()
+        do {
+            _ = try await task.value
+            Issue.record("Expected handshake deadline.")
+        } catch let error as CodexAppServerError {
+            guard case .request(let failure) = error,
+                  case .deadlineExceeded(let duration) = failure.kind
+            else {
+                Issue.record("Expected handshake deadline, got \(error).")
+                return
+            }
+            #expect(failure.requestID == 1)
+            #expect(failure.method == "initialize")
+            #expect(failure.purpose == .handshake)
+            #expect(duration == .seconds(7))
+        }
+    }
+
+    @Test func turnDeadlineKeepsHandleAndDoesNotInterruptServerTurn() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueTurnStart(turnID: "turn-deadline", status: "inProgress")
+        let deadlineGate = CodexAppServerTestGate()
+        let harness = await CodexAppServerTestConnectionHarness.start(
+            transport: transport,
+            deadlineClock: .init { duration in
+                #expect(duration == .seconds(9))
+                await deadlineGate.waitIgnoringCancellation()
+            }
+        )
+        let client = harness.client
+        let router = harness.router
+        await transport.waitForNotificationStreamCount(1)
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
+        let stream = try await thread.streamResponse(to: "Wait for terminal.")
+
+        let task = Task { try await stream.collect(timeout: .seconds(9)) }
+        await deadlineGate.open()
+        do {
+            _ = try await task.value
+            Issue.record("Expected turn deadline.")
+        } catch let error as CodexAppServerError {
+            #expect(error == .turnDeadlineExceeded(turnID: "turn-deadline", duration: .seconds(9)))
+        }
+        #expect(await transport.recordedRequests(method: "turn/interrupt").isEmpty)
+
+        try await transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(id: "turn-deadline", status: "completed"))
+        )
+        guard case .completed(let response) = try await stream.collect() else {
+            Issue.record("Expected terminal replay after deadline.")
+            return
+        }
+        #expect(response.turnID == "turn-deadline")
+    }
+
+    @Test func responseCollectionCancellationIsLocalAndTerminalRemainsReplayable() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueTurnStart(turnID: "turn-local-cancel", status: "inProgress")
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
+        await transport.waitForNotificationStreamCount(1)
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
+        let stream = try await thread.streamResponse(to: "Keep running.")
+
+        let task = Task { try await stream.collect() }
+        #expect(await eventually {
+            await harness.turnReplayStore.subscriberCountForTesting(
+                turnID: "turn-local-cancel"
+            ) == 1
+        })
+        task.cancel()
+        do {
+            _ = try await task.value
+            Issue.record("Expected local collection cancellation.")
+        } catch is CancellationError {
+        } catch {
+            Issue.record("Expected CancellationError, got \(error).")
+        }
+        #expect(await transport.recordedRequests(method: "turn/interrupt").isEmpty)
+
+        try await transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(turn: .init(id: "turn-local-cancel", status: "completed"))
+        )
+        guard case .completed(let response) = try await stream.collect() else {
+            Issue.record("Expected replayed terminal outcome.")
+            return
+        }
+        #expect(response.turnID == "turn-local-cancel")
     }
 
     @Test func scopedRequestCancelledWhileQueuedDoesNotSend() async throws {
@@ -2508,7 +3997,8 @@ struct CodexAppServerKitTests {
         let gate = CodexAppServerTestGate()
         await transport.holdNextIgnoringCancellation(method: "turn/start", gate: gate)
         try await transport.enqueueTurnStart(turnID: "turn-1", status: "running")
-        let client = AppServerClient(transport: transport)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
 
         let first = Task {
             try await client.send(AppServerAPI.Turn.Start.Request(
@@ -2522,77 +4012,321 @@ struct CodexAppServerKitTests {
                 params: .init(threadID: "thread-1", input: [.text("second")])
             ))
         }
-        try await Task.sleep(for: .milliseconds(20))
+        try await client.waitForQueuedRequestCountForTesting(
+            scope: .thread("thread-1"),
+            atLeast: 1
+        )
         second.cancel()
 
-        await gate.open()
-        _ = try await first.value
         do {
-            _ = try await withTimeout {
-                try await second.value
-            }
+            _ = try await second.value
             Issue.record("Expected the queued scoped request to throw CancellationError.")
         } catch is CancellationError {
         } catch {
             Issue.record("Expected CancellationError, got \(error).")
         }
+        #expect(await client.queuedRequestCountForTesting(scope: .thread("thread-1")) == 0)
+        #expect(await client.requestLaneCountForTesting() == 1)
 
+        await gate.open()
+        _ = try await first.value
         #expect(await transport.recordedRequests(method: "turn/start").count == 1)
+        #expect(await client.requestLaneCountForTesting() == 0)
+        await harness.close()
     }
 
-    @Test func turnResultReplaysEarlyNotificationsAndKeepsUnknownEvents() async throws {
+    @Test func postWriteCancellationKeepsLaneUntilCorrelatedResponse() async throws {
         let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let responseGate = CodexAppServerTestGate()
+        await transport.holdNextIgnoringCancellation(method: "ping", gate: responseGate)
+        try await transport.enqueueEmpty(for: "ping")
+        try await transport.enqueueEmpty(for: "ping")
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let scope = AppServerAPI.RequestScope.thread("thread-1")
+
+        let first = Task {
+            let _: EmptyResponse = try await client.send(
+                method: "ping",
+                params: EmptyResponse(),
+                responseType: EmptyResponse.self,
+                scope: scope
+            )
+        }
+        await transport.waitForRequest(method: "ping")
+        first.cancel()
+
+        let second = Task {
+            let _: EmptyResponse = try await client.send(
+                method: "ping",
+                params: EmptyResponse(),
+                responseType: EmptyResponse.self,
+                scope: scope
+            )
+        }
+        try await client.waitForQueuedRequestCountForTesting(scope: scope, atLeast: 1)
+
+        #expect(await transport.recordedRequests(method: "ping").count == 1)
+        await responseGate.open()
+
+        await #expect(throws: CancellationError.self) {
+            try await first.value
+        }
+        try await second.value
+        #expect(await transport.recordedRequests(method: "ping").count == 2)
+        #expect(await client.requestLaneCountForTesting() == 0)
+        await harness.close()
+    }
+
+    @Test func postWriteCancellationKeepsLaneThroughRequiredCleanup() async throws {
+        let transport = CodexAppServerTestTransport()
+        let responseGate = CodexAppServerTestGate()
+        let cleanupStarted = TestSignal()
+        let cleanupGate = CodexAppServerTestGate()
+        await transport.holdNextIgnoringCancellation(method: "ping", gate: responseGate)
+        try await transport.enqueueEmpty(for: "ping")
+        try await transport.enqueueEmpty(for: "ping")
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let scope = AppServerAPI.RequestScope.thread("thread-1")
+
+        let first = Task {
+            let _: EmptyResponse = try await client.send(
+                method: "ping",
+                params: EmptyResponse(),
+                responseType: EmptyResponse.self,
+                scope: scope,
+                onPostWriteCancellation: { _ in
+                    cleanupStarted.signal()
+                    await cleanupGate.waitIgnoringCancellation()
+                }
+            )
+        }
+        await transport.waitForRequest(method: "ping")
+        first.cancel()
+        await responseGate.open()
+        await cleanupStarted.wait()
+
+        let second = Task {
+            let _: EmptyResponse = try await client.send(
+                method: "ping",
+                params: EmptyResponse(),
+                responseType: EmptyResponse.self,
+                scope: scope
+            )
+        }
+        try await client.waitForQueuedRequestCountForTesting(scope: scope, atLeast: 1)
+
+        #expect(await transport.recordedRequests(method: "ping").count == 1)
+        await cleanupGate.open()
+        await #expect(throws: CancellationError.self) {
+            try await first.value
+        }
+        try await second.value
+        #expect(await transport.recordedRequests(method: "ping").count == 2)
+        #expect(await client.requestLaneCountForTesting() == 0)
+        await harness.close()
+    }
+
+    @Test func cleanupChildWithStaleLaneTokenQueuesBehindCurrentOwner() async throws {
+        let transport = CodexAppServerTestTransport()
+        let firstResponseGate = CodexAppServerTestGate()
+        let blockerResponseGate = CodexAppServerTestGate()
+        let staleChildGate = CodexAppServerTestGate()
+        let staleChildTask = Mutex<Task<Void, Error>?>(nil)
+        await transport.holdNextIgnoringCancellation(method: "ping", gate: firstResponseGate)
+        await transport.holdNextIgnoringCancellation(method: "ping", gate: blockerResponseGate)
+        try await transport.enqueueEmpty(for: "ping")
+        try await transport.enqueueEmpty(for: "ping")
+        try await transport.enqueueEmpty(for: "ping")
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let scope = AppServerAPI.RequestScope.thread("thread-1")
+
+        let first = Task {
+            let _: EmptyResponse = try await client.send(
+                method: "ping",
+                params: EmptyResponse(),
+                responseType: EmptyResponse.self,
+                scope: scope,
+                onPostWriteCancellation: { _ in
+                    let task = Task {
+                        await staleChildGate.waitIgnoringCancellation()
+                        let _: EmptyResponse = try await client.send(
+                            method: "ping",
+                            params: EmptyResponse(),
+                            responseType: EmptyResponse.self,
+                            scope: scope
+                        )
+                    }
+                    staleChildTask.withLock { $0 = task }
+                }
+            )
+        }
+        await transport.waitForRequest(method: "ping")
+        first.cancel()
+        await firstResponseGate.open()
+        await #expect(throws: CancellationError.self) {
+            try await first.value
+        }
+
+        let blocker = Task {
+            let _: EmptyResponse = try await client.send(
+                method: "ping",
+                params: EmptyResponse(),
+                responseType: EmptyResponse.self,
+                scope: scope
+            )
+        }
+        await transport.waitForRequest(method: "ping", count: 2)
+        let child = try #require(staleChildTask.withLock { $0 })
+        await staleChildGate.open()
+        try await withTimeout {
+            try await client.waitForQueuedRequestCountForTesting(scope: scope, atLeast: 1)
+        }
+
+        #expect(await transport.recordedRequests(method: "ping").count == 2)
+        await blockerResponseGate.open()
+        try await blocker.value
+        try await child.value
+        #expect(await transport.recordedRequests(method: "ping").count == 3)
+        #expect(await client.requestLaneCountForTesting() == 0)
+        await harness.close()
+    }
+
+    @Test func postWriteDeadlineClosesConnectionBeforeReleasingLane() async throws {
+        let transport = CodexAppServerTestTransport()
+        let responseGate = CodexAppServerTestGate()
+        let deadlineGate = CodexAppServerTestGate()
+        await transport.holdNextIgnoringCancellation(method: "ping", gate: responseGate)
+        try await transport.enqueueEmpty(for: "ping")
+        let harness = await CodexAppServerTestConnectionHarness.start(
+            transport: transport,
+            deadlineClock: .init { duration in
+                #expect(duration == .seconds(5))
+                await deadlineGate.waitIgnoringCancellation()
+            }
+        )
+        let client = harness.client
+        let scope = AppServerAPI.RequestScope.thread("thread-1")
+
+        let first = Task {
+            let _: EmptyResponse = try await client.send(
+                method: "ping",
+                params: EmptyResponse(),
+                responseType: EmptyResponse.self,
+                scope: scope,
+                deadline: .seconds(5)
+            )
+        }
+        await transport.waitForRequest(method: "ping")
+
+        let second = Task {
+            let _: EmptyResponse = try await client.send(
+                method: "ping",
+                params: EmptyResponse(),
+                responseType: EmptyResponse.self,
+                scope: scope
+            )
+        }
+        try await client.waitForQueuedRequestCountForTesting(scope: scope, atLeast: 1)
+
+        await deadlineGate.open()
+        do {
+            try await first.value
+            Issue.record("Expected request deadline.")
+        } catch let error as CodexAppServerError {
+            #expect(error == .request(.init(
+                requestID: 1,
+                method: "ping",
+                purpose: .operation("ping"),
+                kind: .deadlineExceeded(.seconds(5))
+            )))
+        }
+        await #expect(throws: CodexAppServerError.self) {
+            try await second.value
+        }
+
+        #expect(await transport.recordedRequests(method: "ping").count == 1)
+        #expect(await transport.isClosedForTesting())
+        #expect(await client.requestLaneCountForTesting() == 0)
+    }
+
+    @Test func turnResultReplaysEarlyDomainEventsAndRoutesUnknownToConnection() async throws {
+        let transport = CodexAppServerTestTransport()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
+        let connectionEvents = await harness.server.connectionEvents()
+        let connectionEventTask = Task {
+            var iterator = connectionEvents.makeAsyncIterator()
+            return await iterator.next()
+        }
+        await connectionEvents.waitUntilNextSuspendsForTesting()
         await transport.waitForNotificationStreamCount(1)
+        let state = TurnGenerationHandleState(connectionLease: harness.lease)
+        let pending = await harness.turnReplayStore.registerPendingOperation(
+            kind: .turn(threadID: "thread-1"),
+            state: state
+        )
+        pending.acceptWrite()
+        let futureParams = TurnIDParams(turnID: "turn-1")
         try await transport.emitServerNotification(
             method: "future/notification",
-            params: TurnIDParams(turnID: "turn-1")
+            params: futureParams
+        )
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-1",
+            turnID: "turn-1",
+            item: .init(id: "message-1", type: "agentMessage", text: "")
         )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
-            params: TurnDeltaParams(turnID: "turn-1", delta: "Done")
+            params: TurnDeltaParams(turnID: "turn-1", itemID: "message-1", delta: "Done")
         )
         try await transport.emitServerNotification(
             method: "turn/completed",
             params: TurnCompletedParams(turn: .init(id: "turn-1", status: "completed"))
         )
+        await harness.turnReplayStore.bind(
+            pending,
+            to: "turn-1",
+            initialSnapshot: .init(id: "turn-1", state: .inProgress)
+        )
         let turn = CodexTurn(
             id: "turn-1",
             threadID: "thread-1",
             client: client,
-            router: router
+            router: router,
+            turnReplayStore: harness.turnReplayStore,
+            state: state
         )
 
         let events = try await collect(turn.events)
-        #expect(
-            events.contains {
-                if case .unknown(let raw) = $0 {
-                    raw.method == "future/notification"
-                } else {
-                    false
-                }
-            })
-        let result = try await CodexResponseCollector.collect(
-            from: .init {
-                AsyncThrowingStream { continuation in
-                    for event in events {
-                        continuation.yield(event)
-                    }
-                    continuation.finish()
-                }
-            })
-        #expect(result.turnID == "turn-1")
-        #expect(result.status == .completed)
-        #expect(result.finalAnswer == "Done")
+        #expect(events.contains {
+            if case .unknown = $0 { true } else { false }
+        } == false)
+        guard case .unknown(let raw) = await connectionEventTask.value else {
+            Issue.record("Expected the future notification on the connection stream.")
+            return
+        }
+        #expect(raw.method == "future/notification")
+        #expect(raw.params == (try JSONEncoder().encode(futureParams)))
+        #expect(raw.threadID == nil)
+        #expect(raw.turnID == "turn-1")
+        let result = try await turn.result()
+        #expect(result.response.turnID == "turn-1")
+        #expect(result == .completed(result.response))
+        #expect(result.response.transcript.finalAnswer == "Done")
     }
 
     @Test func threadEventStreamCancellationRemovesRouterSubscriber() async throws {
         let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
 
         let consumer = Task {
             var iterator = thread.events.makeAsyncIterator()
@@ -2600,48 +4334,33 @@ struct CodexAppServerKitTests {
         }
 
         #expect(await eventually {
-            await router.threadSubscriberCountForTesting(for: "thread-1") == 1
+            router.threadSubscriberCountForTesting(for: "thread-1") == 1
         })
         consumer.cancel()
-        let removed = await eventually {
-            await router.threadSubscriberCountForTesting(for: "thread-1") == 0
-        }
-        #expect(removed)
-        if removed {
-            try await consumer.value
-        }
+        try await consumer.value
+        #expect(router.threadSubscriberCountForTesting(for: "thread-1") == 0)
     }
 
     @Test func directThreadEventStreamCancellationRemovesRouterSubscriber() async throws {
         let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        let stream = await router.events(for: CodexThreadID(rawValue: "thread-1"))
-        #expect(await router.threadSubscriberCountForTesting(for: "thread-1") == 1)
-
-        let consumer = Task {
-            var iterator = stream.makeAsyncIterator()
-            _ = try await iterator.next()
-        }
-
-        consumer.cancel()
-        let removed = await eventually {
-            await router.threadSubscriberCountForTesting(for: "thread-1") == 0
-        }
-        #expect(removed)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let router = harness.router
+        let stream = router.events(for: CodexThreadID(rawValue: "thread-1"))
+        #expect(router.threadSubscriberCountForTesting(for: "thread-1") == 1)
+        stream.cancel()
+        #expect(router.threadSubscriberCountForTesting(for: "thread-1") == 0)
     }
 
     @Test func liveThreadEventStreamFinishesWhenHistoryIsAlreadyTerminal() async throws {
         let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
         try await transport.emitServerNotification(
             method: "thread/closed",
             params: ThreadIDParams(threadID: "thread-1")
         )
-        let replayStream = await router.events(for: CodexThreadID(rawValue: "thread-1"))
+        let replayStream = router.events(for: CodexThreadID(rawValue: "thread-1"))
         let replayEvents = try await withTimeout {
             try await collect(replayStream)
         }
@@ -2652,27 +4371,20 @@ struct CodexAppServerKitTests {
             return false
         })
 
-        let stream = await router.liveEvents(for: CodexThreadID(rawValue: "thread-1"))
-        #expect(await router.threadSubscriberCountForTesting(for: "thread-1") == 0)
-
-        let events = try await withTimeout {
-            try await collect(stream)
-        }
-        #expect(events.isEmpty)
+        #expect(router.threadSubscriberCountForTesting(for: "thread-1") == 0)
     }
 
     @Test func threadEventStreamsReplayOnlyCurrentGenerationAfterNewGenerationStarts() async throws {
         let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
         try await transport.emitServerNotification(
             method: "thread/closed",
             params: ThreadIDParams(threadID: "thread-1")
         )
         let firstGeneration = try await withTimeout {
-            try await collect(await router.events(for: CodexThreadID(rawValue: "thread-1")))
+            try await collect(router.events(for: CodexThreadID(rawValue: "thread-1")))
         }
         #expect(firstGeneration.contains { event in
             if case .closed = event {
@@ -2681,12 +4393,19 @@ struct CodexAppServerKitTests {
             return false
         })
 
-        await router.beginThreadEventGeneration("thread-1")
+        router.resetThreadEventGeneration("thread-1")
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-1",
+            turnID: "turn-2",
+            item: .init(id: "message-1", type: "agentMessage", text: "")
+        )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(
                 threadID: "thread-1",
                 turnID: "turn-2",
+                itemID: "message-1",
                 delta: "Current"
             )
         )
@@ -2696,49 +4415,56 @@ struct CodexAppServerKitTests {
         )
 
         let currentGeneration = try await withTimeout {
-            try await collect(await router.observationEvents(for: "thread-1"))
+            try await collect(router.events(for: "thread-1"))
         }
-        #expect(currentGeneration.count == 2)
-        #expect(currentGeneration.contains { event in
-            if case .messageDelta(let delta, let turnID) = event {
-                return delta.text == "Current" && turnID == "turn-2"
-            }
-            return false
-        })
+        #expect(currentGeneration.containsThreadText("Current", turnID: "turn-2"))
         #expect(currentGeneration.last == .closed)
     }
 
     @Test func threadGenerationIncludingTurnStartsAfterPriorTerminalTurn() async throws {
         let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
         try await transport.emitServerNotification(
             method: "turn/started",
             params: TurnStartedParams(threadID: "thread-review", turnID: "turn-old")
+        )
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-review",
+            turnID: "turn-old",
+            item: .init(id: "message-1", type: "agentMessage", text: "")
         )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(
                 threadID: "thread-review",
                 turnID: "turn-old",
+                itemID: "message-1",
                 delta: "Old"
             )
         )
         try await transport.emitServerNotification(
             method: "turn/completed",
-            params: TurnCompletedParams(turn: .init(id: "turn-old", status: "completed"))
+            params: TurnCompletedParams(threadID: "thread-review", turn: .init(id: "turn-old", status: "completed"))
         )
         try await transport.emitServerNotification(
             method: "turn/started",
             params: TurnStartedParams(threadID: "thread-review", turnID: "turn-current")
+        )
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-review",
+            turnID: "turn-current",
+            item: .init(id: "message-1", type: "agentMessage", text: "")
         )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(
                 threadID: "thread-review",
                 turnID: "turn-current",
+                itemID: "message-1",
                 delta: "Current"
             )
         )
@@ -2747,9 +4473,16 @@ struct CodexAppServerKitTests {
             params: ThreadIDParams(threadID: "thread-review")
         )
 
-        await router.beginThreadEventGeneration("thread-review", including: "turn-current")
+        let provisionalGeneration = try await withTimeout {
+            try await collect(router.events(for: "thread-review"))
+        }
+        #expect(provisionalGeneration.last == .closed)
+        await router.adoptThreadEventGeneration(
+            "thread-review",
+            including: "turn-current"
+        )
         let currentGeneration = try await withTimeout {
-            try await collect(await router.observationEvents(for: "thread-review"))
+            try await collect(router.events(for: "thread-review"))
         }
 
         #expect(currentGeneration.contains { event in
@@ -2759,35 +4492,56 @@ struct CodexAppServerKitTests {
             return false
         } == false)
         #expect(currentGeneration.contains { event in
-            if case .turnStarted(let turnID) = event {
-                return turnID == "turn-current"
+            if case .snapshot(let snapshot) = event {
+                return snapshot.id == "turn-current"
             }
             return false
         })
-        #expect(currentGeneration.contains { event in
-            if case .messageDelta(let delta, let turnID) = event {
-                return delta.text == "Current" && turnID == "turn-current"
-            }
-            return false
-        })
+        #expect(currentGeneration.containsThreadText("Current", turnID: "turn-current"))
         #expect(currentGeneration.last == .closed)
     }
 
-    @Test func resumeThreadCapturesEventsReceivedDuringResume() async throws {
+    @Test func resumeThreadReidentifiesResponseSnapshotFromCanonicalEventsDuringResume() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         let gate = CodexAppServerTestGate()
         await runtime.transport.holdNext(method: "thread/resume", gate: gate)
-        try await runtime.transport.enqueueThreadResume(.init(id: "thread-resume-events"))
+        try await runtime.transport.enqueueThreadResume(.init(
+            id: "thread-resume-events",
+            turns: [
+                .init(
+                    id: "rollout-synthesized-turn",
+                    state: .inProgress,
+                    items: [
+                        .init(
+                            id: "response-message",
+                            kind: .agentMessage,
+                            content: .message(.init(
+                                id: "response-message",
+                                role: .assistant,
+                                text: "From resume response"
+                            ))
+                        ),
+                    ]
+                ),
+            ]
+        ))
 
         let resumeTask = Task {
             try await runtime.server.resumeThread("thread-resume-events")
         }
         await runtime.transport.waitForRequest(method: "thread/resume")
+        try await emitItemStarted(
+            on: runtime.transport,
+            threadID: "thread-resume-events",
+            turnID: "turn-resume-events",
+            item: .init(id: "message-1", type: "agentMessage", text: "")
+        )
         try await runtime.transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(
                 threadID: "thread-resume-events",
                 turnID: "turn-resume-events",
+                itemID: "message-1",
                 delta: "During resume"
             )
         )
@@ -2800,45 +4554,69 @@ struct CodexAppServerKitTests {
         )
 
         let events = try await collect(thread.events)
+        #expect(events.containsThreadText("From resume response", turnID: "turn-resume-events"))
+        #expect(events.containsThreadText("During resume", turnID: "turn-resume-events"))
         #expect(events.contains { event in
-            if case .messageDelta(let delta, let turnID) = event {
-                return delta.text == "During resume" && turnID == "turn-resume-events"
+            if case .snapshot(let snapshot) = event {
+                return snapshot.id == "rollout-synthesized-turn"
             }
             return false
-        })
+        } == false)
     }
 
-    @Test func threadGenerationStartPreservesActiveUnscopedDiagnostics() async throws {
-        let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
-        await transport.waitForNotificationStreamCount(1)
+    @Test func resumeThreadReidentifiesProvisionalResponseWhenCanonicalEventsArriveLater() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        try await runtime.transport.enqueueThreadResume(.init(
+            id: "thread-resume-events",
+            turns: [
+                .init(
+                    id: "rollout-synthesized-turn",
+                    state: .inProgress,
+                    items: [
+                        .init(
+                            id: "response-message",
+                            kind: .agentMessage,
+                            content: .message(.init(
+                                id: "response-message",
+                                role: .assistant,
+                                text: "From resume response"
+                            ))
+                        ),
+                    ]
+                ),
+            ]
+        ))
 
-        await router.activateUnscopedDiagnosticRouting(in: "thread-review", until: "turn-review")
-        let cursor = await router.threadEventGenerationCursor("thread-review")
-        await router.beginThreadEventGeneration("thread-review", at: cursor)
-        try await transport.emitServerNotification(
-            method: "configWarning",
-            params: ThreadlessDiagnosticParams(message: "after resume")
+        let thread = try await runtime.server.resumeThread("thread-resume-events")
+        try await emitItemStarted(
+            on: runtime.transport,
+            threadID: "thread-resume-events",
+            turnID: "turn-resume-events",
+            item: .init(id: "message-1", type: "agentMessage", text: "")
         )
-        try await transport.emitServerNotification(
+        try await runtime.transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(
+                threadID: "thread-resume-events",
+                turnID: "turn-resume-events",
+                itemID: "message-1",
+                delta: "After resume"
+            )
+        )
+        try await runtime.transport.emitServerNotification(
             method: "thread/closed",
-            params: ThreadIDParams(threadID: "thread-review")
+            params: ThreadIDParams(threadID: "thread-resume-events")
         )
 
-        let events = try await withTimeout {
-            try await collect(await router.observationEvents(for: "thread-review"))
-        }
+        let events = try await collect(thread.events)
+        #expect(events.containsThreadText("From resume response", turnID: "turn-resume-events"))
+        #expect(events.containsThreadText("After resume", turnID: "turn-resume-events"))
         #expect(events.contains { event in
-            if case .unknown(let raw) = event {
-                return raw.method == "configWarning"
-                    && raw.threadID == "thread-review"
-                    && raw.turnID == nil
+            if case .snapshot(let snapshot) = event {
+                return snapshot.id == "rollout-synthesized-turn"
             }
             return false
-        })
-        #expect(events.last == .closed)
+        } == false)
     }
 
     @Test func streamResponseBeginsNewThreadEventGeneration() async throws {
@@ -2846,17 +4624,24 @@ struct CodexAppServerKitTests {
         try await transport.enqueueTurnStart(turnID: "turn-2", status: "running")
         let gate = CodexAppServerTestGate()
         await transport.holdNext(method: "turn/start", gate: gate)
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
 
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-1",
+            turnID: "turn-1",
+            item: .init(id: "message-1", type: "agentMessage", text: "")
+        )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(
                 threadID: "thread-1",
                 turnID: "turn-1",
+                itemID: "message-1",
                 delta: "Previous generation"
             )
         )
@@ -2873,10 +4658,17 @@ struct CodexAppServerKitTests {
             try await thread.streamResponse(to: "Next turn.")
         }
         await transport.waitForRequest(method: "turn/start")
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-1",
+            turnID: "turn-2",
+            item: .init(id: "message-1", type: "agentMessage", text: "")
+        )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(
                 turnID: "turn-2",
+                itemID: "message-1",
                 delta: "During start"
             )
         )
@@ -2890,39 +4682,40 @@ struct CodexAppServerKitTests {
         let events = try await withTimeout {
             try await collect(thread.events)
         }
-        #expect(events.count == 2)
-        #expect(events.contains { event in
-            if case .messageDelta(let delta, let turnID) = event {
-                return delta.text == "During start" && turnID == "turn-2"
-            }
-            return false
-        })
-        #expect(events.contains { event in
-            if case .messageDelta(let delta, let turnID) = event {
-                return delta.text == "Previous generation" && turnID == "turn-1"
-            }
-            return false
-        } == false)
+        #expect(events.count == 3)
+        #expect(events.containsThreadText("During start", turnID: "turn-2"))
+        #expect(events.containsThreadText("Previous generation", turnID: "turn-1") == false)
         #expect(events.last == .closed)
         withExtendedLifetime(responseStream) {}
     }
 
     @Test func startReviewBeginsNewThreadEventGeneration() async throws {
         let transport = CodexAppServerTestTransport()
-        try await transport.enqueueReviewStart(turnID: "turn-review", status: .running)
+        try await transport.enqueueReviewStart(
+            turnID: "turn-review",
+            reviewThreadID: "thread-1",
+            status: .inProgress
+        )
         let gate = CodexAppServerTestGate()
         await transport.holdNext(method: "review/start", gate: gate)
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
 
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-1",
+            turnID: "turn-previous",
+            item: .init(id: "message-1", type: "agentMessage", text: "")
+        )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(
                 threadID: "thread-1",
                 turnID: "turn-previous",
+                itemID: "message-1",
                 delta: "Previous generation"
             )
         )
@@ -2940,23 +4733,42 @@ struct CodexAppServerKitTests {
         }
         await transport.waitForRequest(method: "review/start")
         try await transport.emitServerNotification(
+            method: "turn/started",
+            params: TurnStartedParams(threadID: "thread-1", turnID: "turn-review-child")
+        )
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-1",
+            turnID: "turn-review",
+            item: .init(id: "message-1", type: "agentMessage", text: "")
+        )
+        try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(
                 turnID: "turn-review",
+                itemID: "message-1",
                 delta: "During review start"
             )
         )
-        try await transport.emitServerNotification(
-            method: "configWarning",
-            params: ThreadlessDiagnosticParams(message: "startup warning")
-        )
         await gate.open()
         let review = try await reviewTask.value
+        try await transport.emitServerNotification(
+            method: "turn/started",
+            params: TurnStartedParams(threadID: "thread-1", turnID: "turn-review-child-late")
+        )
+        try await transport.emitServerNotification(
+            method: "item/completed",
+            params: ThreadItemParams(
+                threadID: "thread-1",
+                turnID: "turn-review",
+                item: .init(id: "review-output", type: "agentMessage", text: "No issues.")
+            )
+        )
         let eventsTask = Task {
             try await collect(thread.events)
         }
         #expect(await eventually {
-            await router.threadSubscriberCountForTesting(for: "thread-1") == 1
+            router.threadSubscriberCountForTesting(for: "thread-1") == 1
         })
 
         try await transport.emitServerNotification(
@@ -2967,26 +4779,8 @@ struct CodexAppServerKitTests {
         let events = try await withTimeout {
             try await eventsTask.value
         }
-        #expect(events.contains { event in
-            if case .messageDelta(let delta, let turnID) = event {
-                return delta.text == "During review start" && turnID == "turn-review"
-            }
-            return false
-        })
-        #expect(events.contains { event in
-            if case .unknown(let raw) = event {
-                return raw.method == "configWarning"
-                    && raw.threadID == "thread-1"
-                    && raw.turnID == nil
-            }
-            return false
-        })
-        #expect(events.contains { event in
-            if case .messageDelta(let delta, let turnID) = event {
-                return delta.text == "Previous generation" && turnID == "turn-previous"
-            }
-            return false
-        } == false)
+        #expect(events.containsThreadText("During review start", turnID: "turn-review"))
+        #expect(events.containsThreadText("Previous generation", turnID: "turn-previous") == false)
         #expect(events.last == .closed)
         withExtendedLifetime(review) {}
     }
@@ -2996,29 +4790,23 @@ struct CodexAppServerKitTests {
         try await transport.enqueueReviewStart(
             turnID: "turn-review",
             reviewThreadID: "thread-review",
-            status: .running
+            status: .inProgress
         )
         let gate = CodexAppServerTestGate()
         await transport.holdNext(method: "review/start", gate: gate)
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
-        let thread = CodexThread(id: "thread-source", client: client, router: router)
-        let reviewThread = CodexThread(id: "thread-review", client: client, router: router)
-        let repeatedDiagnostic = ThreadlessDiagnosticParams(message: "detached startup warning")
+        let thread = CodexThread(id: "thread-source", client: client, router: router, connectionLease: harness.lease)
+        let reviewThread = CodexThread(id: "thread-review", client: client, router: router, connectionLease: harness.lease)
 
         let oldSourceEventsTask = Task {
             try await collect(thread.events)
         }
         #expect(await eventually {
-            await router.threadSubscriberCountForTesting(for: "thread-source") == 1
+            router.threadSubscriberCountForTesting(for: "thread-source") == 1
         })
-        await router.beginUnscopedDiagnosticRouting(in: "thread-source")
-        try await transport.emitServerNotification(
-            method: "configWarning",
-            params: repeatedDiagnostic
-        )
         try await transport.emitServerNotification(
             method: "thread/closed",
             params: ThreadIDParams(threadID: "thread-source")
@@ -3026,29 +4814,29 @@ struct CodexAppServerKitTests {
         let oldSourceEvents = try await withTimeout {
             try await oldSourceEventsTask.value
         }
-        #expect(oldSourceEvents.contains { event in
-            if case .unknown(let raw) = event {
-                return raw.method == "configWarning"
-                    && raw.threadID == "thread-source"
-                    && raw.turnID == nil
-            }
-            return false
-        })
+        #expect(oldSourceEvents.last == .closed)
 
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-review-previous",
+            turnID: "turn-previous",
+            item: .init(id: "message-1", type: "agentMessage", text: "")
+        )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(
-                threadID: "thread-review",
+                threadID: "thread-review-previous",
                 turnID: "turn-previous",
+                itemID: "message-1",
                 delta: "Previous detached generation"
             )
         )
         try await transport.emitServerNotification(
             method: "thread/closed",
-            params: ThreadIDParams(threadID: "thread-review")
+            params: ThreadIDParams(threadID: "thread-review-previous")
         )
         let previousEvents = try await withTimeout {
-            try await collect(reviewThread.events)
+            try await collect(router.events(for: "thread-review-previous"))
         }
         #expect(previousEvents.last == .closed)
 
@@ -3056,97 +4844,448 @@ struct CodexAppServerKitTests {
             try await thread.startReview(target: .baseBranch("main"), delivery: .detached)
         }
         await transport.waitForRequest(method: "review/start")
-        await transport.emitServerNotificationJSON(
+        try await transport.emitServerNotificationJSON(
+            method: "thread/status/changed",
+            json: #"{"threadId":"thread-source","status":{"type":"active","activeFlags":["waitingOnApproval"]}}"#
+        )
+        try await transport.emitServerNotification(
+            method: "turn/started",
+            params: TurnStartedParams(threadID: "thread-review", turnID: "turn-review-child")
+        )
+        try await transport.emitServerNotificationJSON(
             method: "thread/status/changed",
             json: #"{"threadId":"thread-review","status":{"type":"active","activeFlags":[]}}"#
+        )
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-review",
+            turnID: "turn-review",
+            item: .init(id: "message-1", type: "agentMessage", text: "")
         )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(
                 threadID: "thread-review",
                 turnID: "turn-review",
+                itemID: "message-1",
                 delta: "During detached review start"
             )
         )
-        try await transport.emitServerNotification(
-            method: "configWarning",
-            params: repeatedDiagnostic
-        )
-        try await transport.emitServerNotification(
-            method: "configWarning",
-            params: repeatedDiagnostic
-        )
         await gate.open()
         let review = try await reviewTask.value
-        let eventsTask = Task {
-            try await collect(review.events)
+        withExtendedLifetime(review) {}
+        let sourceEventsTask = Task {
+            try await collect(thread.events)
         }
         #expect(await eventually {
-            await router.threadSubscriberCountForTesting(for: "thread-review") == 1
+            router.threadSubscriberCountForTesting(for: "thread-source") == 1
+        })
+        let eventsTask = Task {
+            try await collect(reviewThread.events)
+        }
+        #expect(await eventually {
+            router.threadSubscriberCountForTesting(for: "thread-review") == 1
         })
 
         try await transport.emitServerNotification(
             method: "thread/closed",
             params: ThreadIDParams(threadID: "thread-review")
         )
+        try await transport.emitServerNotification(
+            method: "thread/closed",
+            params: ThreadIDParams(threadID: "thread-source")
+        )
 
         let events = try await withTimeout {
             try await eventsTask.value
         }
         #expect(events.contains(.statusChanged(.active(activeFlags: []))))
-        let diagnostics = events.filter { event in
-            if case .unknown(let raw) = event {
-                return raw.method == "configWarning"
-                    && raw.threadID == "thread-review"
-                    && raw.turnID == nil
-            }
-            return false
-        }
-        #expect(diagnostics.count == 2)
+        #expect(events.containsThreadText("During detached review start", turnID: "turn-review"))
         #expect(events.contains { event in
-            if case .messageDelta(let delta, let turnID) = event {
-                return delta.text == "During detached review start" && turnID == "turn-review"
-            }
-            return false
-        })
-        #expect(events.contains { event in
-            if case .messageDelta(let delta, let turnID) = event {
-                return delta.text == "Previous detached generation" && turnID == "turn-previous"
+            if case .snapshot(let snapshot) = event {
+                return snapshot.id == "turn-review-child"
             }
             return false
         } == false)
+        #expect(
+            events.containsThreadText("Previous detached generation", turnID: "turn-previous")
+                == false
+        )
         #expect(events.last == .closed)
-
-        await router.beginThreadEventGeneration("thread-source", at: 0)
-        let sourceEventsTask = Task {
-            try await collect(thread.events)
-        }
         let sourceEvents = try await withTimeout {
             try await sourceEventsTask.value
         }
-        let sourceDiagnostics = sourceEvents.filter { event in
-            if case .unknown(let raw) = event {
-                return raw.method == "configWarning"
+        #expect(sourceEvents.contains(.statusChanged(.active(activeFlags: [.waitingOnApproval]))))
+        #expect(sourceEvents.contains { event in
+            if case .snapshot(let snapshot) = event {
+                return snapshot.id == "turn-review"
             }
             return false
+        } == false)
+        #expect(sourceEvents.last == .closed)
+    }
+
+    @Test func detachedReviewAmbiguityPreservesAnUnrelatedTurnStart() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueReviewStart(
+            turnID: "turn-review",
+            reviewThreadID: "thread-review",
+            status: .inProgress
+        )
+        let gate = CodexAppServerTestGate()
+        await transport.holdNext(method: "review/start", gate: gate)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let sourceThread = CodexThread(
+            id: "thread-source",
+            client: harness.client,
+            router: harness.router,
+            connectionLease: harness.lease
+        )
+        let unrelatedThread = CodexThread(
+            id: "thread-unrelated",
+            client: harness.client,
+            router: harness.router,
+            connectionLease: harness.lease
+        )
+        let unrelatedEvents = Task {
+            try await collect(unrelatedThread.events)
         }
-        #expect(sourceDiagnostics.count == 1)
+        #expect(await eventually {
+            harness.router.threadSubscriberCountForTesting(for: "thread-unrelated") == 1
+        })
+
+        let reviewTask = Task {
+            try await sourceThread.startReview(
+                target: .baseBranch("main"),
+                delivery: .detached
+            )
+        }
+        await transport.waitForRequest(method: "review/start")
+        try await transport.emitServerNotification(
+            method: "turn/started",
+            params: TurnStartedParams(
+                threadID: "thread-unrelated",
+                turnID: "turn-unrelated"
+            )
+        )
+        #expect(await eventually {
+            await harness.router.detachedReviewRoutingSnapshotForTesting() == .init(
+                attemptCount: 1,
+                candidateCount: 1,
+                drainCount: 0
+            )
+        })
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-unrelated",
+            turnID: "turn-unrelated",
+            item: .init(id: "message-unrelated", type: "agentMessage", text: "")
+        )
+        try await transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(
+                threadID: "thread-unrelated",
+                turnID: "turn-unrelated",
+                itemID: "message-unrelated",
+                delta: "Unrelated work"
+            )
+        )
+        await harness.router.seedTurn(
+            "turn-unrelated",
+            threadID: "thread-unrelated"
+        )
+        #expect(await harness.router.detachedReviewRoutingSnapshotForTesting() == .init(
+            attemptCount: 1,
+            candidateCount: 1,
+            drainCount: 0
+        ))
+        try await transport.emitServerNotification(
+            method: "thread/closed",
+            params: ThreadIDParams(threadID: "thread-unrelated")
+        )
+        await gate.open()
+        let review = try await reviewTask.value
+        withExtendedLifetime(review) {}
+        #expect(await harness.router.detachedReviewRoutingSnapshotForTesting() == .init(
+            attemptCount: 0,
+            candidateCount: 0,
+            drainCount: 0
+        ))
+
+        let events = try await withTimeout {
+            try await unrelatedEvents.value
+        }
+        #expect(events.contains { event in
+            switch event {
+            case .turnStarted("turn-unrelated"):
+                true
+            case .snapshot(let snapshot):
+                snapshot.id == "turn-unrelated"
+            default:
+                false
+            }
+        })
+        #expect(events.contains { event in
+            if case .itemStarted(_, let turnID) = event {
+                return turnID == "turn-unrelated"
+            }
+            return false
+        })
+        #expect(events.containsThreadText("Unrelated work", turnID: "turn-unrelated"))
+        await harness.close()
+    }
+
+    @Test func failedDetachedReviewReleasesRoutingCandidates() async throws {
+        let transport = CodexAppServerTestTransport()
+        await transport.enqueueFailure(
+            code: -32_000,
+            message: "review start failed",
+            for: "review/start"
+        )
+        let gate = CodexAppServerTestGate()
+        await transport.holdNext(method: "review/start", gate: gate)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let sourceThread = CodexThread(
+            id: "thread-source",
+            client: harness.client,
+            router: harness.router,
+            connectionLease: harness.lease
+        )
+
+        let reviewTask = Task {
+            try await sourceThread.startReview(
+                target: .baseBranch("main"),
+                delivery: .detached
+            )
+        }
+        await transport.waitForRequest(method: "review/start")
+        try await transport.emitServerNotification(
+            method: "turn/started",
+            params: TurnStartedParams(
+                threadID: "thread-unrelated",
+                turnID: "turn-unrelated"
+            )
+        )
+        #expect(await eventually {
+            await harness.router.detachedReviewRoutingSnapshotForTesting() == .init(
+                attemptCount: 1,
+                candidateCount: 1,
+                drainCount: 0
+            )
+        })
+
+        await gate.open()
+        do {
+            _ = try await reviewTask.value
+            Issue.record("Expected detached review start failure.")
+        } catch {
+            // Expected.
+        }
+
+        #expect(await harness.router.detachedReviewRoutingSnapshotForTesting() == .init(
+            attemptCount: 0,
+            candidateCount: 0,
+            drainCount: 0
+        ))
+        await harness.close()
+    }
+
+    @Test func detachedReviewRetryReleasesFirstAttemptCandidates() async throws {
+        let transport = CodexAppServerTestTransport()
+        await transport.enqueueFailure(
+            code: -32_001,
+            message: "overloaded",
+            for: "review/start"
+        )
+        try await transport.enqueueReviewStart(
+            turnID: "turn-review",
+            reviewThreadID: "thread-review",
+            status: .inProgress
+        )
+        let firstResponseGate = CodexAppServerTestGate()
+        await transport.holdNext(method: "review/start", gate: firstResponseGate)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let sourceThread = CodexThread(
+            id: "thread-source",
+            client: harness.client,
+            router: harness.router,
+            connectionLease: harness.lease
+        )
+        let unrelatedThread = CodexThread(
+            id: "thread-unrelated",
+            client: harness.client,
+            router: harness.router,
+            connectionLease: harness.lease
+        )
+        let unrelatedEvents = Task {
+            try await collect(unrelatedThread.events)
+        }
+        #expect(await eventually {
+            harness.router.threadSubscriberCountForTesting(for: "thread-unrelated") == 1
+        })
+
+        let reviewTask = Task {
+            try await sourceThread.startReview(
+                target: .baseBranch("main"),
+                delivery: .detached
+            )
+        }
+        await transport.waitForRequest(method: "review/start")
+        try await transport.emitServerNotification(
+            method: "turn/started",
+            params: TurnStartedParams(
+                threadID: "thread-unrelated",
+                turnID: "turn-unrelated"
+            )
+        )
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-unrelated",
+            turnID: "turn-unrelated",
+            item: .init(id: "message-unrelated", type: "agentMessage", text: "")
+        )
+        try await transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(
+                threadID: "thread-unrelated",
+                turnID: "turn-unrelated",
+                itemID: "message-unrelated",
+                delta: "First attempt unrelated work"
+            )
+        )
+        try await transport.emitServerNotification(
+            method: "thread/closed",
+            params: ThreadIDParams(threadID: "thread-unrelated")
+        )
+        #expect(await eventually {
+            (await harness.router.detachedReviewRoutingSnapshotForTesting()).candidateCount == 1
+        })
+
+        await firstResponseGate.open()
+        #expect(await eventually {
+            (await harness.router.detachedReviewRoutingSnapshotForTesting()).candidateCount == 0
+        })
+        await transport.waitForRequest(method: "review/start", count: 2)
+        let review = try await reviewTask.value
+        withExtendedLifetime(review) {}
+
+        #expect(await harness.router.detachedReviewRoutingSnapshotForTesting() == .init(
+            attemptCount: 0,
+            candidateCount: 0,
+            drainCount: 0
+        ))
+        let events = try await withTimeout {
+            try await unrelatedEvents.value
+        }
+        #expect(events.contains { event in
+            switch event {
+            case .turnStarted("turn-unrelated"):
+                true
+            case .snapshot(let snapshot):
+                snapshot.id == "turn-unrelated"
+            default:
+                false
+            }
+        })
+        #expect(events.containsThreadText(
+            "First attempt unrelated work",
+            turnID: "turn-unrelated"
+        ))
+        #expect(events.last == .closed)
+        await harness.close()
+    }
+
+    @Test func connectionTerminationCanInterleaveWithDetachedReviewDrain() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueReviewStart(
+            turnID: "turn-review",
+            reviewThreadID: "thread-review",
+            status: .inProgress
+        )
+        let responseGate = CodexAppServerTestGate()
+        let drainGate = CodexAppServerTestGate()
+        await transport.holdNext(method: "review/start", gate: responseGate)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        await harness.router.setNotificationDrainPauseForTesting {
+            await drainGate.waitIgnoringCancellation()
+        }
+        let sourceThread = CodexThread(
+            id: "thread-source",
+            client: harness.client,
+            router: harness.router,
+            connectionLease: harness.lease
+        )
+        let reviewTask = Task {
+            try await sourceThread.startReview(
+                target: .baseBranch("main"),
+                delivery: .detached
+            )
+        }
+        await transport.waitForRequest(method: "review/start")
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-review",
+            turnID: "turn-review",
+            item: .init(id: "message-review", type: "agentMessage", text: "")
+        )
+        for index in 0..<256 {
+            try await transport.emitServerNotification(
+                method: "item/agentMessage/delta",
+                params: TurnDeltaParams(
+                    threadID: "thread-review",
+                    turnID: "turn-review",
+                    itemID: "message-review",
+                    delta: "\(index)"
+                )
+            )
+        }
+
+        await responseGate.open()
+        await drainGate.waitUntilBlocked()
+        let closeTask = Task {
+            await harness.close()
+        }
+        await closeTask.value
+        await drainGate.open()
+        do {
+            let review = try await reviewTask.value
+            withExtendedLifetime(review) {}
+            Issue.record("Expected connection termination, got a review session.")
+        } catch let error as CodexAppServerError {
+            #expect(error == .connectionTerminated(.closedByCaller))
+        } catch {
+            Issue.record("Expected connection termination, got \(error).")
+        }
+        #expect(await eventually {
+            await harness.router.detachedReviewRoutingSnapshotForTesting() == .init(
+                attemptCount: 0,
+                candidateCount: 0,
+                drainCount: 0
+            )
+        })
     }
 
     @Test func compactBeginsNewThreadEventGeneration() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueueEmpty(for: "thread/compact/start")
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
 
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-1",
+            turnID: "turn-previous",
+            item: .init(id: "message-1", type: "agentMessage", text: "")
+        )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(
                 threadID: "thread-1",
                 turnID: "turn-previous",
+                itemID: "message-1",
                 delta: "Previous generation"
             )
         )
@@ -3164,14 +5303,21 @@ struct CodexAppServerKitTests {
             try await collect(thread.events)
         }
         #expect(await eventually {
-            await router.threadSubscriberCountForTesting(for: "thread-1") == 1
+            router.threadSubscriberCountForTesting(for: "thread-1") == 1
         })
 
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-1",
+            turnID: "turn-compact",
+            item: .init(id: "message-1", type: "agentMessage", text: "")
+        )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(
                 threadID: "thread-1",
                 turnID: "turn-compact",
+                itemID: "message-1",
                 delta: "Current compact generation"
             )
         )
@@ -3183,18 +5329,8 @@ struct CodexAppServerKitTests {
         let events = try await withTimeout {
             try await eventsTask.value
         }
-        #expect(events.contains { event in
-            if case .messageDelta(let delta, let turnID) = event {
-                return delta.text == "Current compact generation" && turnID == "turn-compact"
-            }
-            return false
-        })
-        #expect(events.contains { event in
-            if case .messageDelta(let delta, let turnID) = event {
-                return delta.text == "Previous generation" && turnID == "turn-previous"
-            }
-            return false
-        } == false)
+        #expect(events.containsThreadText("Current compact generation", turnID: "turn-compact"))
+        #expect(events.containsThreadText("Previous generation", turnID: "turn-previous") == false)
         #expect(events.last == .closed)
     }
 
@@ -3207,17 +5343,24 @@ struct CodexAppServerKitTests {
         )
         let gate = CodexAppServerTestGate()
         await transport.holdNext(method: "review/start", gate: gate)
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
 
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-1",
+            turnID: "turn-previous",
+            item: .init(id: "message-1", type: "agentMessage", text: "")
+        )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(
                 threadID: "thread-1",
                 turnID: "turn-previous",
+                itemID: "message-1",
                 delta: "Previous generation"
             )
         )
@@ -3234,13 +5377,6 @@ struct CodexAppServerKitTests {
             try await thread.startReview(target: .baseBranch("main"))
         }
         await transport.waitForRequest(method: "review/start")
-        try await transport.emitServerNotification(
-            method: "item/agentMessage/delta",
-            params: TurnDeltaParams(
-                turnID: "turn-failed-review",
-                delta: "Failed review start"
-            )
-        )
         await gate.open()
         do {
             _ = try await reviewTask.value
@@ -3252,18 +5388,8 @@ struct CodexAppServerKitTests {
         let events = try await withTimeout {
             try await collect(thread.events)
         }
-        #expect(events.contains { event in
-            if case .messageDelta(let delta, let turnID) = event {
-                return delta.text == "Previous generation" && turnID == "turn-previous"
-            }
-            return false
-        })
-        #expect(events.contains { event in
-            if case .messageDelta(let delta, let turnID) = event {
-                return delta.text == "Failed review start" && turnID == "turn-failed-review"
-            }
-            return false
-        } == false)
+        #expect(events.containsThreadText("Previous generation", turnID: "turn-previous"))
+        #expect(events.containsThreadText("Failed review start", turnID: "turn-failed-review") == false)
         #expect(events.last == .closed)
     }
 
@@ -3271,14 +5397,35 @@ struct CodexAppServerKitTests {
         let runtime = try await CodexAppServerTestRuntime.start()
         try await runtime.transport.enqueueThreadResume(.init(id: "thread-resume-failure"))
         let thread = try await runtime.server.resumeThread("thread-resume-failure")
+        let priorEvents = thread.events
+        var priorIterator = priorEvents.makeAsyncIterator()
+        try await emitItemStarted(
+            on: runtime.transport,
+            threadID: "thread-resume-failure",
+            turnID: "turn-resume-failure",
+            item: .init(id: "message-1", type: "agentMessage", text: "")
+        )
         try await runtime.transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(
                 threadID: "thread-resume-failure",
                 turnID: "turn-resume-failure",
+                itemID: "message-1",
                 delta: "Before failed resume"
             )
         )
+        var routedPriorGeneration = false
+        while let event = try await priorIterator.next() {
+            if [event].containsThreadText(
+                "Before failed resume",
+                turnID: "turn-resume-failure"
+            ) {
+                routedPriorGeneration = true
+                break
+            }
+        }
+        #expect(routedPriorGeneration)
+        priorEvents.cancel()
 
         await runtime.transport.enqueueFailure(
             code: -32_000,
@@ -3297,67 +5444,14 @@ struct CodexAppServerKitTests {
         )
 
         let events = try await collect(thread.events)
-        #expect(events.contains { event in
-            if case .messageDelta(let delta, let turnID) = event {
-                return delta.text == "Before failed resume" && turnID == "turn-resume-failure"
-            }
-            return false
-        })
-    }
-
-    @Test func turnEventStreamCancellationRemovesRouterSubscriber() async throws {
-        let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        let turn = CodexTurn(
-            id: "turn-1",
-            threadID: "thread-1",
-            client: client,
-            router: router
-        )
-
-        let consumer = Task {
-            var iterator = turn.events.makeAsyncIterator()
-            _ = try await iterator.next()
-        }
-
-        #expect(await eventually {
-            await router.turnSubscriberCountForTesting(for: "turn-1") == 1
-        })
-        consumer.cancel()
-        let removed = await eventually {
-            await router.turnSubscriberCountForTesting(for: "turn-1") == 0
-        }
-        #expect(removed)
-        if removed {
-            try await consumer.value
-        }
-    }
-
-    @Test func directTurnEventStreamCancellationRemovesRouterSubscriber() async throws {
-        let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        let stream = await router.events(for: CodexTurnID(rawValue: "turn-1"))
-        #expect(await router.turnSubscriberCountForTesting(for: "turn-1") == 1)
-
-        let consumer = Task {
-            var iterator = stream.makeAsyncIterator()
-            _ = try await iterator.next()
-        }
-
-        consumer.cancel()
-        let removed = await eventually {
-            await router.turnSubscriberCountForTesting(for: "turn-1") == 0
-        }
-        #expect(removed)
+        #expect(events.containsThreadText("Before failed resume", turnID: "turn-resume-failure"))
     }
 
     @Test func threadStreamsReplayMessagesTranscriptLogsAndUsage() async throws {
         let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
         try await transport.emitServerNotification(
             method: "item/completed",
@@ -3420,7 +5514,8 @@ struct CodexAppServerKitTests {
         let thread = CodexThread(
             id: "thread-1",
             client: client,
-            router: router
+            router: router,
+            connectionLease: harness.lease
         )
 
         let messages = try await collect(thread.messages)
@@ -3438,8 +5533,9 @@ struct CodexAppServerKitTests {
         let events = try await collect(thread.events)
         #expect(
             events.contains {
-                if case .tokenUsageUpdated(let usage, let turnID) = $0 {
-                    turnID == "turn-1" && usage.totalTokens == 3
+                if case .terminal(let outcome) = $0 {
+                    outcome.response.turnID == "turn-1"
+                        && outcome.response.usage?.totalTokens == 3
                 } else {
                     false
                 }
@@ -3448,9 +5544,9 @@ struct CodexAppServerKitTests {
 
     @Test func threadItemDecodeReadsTextObjectContentFragments() async throws {
         let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
         try await transport.emitServerNotification(
             method: "item/completed",
@@ -3475,22 +5571,44 @@ struct CodexAppServerKitTests {
             method: "thread/closed",
             params: ThreadIDParams(threadID: "thread-1")
         )
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
-
+        let thread = CodexThread(
+            id: "thread-1",
+            client: client,
+            router: router,
+            connectionLease: harness.lease
+        )
         let transcripts = try await collect(thread.transcriptUpdates)
 
         #expect(transcripts.last?.items.first?.text == "hello\nworld")
     }
 
-    @Test func threadTranscriptKeepsDistinctMessageDeltaItemIDs() async throws {
+    @Test func threadTranscriptSupersedesPriorTerminalGeneration() async throws {
         let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
+        let thread = CodexThread(
+            id: "thread-1",
+            client: client,
+            router: router,
+            connectionLease: harness.lease
+        )
+        let transcriptsTask = Task {
+            try await collect(thread.transcriptUpdates)
+        }
+        #expect(await eventually {
+            router.threadSubscriberCountForTesting(for: "thread-1") == 1
+        })
         try await transport.emitServerNotification(
             method: "turn/started",
             params: TurnStartedParams(threadID: "thread-1", turnID: "turn-1")
+        )
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-1",
+            turnID: "turn-1",
+            item: .init(id: "message-1", type: "agentMessage", text: "")
         )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
@@ -3504,6 +5622,12 @@ struct CodexAppServerKitTests {
             method: "turn/started",
             params: TurnStartedParams(threadID: "thread-1", turnID: "turn-2")
         )
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-1",
+            turnID: "turn-2",
+            item: .init(id: "message-2", type: "agentMessage", text: "")
+        )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(turnID: "turn-2", itemID: "message-2", delta: "Second")
@@ -3516,80 +5640,9 @@ struct CodexAppServerKitTests {
             method: "thread/closed",
             params: ThreadIDParams(threadID: "thread-1")
         )
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let transcripts = try await transcriptsTask.value
 
-        let transcripts = try await collect(thread.transcriptUpdates)
-
-        #expect(transcripts.last?.items.compactMap(\.text) == ["First", "Second"])
-    }
-
-    @Test func threadTranscriptReconcilesCompleteAgentMessageWithoutItemIDWithPriorDelta() async throws {
-        let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
-        await transport.waitForNotificationStreamCount(1)
-        try await transport.emitServerNotification(
-            method: "item/agentMessage/delta",
-            params: MessageDeltaWithoutItemIDParams(
-                threadID: "thread-1",
-                turnID: "turn-1",
-                delta: "Final"
-            )
-        )
-        try await transport.emitServerNotification(
-            method: "agent/message",
-            params: AgentMessageParams(
-                threadID: "thread-1",
-                turnID: "turn-1",
-                itemID: nil,
-                message: "Final"
-            )
-        )
-        try await transport.emitServerNotification(
-            method: "thread/closed",
-            params: ThreadIDParams(threadID: "thread-1")
-        )
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
-
-        let transcripts = try await collect(thread.transcriptUpdates)
-
-        #expect(transcripts.last?.items.compactMap(\.text) == ["Final"])
-    }
-
-    @Test func threadTranscriptReconcilesCompleteAgentMessageRealItemIDWithFallbackDelta() async throws {
-        let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
-        await transport.waitForNotificationStreamCount(1)
-        try await transport.emitServerNotification(
-            method: "item/agentMessage/delta",
-            params: MessageDeltaWithoutItemIDParams(
-                threadID: "thread-1",
-                turnID: "turn-1",
-                delta: "Final"
-            )
-        )
-        try await transport.emitServerNotification(
-            method: "agent/message",
-            params: AgentMessageParams(
-                threadID: "thread-1",
-                turnID: "turn-1",
-                itemID: "message-1",
-                message: "Final"
-            )
-        )
-        try await transport.emitServerNotification(
-            method: "thread/closed",
-            params: ThreadIDParams(threadID: "thread-1")
-        )
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
-
-        let transcripts = try await collect(thread.transcriptUpdates)
-
-        #expect(transcripts.last?.items.map(\.id) == ["message-1"])
-        #expect(transcripts.last?.items.compactMap(\.text) == ["Final"])
+        #expect(transcripts.last?.items.compactMap(\.text) == ["Second"])
     }
 
     @Test func responseStreamYieldsSnapshotsAndCollectsFinalResponse() async throws {
@@ -3598,38 +5651,50 @@ struct CodexAppServerKitTests {
             AppServerAPI.Turn.Start.Response(turn: .init(id: "turn-1", status: "running")),
             for: "turn/start"
         )
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
         let thread = CodexThread(
             id: "thread-1",
             client: client,
-            router: router
+            router: router,
+            connectionLease: harness.lease
         )
 
         let stream = try await thread.streamResponse {
             "Summarize this."
             CodexPrompt.Part.mention(name: "repo", path: URL(fileURLWithPath: "/tmp/repo"))
         }
+        var iterator = stream.makeAsyncIterator()
+        let started = try await iterator.next()
+        #expect(started?.turnID == "turn-1")
+        #expect(started?.content == nil)
 
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-1",
+            turnID: "turn-1",
+            item: .init(id: "message-1", type: "agentMessage", text: "", phase: "final_answer")
+        )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
-            params: TurnDeltaParams(turnID: "turn-1", delta: "Final")
+            params: TurnDeltaParams(turnID: "turn-1", itemID: "message-1", delta: "Final")
         )
+        var updated = try await iterator.next()
+        while let snapshot = updated, snapshot.content != "Final" {
+            updated = try await iterator.next()
+        }
+        #expect(updated?.turnID == "turn-1")
+        #expect(updated?.content == "Final")
         try await transport.emitServerNotification(
             method: "turn/completed",
             params: TurnCompletedParams(turn: .init(id: "turn-1", status: "completed"))
         )
 
-        var iterator = stream.makeAsyncIterator()
-        let first = try await iterator.next()
-        #expect(first?.turnID == "turn-1")
-        #expect(first?.content == "Final")
-
         let response = try await stream.collect()
-        #expect(response.turnID == "turn-1")
-        #expect(response.finalAnswer == "Final")
+        #expect(response.response.turnID == "turn-1")
+        #expect(response.response.transcript.finalAnswer == "Final")
 
         let request = try #require(await transport.recordedRequests().first)
         let params = try JSONDecoder().decode(
@@ -3647,13 +5712,19 @@ struct CodexAppServerKitTests {
             AppServerAPI.Turn.Start.Response(turn: .init(id: "turn-1", status: "running")),
             for: "turn/start"
         )
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
 
         let stream = try await thread.streamResponse(to: "Summarize this.")
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-1",
+            turnID: "turn-1",
+            item: .init(id: "message-1", type: "agentMessage", text: "", phase: "final_answer")
+        )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: TurnDeltaParams(turnID: "turn-1", itemID: "message-1", delta: "Final")
@@ -3669,73 +5740,8 @@ struct CodexAppServerKitTests {
 
         let response = try await stream.collect()
 
-        #expect(response.finalAnswer == "Final")
-        #expect(response.transcript.items.first?.text == "Final")
-    }
-
-    @Test func responseStreamReconcilesCompleteAgentMessageWithoutItemIDWithPriorDelta() async throws {
-        let transport = CodexAppServerTestTransport()
-        try await transport.enqueue(
-            AppServerAPI.Turn.Start.Response(turn: .init(id: "turn-1", status: "running")),
-            for: "turn/start"
-        )
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
-        await transport.waitForNotificationStreamCount(1)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
-
-        let stream = try await thread.streamResponse(to: "Summarize this.")
-        try await transport.emitServerNotification(
-            method: "item/agentMessage/delta",
-            params: MessageDeltaWithoutItemIDParams(turnID: "turn-1", delta: "Final")
-        )
-        try await transport.emitServerNotification(
-            method: "agent/message",
-            params: AgentMessageParams(turnID: "turn-1", itemID: nil, message: "Final")
-        )
-        try await transport.emitServerNotification(
-            method: "turn/completed",
-            params: TurnCompletedParams(turn: .init(id: "turn-1", status: "completed"))
-        )
-
-        let response = try await stream.collect()
-
-        #expect(response.finalAnswer == "Final")
-        #expect(response.transcript.items.compactMap(\.text) == ["Final"])
-    }
-
-    @Test func responseStreamReconcilesCompleteAgentMessageRealItemIDWithFallbackDelta() async throws {
-        let transport = CodexAppServerTestTransport()
-        try await transport.enqueue(
-            AppServerAPI.Turn.Start.Response(turn: .init(id: "turn-1", status: "running")),
-            for: "turn/start"
-        )
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
-        await transport.waitForNotificationStreamCount(1)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
-
-        let stream = try await thread.streamResponse(to: "Summarize this.")
-        try await transport.emitServerNotification(
-            method: "item/agentMessage/delta",
-            params: MessageDeltaWithoutItemIDParams(turnID: "turn-1", delta: "Final")
-        )
-        try await transport.emitServerNotification(
-            method: "agent/message",
-            params: AgentMessageParams(turnID: "turn-1", itemID: "message-1", message: "Final")
-        )
-        try await transport.emitServerNotification(
-            method: "turn/completed",
-            params: TurnCompletedParams(turn: .init(id: "turn-1", status: "completed"))
-        )
-
-        let response = try await stream.collect()
-
-        #expect(response.finalAnswer == "Final")
-        #expect(response.transcript.items.map(\.id) == ["message-1"])
-        #expect(response.transcript.items.compactMap(\.text) == ["Final"])
+        #expect(response.response.transcript.finalAnswer == "Final")
+        #expect(response.response.transcript.items.first?.text == "Final")
     }
 
     @Test func responseStreamCollectsTranscriptFromCompletedTurnItems() async throws {
@@ -3744,11 +5750,11 @@ struct CodexAppServerKitTests {
             AppServerAPI.Turn.Start.Response(turn: .init(id: "turn-1", status: "running")),
             for: "turn/start"
         )
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
 
         let stream = try await thread.streamResponse(to: "Summarize this.")
         try await transport.emitServerNotification(
@@ -3769,8 +5775,8 @@ struct CodexAppServerKitTests {
 
         let response = try await stream.collect()
 
-        #expect(response.finalAnswer == "Final from payload")
-        #expect(response.transcript.items.first?.text == "Final from payload")
+        #expect(response.response.transcript.finalAnswer == "Final from payload")
+        #expect(response.response.transcript.items.first?.text == "Final from payload")
     }
 
     @Test func responseStreamSnapshotsIncludeIncrementalTokenUsage() async throws {
@@ -3779,13 +5785,17 @@ struct CodexAppServerKitTests {
             AppServerAPI.Turn.Start.Response(turn: .init(id: "turn-1", status: "running")),
             for: "turn/start"
         )
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
 
         let stream = try await thread.streamResponse(to: "Summarize usage.")
+        var iterator = stream.makeAsyncIterator()
+        let initial = try await iterator.next()
+        #expect(initial?.turnID == "turn-1")
+        #expect(initial?.usage == nil)
         try await transport.emitServerNotification(
             method: "thread/tokenUsage/updated",
             params: TokenUsageParams(
@@ -3797,7 +5807,6 @@ struct CodexAppServerKitTests {
             )
         )
 
-        var iterator = stream.makeAsyncIterator()
         let snapshot = try await iterator.next()
 
         #expect(snapshot?.turnID == "turn-1")
@@ -3813,17 +5822,31 @@ struct CodexAppServerKitTests {
             AppServerAPI.Turn.Start.Response(turn: .init(id: "turn-1", status: "running")),
             for: "turn/start"
         )
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
 
         let stream = try await thread.streamResponse(to: "Try this.")
+        var iterator = stream.makeAsyncIterator()
+        let started = try await iterator.next()
+        #expect(started?.content == nil)
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-1",
+            turnID: "turn-1",
+            item: .init(id: "message-1", type: "agentMessage", text: "", phase: "final_answer")
+        )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
-            params: TurnDeltaParams(turnID: "turn-1", delta: "Partial")
+            params: TurnDeltaParams(turnID: "turn-1", itemID: "message-1", delta: "Partial")
         )
+        var partial = try await iterator.next()
+        while let snapshot = partial, snapshot.content != "Partial" {
+            partial = try await iterator.next()
+        }
+        #expect(partial?.content == "Partial")
         try await transport.emitServerNotification(
             method: "turn/completed",
             params: TurnCompletedParams(turn: .init(
@@ -3836,29 +5859,21 @@ struct CodexAppServerKitTests {
             ))
         )
 
-        var iterator = stream.makeAsyncIterator()
-        let first = try await iterator.next()
-        #expect(first?.content == "Partial")
-        let terminal = try await iterator.next()
-        #expect(terminal?.response?.status == .failed)
-        #expect(terminal?.response?.errorMessage == "Tool failed.")
+        var terminal = try await iterator.next()
+        while let snapshot = terminal, snapshot.response == nil {
+            terminal = try await iterator.next()
+        }
         #expect(terminal?.response?.transcript.responseText == "Partial")
         #expect(terminal?.response?.startedAt == Date(timeIntervalSince1970: 1_700_000_000))
         #expect(terminal?.response?.duration == .milliseconds(1_000))
-        do {
-            _ = try await iterator.next()
-            Issue.record("Expected failed stream to throw after terminal snapshot.")
-        } catch let error as CodexAppServerError {
-            #expect(error.response?.status == .failed)
-            #expect(error.response?.transcript.responseText == "Partial")
-        }
+        #expect(try await iterator.next() == nil)
 
-        do {
-            _ = try await stream.collect()
-            Issue.record("Expected collect() to throw for failed turn.")
-        } catch let error as CodexAppServerError {
-            #expect(error.response?.status == .failed)
-            #expect(error.response?.transcript.responseText == "Partial")
+        let outcome = try await stream.collect()
+        if case .failed(let failedTurn) = outcome {
+            #expect(failedTurn.error.message == "Tool failed.")
+            #expect(failedTurn.response.transcript.responseText == "Partial")
+        } else {
+            Issue.record("Expected failed turn outcome.")
         }
     }
 
@@ -3868,9 +5883,10 @@ struct CodexAppServerKitTests {
             AppServerAPI.Turn.Start.Response(turn: .init(id: "turn-1", status: "running")),
             for: "turn/start"
         )
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
 
         _ = try await thread.streamResponse(
             to: "Explain the patch.",
@@ -3907,9 +5923,10 @@ struct CodexAppServerKitTests {
             AppServerAPI.Turn.Start.Response(turn: .init(id: "turn-1", status: "running")),
             for: "turn/start"
         )
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
 
         _ = try await thread.streamResponse(
             to: "Explain the patch.",
@@ -3936,9 +5953,10 @@ struct CodexAppServerKitTests {
             AppServerAPI.Turn.Start.Response(turn: .init(id: "turn-1", status: "running")),
             for: "turn/start"
         )
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
 
         _ = try await thread.streamResponse(
             to: "Explain the patch.",
@@ -3955,64 +5973,114 @@ struct CodexAppServerKitTests {
 
     @Test func messageDeltaLogEntriesUseUniqueEntryIDs() async throws {
         let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
-        try await transport.emitServerNotification(
-            method: "item/agentMessage/delta",
-            params: TurnDeltaParams(threadID: "thread-1", turnID: "turn-1", delta: "First")
+        let thread = CodexThread(
+            id: "thread-1",
+            client: client,
+            router: router,
+            connectionLease: harness.lease
+        )
+        let logs = thread.logEntries
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-1",
+            turnID: "turn-1",
+            item: .init(id: "message-1", type: "agentMessage", text: "")
         )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
-            params: TurnDeltaParams(threadID: "thread-1", turnID: "turn-1", delta: "Second")
+            params: TurnDeltaParams(
+                threadID: "thread-1",
+                turnID: "turn-1",
+                itemID: "message-1",
+                delta: "First"
+            )
+        )
+        try await transport.emitServerNotification(
+            method: "item/agentMessage/delta",
+            params: TurnDeltaParams(
+                threadID: "thread-1",
+                turnID: "turn-1",
+                itemID: "message-1",
+                delta: "Second"
+            )
         )
         try await transport.emitServerNotification(
             method: "thread/closed",
             params: ThreadIDParams(threadID: "thread-1")
         )
 
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
-        let logs = try await collect(thread.logEntries)
-        #expect(logs.map(\.id) == ["message-1:0", "message-1:1"])
-        #expect(logs.compactMap(\.messageDelta).map(\.text) == ["First", "Second"])
+        let collectedLogs = try await collect(logs)
+        let deltas = collectedLogs.filter { $0.phase == .delta }
+        #expect(deltas.map(\.id) == ["message-1:0", "message-1:1"])
+        #expect(deltas.compactMap(\.messageDelta).map(\.text) == ["First", "Second"])
     }
 
-    @Test func threadLogEntriesContinueAfterTurnCompletionUntilThreadClosed() async throws {
+    @Test func lateThreadLogEntriesReplayOnlyTheCurrentGeneration() async throws {
         let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-1",
+            turnID: "turn-1",
+            item: .init(id: "message-1", type: "agentMessage", text: "")
+        )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
-            params: TurnDeltaParams(threadID: "thread-1", turnID: "turn-1", delta: "First")
+            params: TurnDeltaParams(
+                threadID: "thread-1",
+                turnID: "turn-1",
+                itemID: "message-1",
+                delta: "First"
+            )
         )
         try await transport.emitServerNotification(
             method: "turn/completed",
             params: TurnCompletedParams(turn: .init(id: "turn-1", status: "completed"))
         )
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-1",
+            turnID: "turn-2",
+            item: .init(id: "message-1", type: "agentMessage", text: "")
+        )
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
-            params: TurnDeltaParams(threadID: "thread-1", turnID: "turn-2", delta: "Second")
+            params: TurnDeltaParams(
+                threadID: "thread-1",
+                turnID: "turn-2",
+                itemID: "message-1",
+                delta: "Second"
+            )
         )
         try await transport.emitServerNotification(
             method: "thread/closed",
             params: ThreadIDParams(threadID: "thread-1")
         )
+        #expect(await eventually {
+            router.threadEventHub.snapshotForTesting(threadID: "thread-1").isClosed
+        })
 
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
         let logs = try await collect(thread.logEntries)
-        #expect(logs.map(\.id) == ["message-1:0", "message-1:1"])
-        #expect(logs.compactMap(\.messageDelta).map(\.text) == ["First", "Second"])
+        let deltas = logs.filter { $0.phase == .delta }
+        #expect(deltas.map(\.id) == ["message-1:0"])
+        #expect(deltas.compactMap(\.messageDelta).map(\.text) == ["Second"])
     }
 
-    @Test func messageDeltaWithoutItemIDDecodesWithFallbackIdentity() async throws {
+    @Test func messageDeltaWithoutItemIDFailsAsMalformedNotification() async throws {
         let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
         await transport.waitForNotificationStreamCount(1)
+        let events = await harness.server.connectionEvents()
+        let terminal = Task { await firstConnectionTermination(in: events) }
+        await events.waitUntilNextSuspendsForTesting()
         try await transport.emitServerNotification(
             method: "item/agentMessage/delta",
             params: MessageDeltaWithoutItemIDParams(
@@ -4021,40 +6089,22 @@ struct CodexAppServerKitTests {
                 delta: "Missing item identity"
             )
         )
-        try await transport.emitServerNotification(
-            method: "thread/closed",
-            params: ThreadIDParams(threadID: "thread-1")
-        )
 
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
-        let events = try await collect(thread.events)
-        let deltaEvent = try #require(events.first { event in
-            if case .messageDelta = event {
-                return true
-            }
-            return false
-        })
-        guard case .messageDelta(let delta, let turnID) = deltaEvent else {
-            Issue.record("Expected message delta event")
+        let termination = try #require(await terminal.value)
+        guard case .transportFailure(.protocolViolation(let message, _)) = termination else {
+            Issue.record("Expected connection protocol violation, got \(termination).")
             return
         }
-        #expect(delta.text == "Missing item identity")
-        #expect(delta.itemID == nil)
-        #expect(turnID == "turn-1")
-        #expect(events.contains { event in
-            if case .unknown(let raw) = event {
-                return raw.method == "item/agentMessage/delta"
-            }
-            return false
-        } == false)
+        #expect(message.contains("item/agentMessage/delta"))
     }
 
-    @Test func threadItemWithoutIDDecodesAsUnknown() async throws {
+    @Test func threadItemWithoutIDFailsAsMalformedNotification() async throws {
         let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
         await transport.waitForNotificationStreamCount(1)
+        let events = await harness.server.connectionEvents()
+        let terminal = Task { await firstConnectionTermination(in: events) }
+        await events.waitUntilNextSuspendsForTesting()
         try await transport.emitServerNotification(
             method: "item/completed",
             params: ThreadItemWithoutIDParams(
@@ -4063,34 +6113,34 @@ struct CodexAppServerKitTests {
                 item: .init(type: "agentMessage", text: "Missing item identity")
             )
         )
-        try await transport.emitServerNotification(
-            method: "thread/closed",
-            params: ThreadIDParams(threadID: "thread-1")
-        )
 
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
-        let events = try await collect(thread.events)
-        #expect(events.contains { event in
-            if case .itemCompleted = event {
-                return true
-            }
-            return false
-        } == false)
-        #expect(events.contains { event in
-            if case .unknown(let raw) = event {
-                return raw.method == "item/completed"
-            }
-            return false
-        })
+        let termination = try #require(await terminal.value)
+        guard case .transportFailure(.protocolViolation(let message, _)) = termination else {
+            Issue.record("Expected connection protocol violation, got \(termination).")
+            return
+        }
+        #expect(message.contains("item/completed"))
     }
 
     @Test func threadLogEntriesIncludeProgressDeltaNotifications() async throws {
         let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
 
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-1",
+            turnID: "turn-1",
+            item: .init(
+                id: "command-1",
+                type: "commandExecution",
+                command: "swift test",
+                aggregatedOutput: "",
+                status: "inProgress"
+            )
+        )
         try await transport.emitServerNotification(
             method: "item/commandExecution/outputDelta",
             params: ItemOutputDeltaParams(
@@ -4100,13 +6150,15 @@ struct CodexAppServerKitTests {
                 delta: "Compiling"
             )
         )
-        try await transport.emitServerNotification(
-            method: "item/fileChange/outputDelta",
-            params: ItemOutputDeltaParams(
-                threadID: "thread-1",
-                turnID: "turn-1",
-                itemID: "file-1",
-                delta: "diff --git"
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-1",
+            turnID: "turn-1",
+            item: .init(
+                id: "patch-1",
+                type: "fileChange",
+                status: "inProgress",
+                changes: .array([])
             )
         )
         try await transport.emitServerNotification(
@@ -4117,10 +6169,22 @@ struct CodexAppServerKitTests {
                 itemID: "patch-1",
                 changes: .array([
                     .object([
-                        "kind": .string("update"),
+                        "diff": .string("@@ -1 +1 @@"),
+                        "kind": .object(["type": .string("update")]),
                         "path": .string("Sources/File.swift"),
                     ]),
                 ])
+            )
+        )
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-1",
+            turnID: "turn-1",
+            item: .init(
+                id: "tool-1",
+                type: "mcpToolCall",
+                status: "inProgress",
+                tool: "review"
             )
         )
         try await transport.emitServerNotification(
@@ -4137,23 +6201,28 @@ struct CodexAppServerKitTests {
             params: ThreadIDParams(threadID: "thread-1")
         )
 
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
         let logs = try await collect(thread.logEntries)
+        let updates = logs.filter { $0.phase == .updated }
 
-        #expect(logs.count == 4)
-        #expect(logs.allSatisfy { $0.phase == .updated && $0.turnID == "turn-1" })
-        #expect(logs.contains { $0.item?.kind == .commandExecution && $0.item?.text == "Compiling" })
-        #expect(logs.contains { $0.item?.kind == .fileChange && $0.item?.text == "diff --git" })
+        #expect(updates.count == 3)
+        #expect(updates.allSatisfy { $0.turnID == "turn-1" })
+        #expect(updates.contains {
+            guard case .command(let command) = $0.item?.content else {
+                return false
+            }
+            return command.command == "swift test" && command.output == "Compiling"
+        })
         #expect(
-            logs.contains {
+            updates.contains {
                 if case .fileChange(let fileChange) = $0.item?.content {
-                    fileChange.output?.contains("File.swift") == true
+                    fileChange.output == "@@ -1 +1 @@"
                 } else {
                     false
                 }
             })
         #expect(
-            logs.contains {
+            updates.contains {
                 if case .toolCall(let toolCall) = $0.item?.content {
                     toolCall.result == "Reviewing"
                 } else {
@@ -4162,12 +6231,13 @@ struct CodexAppServerKitTests {
             })
     }
 
-    @Test func progressDeltaNotificationsWithoutItemIDRemainItemUpdates() async throws {
+    @Test func progressDeltaWithoutItemIDFailsAsMalformedNotification() async throws {
         let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
         await transport.waitForNotificationStreamCount(1)
+        let events = await harness.server.connectionEvents()
+        let terminal = Task { await firstConnectionTermination(in: events) }
+        await events.waitUntilNextSuspendsForTesting()
 
         try await transport.emitServerNotification(
             method: "item/commandExecution/outputDelta",
@@ -4177,60 +6247,20 @@ struct CodexAppServerKitTests {
                 delta: "Compiling"
             )
         )
-        try await transport.emitServerNotification(
-            method: "item/fileChange/patchUpdated",
-            params: ItemPatchUpdatedWithoutItemIDParams(
-                threadID: "thread-1",
-                turnID: "turn-1",
-                changes: .array([
-                    .object([
-                        "kind": .string("update"),
-                        "path": .string("Sources/File.swift"),
-                    ]),
-                ])
-            )
-        )
-        try await transport.emitServerNotification(
-            method: "item/mcpToolCall/progress",
-            params: ItemProgressWithoutItemIDParams(
-                threadID: "thread-1",
-                turnID: "turn-1",
-                message: "Reviewing"
-            )
-        )
-        try await transport.emitServerNotification(
-            method: "thread/closed",
-            params: ThreadIDParams(threadID: "thread-1")
-        )
 
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
-        let events = try await collect(thread.events)
-        let updates = events.compactMap { event -> CodexThreadItem? in
-            if case .itemUpdated(let item, let turnID) = event {
-                #expect(turnID == "turn-1")
-                return item
-            }
-            return nil
+        let termination = try #require(await terminal.value)
+        guard case .transportFailure(.protocolViolation(let message, _)) = termination else {
+            Issue.record("Expected connection protocol violation, got \(termination).")
+            return
         }
-
-        #expect(updates.count == 3)
-        #expect(updates.allSatisfy { $0.id.isEmpty == false })
-        #expect(updates.contains { $0.kind == .commandExecution && $0.text == "Compiling" })
-        #expect(updates.contains { $0.kind == .fileChange && $0.text?.contains("File.swift") == true })
-        #expect(updates.contains { $0.kind == .mcpToolCall && $0.text == "Reviewing" })
-        #expect(events.contains { event in
-            if case .unknown(let raw) = event {
-                return raw.method.hasPrefix("item/")
-            }
-            return false
-        } == false)
+        #expect(message.contains("item/commandExecution/outputDelta"))
     }
 
     @Test func completedFileChangeItemsPreserveChangesOutput() async throws {
         let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
         try await transport.emitServerNotification(
             method: "item/completed",
@@ -4240,9 +6270,11 @@ struct CodexAppServerKitTests {
                 item: .init(
                     id: "file-1",
                     type: "fileChange",
+                    status: "completed",
                     changes: .array([
                         .object([
-                            "kind": .string("update"),
+                            "diff": .string("@@ -1 +1 @@"),
+                            "kind": .object(["type": .string("update")]),
                             "path": .string("Sources/File.swift"),
                         ]),
                     ])
@@ -4253,21 +6285,48 @@ struct CodexAppServerKitTests {
             method: "thread/closed",
             params: ThreadIDParams(threadID: "thread-1")
         )
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
 
         let logs = try await collect(thread.logEntries)
 
-        #expect(logs.first?.item?.kind == .fileChange)
-        #expect(logs.first?.item?.text?.contains("File.swift") == true)
+        guard case .fileChange(let fileChange) = logs.first?.item?.content else {
+            Issue.record("Expected a structured file-change item.")
+            return
+        }
+        #expect(fileChange.path == "Sources/File.swift")
+        #expect(fileChange.output == "@@ -1 +1 @@")
     }
 
     @Test func reasoningNotificationsRouteAsTypedEventsLogsAndTranscript() async throws {
         let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         await transport.waitForNotificationStreamCount(1)
+        let thread = CodexThread(
+            id: "thread-1",
+            client: client,
+            router: router,
+            connectionLease: harness.lease
+        )
+        let eventsTask = Task { try await collect(thread.events) }
+        let logsTask = Task { try await collect(thread.logEntries) }
+        let transcriptsTask = Task { try await collect(thread.transcriptUpdates) }
+        #expect(await eventually {
+            router.threadSubscriberCountForTesting(for: "thread-1") == 3
+        })
 
+        try await emitItemStarted(
+            on: transport,
+            threadID: "thread-1",
+            turnID: "turn-1",
+            item: .init(
+                id: "reasoning-1",
+                type: "reasoning",
+                summary: [],
+                content: []
+            )
+        )
         try await transport.emitServerNotification(
             method: "item/reasoning/summaryPartAdded",
             params: ReasoningSummaryPartParams(
@@ -4319,8 +6378,7 @@ struct CodexAppServerKitTests {
             params: ThreadIDParams(threadID: "thread-1")
         )
 
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
-        let events = try await collect(thread.events)
+        let events = try await eventsTask.value
         #expect(
             events.contains {
                 if case .reasoningSummaryPartAdded(let part, let turnID) = $0 {
@@ -4340,7 +6398,7 @@ struct CodexAppServerKitTests {
                 }
             })
 
-        let logs = try await collect(thread.logEntries)
+        let logs = try await logsTask.value
         #expect(logs.contains { $0.id == "reasoning-1:summary:0" && $0.phase == .started })
         #expect(
             logs.contains {
@@ -4353,7 +6411,7 @@ struct CodexAppServerKitTests {
                     && $0.reasoningDelta?.delta == "Raw trace"
             })
 
-        let transcripts = try await collect(thread.transcriptUpdates)
+        let transcripts = try await transcriptsTask.value
         let finalTranscript = try #require(transcripts.last)
         #expect(finalTranscript.items.map(\.id) == ["reasoning-1"])
         #expect(finalTranscript.items.first?.content == .reasoning(
@@ -4398,11 +6456,8 @@ struct CodexAppServerKitTests {
             """,
             for: "config/read"
         )
-        let client = AppServerClient(transport: transport)
-        let server = CodexAppServer(
-            client: client,
-            router: CodexAppServerNotificationRouter(client: client)
-        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let server = harness.server
 
         let models = try await server.models()
         let reasoningEfforts = models.first?.supportedReasoningEfforts.map(\.reasoningEffort)
@@ -4416,11 +6471,8 @@ struct CodexAppServerKitTests {
     @Test func updateConfigurationSendsBatchWriteEdits() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueueJSON(#"{"status":"ok"}"#, for: "config/batchWrite")
-        let client = AppServerClient(transport: transport)
-        let server = CodexAppServer(
-            client: client,
-            router: CodexAppServerNotificationRouter(client: client)
-        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let server = harness.server
 
         var patch = CodexConfigurationPatch()
         patch.setReviewModel("gpt-5-codex-review")
@@ -4441,11 +6493,8 @@ struct CodexAppServerKitTests {
 
     @Test func updateConfigurationSkipsEmptyPatch() async throws {
         let transport = CodexAppServerTestTransport()
-        let client = AppServerClient(transport: transport)
-        let server = CodexAppServer(
-            client: client,
-            router: CodexAppServerNotificationRouter(client: client)
-        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let server = harness.server
 
         try await server.updateConfiguration(.init())
 
@@ -4465,11 +6514,8 @@ struct CodexAppServerKitTests {
                 ),
             ]
         ))
-        let client = AppServerClient(transport: transport)
-        let server = CodexAppServer(
-            client: client,
-            router: CodexAppServerNotificationRouter(client: client)
-        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let server = harness.server
 
         let rateLimits = try await server.rateLimits()
 
@@ -4501,11 +6547,8 @@ struct CodexAppServerKitTests {
             """,
             for: "account/rateLimits/read"
         )
-        let client = AppServerClient(transport: transport)
-        let server = CodexAppServer(
-            client: client,
-            router: CodexAppServerNotificationRouter(client: client)
-        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let server = harness.server
 
         let rateLimits = try await server.rateLimits()
 
@@ -4534,11 +6577,8 @@ struct CodexAppServerKitTests {
             """,
             for: "account/read"
         )
-        let client = AppServerClient(transport: transport)
-        let server = CodexAppServer(
-            client: client,
-            router: CodexAppServerNotificationRouter(client: client)
-        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let server = harness.server
 
         let account = try #require(try await server.account())
 
@@ -4548,7 +6588,7 @@ struct CodexAppServerKitTests {
         #expect(account.planType == "plus")
     }
 
-    @Test func loginFlowUsesSupportedRequestsAndCompletionNotification() async throws {
+    @Test func loginFlowUsesSupportedRequests() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueueChatGPTLogin(
             loginID: "login-1",
@@ -4558,28 +6598,19 @@ struct CodexAppServerKitTests {
             AppServerAPI.Account.Login.Cancel.Response(),
             for: "account/login/cancel"
         )
-        let client = AppServerClient(transport: transport)
-        let server = CodexAppServer(
-            client: client,
-            router: CodexAppServerNotificationRouter(client: client)
-        )
-        let accountEvents = await server.accountEvents()
-        await transport.waitForNotificationStreamCount(1)
-
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let server = harness.server
         let handle = try await server.loginChatGPT()
 
-        #expect(handle == .chatGPT(
-            id: "login-1",
-            authenticationURL: URL(string: "https://chatgpt.com/auth")!
-        ))
+        #expect(handle.id == "login-1")
+        #expect(handle.authenticationURL == URL(string: "https://chatgpt.com/auth")!)
         let loginRequest = try #require(await transport.recordedRequests().first)
         #expect(loginRequest.method == "account/login/start")
         let loginParams = try loginRequest.decodeParams(AppServerAPI.Account.Login.Params.self)
         #expect(loginParams.type == "chatgpt")
         #expect(loginParams.codexStreamlinedLogin == true)
-        #expect(loginParams.nativeWebAuthentication == nil)
 
-        try await server.cancelLogin(handle)
+        #expect(try await handle.cancel() == .cancelled)
         let cancelRequest = try #require(await transport.recordedRequests().last)
         #expect(cancelRequest.method == "account/login/cancel")
         let cancelParams = try cancelRequest.decodeParams(
@@ -4587,68 +6618,500 @@ struct CodexAppServerKitTests {
         )
         #expect(cancelParams.loginID == "login-1")
 
-        try await transport.emitServerNotification(
-            method: "account/login/completed",
-            params: LoginCompletedParams(loginID: "login-1", success: true)
-        )
-        var iterator = accountEvents.makeAsyncIterator()
-        #expect(try await iterator.next() == .loginCompleted(.init(
-            loginID: "login-1",
-            success: true
-        )))
         #expect(await transport.recordedRequests().map(\.method) == [
             "account/login/start",
             "account/login/cancel",
         ])
     }
 
-    @Test func nativeChatGPTLoginSendsCallbackSchemeAndCompletesWithCallbackURL() async throws {
+    @Test func stockChatGPTLoginResolvesAfterPostSuccessAccountUpdate() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueueChatGPTLogin(
             loginID: "login-1",
-            authenticationURL: URL(string: "https://chatgpt.com/auth")!,
-            nativeWebAuthentication: .init(callbackURLScheme: "lynnpd.CodexReviewMonitor.auth")
+            authenticationURL: URL(string: "https://chatgpt.com/auth")!
         )
-        try await transport.enqueue(EmptyResponse(), for: "account/login/complete")
-        let client = AppServerClient(transport: transport)
-        let server = CodexAppServer(
-            client: client,
-            router: CodexAppServerNotificationRouter(client: client)
-        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let server = harness.server
 
-        let login = try await server.loginChatGPT(
-            nativeWebAuthentication: .init(callbackURLScheme: "lynnpd.CodexReviewMonitor.auth")
-        )
+        let login = try await server.loginChatGPT()
 
-        #expect(login == CodexChatGPTLogin(
-            id: "login-1",
-            authenticationURL: URL(string: "https://chatgpt.com/auth")!,
-            nativeWebAuthentication: .init(callbackURLScheme: "lynnpd.CodexReviewMonitor.auth")
-        ))
+        #expect(login.id == "login-1")
+        #expect(login.authenticationURL == URL(string: "https://chatgpt.com/auth")!)
         let loginRequest = try #require(await transport.recordedRequests().first)
         #expect(loginRequest.method == "account/login/start")
         let loginParams = try loginRequest.decodeParams(AppServerAPI.Account.Login.Params.self)
         #expect(loginParams.type == "chatgpt")
         #expect(loginParams.codexStreamlinedLogin == true)
-        #expect(loginParams.nativeWebAuthentication == .init(
-            callbackURLScheme: "lynnpd.CodexReviewMonitor.auth"
-        ))
+        try await transport.emitServerNotificationJSON(
+            method: "account/login/completed",
+            json: #"{"loginId":"login-1","success":true,"error":null}"#
+        )
+        try await transport.emitServerNotificationJSON(
+            method: "account/updated",
+            json: #"{"authMode":"chatgpt","planType":"plus"}"#
+        )
+        #expect(try await login.result() == .succeeded)
+        #expect(try await login.result() == .succeeded)
+        #expect(await transport.recordedRequests().map(\.method) == ["account/login/start"])
+    }
 
-        try await server.completeLogin(
-            id: login.id,
-            callbackURL: URL(string: "lynnpd.CodexReviewMonitor.auth://callback?code=abc")!
+    @Test func stockChatGPTLoginPreservesAccountUpdateReceivedBeforeSuccess() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueChatGPTLogin(
+            loginID: "login-1",
+            authenticationURL: URL(string: "https://chatgpt.com/auth")!
         )
-        let completeRequest = try #require(await transport.recordedRequests().last)
-        #expect(completeRequest.method == "account/login/complete")
-        let completeParams = try completeRequest.decodeParams(
-            AppServerAPI.Account.Login.Complete.Params.self
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let login = try await harness.server.loginChatGPT()
+
+        try await transport.emitServerNotificationJSON(
+            method: "account/updated",
+            json: #"{"authMode":"chatgpt","planType":"plus"}"#
         )
-        #expect(completeParams.loginID == "login-1")
-        #expect(completeParams.callbackURL == "lynnpd.CodexReviewMonitor.auth://callback?code=abc")
-        #expect(await transport.recordedRequests().map(\.method) == [
-            "account/login/start",
-            "account/login/complete",
-        ])
+        try await transport.emitServerNotificationJSON(
+            method: "account/login/completed",
+            json: #"{"loginId":"login-1","success":true,"error":null}"#
+        )
+
+        #expect(try await login.result() == .succeeded)
+    }
+
+    @Test func stockChatGPTLoginIgnoresSparseAccountUpdateWhileAwaitingReadiness() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueChatGPTLogin(
+            loginID: "login-1",
+            authenticationURL: URL(string: "https://chatgpt.com/auth")!
+        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let login = try await harness.server.loginChatGPT()
+
+        try await transport.emitServerNotificationJSON(
+            method: "account/login/completed",
+            json: #"{"loginId":"login-1","success":true,"error":null}"#
+        )
+        try await transport.emitServerNotificationJSON(
+            method: "account/updated",
+            json: #"{"planType":"plus"}"#
+        )
+        await #expect(throws: CodexAppServerError.loginAlreadyInProgress) {
+            _ = try await harness.server.loginChatGPT()
+        }
+
+        try await transport.emitServerNotificationJSON(
+            method: "account/updated",
+            json: #"{"authMode":"chatgpt","planType":"plus"}"#
+        )
+        #expect(try await login.result() == .succeeded)
+    }
+
+    @Test func stockChatGPTLoginRejectsExplicitNonChatGPTAccountAfterSuccess() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueChatGPTLogin(
+            loginID: "login-1",
+            authenticationURL: URL(string: "https://chatgpt.com/auth")!
+        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let login = try await harness.server.loginChatGPT()
+
+        try await transport.emitServerNotificationJSON(
+            method: "account/login/completed",
+            json: #"{"loginId":"login-1","success":true,"error":null}"#
+        )
+        try await transport.emitServerNotificationJSON(
+            method: "account/updated",
+            json: #"{"authMode":"apikey"}"#
+        )
+
+        #expect(
+            try await login.result() == .authenticationCommittedNeedsConnectionReconciliation(
+                .chatGPTAccountUnavailableAfterSuccess
+            )
+        )
+    }
+
+    @Test func stockChatGPTLoginDropsMismatchedCompletionID() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueChatGPTLogin(
+            loginID: "login-1",
+            authenticationURL: URL(string: "https://chatgpt.com/auth")!
+        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let handle = try await harness.server.loginChatGPT()
+
+        try await transport.emitServerNotificationJSON(
+            method: "account/login/completed",
+            json: #"{"loginId":"other-login","success":false,"error":"stale"}"#
+        )
+        try await transport.emitServerNotificationJSON(
+            method: "account/login/completed",
+            json: #"{"loginId":"login-1","success":true,"error":null}"#
+        )
+        try await transport.emitServerNotificationJSON(
+            method: "account/updated",
+            json: #"{"authMode":"chatgpt","planType":"plus"}"#
+        )
+
+        #expect(try await handle.result() == .succeeded)
+    }
+
+    @Test func stockChatGPTLoginReleasesReservationAfterStartFailure() async throws {
+        let transport = CodexAppServerTestTransport()
+        await transport.enqueueFailure(
+            code: -32_000,
+            message: "login unavailable",
+            for: "account/login/start"
+        )
+        try await transport.enqueueChatGPTLogin(
+            loginID: "login-2",
+            authenticationURL: URL(string: "https://chatgpt.com/auth/2")!
+        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+
+        await #expect(throws: CodexAppServerError.self) {
+            _ = try await harness.server.loginChatGPT()
+        }
+        let handle = try await harness.server.loginChatGPT()
+
+        #expect(handle.id == "login-2")
+        #expect(await transport.recordedRequests(method: "account/login/start").count == 2)
+    }
+
+    @Test func stockChatGPTLoginRejectsConcurrentStartBeforeSendingASecondRequest() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueChatGPTLogin(
+            loginID: "login-1",
+            authenticationURL: URL(string: "https://chatgpt.com/auth")!
+        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let activeHandle = try await harness.server.loginChatGPT()
+
+        do {
+            _ = try await harness.server.loginChatGPT()
+            Issue.record("Expected the active login reservation to reject a second start.")
+        } catch let error as CodexAppServerError {
+            #expect(error == .loginAlreadyInProgress)
+        }
+        #expect(await transport.recordedRequests(method: "account/login/start").count == 1)
+        _ = activeHandle
+    }
+
+    @Test func stockChatGPTLoginRegistryRetainsPendingStateAfterHandleIsDropped() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueChatGPTLogin(
+            loginID: "login-1",
+            authenticationURL: URL(string: "https://chatgpt.com/auth/1")!
+        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let server = harness.server
+
+        let authenticationURL = try await server.loginChatGPT().authenticationURL
+        #expect(authenticationURL == URL(string: "https://chatgpt.com/auth/1")!)
+        await #expect(throws: CodexAppServerError.loginAlreadyInProgress) {
+            _ = try await server.loginChatGPT()
+        }
+        #expect(await transport.recordedRequests(method: "account/login/start").count == 1)
+
+        await harness.router.loginRegistry.apply(
+            .init(loginID: "login-1", success: true)
+        )
+        await harness.router.loginRegistry.applyAccountUpdate(
+            .init(authMode: .chatGPT, planType: .plus)
+        )
+        try await transport.enqueueChatGPTLogin(
+            loginID: "login-2",
+            authenticationURL: URL(string: "https://chatgpt.com/auth/2")!
+        )
+
+        let nextHandle = try await server.loginChatGPT()
+
+        #expect(nextHandle.id == "login-2")
+        #expect(await transport.recordedRequests(method: "account/login/start").count == 2)
+    }
+
+    @Test func stockChatGPTLoginCancellationIsSharedAcrossConcurrentCallers() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueChatGPTLogin(
+            loginID: "login-1",
+            authenticationURL: URL(string: "https://chatgpt.com/auth")!
+        )
+        try await transport.enqueue(
+            AppServerAPI.Account.Login.Cancel.Response(),
+            for: "account/login/cancel"
+        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let handle = try await harness.server.loginChatGPT()
+
+        async let first = handle.cancel()
+        async let second = handle.cancel()
+
+        #expect(try await first == .cancelled)
+        #expect(try await second == .cancelled)
+        #expect(await transport.recordedRequests(method: "account/login/cancel").count == 1)
+    }
+
+    @Test func unknownPendingLoginCancelOutcomeRequiresReconciliation() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueChatGPTLogin(
+            loginID: "login-1",
+            authenticationURL: URL(string: "https://chatgpt.com/auth")!
+        )
+        await transport.enqueueFailure(
+            code: -32_000,
+            message: "cancel response lost",
+            for: "account/login/cancel"
+        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let handle = try await harness.server.loginChatGPT()
+
+        let outcome = try await handle.cancel(acknowledgementTimeout: .seconds(5))
+
+        guard case .authenticationCommittedNeedsConnectionReconciliation(
+            .cancelOutcomeUnknown(let failure)
+        ) = outcome else {
+            Issue.record("Expected an unknown pending cancel outcome to require reconciliation.")
+            return
+        }
+        #expect(failure?.method == "account/login/cancel")
+        #expect(try await handle.result() == outcome)
+
+        try await transport.emitServerNotificationJSON(
+            method: "account/login/completed",
+            json: #"{"loginId":"login-1","success":true,"error":null}"#
+        )
+        try await transport.emitServerNotificationJSON(
+            method: "account/updated",
+            json: #"{"authMode":"chatgpt","planType":"plus"}"#
+        )
+        #expect(try await handle.result() == outcome)
+    }
+
+    @Test func pendingLoginConnectionFailureWhileCancellationIsInFlightRequiresReconciliation() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueChatGPTLogin(
+            loginID: "login-1",
+            authenticationURL: URL(string: "https://chatgpt.com/auth")!
+        )
+        await transport.enqueueFailure(
+            code: -32_000,
+            message: "cancel response lost",
+            for: "account/login/cancel"
+        )
+        let cancelGate = CodexAppServerTestGate()
+        await transport.holdNextIgnoringCancellation(
+            method: "account/login/cancel",
+            gate: cancelGate
+        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let handle = try await harness.server.loginChatGPT()
+        let cancellation = Task {
+            try await handle.cancel(acknowledgementTimeout: .seconds(5))
+        }
+        await transport.waitForRequest(method: "account/login/cancel")
+        let result = Task { try await handle.result() }
+
+        await transport.failConnection(.closed)
+        let terminalResult = await result.result
+        await cancelGate.open()
+        let cancellationResult = await cancellation.result
+
+        let expected = CodexLoginOutcome.authenticationCommittedNeedsConnectionReconciliation(
+            .cancelOutcomeUnknown(nil)
+        )
+        switch terminalResult {
+        case .success(let outcome):
+            #expect(outcome == expected)
+        case .failure(let error):
+            Issue.record("Expected connection reconciliation, got terminal failure: \(error)")
+        }
+        switch cancellationResult {
+        case .success(let outcome):
+            #expect(outcome == expected)
+        case .failure(let error):
+            Issue.record("Expected shared cancellation reconciliation, got failure: \(error)")
+        }
+        await harness.close()
+    }
+
+    @Test func loginSuccessTerminalWinsOverLateCancelResponse() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueChatGPTLogin(
+            loginID: "login-1",
+            authenticationURL: URL(string: "https://chatgpt.com/auth")!
+        )
+        try await transport.enqueue(
+            AppServerAPI.Account.Login.Cancel.Response(),
+            for: "account/login/cancel"
+        )
+        let cancelGate = CodexAppServerTestGate()
+        await transport.holdNextIgnoringCancellation(
+            method: "account/login/cancel",
+            gate: cancelGate
+        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let handle = try await harness.server.loginChatGPT()
+        let cancellation = Task {
+            try await handle.cancel(acknowledgementTimeout: .seconds(5))
+        }
+        await transport.waitForRequest(method: "account/login/cancel")
+
+        try await transport.emitServerNotificationJSON(
+            method: "account/login/completed",
+            json: #"{"loginId":"login-1","success":true,"error":null}"#
+        )
+        try await transport.emitServerNotificationJSON(
+            method: "account/updated",
+            json: #"{"authMode":"chatgpt","planType":"plus"}"#
+        )
+        #expect(try await handle.result() == .succeeded)
+        await cancelGate.open()
+
+        #expect(try await cancellation.value == .succeeded)
+    }
+
+    @Test func loginFailureTerminalWinsOverLateCancelResponse() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueChatGPTLogin(
+            loginID: "login-1",
+            authenticationURL: URL(string: "https://chatgpt.com/auth")!
+        )
+        try await transport.enqueue(
+            AppServerAPI.Account.Login.Cancel.Response(),
+            for: "account/login/cancel"
+        )
+        let cancelGate = CodexAppServerTestGate()
+        await transport.holdNextIgnoringCancellation(
+            method: "account/login/cancel",
+            gate: cancelGate
+        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let handle = try await harness.server.loginChatGPT()
+        let cancellation = Task {
+            try await handle.cancel(acknowledgementTimeout: .seconds(5))
+        }
+        await transport.waitForRequest(method: "account/login/cancel")
+
+        try await transport.emitServerNotificationJSON(
+            method: "account/login/completed",
+            json: #"{"loginId":"login-1","success":false,"error":"denied"}"#
+        )
+        #expect(try await handle.result() == .failed(message: "denied"))
+        await cancelGate.open()
+
+        #expect(try await cancellation.value == .failed(message: "denied"))
+    }
+
+    @Test func cancellingLoginResultWaiterDoesNotCancelSharedLogin() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueChatGPTLogin(
+            loginID: "login-1",
+            authenticationURL: URL(string: "https://chatgpt.com/auth")!
+        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let handle = try await harness.server.loginChatGPT()
+        let cancelledWaiter = Task { try await handle.result() }
+
+        cancelledWaiter.cancel()
+        await #expect(throws: CancellationError.self) {
+            try await cancelledWaiter.value
+        }
+        try await transport.emitServerNotificationJSON(
+            method: "account/login/completed",
+            json: #"{"loginId":"login-1","success":true,"error":null}"#
+        )
+        try await transport.emitServerNotificationJSON(
+            method: "account/updated",
+            json: #"{"authMode":"chatgpt","planType":"plus"}"#
+        )
+
+        #expect(try await handle.result() == .succeeded)
+        #expect(await transport.recordedRequests(method: "account/login/cancel").isEmpty)
+    }
+
+    @Test func stockChatGPTLoginReadinessDeadlineStartsAfterSuccess() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueChatGPTLogin(
+            loginID: "login-1",
+            authenticationURL: URL(string: "https://chatgpt.com/auth")!
+        )
+        let deadlineGate = CodexAppServerTestGate()
+        let deadlineStarted = TestSignal()
+        let harness = await CodexAppServerTestConnectionHarness.start(
+            transport: transport,
+            deadlineClock: .init { duration in
+                #expect(duration == .seconds(5))
+                deadlineStarted.signal()
+                await deadlineGate.waitIgnoringCancellation()
+            }
+        )
+        let handle = try await harness.server.loginChatGPT(accountReadinessTimeout: .seconds(5))
+        let result = Task { try await handle.result() }
+
+        try await transport.emitServerNotificationJSON(
+            method: "account/login/completed",
+            json: #"{"loginId":"login-1","success":true,"error":null}"#
+        )
+        await deadlineStarted.wait()
+        await deadlineGate.open()
+
+        #expect(
+            try await result.value == .authenticationCommittedNeedsConnectionReconciliation(
+                .accountReadinessDeadlineExceeded(.seconds(5))
+            )
+        )
+    }
+
+    @Test func malformedAccountUpdateAfterLoginSuccessRequiresReconciliation() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueChatGPTLogin(
+            loginID: "login-1",
+            authenticationURL: URL(string: "https://chatgpt.com/auth")!
+        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let handle = try await harness.server.loginChatGPT()
+
+        try await transport.emitServerNotificationJSON(
+            method: "account/login/completed",
+            json: #"{"loginId":"login-1","success":true,"error":null}"#
+        )
+        try await transport.emitServerNotificationJSON(
+            method: "account/updated",
+            json: #"{"authMode":42}"#
+        )
+
+        guard case .authenticationCommittedNeedsConnectionReconciliation(
+            .malformedAccountUpdateAfterSuccess(let malformed)
+        ) = try await handle.result() else {
+            Issue.record("Expected malformed post-success account update reconciliation.")
+            return
+        }
+        #expect(malformed.method == "account/updated")
+    }
+
+    @Test func unknownCancelOutcomeAfterLoginSuccessRequiresReconciliation() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueChatGPTLogin(
+            loginID: "login-1",
+            authenticationURL: URL(string: "https://chatgpt.com/auth")!
+        )
+        await transport.enqueueFailure(
+            code: -32_000,
+            message: "cancel response lost",
+            for: "account/login/cancel"
+        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let handle = try await harness.server.loginChatGPT()
+        try await transport.emitServerNotificationJSON(
+            method: "account/login/completed",
+            json: #"{"loginId":"login-1","success":true,"error":null}"#
+        )
+
+        guard case .authenticationCommittedNeedsConnectionReconciliation(
+            .cancelOutcomeUnknown(let failure)
+        ) = try await handle.cancel(acknowledgementTimeout: .seconds(5)) else {
+            Issue.record("Expected unknown post-success cancel reconciliation.")
+            return
+        }
+        #expect(failure?.method == "account/login/cancel")
     }
 
     @Test func responseStreamCancelSendsTurnInterrupt() async throws {
@@ -4658,12 +7121,14 @@ struct CodexAppServerKitTests {
             for: "turn/start"
         )
         try await transport.enqueue(EmptyResponse(), for: "turn/interrupt")
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         let thread = CodexThread(
             id: "thread-1",
             client: client,
-            router: router
+            router: router,
+            connectionLease: harness.lease
         )
 
         let stream = try await thread.streamResponse(to: "Run the slow checks.")
@@ -4684,12 +7149,14 @@ struct CodexAppServerKitTests {
     @Test func threadCancelActiveTurnSendsExpectedTurnID() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueue(EmptyResponse(), for: "turn/interrupt")
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         let thread = CodexThread(
             id: "thread-1",
             client: client,
-            router: router
+            router: router,
+            connectionLease: harness.lease
         )
 
         let cancellation = try await thread.cancelActiveTurn(expectedTurnID: "turn-1")
@@ -4715,12 +7182,14 @@ struct CodexAppServerKitTests {
             for: "turn/interrupt"
         )
         try await transport.enqueue(EmptyResponse(), for: "turn/interrupt")
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         let thread = CodexThread(
             id: "thread-1",
             client: client,
-            router: router
+            router: router,
+            connectionLease: harness.lease
         )
 
         let stream = try await thread.streamResponse(to: "Run the slow checks.")
@@ -4749,9 +7218,13 @@ struct CodexAppServerKitTests {
             for: "turn/interrupt"
         )
         try await transport.enqueue(EmptyResponse(), for: "turn/interrupt")
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
+        let harness = await CodexAppServerTestConnectionHarness.start(
+            transport: transport,
+            deadlineClock: .init { _ in }
+        )
+        let client = harness.client
+        let router = harness.router
+        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
 
         let stream = try await thread.streamResponse(to: "Run the slow checks.")
         let cancellation = try await stream.cancel()
@@ -4774,23 +7247,23 @@ struct CodexAppServerKitTests {
             AppServerAPI.Turn.Steer.Response(turnID: "turn-1"),
             for: "turn/steer"
         )
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let client = harness.client
+        let router = harness.router
         let thread = CodexThread(
             id: "thread-1",
             client: client,
-            router: router
+            router: router,
+            connectionLease: harness.lease
         )
 
         let stream = try await thread.streamResponse(to: "Run the slow checks.")
         try await stream.steer(with: "Prefer the smallest fix.")
 
-        #expect(
-            await transport.recordedRequests().map(\.method) == [
-                "turn/start",
-                "turn/steer",
-            ])
-        let request = try #require(await transport.recordedRequests().last)
+        #expect(await transport.recordedRequests(method: "turn/start").count == 1)
+        let request = try #require(
+            await transport.recordedRequests(method: "turn/steer").last
+        )
         let params = try JSONDecoder().decode(
             AppServerAPI.Turn.Steer.Params.self, from: request.params)
         #expect(params.threadID == "thread-1")
@@ -4798,164 +7271,6 @@ struct CodexAppServerKitTests {
         #expect(params.input == [.text("Prefer the smallest fix.")])
     }
 
-    @Test func responseStreamQueueStartsFollowUpAfterCurrentResponse() async throws {
-        let transport = CodexAppServerTestTransport()
-        try await transport.enqueue(
-            AppServerAPI.Turn.Start.Response(turn: .init(id: "turn-1", status: "running")),
-            for: "turn/start"
-        )
-        try await transport.enqueue(
-            AppServerAPI.Turn.Start.Response(turn: .init(id: "turn-2", status: "running")),
-            for: "turn/start"
-        )
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
-        await transport.waitForNotificationStreamCount(1)
-        let thread = CodexThread(
-            id: "thread-1",
-            client: client,
-            router: router
-        )
-
-        let stream = try await thread.streamResponse(to: "First request.")
-        try await transport.emitServerNotification(
-            method: "turn/completed",
-            params: TurnCompletedParams(turn: .init(id: "turn-1", status: "completed"))
-        )
-
-        _ = try await stream.submit(
-            "Second request.",
-            mode: .queueAfterCurrentResponse,
-            options: .init(model: "gpt-5")
-        )
-
-        #expect(
-            await transport.recordedRequests().map(\.method) == [
-                "turn/start",
-                "turn/start",
-            ])
-        let request = try #require(await transport.recordedRequests().last)
-        let params = try JSONDecoder().decode(
-            AppServerAPI.Turn.Start.Params.self, from: request.params)
-        #expect(params.threadID == "thread-1")
-        #expect(params.input == [.text("Second request.")])
-        #expect(params.model == "gpt-5")
-    }
-
-    @Test func responseStreamCancelStartsFollowUpAfterServerTerminalEvent() async throws {
-        let transport = CodexAppServerTestTransport()
-        try await transport.enqueue(
-            AppServerAPI.Turn.Start.Response(turn: .init(id: "turn-1", status: "running")),
-            for: "turn/start"
-        )
-        try await transport.enqueue(EmptyResponse(), for: "turn/interrupt")
-        try await transport.enqueue(
-            AppServerAPI.Turn.Start.Response(turn: .init(id: "turn-2", status: "running")),
-            for: "turn/start"
-        )
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
-        await transport.waitForNotificationStreamCount(1)
-        let thread = CodexThread(
-            id: "thread-1",
-            client: client,
-            router: router
-        )
-
-        let stream = try await thread.streamResponse(to: "Long request.")
-        let followUpTask = Task {
-            try await stream.submit(
-                "Use the shorter path.",
-                mode: .cancelCurrentResponse
-            )
-        }
-        await transport.waitForRequestCount(2)
-        try await transport.emitServerNotification(
-            method: "turn/completed",
-            params: TurnCompletedParams(turn: .init(id: "turn-1", status: "interrupted"))
-        )
-        _ = try await followUpTask.value
-
-        #expect(
-            await transport.recordedRequests().map(\.method) == [
-                "turn/start",
-                "turn/interrupt",
-                "turn/start",
-            ])
-        let interruptRequest = try #require(await transport.recordedRequests().dropLast().last)
-        let interruptParams = try JSONDecoder().decode(
-            AppServerAPI.Turn.Interrupt.Params.self, from: interruptRequest.params)
-        #expect(interruptParams.threadID == "thread-1")
-        #expect(interruptParams.turnID == "turn-1")
-
-        let followUpRequest = try #require(await transport.recordedRequests().last)
-        let followUpParams = try JSONDecoder().decode(
-            AppServerAPI.Turn.Start.Params.self, from: followUpRequest.params)
-        #expect(followUpParams.threadID == "thread-1")
-        #expect(followUpParams.input == [.text("Use the shorter path.")])
-    }
-
-    @Test func responseStreamCancelFollowUpWaitsForRetriedActiveTurn() async throws {
-        let transport = CodexAppServerTestTransport()
-        try await transport.enqueue(
-            AppServerAPI.Turn.Start.Response(turn: .init(id: "turn-old", status: "running")),
-            for: "turn/start"
-        )
-        await transport.enqueueFailure(
-            code: -32602,
-            message: "expected active turn id turn-old but found turn-new",
-            for: "turn/interrupt"
-        )
-        try await transport.enqueue(EmptyResponse(), for: "turn/interrupt")
-        try await transport.enqueue(
-            AppServerAPI.Turn.Start.Response(turn: .init(id: "turn-follow-up", status: "running")),
-            for: "turn/start"
-        )
-        let client = AppServerClient(transport: transport)
-        let router = CodexAppServerNotificationRouter(client: client)
-        await router.start()
-        await transport.waitForNotificationStreamCount(1)
-        let thread = CodexThread(id: "thread-1", client: client, router: router)
-
-        let stream = try await thread.streamResponse(to: "Long request.")
-        let followUpTask = Task {
-            try await stream.submit(
-                "Continue after the active turn stops.",
-                mode: .cancelCurrentResponse
-            )
-        }
-        defer {
-            followUpTask.cancel()
-        }
-        await transport.waitForRequestCount(3)
-        #expect(await transport.recordedRequests().map(\.method) == [
-            "turn/start",
-            "turn/interrupt",
-            "turn/interrupt",
-        ])
-        try await transport.emitServerNotification(
-            method: "turn/completed",
-            params: TurnCompletedParams(turn: .init(id: "turn-new", status: "interrupted"))
-        )
-        _ = try await withTimeout {
-            try await followUpTask.value
-        }
-
-        let requests = await transport.recordedRequests()
-        #expect(requests.map(\.method) == [
-            "turn/start",
-            "turn/interrupt",
-            "turn/interrupt",
-            "turn/start",
-        ])
-        let followUpParams = try #require(
-            try requests.last?.decodeParams(AppServerAPI.Turn.Start.Params.self)
-        )
-        #expect(followUpParams.threadID == "thread-1")
-        #expect(followUpParams.input == [.text("Continue after the active turn stops.")])
-    }
 }
 
 private func collect<Sequence: AsyncSequence>(
@@ -5024,29 +7339,27 @@ private struct LoginCompletedParams: Encodable, Sendable {
 }
 
 private struct ReviewErrorParams: Encodable, Sendable {
+    var threadID: String
     var turnID: String
-    var message: String
+    var error: ErrorPayload
+    var willRetry: Bool
 
     enum CodingKeys: String, CodingKey {
+        case threadID = "threadId"
         case turnID = "turnId"
-        case message
+        case error
+        case willRetry
     }
-}
 
-private struct ThreadlessDiagnosticParams: Encodable, Sendable {
-    var summary: String
-    var details: String?
-
-    init(message: String) {
-        self.summary = message
-        self.details = nil
+    struct ErrorPayload: Encodable, Sendable {
+        var message: String
     }
 }
 
 private struct TurnDeltaParams: Encodable, Sendable {
-    var threadID: String? = nil
+    var threadID: String = "thread-1"
     var turnID: String
-    var itemID: String = "message-1"
+    var itemID: String
     var delta: String
 
     enum CodingKeys: String, CodingKey {
@@ -5058,7 +7371,7 @@ private struct TurnDeltaParams: Encodable, Sendable {
 }
 
 private struct AgentMessageParams: Encodable, Sendable {
-    var threadID: String? = nil
+    var threadID: String = "thread-1"
     var turnID: String
     var itemID: String? = "message-1"
     var message: String
@@ -5072,7 +7385,7 @@ private struct AgentMessageParams: Encodable, Sendable {
 }
 
 private struct MessageDeltaWithoutItemIDParams: Encodable, Sendable {
-    var threadID: String? = nil
+    var threadID: String = "thread-1"
     var turnID: String
     var delta: String
 
@@ -5085,11 +7398,16 @@ private struct MessageDeltaWithoutItemIDParams: Encodable, Sendable {
 
 private struct TurnStartedParams: Encodable, Sendable {
     var threadID: String
-    var turnID: String
+    var turn: AppServerAPI.Turn.Payload
 
     enum CodingKeys: String, CodingKey {
         case threadID = "threadId"
-        case turnID = "turnId"
+        case turn
+    }
+
+    init(threadID: String, turnID: String) {
+        self.threadID = threadID
+        self.turn = .init(id: turnID, status: "inProgress", items: [])
     }
 }
 
@@ -5133,18 +7451,6 @@ private struct ItemPatchUpdatedParams: Encodable, Sendable {
     }
 }
 
-private struct ItemPatchUpdatedWithoutItemIDParams: Encodable, Sendable {
-    var threadID: String
-    var turnID: String
-    var changes: AppServerJSONValue
-
-    enum CodingKeys: String, CodingKey {
-        case threadID = "threadId"
-        case turnID = "turnId"
-        case changes
-    }
-}
-
 private struct ItemProgressParams: Encodable, Sendable {
     var threadID: String
     var turnID: String
@@ -5159,31 +7465,36 @@ private struct ItemProgressParams: Encodable, Sendable {
     }
 }
 
-private struct ItemProgressWithoutItemIDParams: Encodable, Sendable {
+private struct TurnCompletedParams: Encodable, Sendable {
     var threadID: String
-    var turnID: String
-    var message: String
+    var turn: AppServerAPI.Turn.Payload
 
     enum CodingKeys: String, CodingKey {
         case threadID = "threadId"
-        case turnID = "turnId"
-        case message
+        case turn
     }
-}
 
-private struct TurnCompletedParams: Encodable, Sendable {
-    var turn: AppServerAPI.Turn.Payload
+    init(threadID: String = "thread-1", turn: AppServerAPI.Turn.Payload) {
+        self.threadID = threadID
+        var turn = turn
+        turn.items = turn.items ?? []
+        self.turn = turn
+    }
 }
 
 private struct ThreadItemParams: Encodable, Sendable {
     var threadID: String
     var turnID: String
     var item: Item
+    var startedAtMS: Int64 = 0
+    var completedAtMS: Int64 = 0
 
     enum CodingKeys: String, CodingKey {
         case threadID = "threadId"
         case turnID = "turnId"
         case item
+        case startedAtMS = "startedAtMs"
+        case completedAtMS = "completedAtMs"
     }
 
     struct Item: Encodable, Sendable {
@@ -5244,6 +7555,10 @@ private struct ThreadItemParams: Encodable, Sendable {
             case summary
             case content
             case changes
+            case cwd
+            case commandActions
+            case server
+            case arguments
         }
 
         func encode(to encoder: Encoder) throws {
@@ -5259,6 +7574,17 @@ private struct ThreadItemParams: Encodable, Sendable {
             try container.encodeIfPresent(tool, forKey: .tool)
             try container.encodeIfPresent(summary, forKey: .summary)
             try container.encodeIfPresent(changes, forKey: .changes)
+            if type == "commandExecution" {
+                try container.encode("/workspace", forKey: .cwd)
+                try container.encode([String](), forKey: .commandActions)
+            }
+            if type == "mcpToolCall" {
+                try container.encode("server", forKey: .server)
+                try container.encode(AppServerJSONValue.object([:]), forKey: .arguments)
+            }
+            if type == "fileChange", changes == nil {
+                try container.encode(AppServerJSONValue.array([]), forKey: .changes)
+            }
             if let contentItems {
                 try container.encode(contentItems, forKey: .content)
             } else {
@@ -5348,8 +7674,15 @@ private struct TokenUsageParams: Encodable, Sendable {
     }
 
     struct TokenUsage: Encodable, Sendable {
+        var last: Breakdown
         var total: Breakdown
         var modelContextWindow: Int?
+
+        init(total: Breakdown, modelContextWindow: Int? = nil) {
+            self.last = total
+            self.total = total
+            self.modelContextWindow = modelContextWindow
+        }
     }
 
     struct Breakdown: Encodable, Sendable {
@@ -5385,6 +7718,286 @@ private actor ServerRequestRecorder {
     }
 }
 
+private final class TestPreWriteSuspendingTransport: JSONRPC.Transport, Sendable {
+    let connectionEventHub = ConnectionEventHub()
+    private let response: Data
+    private let sendEntered = TestSignal()
+    private let writeAcceptanceGate = CodexAppServerTestGate()
+    private let requestCount = Mutex(0)
+
+    init(response: Data) {
+        self.response = response
+    }
+
+    func send(
+        _ request: JSONRPC.Request,
+        acceptWrite: @Sendable () throws -> Void
+    ) async throws -> Data {
+        sendEntered.signal()
+        await writeAcceptanceGate.waitIgnoringCancellation()
+        try acceptWrite()
+        requestCount.withLock { $0 += 1 }
+        return response
+    }
+
+    func waitUntilSendEntered() async {
+        await sendEntered.wait()
+    }
+
+    func allowWriteAcceptance() async {
+        await writeAcceptanceGate.open()
+    }
+
+    func wireRequestCount() -> Int {
+        requestCount.withLock { $0 }
+    }
+
+    func notify(_ notification: JSONRPC.Notification) async throws {}
+
+    func nextInboundEvent() async throws -> JSONRPC.InboundEvent? { nil }
+
+    func respond(
+        to requestID: CodexServerRequestID,
+        with response: CodexServerRequestResponse
+    ) async throws {}
+
+    func beginClose() async -> JSONRPC.ProcessExitObservation? {
+        await writeAcceptanceGate.open()
+        return nil
+    }
+
+    func finishPendingResponsesAfterInboundDrain(_ failure: CodexTransportFailure) async {}
+
+    func waitForProcessExit() async -> JSONRPC.ProcessExitObservation { .unavailable }
+
+    func waitUntilClosed() async {}
+
+    func reapProcess() async {}
+}
+
+private final class TestOutboundWriteFailureTransport: JSONRPC.Transport, Sendable {
+    let connectionEventHub = ConnectionEventHub()
+    private let failure: CodexTransportFailure
+
+    init(failure: CodexTransportFailure) {
+        self.failure = failure
+    }
+
+    func send(
+        _ request: JSONRPC.Request,
+        acceptWrite: @Sendable () throws -> Void
+    ) async throws -> Data {
+        try acceptWrite()
+        throw JSONRPC.OutboundWriteFailure(failure)
+    }
+
+    func notify(_ notification: JSONRPC.Notification) async throws {}
+    func nextInboundEvent() async throws -> JSONRPC.InboundEvent? { nil }
+    func respond(
+        to requestID: CodexServerRequestID,
+        with response: CodexServerRequestResponse
+    ) async throws {}
+    func beginClose() async -> JSONRPC.ProcessExitObservation? { nil }
+    func finishPendingResponsesAfterInboundDrain(_ failure: CodexTransportFailure) async {}
+    func waitForProcessExit() async -> JSONRPC.ProcessExitObservation { .unavailable }
+    func waitUntilClosed() async {}
+    func reapProcess() async {}
+}
+
+private final class TestSuspendingTransport: JSONRPC.Transport, Sendable {
+    let connectionEventHub = ConnectionEventHub()
+    let response: Data
+    private let started = TestSignal()
+    private let cancelled: TestSignal
+    private let suspension: TestCancellationWaiter
+
+    init(response: Data) {
+        self.response = response
+        let cancelled = TestSignal()
+        self.cancelled = cancelled
+        self.suspension = TestCancellationWaiter {
+            cancelled.signal()
+        }
+    }
+
+    func send(
+        _ request: JSONRPC.Request,
+        acceptWrite: @Sendable () throws -> Void
+    ) async throws -> Data {
+        try acceptWrite()
+        started.signal()
+        try await suspension.wait()
+        return response
+    }
+
+    func waitUntilStarted() async {
+        await started.wait()
+    }
+
+    func waitUntilCancelled() async {
+        await cancelled.wait()
+    }
+
+    func notify(_ notification: JSONRPC.Notification) async throws {}
+
+    func nextInboundEvent() async throws -> JSONRPC.InboundEvent? { nil }
+
+    func respond(
+        to requestID: CodexServerRequestID,
+        with response: CodexServerRequestResponse
+    ) async throws {}
+
+    func beginClose() async -> JSONRPC.ProcessExitObservation? {
+        suspension.cancel()
+        return nil
+    }
+
+    func finishPendingResponsesAfterInboundDrain(_ failure: CodexTransportFailure) async {}
+
+    func waitForProcessExit() async -> JSONRPC.ProcessExitObservation { .unavailable }
+
+    func waitUntilClosed() async {}
+
+    func reapProcess() async {}
+}
+
+private final class TestSignal: Sendable {
+    private struct State {
+        var isSignalled = false
+        var waiters: [UUID: CheckedContinuation<Void, Never>] = [:]
+    }
+
+    private let state = Mutex(State())
+
+    func wait() async {
+        let waiterID = UUID()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                let shouldResume = state.withLock { state in
+                    if state.isSignalled || Task.isCancelled {
+                        return true
+                    }
+                    state.waiters[waiterID] = continuation
+                    return false
+                }
+                if shouldResume {
+                    continuation.resume()
+                }
+            }
+        } onCancel: {
+            let waiter = state.withLock { state in
+                state.waiters.removeValue(forKey: waiterID)
+            }
+            waiter?.resume()
+        }
+    }
+
+    func signal() {
+        let waiters = state.withLock { state in
+            state.isSignalled = true
+            let waiters = Array(state.waiters.values)
+            state.waiters.removeAll(keepingCapacity: false)
+            return waiters
+        }
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
+}
+
+private final class TestCancellationWaiter: Sendable {
+    private struct State {
+        var continuation: CheckedContinuation<Void, Never>?
+        var isCancelled = false
+    }
+
+    private let state = Mutex(State())
+    private let onCancel: @Sendable () -> Void
+
+    init(onCancel: @escaping @Sendable () -> Void) {
+        self.onCancel = onCancel
+    }
+
+    func wait() async throws {
+        try Task.checkCancellation()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                let shouldResume = state.withLock { state in
+                    if state.isCancelled {
+                        return true
+                    }
+                    precondition(state.continuation == nil)
+                    state.continuation = continuation
+                    return false
+                }
+                if shouldResume {
+                    continuation.resume()
+                }
+            }
+        } onCancel: {
+            cancel()
+        }
+        try Task.checkCancellation()
+    }
+
+    func cancel() {
+        onCancel()
+        let continuation = state.withLock { state in
+            state.isCancelled = true
+            let continuation = state.continuation
+            state.continuation = nil
+            return continuation
+        }
+        continuation?.resume()
+    }
+}
+
+private func firstConnectionTermination(
+    in events: CodexConnectionEvents
+) async -> CodexConnectionTermination? {
+    var iterator = events.makeAsyncIterator()
+    while let event = await iterator.next() {
+        if case .terminated(let termination) = event {
+            return termination
+        }
+    }
+    return nil
+}
+
+private func emitItemStarted(
+    on transport: CodexAppServerTestTransport,
+    threadID: String,
+    turnID: String,
+    item: ThreadItemParams.Item
+) async throws {
+    try await transport.emitServerNotification(
+        method: "item/started",
+        params: ThreadItemParams(threadID: threadID, turnID: turnID, item: item)
+    )
+}
+
+private extension Array where Element == CodexThreadEvent {
+    func containsThreadText(_ text: String, turnID expectedTurnID: CodexTurnID) -> Bool {
+        contains { event in
+            switch event {
+            case .snapshot(let snapshot):
+                snapshot.id == expectedTurnID && snapshot.items.contains { $0.text == text }
+            case .itemStarted(let item, let turnID),
+                 .itemUpdated(let item, let turnID),
+                 .itemCompleted(let item, let turnID):
+                turnID == expectedTurnID && item.text == text
+            case .message(let message, let turnID):
+                turnID == expectedTurnID && message.text == text
+            case .messageDelta(let delta, let turnID):
+                turnID == expectedTurnID && delta.text == text
+            case .turnStarted, .terminal, .reasoningSummaryPartAdded, .reasoningDelta,
+                 .diagnostic, .tokenUsageUpdated, .statusChanged, .closed, .unknown:
+                false
+            }
+        }
+    }
+}
+
 private func eventually(
     attempts: Int = 50,
     _ condition: () async -> Bool
@@ -5396,6 +8009,14 @@ private func eventually(
         try? await Task.sleep(for: .milliseconds(10))
     }
     return await condition()
+}
+
+private func testConnectionCloseAction(
+    for transport: any JSONRPC.Transport
+) -> ConnectionCloseAction {
+    ConnectionCloseAction(action: {
+        _ = await transport.beginClose()
+    })
 }
 
 private enum TestTimeoutError: Error {
@@ -5417,11 +8038,12 @@ private func prepareRestartToken(
     await runtime.transport.waitForRequest(method: "turn/interrupt")
     try await runtime.transport.emitServerNotification(
         method: "turn/completed",
-        params: TurnCompletedParams(turn: .init(id: identity.turnID.rawValue, status: "interrupted"))
+        params: TurnCompletedParams(
+            threadID: identity.activeTurnThreadID.rawValue,
+            turn: .init(id: identity.turnID.rawValue, status: "interrupted")
+        )
     )
-    return try await withTimeout {
-        try await prepareTask.value
-    }
+    return try await prepareTask.value
 }
 
 private func withTimeout<Value: Sendable>(
