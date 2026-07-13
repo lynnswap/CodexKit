@@ -11297,6 +11297,75 @@ struct CodexModelContextTests {
             return
         }
         #expect(liveValue.status == .completed)
+
+        // Once the rollout materializes a terminal reviewer turn, its
+        // authoritative boundary must not be folded back into the still-open
+        // seed merely because its synthesized identity has not been seen.
+        started.chat.apply(
+            .init(
+                id: "thread-review",
+                workspace: workspaceURL,
+                status: .active(activeFlags: []),
+                turns: [
+                    .init(
+                        id: "rollout-exit",
+                        state: .completed,
+                        itemsLoadState: .full,
+                        items: [
+                            .init(
+                                id: "item-2",
+                                kind: .enteredReviewMode,
+                                content: .log("current changes")
+                            ),
+                            .init(
+                                id: "review-exit",
+                                kind: .exitedReviewMode,
+                                content: .log("No issues found.")
+                            ),
+                        ]
+                    ),
+                    .init(
+                        id: "rollout-reviewer",
+                        state: .interrupted,
+                        itemsLoadState: .full,
+                        items: [
+                            .init(
+                                id: "item-1",
+                                kind: .userMessage,
+                                content: .message(.init(
+                                    id: "item-1",
+                                    role: .user,
+                                    text: "current changes"
+                                ))
+                            ),
+                            .init(
+                                id: "item-2",
+                                kind: .userMessage,
+                                content: .message(.init(
+                                    id: "item-2",
+                                    role: .user,
+                                    text: "current changes"
+                                ))
+                            ),
+                            .init(
+                                id: "item-3",
+                                kind: .agentMessage,
+                                content: .message(.init(
+                                    id: "item-3",
+                                    role: .assistant,
+                                    text: "No issues found."
+                                ))
+                            ),
+                        ]
+                    ),
+                ]
+            ),
+            workspace: started.chat.workspace,
+            preservesExistingTurnItems: true
+        )
+
+        #expect(started.chat.turns.map(\.id) == ["turn-seed", "rollout-reviewer"])
+        #expect(started.chat.items(in: "rollout-reviewer").count == 3)
     }
 
     @Test("started review coalesces multiple synthesized rollout records into the live turn")

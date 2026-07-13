@@ -1005,6 +1005,12 @@ public final class CodexChat: CodexPersistentModel {
         guard turnsByID[record.id] == nil else {
             return nil
         }
+        // A terminal reviewer record is an authoritative turn boundary. Its
+        // index-based narrative ids can collide with the still-open seed, so
+        // only a record carrying a review marker may anchor back to that seed.
+        let rejectsSeedMatch = record.status.isTerminal
+            && record.items.contains(where: \.isReviewModeMarker) == false
+            && seededReviewTurnID.flatMap { turnsByID[$0]?.status?.isTerminal } == false
         for incomingItem in record.items {
             guard let match = items.first(where: { item in
                 item.turnID != nil
@@ -1012,6 +1018,9 @@ public final class CodexChat: CodexPersistentModel {
                     && item.kind == incomingItem.kind
                     && item.itemID == incomingItem.id
             }) else {
+                continue
+            }
+            if rejectsSeedMatch, match.turnID == seededReviewTurnID {
                 continue
             }
             return match.turnID
@@ -1031,6 +1040,7 @@ public final class CodexChat: CodexPersistentModel {
             reviewTurnID != record.id,
             let reviewTurn = turnsByID[reviewTurnID],
             reviewTurn.status?.isTerminal != true,
+            record.status.isTerminal == false,
             record.items.contains(where: { $0.kind == .exitedReviewMode }) == false
         else {
             return nil
