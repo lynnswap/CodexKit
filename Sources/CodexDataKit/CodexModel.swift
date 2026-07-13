@@ -895,7 +895,31 @@ public final class CodexChat: CodexPersistentModel {
             }
             coalesced[index] = coalescing(coalesced[index], with: record)
         }
-        return coalesced
+        return coalesced.map(normalizingLifecycleFromItemOrder)
+    }
+
+    private func normalizingLifecycleFromItemOrder(
+        _ record: CodexTurnSnapshot
+    ) -> CodexTurnSnapshot {
+        var record = record
+        var normalizedItems: [CodexThreadItem] = []
+        normalizedItems.reserveCapacity(record.items.count)
+        let inferredStatus = record.status.isTerminal ? record.status : .completed
+        var activeLifecycleItemIndex: Int?
+        for incomingItem in record.items {
+            if let activeLifecycleItemIndex {
+                normalizedItems[activeLifecycleItemIndex] = itemByApplyingTerminalLifecycleStatus(
+                    inferredStatus,
+                    to: normalizedItems[activeLifecycleItemIndex]
+                )
+            }
+            normalizedItems.append(incomingItem)
+            activeLifecycleItemIndex = hasActiveLifecycleStatus(incomingItem)
+                ? normalizedItems.index(before: normalizedItems.endIndex)
+                : nil
+        }
+        record.items = normalizedItems
+        return record
     }
 
     private func coalescing(
@@ -2242,6 +2266,19 @@ public final class CodexChat: CodexPersistentModel {
         switch item.content {
         case .command, .fileChange, .toolCall:
             true
+        default:
+            false
+        }
+    }
+
+    private func hasActiveLifecycleStatus(_ item: CodexThreadItem) -> Bool {
+        switch item.content {
+        case .command(let command):
+            shouldTerminalizeLifecycleStatus(command.status)
+        case .fileChange(let fileChange):
+            shouldTerminalizeLifecycleStatus(fileChange.status)
+        case .toolCall(let toolCall):
+            shouldTerminalizeLifecycleStatus(toolCall.status)
         default:
             false
         }

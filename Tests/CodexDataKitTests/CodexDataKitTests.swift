@@ -8830,6 +8830,135 @@ struct CodexModelContextTests {
         }
     }
 
+    @Test("later snapshot content terminalizes a command without inventing timing")
+    func laterSnapshotContentTerminalizesCommandWithoutInventingTiming() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let threadID: CodexThreadID = "thread-active-command-timestamps"
+
+        try await runtime.transport.enqueueThreadResume(.init(id: threadID))
+        try await runtime.transport.enqueueThreadTurns(.init(profile: .currentV2, turns: [
+            .init(
+                id: "turn-active-command-timestamps",
+                state: .inProgress,
+                items: [
+                    .init(
+                        id: "command-before-message",
+                        kind: .commandExecution,
+                        content: .command(.init(
+                            command: "git status",
+                            status: .inProgress,
+                            startedAt: Date(timeIntervalSince1970: 4_000)
+                        ))
+                    ),
+                    .init(
+                        id: "message-after-command",
+                        kind: .agentMessage,
+                        content: .message(.init(
+                            id: "message-after-command",
+                            role: .assistant,
+                            text: "Done"
+                        ))
+                    ),
+                ]
+            ),
+        ]))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: threadID,
+            updatedAt: Date(timeIntervalSince1970: 5_000),
+            status: .active(activeFlags: [])
+        ))
+
+        let chat = context.model(for: threadID)
+        try await context.refresh(chat)
+
+        let item = try #require(chat.items.first {
+            $0.itemID == "command-before-message"
+        })
+        guard case .command(let command) = item.content else {
+            Issue.record("Expected command item")
+            return
+        }
+        #expect(chat.turn(id: "turn-active-command-timestamps")?.state == .inProgress)
+        #expect(command.status == .completed)
+        #expect(command.startedAt == nil)
+        #expect(command.completedAt == nil)
+        #expect(command.duration == nil)
+    }
+
+    @Test("snapshot item order preserves interrupted and failed turn dispositions")
+    func snapshotItemOrderPreservesTerminalTurnDispositions() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let threadID: CodexThreadID = "thread-terminal-command-dispositions"
+
+        func items(commandID: String, messageID: String) -> [CodexThreadItem] {
+            [
+                .init(
+                    id: commandID,
+                    kind: .commandExecution,
+                    content: .command(.init(
+                        command: "git status",
+                        status: .inProgress
+                    ))
+                ),
+                .init(
+                    id: messageID,
+                    kind: .agentMessage,
+                    content: .message(.init(
+                        id: messageID,
+                        role: .assistant,
+                        text: "Stopped"
+                    ))
+                ),
+            ]
+        }
+
+        try await runtime.transport.enqueueThreadResume(.init(id: threadID))
+        try await runtime.transport.enqueueThreadTurns(.init(profile: .currentV2, turns: [
+            .init(
+                id: "turn-interrupted-command",
+                state: .interrupted,
+                items: items(
+                    commandID: "command-interrupted",
+                    messageID: "message-interrupted"
+                )
+            ),
+            .init(
+                id: "turn-failed-command",
+                state: .failed(.init(message: "failed")),
+                items: items(
+                    commandID: "command-failed",
+                    messageID: "message-failed"
+                )
+            ),
+        ]))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: threadID,
+            status: .idle
+        ))
+
+        let chat = context.model(for: threadID)
+        try await context.refresh(chat)
+
+        let interruptedItem = try #require(chat.items.first {
+            $0.itemID == "command-interrupted"
+        })
+        let failedItem = try #require(chat.items.first {
+            $0.itemID == "command-failed"
+        })
+        guard case .command(let interruptedCommand) = interruptedItem.content,
+            case .command(let failedCommand) = failedItem.content
+        else {
+            Issue.record("Expected command items")
+            return
+        }
+        #expect(interruptedCommand.status == .interrupted)
+        #expect(failedCommand.status == .failed)
+        #expect(interruptedCommand.duration == nil)
+        #expect(failedCommand.duration == nil)
+    }
+
     @Test("not-loaded metadata refresh replaces live-streamed items with authoritative turns")
     func notLoadedMetadataRefreshReplacesLiveStreamedItemsWithAuthoritativeTurns() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
