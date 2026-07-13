@@ -886,6 +886,37 @@ struct CodexModelContextTests {
         #expect(params.cwd == .paths([app.path, tools.path]))
     }
 
+    @Test("unsorted chat fetches preserve app-server ordering")
+    func unsortedChatFetchesPreserveAppServerOrdering() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadList(.init(profile: .currentV2, threads: [
+            .init(
+                id: "recently-active-old-thread",
+                createdAt: Date(timeIntervalSince1970: 100),
+                updatedAt: Date(timeIntervalSince1970: 400)
+            ),
+            .init(
+                id: "inactive-new-thread",
+                createdAt: Date(timeIntervalSince1970: 300),
+                updatedAt: Date(timeIntervalSince1970: 300)
+            ),
+        ]))
+
+        let chats = try await context.fetch(CodexFetchDescriptor<CodexChat>())
+
+        #expect(chats.map(\.id.rawValue) == [
+            "recently-active-old-thread",
+            "inactive-new-thread",
+        ])
+        let request = try #require(
+            await runtime.transport.recordedRequests(method: "thread/list").first)
+        let params = try request.decodeParams(ThreadListParams.self)
+        #expect(params.sortKey == nil)
+        #expect(params.sortDirection == nil)
+    }
+
     @Test("localized search predicates are evaluated without server search pushdown")
     func localizedSearchPredicatesAreEvaluatedWithoutServerSearchPushdown() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -1124,6 +1155,15 @@ struct CodexModelContextTests {
 
     @Test("query plan owns every fetched-results mutation strategy")
     func queryPlanOwnsMutationStrategies() throws {
+        let defaultPlan = try CodexThreadQueryPlan(
+            descriptor: CodexFetchDescriptor<CodexChat>()
+        )
+        #expect(defaultPlan.sortPlans.isEmpty)
+        #expect(defaultPlan.mutationStrategy(for: .insert) == .refreshLoadedWindow)
+        #expect(defaultPlan.mutationStrategy(
+            for: .relationshipRefresh
+        ) == .refreshLoadedWindow)
+
         let localPlan = try CodexThreadQueryPlan(descriptor: CodexFetchDescriptor<CodexChat>(
             predicate: archivedChatPredicate(false),
             sortBy: [CodexSortDescriptor(\.title)]
@@ -3197,8 +3237,8 @@ struct CodexModelContextTests {
         #expect(results.items.map(\.title) == ["Alpha"])
     }
 
-    @Test("default chat ordering remains stable after a model refresh")
-    func defaultChatOrderingRemainsStableAfterModelRefresh() async throws {
+    @Test("default chat ordering follows the app-server after a model refresh")
+    func defaultChatOrderingFollowsAppServerAfterModelRefresh() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         let context = CodexModelContainer(appServer: runtime.server).mainContext
 
@@ -3212,10 +3252,14 @@ struct CodexModelContextTests {
 
         try await runtime.transport.enqueueThreadResume(.init(id: "thread-alpha"))
         try await runtime.transport.enqueueThreadRead(.init(id: "thread-alpha", name: "Alpha"))
+        try await runtime.transport.enqueueThreadList(.init(profile: .currentV2, threads: [
+            .init(id: "thread-beta", name: "Beta"),
+            .init(id: "thread-alpha", name: "Alpha"),
+        ]))
         try await context.refresh(alpha, includeTurns: false)
 
         #expect(results.items.map(\.id.rawValue) == ["thread-beta", "thread-alpha"])
-        #expect(await runtime.transport.recordedRequests(method: "thread/list").count == 1)
+        #expect(await runtime.transport.recordedRequests(method: "thread/list").count == 2)
     }
 
     @Test("non-recency sort descriptors still apply when recency is present")
@@ -5938,7 +5982,7 @@ struct CodexModelContextTests {
         ]))
         try await allResults.performFetch()
 
-        #expect(searchResults.items.map(\.title) == ["Second renamed", "First renamed"])
+        #expect(searchResults.items.map(\.title) == ["First renamed", "Second renamed"])
         let recordedRequests = await runtime.transport.recordedRequests(method: "thread/list")
         #expect(recordedRequests.count == 4)
         let refreshParams = try #require(recordedRequests.last).decodeParams(ThreadListParams.self)

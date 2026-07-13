@@ -57,7 +57,7 @@ package struct CodexThreadQueryPlan: Sendable {
             self.predicateSignature = nil
             self.serverFilter = .defaultChatFilter
         }
-        self.sortPlans = try Self.effectiveSortPlans(for: descriptor.sortBy)
+        self.sortPlans = try descriptor.validatedSortPlans()
         self.fetchLimit = descriptor.fetchLimit
         self.fetchOffset = descriptor.normalizedFetchOffset
         self.includeContextChanges = descriptor.includeContextChanges
@@ -115,18 +115,7 @@ package struct CodexThreadQueryPlan: Sendable {
     }
 
     package var usesServerOwnedOrdering: Bool {
-        sortPlans.first?.key == .recencyAt
-    }
-
-    package static func effectiveSortPlans(
-        for descriptors: [CodexSortDescriptor<CodexChat>]
-    ) throws -> [CodexSortPlan<CodexChat>] {
-        if descriptors.isEmpty {
-            return [try CodexSortPlan(
-                descriptor: CodexSortDescriptor(\CodexChat.createdAt, order: .reverse)
-            )]
-        }
-        return try descriptors.map(CodexSortPlan.init(descriptor:))
+        sortPlans.isEmpty || sortPlans.first?.key == .recencyAt
     }
 
     package func mutationStrategy(

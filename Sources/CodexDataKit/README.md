@@ -88,7 +88,8 @@ when a fetch should report only the server-owned page membership.
 Every effective local ordering ends with the model's typed ID in the primary sort
 direction. The pinned app-server's `createdAt` and `updatedAt` cursors do not include
 that tie-breaker, so those sorts enumerate the server through its stable `recencyAt`
-cursor and then sort/page locally. Only a single primary `recencyAt` sort uses direct
+cursor and then sort/page locally. An empty `sortBy` preserves the app-server's
+default ordering. Empty sorting and a single primary `recencyAt` sort use direct
 server paging.
 
 Fetches preserve object identity. If the same app-server thread appears in a later refresh, CodexDataKit mutates the existing `CodexChat` instance instead of replacing it.

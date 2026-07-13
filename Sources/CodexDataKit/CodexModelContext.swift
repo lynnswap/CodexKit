@@ -1923,6 +1923,9 @@ public final class CodexModelContext: Equatable, SendableMetatype {
             case (.none, .some):
                 return false
             case (.none, .none):
+                if descriptor.sortBy.isEmpty {
+                    return lhs.id.rawValue < rhs.id.rawValue
+                }
                 return liveChatShouldSortBefore(lhs, rhs, descriptor: descriptor)
             }
         }
@@ -1952,7 +1955,10 @@ public final class CodexModelContext: Equatable, SendableMetatype {
         _ rhs: CodexChat,
         descriptor: CodexFetchDescriptor<CodexChat>
     ) -> Bool {
-        let plans = effectiveChatSortPlans(descriptor.sortBy)
+        guard descriptor.sortBy.isEmpty == false else {
+            return false
+        }
+        let plans = descriptor.sortBy.map(CodexSortPlan.afterValidation)
         return shouldSortBefore(
             lhs,
             rhs,
@@ -2841,7 +2847,8 @@ public final class CodexModelContext: Equatable, SendableMetatype {
         guard plan.serverPredicateIsComplete else {
             return false
         }
-        return plan.sortPlans.count == 1 && plan.sortPlans[0].key == .recencyAt
+        return plan.sortPlans.isEmpty
+            || (plan.sortPlans.count == 1 && plan.sortPlans[0].key == .recencyAt)
     }
 
     package func localCursor(for offset: Int) -> String {
@@ -2928,7 +2935,10 @@ public final class CodexModelContext: Equatable, SendableMetatype {
     )
         -> [CodexChat]
     {
-        let plans = effectiveChatSortPlans(descriptors)
+        guard descriptors.isEmpty == false else {
+            return chats
+        }
+        let plans = descriptors.map(CodexSortPlan.afterValidation)
         return sortModels(
             chats,
             using: plans,
@@ -2936,20 +2946,6 @@ public final class CodexModelContext: Equatable, SendableMetatype {
             tieBreakOrder: plans[0].order
         ) { plan, lhs, rhs in
             plan.compare(lhs, rhs)
-        }
-    }
-
-    private func effectiveChatSortPlans(
-        _ descriptors: [CodexSortDescriptor<CodexChat>]
-    ) -> [CodexSortPlan<CodexChat>] {
-        do {
-            return try CodexThreadQueryPlan.effectiveSortPlans(
-                for: descriptors
-            )
-        } catch {
-            preconditionFailure(
-                "CodexFetchDescriptor was used before successful validation: \(error)"
-            )
         }
     }
 
