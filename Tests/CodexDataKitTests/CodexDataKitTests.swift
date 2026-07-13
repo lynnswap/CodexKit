@@ -6579,6 +6579,50 @@ struct CodexModelContextTests {
         #expect(chat.transcript.finalAnswer == "Done")
     }
 
+    @Test("chat send cancellation applies the interrupted terminal outcome")
+    func chatSendCancellationAppliesInterruptedTerminalOutcome() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadResume(.init(id: "thread-cancelled-send"))
+        try await runtime.transport.enqueueTurnStart(
+            turnID: "turn-cancelled-send",
+            status: "running"
+        )
+        try await runtime.transport.enqueueEmpty(for: "turn/interrupt")
+
+        let chat = context.model(for: CodexThreadID(rawValue: "thread-cancelled-send"))
+        let sendTask = Task {
+            try await chat.send("hello")
+        }
+
+        await runtime.transport.waitForRequest(method: "turn/start")
+        sendTask.cancel()
+        await runtime.transport.waitForRequest(method: "turn/interrupt")
+        try await runtime.transport.emitServerNotification(
+            method: "turn/completed",
+            params: TurnCompletedParams(
+                threadID: "thread-cancelled-send",
+                turn: .init(id: "turn-cancelled-send", status: "interrupted")
+            )
+        )
+
+        do {
+            _ = try await sendTask.value
+            Issue.record("Expected the cancelled send to throw CancellationError.")
+        } catch is CancellationError {
+        } catch {
+            Issue.record("Expected CancellationError, got \(error).")
+        }
+
+        #expect(chat.turn(id: "turn-cancelled-send")?.status == .interrupted)
+        #expect(chat.phase == .terminal(
+            turnID: "turn-cancelled-send",
+            disposition: .interrupted
+        ))
+        await runtime.close()
+    }
+
     @Test("observed chat send emits a loaded phase change")
     func observedChatSendEmitsLoadedPhaseChange() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()

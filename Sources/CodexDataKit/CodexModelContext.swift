@@ -1673,9 +1673,14 @@ public final class CodexModelContext: Equatable, SendableMetatype {
     ) async throws -> CodexTurnOutcome {
         try requireAttached(chat)
         let thread = try await eventThread(for: chat)
-        let response = try await thread.respond(to: input.prompt, options: input.options)
-        await apply(response, to: chat)
-        return response
+        switch try await thread.collectResponse(to: input.prompt, options: input.options) {
+        case .outcome(let outcome):
+            await apply(outcome, to: chat)
+            return outcome
+        case .cancelled(let outcome):
+            await apply(outcome, to: chat)
+            throw CancellationError()
+        }
     }
 
     @discardableResult

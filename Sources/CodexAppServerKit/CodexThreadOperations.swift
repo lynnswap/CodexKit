@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 
 extension CodexThread {
     /// Thread-scoped events emitted by the app-server.
@@ -53,17 +54,42 @@ extension CodexThread {
         options: CodexGenerationOptions = .init(),
         timeout: Duration? = nil
     ) async throws -> CodexTurnOutcome {
-        let stream = try await streamResponse(to: prompt, options: options)
+        switch try await collectResponse(to: prompt, options: options, timeout: timeout) {
+        case .outcome(let outcome):
+            return outcome
+        case .cancelled:
+            throw CancellationError()
+        }
+    }
+
+    package func collectResponse(
+        to prompt: CodexPrompt,
+        options: CodexGenerationOptions = .init(),
+        timeout: Duration? = nil
+    ) async throws -> CodexResponseCollectionResult {
+        let cancellationRecorder = CodexResponseCancellationRecorder()
+        let stream: CodexResponseStream
+        do {
+            stream = try await streamResponse(
+                to: prompt,
+                options: options,
+                cancellationRecorder: cancellationRecorder
+            )
+        } catch is CancellationError {
+            guard let outcome = cancellationRecorder.outcome else {
+                throw CancellationError()
+            }
+            return .cancelled(outcome)
+        }
         do {
             let outcome = try await stream.collect(timeout: timeout)
             try Task.checkCancellation()
-            return outcome
+            return .outcome(outcome)
         } catch is CancellationError {
-            try await interruptAndAwaitTerminal(stream)
-            throw CancellationError()
+            return .cancelled(try await interruptAndAwaitTerminal(stream))
         } catch let error as CodexAppServerError {
             if case .turnDeadlineExceeded = error {
-                try await interruptAndAwaitTerminal(stream)
+                _ = try await interruptAndAwaitTerminal(stream)
             }
             throw error
         }
@@ -100,7 +126,23 @@ extension CodexThread {
         to prompt: CodexPrompt,
         options: CodexGenerationOptions = .init()
     ) async throws -> CodexResponseStream {
-        let turn = try await startTurn(prompt, options: options)
+        try await streamResponse(
+            to: prompt,
+            options: options,
+            cancellationRecorder: nil
+        )
+    }
+
+    private func streamResponse(
+        to prompt: CodexPrompt,
+        options: CodexGenerationOptions,
+        cancellationRecorder: CodexResponseCancellationRecorder?
+    ) async throws -> CodexResponseStream {
+        let turn = try await startTurn(
+            prompt,
+            options: options,
+            cancellationRecorder: cancellationRecorder
+        )
         return .init(turn: turn)
     }
 
@@ -257,7 +299,7 @@ extension CodexThread {
     private func cleanupCancelledReviewSession(
         _ review: CodexReviewSession
     ) async throws {
-        try await interruptAndAwaitTerminal(review.response)
+        _ = try await interruptAndAwaitTerminal(review.response)
         guard review.reviewThreadID != id else {
             return
         }
@@ -345,7 +387,8 @@ extension CodexThread {
 
     package func startTurn(
         _ prompt: CodexPrompt,
-        options: CodexGenerationOptions = .init()
+        options: CodexGenerationOptions = .init(),
+        cancellationRecorder: CodexResponseCancellationRecorder? = nil
     ) async throws -> CodexTurn {
         try await startCodexTurn(
             threadID: id,
@@ -353,7 +396,8 @@ extension CodexThread {
             options: options,
             client: client,
             router: router,
-            connectionLease: connectionLease
+            connectionLease: connectionLease,
+            cancellationRecorder: cancellationRecorder
         )
     }
 
@@ -468,11 +512,34 @@ extension CodexThread {
     }
 }
 
-package func interruptAndAwaitTerminal(_ stream: CodexResponseStream) async throws {
-    let cleanup = Task {
-        try await stream.turn.interruptAndAwaitTerminal()
+package enum CodexResponseCollectionResult: Sendable {
+    case outcome(CodexTurnOutcome)
+    case cancelled(CodexTurnOutcome)
+}
+
+package final class CodexResponseCancellationRecorder: Sendable {
+    private let storedOutcome = Mutex<CodexTurnOutcome?>(nil)
+
+    package var outcome: CodexTurnOutcome? {
+        storedOutcome.withLock { $0 }
     }
-    _ = try await cleanup.value
+
+    package func record(_ outcome: CodexTurnOutcome) {
+        storedOutcome.withLock { storedOutcome in
+            precondition(
+                storedOutcome == nil,
+                "A response collection can record only one cancellation outcome."
+            )
+            storedOutcome = outcome
+        }
+    }
+}
+
+package func interruptAndAwaitTerminal(_ stream: CodexResponseStream) async throws -> CodexTurnOutcome {
+    let cleanup = Task {
+        try await stream.turn.interruptAndAwaitTerminalAcknowledgement().outcome
+    }
+    return try await cleanup.value
 }
 
 package func startCodexTurn(
@@ -481,7 +548,8 @@ package func startCodexTurn(
     options: CodexGenerationOptions = .init(),
     client: AppServerClient,
     router: CodexAppServerNotificationRouter,
-    connectionLease: AppServerConnectionLease
+    connectionLease: AppServerConnectionLease,
+    cancellationRecorder: CodexResponseCancellationRecorder? = nil
 ) async throws -> CodexTurn {
     let store = router.turnReplayStore
     let state = TurnGenerationHandleState(connectionLease: connectionLease)
@@ -536,7 +604,9 @@ package func startCodexTurn(
                         pending: pending,
                         state: state
                     )
-                    _ = try await turn.interruptAndAwaitTerminal()
+                    let acknowledgement = try await turn
+                        .interruptAndAwaitTerminalAcknowledgement()
+                    cancellationRecorder?.record(acknowledgement.outcome)
                 }
             )
         }
