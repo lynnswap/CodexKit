@@ -172,7 +172,7 @@ struct TerminalLifecycleProofTests {
         }
     }
 
-    @Test func historicalTerminalStatusAliasesRemainTypedInvalidOutcomes() async throws {
+    @Test func nonterminalAndHistoricalTerminalStatusesRemainTypedInvalidOutcomes() async throws {
         let aliases = ["success", "succeeded", "cancelled", "aborted", "started", "running"]
         let transport = CodexAppServerTestTransport()
         let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
@@ -205,7 +205,8 @@ struct TerminalLifecycleProofTests {
                 Issue.record("Expected \(alias) to remain an invalid terminal status.")
                 continue
             }
-            #expect(rawStatus == alias)
+            let expectedRawStatus = ["started", "running"].contains(alias) ? "inProgress" : alias
+            #expect(rawStatus == expectedRawStatus)
             #expect(error == nil)
             #expect(response.turnID == turnID)
         }

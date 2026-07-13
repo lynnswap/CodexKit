@@ -1987,7 +1987,7 @@ public enum CodexTurnStatus: Equatable, Sendable {
 
     public init(rawValue: String) {
         switch rawValue {
-        case "inProgress":
+        case "inProgress", "running", "started":
             self = .inProgress
         case "completed":
             self = .completed

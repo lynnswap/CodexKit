@@ -1271,9 +1271,12 @@ struct CodexAppServerKitTests {
         #expect(CodexThreadStatus(rawValue: "closed") == .unknown(rawValue: "closed"))
     }
 
-    @Test func turnStatusPreservesHistoricalAliasesAsUnknown() {
+    @Test func turnStatusCanonicalizesActiveAliases() {
         #expect(CodexTurnStatus.inProgress.rawValue == "inProgress")
-        for rawValue in ["success", "succeeded", "cancelled", "aborted", "started", "running"] {
+        for rawValue in ["inProgress", "started", "running"] {
+            #expect(CodexTurnStatus(rawValue: rawValue) == .inProgress)
+        }
+        for rawValue in ["success", "succeeded", "cancelled", "aborted"] {
             #expect(CodexTurnStatus(rawValue: rawValue) == .unknown(rawValue: rawValue))
         }
     }
