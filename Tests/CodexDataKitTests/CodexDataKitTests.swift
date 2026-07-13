@@ -8625,6 +8625,58 @@ struct CodexModelContextTests {
         #expect(chat.items.map(\.text) == ["Authoritative"])
     }
 
+    @Test("terminal snapshot does not invent per-command completion timestamps")
+    func terminalSnapshotDoesNotInventPerCommandCompletionTimestamps() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let threadID: CodexThreadID = "thread-terminal-command-timestamps"
+
+        try await runtime.transport.enqueueThreadResume(.init(id: threadID))
+        try await runtime.transport.enqueueThreadTurns(.init(profile: .currentV2, turns: [
+            .init(
+                id: "turn-terminal-command-timestamps",
+                state: .completed,
+                items: [
+                    .init(
+                        id: "command-early",
+                        kind: .commandExecution,
+                        content: .command(.init(
+                            command: "first",
+                            startedAt: Date(timeIntervalSince1970: 4_000)
+                        ))
+                    ),
+                    .init(
+                        id: "command-late",
+                        kind: .commandExecution,
+                        content: .command(.init(
+                            command: "second",
+                            startedAt: Date(timeIntervalSince1970: 4_500)
+                        ))
+                    ),
+                ]
+            ),
+        ]))
+        try await runtime.transport.enqueueThreadRead(.init(
+            id: threadID,
+            updatedAt: Date(timeIntervalSince1970: 5_000),
+            status: .idle
+        ))
+
+        let chat = context.model(for: threadID)
+        try await context.refresh(chat)
+
+        #expect(chat.items.count == 2)
+        for item in chat.items {
+            guard case .command(let command) = item.content else {
+                Issue.record("Expected command item")
+                continue
+            }
+            #expect(command.status == .completed)
+            #expect(command.completedAt == nil)
+            #expect(command.duration == nil)
+        }
+    }
+
     @Test("not-loaded metadata refresh replaces live-streamed items with authoritative turns")
     func notLoadedMetadataRefreshReplacesLiveStreamedItemsWithAuthoritativeTurns() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
