@@ -412,6 +412,44 @@ struct CodexChatObservationMulticastTests {
         })
     }
 
+    @Test("observation publishes mutations before fetched results revalidation suspends")
+    func observationPublishesBeforeFetchedResultsRevalidation() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let threadID = CodexThreadID(rawValue: "thread-revalidation-order")
+        let storedThread = try observationStoredThread(id: threadID)
+
+        try await runtime.transport.enqueueThreadList(.init(threads: [storedThread]))
+        let results = context.fetchedResults(for: CodexFetchDescriptor<CodexChat>())
+        try await results.performFetch()
+        let chat = try #require(results.items.first)
+
+        try await runtime.transport.enqueueThreadResume(storedThread)
+        try await runtime.transport.enqueueThreadRead(storedThread)
+        let observation = try await chat.observe()
+        defer { observation.cancel() }
+        let recorder = ObservationUpdateRecorder(stream: observation.updates)
+        await recorder.waitUntilStarted()
+
+        let revalidationGate = CodexAppServerTestGate()
+        try await runtime.transport.enqueueThreadList(.init(threads: [storedThread]))
+        await runtime.transport.holdNext(.threadList, gate: revalidationGate)
+
+        try await runtime.notificationEmitter.emitItemStarted(
+            threadID: threadID,
+            turnID: .init(rawValue: "turn-revalidation-order"),
+            item: .agentMessage(
+                id: "message-revalidation-order",
+                text: "Publish before await"
+            )
+        )
+        await revalidationGate.waitUntilBlocked()
+
+        #expect(await recorder.itemInserted(id: "message-revalidation-order") != nil)
+
+        await revalidationGate.open()
+    }
+
     @Test("multiple update consumers do not duplicate model mutation")
     func multipleUpdateConsumersDoNotDuplicateModelMutation() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()

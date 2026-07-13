@@ -1049,9 +1049,7 @@ public final class CodexModelContext: Equatable, SendableMetatype {
     ) async {
         let bufferedEvents = observation?.finishBufferingEvents() ?? []
         for event in bufferedEvents {
-            let changes = await apply(event, to: chat)
-            observation?.markAppliedLiveUpdates()
-            yield(changes, from: chat, to: observation)
+            _ = await apply(event, to: chat)
         }
     }
 
@@ -1396,14 +1394,12 @@ public final class CodexModelContext: Equatable, SendableMetatype {
         _ event: CodexThreadEvent,
         to chat: CodexChat,
         observation: ActiveChatObservation
-    ) async -> [CodexChatMutation] {
+    ) async {
         if observation.isBufferingEvents {
             observation.appendBufferedEvent(event)
-            return []
+            return
         }
-        let changes = await apply(event, to: chat)
-        observation.markAppliedLiveUpdates()
-        return changes
+        _ = await apply(event, to: chat)
     }
 
     private func processObservedEvent(
@@ -1418,8 +1414,7 @@ public final class CodexModelContext: Equatable, SendableMetatype {
             finishChatObservationIfIdle(chatID, observation: observation)
             return
         }
-        let changes = await applyObservedEvent(event, to: chat, observation: observation)
-        yield(changes, from: chat, to: observation)
+        await applyObservedEvent(event, to: chat, observation: observation)
     }
 
     private func failChatObservation(
@@ -1695,15 +1690,15 @@ public final class CodexModelContext: Equatable, SendableMetatype {
         {
             workspace.moveContextChatToFront(chat)
         }
+        let observation = activeChatObservationsByID[chat.id]
+        observation?.markAppliedLiveUpdates()
+        yield(changes, from: chat, to: observation)
         await revalidateChatInRegisteredResults(
             chat,
             previousWorkspace: previousWorkspace,
             previousGroup: previousGroup,
             archived: chat.isArchived
         )
-        let observation = activeChatObservationsByID[chat.id]
-        observation?.markAppliedLiveUpdates()
-        yield(changes, from: chat, to: observation)
         return changes
     }
 
@@ -1727,6 +1722,9 @@ public final class CodexModelContext: Equatable, SendableMetatype {
         {
             workspace.moveContextChatToFront(chat)
         }
+        let observation = activeChatObservationsByID[chat.id]
+        observation?.markAppliedLiveUpdates()
+        yield(changes, from: chat, to: observation)
         if previousState != fetchedResultState(for: chat) {
             await revalidateChatInRegisteredResults(
                 chat,
