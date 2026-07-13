@@ -110,10 +110,12 @@ package actor LoginState {
 
     private enum Phase {
         case starting
-        case pending(id: CodexLoginHandle.ID)
+        case pending(id: CodexLoginHandle.ID, observedAuthMode: AccountUpdate.AuthMode?)
         case successAwaitingAccount(id: CodexLoginHandle.ID)
         case terminal(Result<CodexLoginOutcome, CodexAppServerError>)
     }
+
+    private typealias AccountUpdate = AppServerNotificationDecoder.AccountUpdate
 
     private enum PreBindEvent: Sendable {
         case completion(CodexLoginCompletion)
@@ -158,7 +160,7 @@ package actor LoginState {
     package func bind(id: CodexLoginHandle.ID, authenticationURL _: URL) {
         switch phase {
         case .starting:
-            phase = .pending(id: id)
+            phase = .pending(id: id, observedAuthMode: nil)
         case .terminal:
             return
         case .pending, .successAwaitingAccount:
@@ -180,7 +182,7 @@ package actor LoginState {
         switch phase {
         case .starting:
             bufferPreBindEvent(.completion(completion))
-        case .pending(let id):
+        case .pending(let id, let observedAuthMode):
             guard let loginID = completion.loginID else {
                 resolve(
                     .success(
@@ -193,8 +195,12 @@ package actor LoginState {
                 return
             }
             if completion.success {
-                phase = .successAwaitingAccount(id: id)
-                startReadinessDeadlineIfNeeded()
+                if let observedAuthMode {
+                    resolveReadiness(authMode: observedAuthMode)
+                } else {
+                    phase = .successAwaitingAccount(id: id)
+                    startReadinessDeadlineIfNeeded()
+                }
             } else {
                 resolve(.success(.failed(message: completion.error)))
             }
@@ -208,12 +214,20 @@ package actor LoginState {
             bufferPreBindEvent(.accountUpdate(update))
             return
         }
-        guard case .successAwaitingAccount = phase else {
-            return
-        }
         guard let authMode = update.authMode else {
             return
         }
+        if case .pending(let id, _) = phase {
+            phase = .pending(id: id, observedAuthMode: authMode)
+            return
+        }
+        guard case .successAwaitingAccount = phase else {
+            return
+        }
+        resolveReadiness(authMode: authMode)
+    }
+
+    private func resolveReadiness(authMode: AccountUpdate.AuthMode) {
         guard authMode == .chatGPT else {
             resolve(
                 .success(
@@ -294,7 +308,7 @@ package actor LoginState {
         switch phase {
         case .terminal(let result):
             return try result.get()
-        case .pending(let id), .successAwaitingAccount(let id):
+        case .pending(let id, _), .successAwaitingAccount(let id):
             let task: Task<Result<CodexLoginOutcome, Error>, Never>
             if let cancelTask {
                 task = cancelTask

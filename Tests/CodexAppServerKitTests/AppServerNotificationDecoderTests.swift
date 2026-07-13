@@ -171,19 +171,13 @@ struct AppServerNotificationDecoderTests {
         #expect(diagnostic.isDisjoint(with: explicitIgnore))
     }
 
-    @Test func requiredFieldsAndKnownStatusesFailAsMalformedNotifications() throws {
+    @Test func requiredFieldsAndClosedStatusesFailAsMalformedNotifications() throws {
         let decoder = AppServerNotificationDecoder()
 
         try expectMalformed(method: "thread/status/changed") {
             try decoder.decode(notification(
                 method: "thread/status/changed",
                 json: #"{"threadId":"thread-1"}"#
-            ))
-        }
-        try expectMalformed(method: "thread/status/changed") {
-            try decoder.decode(notification(
-                method: "thread/status/changed",
-                json: #"{"threadId":"thread-1","status":{"type":"paused"}}"#
             ))
         }
         try expectMalformed(method: "item/started") {
@@ -240,6 +234,41 @@ struct AppServerNotificationDecoderTests {
                 json: #"{"threadId":"thread-1","turnId":"turn-1","itemId":" \n\t ","delta":"blank"}"#
             ))
         }
+    }
+
+    @Test func extensibleWireValuesReachTheirDomainRepresentations() throws {
+        let decoder = AppServerNotificationDecoder()
+
+        for status in ["running", "started"] {
+            let decoded = try decoder.decode(notification(
+                method: "turn/started",
+                json: #"{"threadId":"thread-1","turn":{"id":"turn-1","status":"\#(status)","items":[]}}"#
+            ))
+            #expect(decoded.payload == .turnStarted("turn-1"))
+        }
+
+        let threadStatus = try decoder.decode(notification(
+            method: "thread/status/changed",
+            json: #"{"threadId":"thread-1","status":{"type":"paused"}}"#
+        ))
+        #expect(threadStatus.payload == .threadStatus(.unknown(rawValue: "paused")))
+
+        let futureItem = try decoder.decode(notification(
+            method: "item/started",
+            json: #"{"threadId":"thread-1","turnId":"turn-1","startedAtMs":1000,"item":{"id":"future-1","type":"futureItem","text":"payload"}}"#
+        ))
+        guard case .item(.started(let item)) = futureItem.payload else {
+            Issue.record("Expected a future item start mutation.")
+            return
+        }
+        #expect(item.kind == .unknown("futureItem"))
+        guard case .unknown(let rawItem) = item.content else {
+            Issue.record("Expected the future item payload to remain available.")
+            return
+        }
+        #expect(rawItem.rawType == "futureItem")
+        #expect(rawItem.text == "payload")
+        #expect(rawItem.payload != nil)
     }
 
     @Test func currentItemAndTerminalPayloadsKeepTheirTypedContracts() throws {

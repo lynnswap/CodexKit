@@ -942,7 +942,7 @@ package struct AppServerNotificationDecoder {
             }
             try validateThreadItem(.init(values: values), lifecycle: nil)
         }
-        if case .started = lifecycle, status != CodexTurnStatus.inProgress.rawValue {
+        if case .started = lifecycle, CodexTurnStatus(rawValue: status) != .inProgress {
             throw NotificationContractError.illegalValue(
                 key: "turn.status",
                 value: status
@@ -1057,7 +1057,7 @@ package struct AppServerNotificationDecoder {
             requiredFields = [("review", .string)]
             statusValues = nil
         default:
-            throw NotificationContractError.illegalValue(key: "item.type", value: type)
+            return
         }
         for (key, kind) in requiredFields {
             try item.require(key, kind: kind)
@@ -1099,10 +1099,7 @@ package struct AppServerNotificationDecoder {
     }
 
     private func decodeThreadStatus(from status: PayloadObject) throws -> CodexThreadStatus {
-        let type = try status.requireEnum(
-            "type",
-            allowed: ["notLoaded", "idle", "systemError", "active"]
-        )
+        let type = try status.requireNonEmptyString("type")
         let activeFlags: [String]?
         if type == "active" {
             activeFlags = try status.requireStringArray("activeFlags")

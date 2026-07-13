@@ -6629,6 +6629,27 @@ struct CodexAppServerKitTests {
         #expect(await transport.recordedRequests().map(\.method) == ["account/login/start"])
     }
 
+    @Test func stockChatGPTLoginPreservesAccountUpdateReceivedBeforeSuccess() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueChatGPTLogin(
+            loginID: "login-1",
+            authenticationURL: URL(string: "https://chatgpt.com/auth")!
+        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let login = try await harness.server.loginChatGPT()
+
+        try await transport.emitServerNotificationJSON(
+            method: "account/updated",
+            json: #"{"authMode":"chatgpt","planType":"plus"}"#
+        )
+        try await transport.emitServerNotificationJSON(
+            method: "account/login/completed",
+            json: #"{"loginId":"login-1","success":true,"error":null}"#
+        )
+
+        #expect(try await login.result() == .succeeded)
+    }
+
     @Test func stockChatGPTLoginIgnoresSparseAccountUpdateWhileAwaitingReadiness() async throws {
         let transport = CodexAppServerTestTransport()
         try await transport.enqueueChatGPTLogin(
