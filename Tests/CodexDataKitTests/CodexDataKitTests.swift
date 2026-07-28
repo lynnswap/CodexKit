@@ -11450,6 +11450,105 @@ struct CodexModelContextTests {
         #expect(reviewerMessage.semanticRelation == .companionOf(.exitedReviewMode))
     }
 
+    @Test("coalesced review companion waits for a full snapshot")
+    func coalescedReviewCompanionWaitsForFullSnapshot() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let chat = CodexChat(id: "review-chat", modelContext: context)
+        let items: [CodexThreadItem] = [
+            .init(
+                id: "review-entry",
+                kind: .enteredReviewMode,
+                content: .log("current changes")
+            ),
+            .init(
+                id: "review-exit",
+                kind: .exitedReviewMode,
+                content: .log("No issues found.")
+            ),
+            .init(
+                id: "reviewer-user-1",
+                kind: .userMessage,
+                content: .message(.init(
+                    id: "reviewer-user-1",
+                    role: .user,
+                    text: "current changes"
+                ))
+            ),
+            .init(
+                id: "reviewer-user-2",
+                kind: .userMessage,
+                content: .message(.init(
+                    id: "reviewer-user-2",
+                    role: .user,
+                    text: "current changes"
+                ))
+            ),
+            .init(
+                id: "review-command",
+                kind: .commandExecution,
+                content: .command(.init(command: "/bin/zsh -lc"))
+            ),
+            .init(
+                id: "reviewer-assistant",
+                kind: .agentMessage,
+                content: .message(.init(
+                    id: "reviewer-assistant",
+                    role: .assistant,
+                    text: "No issues found."
+                ))
+            ),
+        ]
+
+        chat.apply(
+            .init(
+                id: chat.id,
+                sourceKind: .vscode,
+                turns: [
+                    .init(
+                        id: "coalesced-review",
+                        state: .inProgress,
+                        itemsLoadState: .summary,
+                        items: items
+                    ),
+                ]
+            ),
+            workspace: nil
+        )
+
+        let summaryMessage = try #require(
+            chat.items(in: "coalesced-review").first {
+                $0.itemID == "reviewer-assistant"
+            }
+        )
+        #expect(summaryMessage.origin == .currentV2Item)
+        #expect(summaryMessage.semanticRelation == nil)
+
+        chat.apply(
+            .init(
+                id: chat.id,
+                sourceKind: .vscode,
+                turns: [
+                    .init(
+                        id: "coalesced-review",
+                        state: .inProgress,
+                        itemsLoadState: .full,
+                        items: items
+                    ),
+                ]
+            ),
+            workspace: nil
+        )
+
+        let fullMessage = try #require(
+            chat.items(in: "coalesced-review").first {
+                $0.itemID == "reviewer-assistant"
+            }
+        )
+        #expect(fullMessage.origin == .reviewRolloutAssistant)
+        #expect(fullMessage.semanticRelation == .companionOf(.exitedReviewMode))
+    }
+
     @Test("live persisted review companion waits for a full completion snapshot")
     func livePersistedReviewCompanionWaitsForFullCompletionSnapshot() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()

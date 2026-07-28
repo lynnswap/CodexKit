@@ -944,12 +944,28 @@ public final class CodexChat: CodexPersistentModel {
         where record.items[index].kind == .agentMessage
             && record.items[index].semanticRelation == nil
         {
-            let precedingNarrativeItem = record.items[..<index].last {
+            let precedingNarrativeItems = record.items[..<index].filter {
                 $0.isReviewNarrativeBoundary
             }
-            if precedingNarrativeItem?.isExitedReviewModeMarker == true {
+            guard let reviewMarkerIndex = precedingNarrativeItems.lastIndex(where: {
+                $0.isReviewModeMarker
+            }), precedingNarrativeItems[reviewMarkerIndex].isExitedReviewModeMarker else {
+                continue
+            }
+            let afterReviewMarker = precedingNarrativeItems.index(after: reviewMarkerIndex)
+            let trailingNarrativeItems = precedingNarrativeItems[afterReviewMarker...]
+            if trailingNarrativeItems.isEmpty {
                 return index
             }
+            guard record.itemsLoadState == .full,
+                trailingNarrativeItems.count == 2,
+                trailingNarrativeItems.allSatisfy({ $0.kind == .userMessage }),
+                trailingNarrativeItems.allSatisfy({ normalizedMessageText($0) != nil }),
+                Set(trailingNarrativeItems.compactMap(normalizedMessageText)).count == 1
+            else {
+                continue
+            }
+            return index
         }
         return nil
     }
