@@ -380,6 +380,44 @@ struct TurnReplayStoreTests {
         #expect(terminalState.outcome.response.transcript.items == [fullItem])
     }
 
+    @Test func sparseTerminalPreservesItemsObservedAfterAPartialSeed() async throws {
+        let store = TurnReplayStore()
+        let state = makeState()
+        let pending = await store.registerPendingOperation(
+            kind: .turn(threadID: "thread-1"),
+            state: state
+        )
+        pending.acceptWrite()
+        let seededItem = makeItem(id: "seeded", text: "Seeded summary")
+        await store.bind(
+            pending,
+            to: "turn-1",
+            initialSnapshot: .init(
+                id: "turn-1",
+                state: .inProgress,
+                itemsLoadState: .summary,
+                items: [seededItem]
+            )
+        )
+        let observedItem = makeItem(id: "observed", text: "Complete live response")
+        _ = await store.yield(.itemCompleted(observedItem), for: "turn-1")
+        let terminalItem = makeItem(id: "seeded", text: "Terminal summary")
+
+        await store.finish(.completed(.init(
+            turnID: "turn-1",
+            transcript: .init(items: [terminalItem]),
+            transcriptItemsLoadState: .summary
+        )))
+
+        let terminalState = try #require(await state.snapshot().terminalSnapshot)
+        #expect(terminalState.snapshot.itemsLoadState == .summary)
+        #expect(terminalState.snapshot.items == [terminalItem, observedItem])
+        #expect(terminalState.outcome.response.transcript.items == [
+            terminalItem,
+            observedItem,
+        ])
+    }
+
     @Test func fullTerminalTranscriptRemovesOmittedReplayItems() async throws {
         let store = TurnReplayStore()
         let state = makeState()

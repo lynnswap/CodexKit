@@ -883,6 +883,7 @@ private struct TurnReplayAccumulator {
     private(set) var snapshot: CodexTurnSnapshot
     private(set) var usage: CodexTokenUsage?
     private var hasRoutedEvent = false
+    private var observedItemIDs: Set<String> = []
 
     init(turnID: CodexTurnID) {
         self.snapshot = .init(
@@ -936,6 +937,7 @@ private struct TurnReplayAccumulator {
         case .snapshot(let newSnapshot):
             precondition(newSnapshot.id == snapshot.id)
             snapshot = newSnapshot
+            observedItemIDs.removeAll(keepingCapacity: true)
         case .itemStarted(let item), .itemUpdated(let item), .itemCompleted(let item):
             upsert(item)
         case .message(let message):
@@ -1013,37 +1015,20 @@ private struct TurnReplayAccumulator {
             snapshot.itemsLoadState,
             response.transcriptItemsLoadState
         )
-        if response.transcriptItemsLoadState != .full,
-           snapshot.itemsLoadState == .full
-        {
+        if response.transcriptItemsLoadState != .full {
             var items = snapshot.items
             for terminalItem in response.transcript.items {
-                if items.contains(where: {
+                if let index = items.firstIndex(where: {
                     $0.id == terminalItem.id && $0.kind == terminalItem.kind
                 }) {
-                    continue
+                    if snapshot.itemsLoadState != .full,
+                       observedItemIDs.contains(terminalItem.id) == false
+                    {
+                        items[index] = terminalItem
+                    }
                 } else {
                     items.append(terminalItem)
                 }
-            }
-            response.transcript = .init(items: items)
-        } else if response.transcriptItemsLoadState != .full,
-                  response.transcript.items.isEmpty
-        {
-            response.transcript = .init(items: snapshot.items)
-        } else if response.transcriptItemsLoadState != .full,
-                  response.transcript.reviewOutputText == nil,
-                  let reviewOutput = snapshot.items.last(where: {
-                      $0.kind == .exitedReviewMode && $0.text?.isEmpty == false
-                  })
-        {
-            var items = response.transcript.items
-            if let index = items.firstIndex(where: { $0.id == reviewOutput.id }) {
-                if items[index].text?.isEmpty != false {
-                    items[index] = reviewOutput
-                }
-            } else {
-                items.append(reviewOutput)
             }
             response.transcript = .init(items: items)
         }
@@ -1055,6 +1040,7 @@ private struct TurnReplayAccumulator {
     }
 
     private mutating func upsert(_ item: CodexThreadItem) {
+        observedItemIDs.insert(item.id)
         if let index = snapshot.items.firstIndex(where: { $0.id == item.id }) {
             snapshot.items[index] = item
         } else {
