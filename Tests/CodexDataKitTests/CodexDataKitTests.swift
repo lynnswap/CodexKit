@@ -11618,6 +11618,138 @@ struct CodexModelContextTests {
         })
     }
 
+    @Test("full snapshot normalization ignores stale omitted review items")
+    func fullSnapshotNormalizationIgnoresStaleOmittedReviewItems() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let chat = CodexChat(id: "corrected-review-chat", modelContext: context)
+        let assistant = CodexThreadItem(
+            id: "reviewer-assistant",
+            kind: .agentMessage,
+            content: .message(.init(
+                id: "reviewer-assistant",
+                role: .assistant,
+                text: "Ordinary assistant response"
+            ))
+        )
+
+        _ = chat.apply(.snapshot(.init(
+            id: "corrected-review",
+            state: .inProgress,
+            itemsLoadState: .full,
+            items: [
+                .init(
+                    id: "review-exit",
+                    kind: .exitedReviewMode,
+                    content: .log("No issues found.")
+                ),
+                assistant,
+            ]
+        )))
+
+        let classifiedMessage = try #require(
+            chat.items(in: "corrected-review").first {
+                $0.itemID == "reviewer-assistant"
+            }
+        )
+        #expect(classifiedMessage.origin == .reviewRolloutAssistant)
+        #expect(classifiedMessage.semanticRelation == .companionOf(.exitedReviewMode))
+
+        let correctedChanges = chat.apply(.snapshot(.init(
+            id: "corrected-review",
+            state: .inProgress,
+            itemsLoadState: .full,
+            items: [assistant]
+        )))
+
+        let correctedMessage = try #require(
+            chat.items(in: "corrected-review").first {
+                $0.itemID == "reviewer-assistant"
+            }
+        )
+        #expect(correctedMessage.origin == .currentV2Item)
+        #expect(correctedMessage.semanticRelation == nil)
+        let correctedUpdates = chat.observationUpdates(for: correctedChanges)
+        #expect(correctedUpdates.contains { update in
+            guard case .itemUpdated(let item, let turnID, _) = update else {
+                return false
+            }
+            return item.id == "reviewer-assistant"
+                && turnID == "corrected-review"
+                && item.origin == .currentV2Item
+                && item.semanticRelation == nil
+        })
+    }
+
+    @Test("first snapshot classifies a persisted companion after a review exit")
+    func firstSnapshotClassifiesPersistedCompanionAfterReviewExit() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let chat = CodexChat(id: "persisted-review-chat", modelContext: context)
+        chat.apply(
+            .init(
+                id: chat.id,
+                turns: [
+                    .init(
+                        id: "review-boundary",
+                        state: .completed,
+                        items: [
+                            .init(
+                                id: "review-exit",
+                                kind: .exitedReviewMode,
+                                content: .log("No issues found.")
+                            ),
+                        ]
+                    ),
+                ]
+            ),
+            workspace: nil
+        )
+
+        _ = chat.apply(.snapshot(.init(
+            id: "persisted-companion",
+            state: .completed,
+            itemsLoadState: .full,
+            items: [
+                .init(
+                    id: "reviewer-user-1",
+                    kind: .userMessage,
+                    content: .message(.init(
+                        id: "reviewer-user-1",
+                        role: .user,
+                        text: "current changes"
+                    ))
+                ),
+                .init(
+                    id: "reviewer-user-2",
+                    kind: .userMessage,
+                    content: .message(.init(
+                        id: "reviewer-user-2",
+                        role: .user,
+                        text: "current changes"
+                    ))
+                ),
+                .init(
+                    id: "reviewer-assistant",
+                    kind: .agentMessage,
+                    content: .message(.init(
+                        id: "reviewer-assistant",
+                        role: .assistant,
+                        text: "No issues found."
+                    ))
+                ),
+            ]
+        )))
+
+        let reviewerMessage = try #require(
+            chat.items(in: "persisted-companion").first {
+                $0.itemID == "reviewer-assistant"
+            }
+        )
+        #expect(reviewerMessage.origin == .reviewRolloutAssistant)
+        #expect(reviewerMessage.semanticRelation == .companionOf(.exitedReviewMode))
+    }
+
     @Test("live persisted review companion waits for a full completion snapshot")
     func livePersistedReviewCompanionWaitsForFullCompletionSnapshot() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()

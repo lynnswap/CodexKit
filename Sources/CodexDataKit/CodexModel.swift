@@ -914,24 +914,31 @@ public final class CodexChat: CodexPersistentModel {
     ) -> [CodexTurnSnapshot] {
         var normalized = records
         for candidateIndex in normalized.indices {
-            if let agentIndex = sameTurnReviewCompanionAgentIndex(
-                in: normalized[candidateIndex]
-            ) {
-                normalized[candidateIndex].items[agentIndex] = reviewRolloutCompanion(
-                    normalized[candidateIndex].items[agentIndex]
+            normalized[candidateIndex] = normalizingReviewRolloutCompanion(
+                normalized[candidateIndex],
+                hasPrecedingReviewExit: hasPrecedingReviewExit(
+                    before: candidateIndex,
+                    in: normalized
                 )
-                continue
-            }
-            guard let agentIndex = persistedReviewCompanionAgentIndex(
-                in: normalized[candidateIndex]
-            ), hasPrecedingReviewExit(
-                before: candidateIndex,
-                in: normalized
-            ) else {
-                continue
-            }
-            normalized[candidateIndex].items[agentIndex] = reviewRolloutCompanion(
-                normalized[candidateIndex].items[agentIndex]
+            )
+        }
+        return normalized
+    }
+
+    private func normalizingReviewRolloutCompanion(
+        _ record: CodexTurnSnapshot,
+        hasPrecedingReviewExit: Bool
+    ) -> CodexTurnSnapshot {
+        var normalized = record
+        if let agentIndex = sameTurnReviewCompanionAgentIndex(in: normalized) {
+            normalized.items[agentIndex] = reviewRolloutCompanion(
+                normalized.items[agentIndex]
+            )
+        } else if let agentIndex = persistedReviewCompanionAgentIndex(in: normalized),
+            hasPrecedingReviewExit
+        {
+            normalized.items[agentIndex] = reviewRolloutCompanion(
+                normalized.items[agentIndex]
             )
         }
         return normalized
@@ -1394,21 +1401,24 @@ public final class CodexChat: CodexPersistentModel {
                 preservesExistingUsage: true
             ))
             changes.appendIfPresent(markRunningIfNeeded(turnID: turnID))
-        case .snapshot(let snapshot):
+        case .snapshot(let incomingSnapshot):
             changes.appendIfPresent(upsertTurn(
-                id: snapshot.id,
-                state: snapshot.state,
-                itemsLoadState: snapshot.itemsLoadState,
+                id: incomingSnapshot.id,
+                state: incomingSnapshot.state,
+                itemsLoadState: incomingSnapshot.itemsLoadState,
                 preservesExistingUsage: true
             ))
+            let snapshot = normalizingReviewRolloutCompanion(
+                incomingSnapshot,
+                hasPrecedingReviewExit: hasPrecedingReviewExit(
+                    before: incomingSnapshot.id
+                )
+            )
             changes.append(contentsOf: mergeItems(
                 snapshot.items,
                 turnID: snapshot.id,
                 reviewCompanionEvidence: .snapshotBatch,
                 itemsLoadState: snapshot.itemsLoadState
-            ))
-            changes.append(contentsOf: normalizeReviewRolloutCompanion(
-                in: snapshot.id
             ))
             switch snapshot.state {
             case .inProgress:
@@ -1691,14 +1701,15 @@ public final class CodexChat: CodexPersistentModel {
         else {
             return item
         }
+        guard case .orderedItems = evidence else {
+            return item
+        }
         let currentTurnItems = (itemsByTurnID[turnID] ?? []).map(\.threadItem)
         let precedingNarrativeItem = currentTurnItems.last {
             ($0.kind != item.kind || $0.id != item.id)
                 && $0.isReviewNarrativeBoundary
         }
-        if case .orderedItems = evidence,
-            precedingNarrativeItem?.isExitedReviewModeMarker == true
-        {
+        if precedingNarrativeItem?.isExitedReviewModeMarker == true {
             return reviewRolloutCompanion(item)
         }
 
