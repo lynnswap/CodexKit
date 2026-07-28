@@ -691,12 +691,15 @@ public final class CodexChat: CodexPersistentModel {
             ephemeral = snapshot.ephemeral
         }
         if let turns = snapshot.turns {
-            let turns = normalizedIncomingTurnRecords(turns)
             let preservesSeededReviewTurnItems = shouldPreserveSeededReviewTurnItemsWhenReconcilingSnapshot
-            if snapshot.turnItemsAreAuthoritative
+            let replacesTurnItems = snapshot.turnItemsAreAuthoritative
                 && preservesExistingTurnItems == false
                 && preservesSeededReviewTurnItems == false
-            {
+            let turns = normalizedIncomingTurnRecords(
+                turns,
+                usesLoadedReviewHistory: replacesTurnItems == false
+            )
+            if replacesTurnItems {
                 replaceTurns(with: turns)
                 replaceItems(with: turns)
                 hasAppliedLiveTurnItemUpdates = false
@@ -884,7 +887,8 @@ public final class CodexChat: CodexPersistentModel {
     }
 
     private func normalizedIncomingTurnRecords(
-        _ records: [CodexTurnSnapshot]
+        _ records: [CodexTurnSnapshot],
+        usesLoadedReviewHistory: Bool
     ) -> [CodexTurnSnapshot] {
         let normalized = recordsByRemovingReplacedProvisionalSeed(records).map { record in
             var record = record
@@ -905,20 +909,27 @@ public final class CodexChat: CodexPersistentModel {
             coalesced[index] = coalescing(coalesced[index], with: record)
         }
         return normalizingReviewRolloutCompanions(
-            coalesced.map(normalizingLifecycleFromItemOrder)
+            coalesced.map(normalizingLifecycleFromItemOrder),
+            usesLoadedReviewHistory: usesLoadedReviewHistory
         )
     }
 
     private func normalizingReviewRolloutCompanions(
-        _ records: [CodexTurnSnapshot]
+        _ records: [CodexTurnSnapshot],
+        usesLoadedReviewHistory: Bool
     ) -> [CodexTurnSnapshot] {
         var normalized = records
+        let supersededTurnIDs = Set(
+            records.lazy.filter(\.itemsAreAuthoritative).map(\.id)
+        )
         for candidateIndex in normalized.indices {
             normalized[candidateIndex] = normalizingReviewRolloutCompanion(
                 normalized[candidateIndex],
                 hasPrecedingReviewExit: hasPrecedingReviewExit(
                     before: candidateIndex,
-                    in: normalized
+                    in: normalized,
+                    usesLoadedReviewHistory: usesLoadedReviewHistory,
+                    supersededTurnIDs: supersededTurnIDs
                 )
             )
         }
@@ -1005,17 +1016,24 @@ public final class CodexChat: CodexPersistentModel {
 
     private func hasPrecedingReviewExit(
         before candidateIndex: Int,
-        in records: [CodexTurnSnapshot]
+        in records: [CodexTurnSnapshot],
+        usesLoadedReviewHistory: Bool,
+        supersededTurnIDs: Set<CodexTurnID>
     ) -> Bool {
-        guard candidateIndex > records.startIndex else {
-            return false
-        }
-        for record in records[..<candidateIndex].reversed() {
-            if let boundary = record.items.last(where: \.isReviewNarrativeBoundary) {
-                return boundary.isExitedReviewModeMarker
+        if candidateIndex > records.startIndex {
+            for record in records[..<candidateIndex].reversed() {
+                if let boundary = record.items.last(where: \.isReviewNarrativeBoundary) {
+                    return boundary.isExitedReviewModeMarker
+                }
             }
         }
-        return false
+        guard usesLoadedReviewHistory else {
+            return false
+        }
+        return hasPrecedingReviewExit(
+            before: records[candidateIndex].id,
+            excluding: supersededTurnIDs
+        )
     }
 
     private func normalizedMessageText(_ item: CodexThreadItem) -> String? {
@@ -1711,9 +1729,14 @@ public final class CodexChat: CodexPersistentModel {
             return item
         }
         let currentTurnItems = (itemsByTurnID[turnID] ?? []).map(\.threadItem)
-        let precedingNarrativeItem = currentTurnItems.last {
-            ($0.kind != item.kind || $0.id != item.id)
-                && $0.isReviewNarrativeBoundary
+        let existingIndex = currentTurnItems.firstIndex {
+            $0.kind == item.kind && $0.id == item.id
+        }
+        let precedingItems = existingIndex.map {
+            currentTurnItems[..<$0]
+        } ?? currentTurnItems[...]
+        let precedingNarrativeItem = precedingItems.last {
+            $0.isReviewNarrativeBoundary
         }
         if precedingNarrativeItem?.isExitedReviewModeMarker == true {
             return reviewRolloutCompanion(item)
@@ -1783,13 +1806,17 @@ public final class CodexChat: CodexPersistentModel {
         )
     }
 
-    private func hasPrecedingReviewExit(before turnID: CodexTurnID) -> Bool {
-        guard let candidateIndex = turns.firstIndex(where: { $0.id == turnID }),
-            candidateIndex > turns.startIndex
-        else {
+    private func hasPrecedingReviewExit(
+        before turnID: CodexTurnID,
+        excluding excludedTurnIDs: Set<CodexTurnID> = []
+    ) -> Bool {
+        let candidateIndex = turns.firstIndex(where: { $0.id == turnID })
+            ?? turns.endIndex
+        guard candidateIndex > turns.startIndex else {
             return false
         }
-        for turn in turns[..<candidateIndex].reversed() {
+        for turn in turns[..<candidateIndex].reversed()
+        where excludedTurnIDs.contains(turn.id) == false {
             let boundary = (itemsByTurnID[turn.id] ?? []).last {
                 $0.threadItem.isReviewNarrativeBoundary
             }
