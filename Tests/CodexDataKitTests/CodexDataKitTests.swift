@@ -11325,6 +11325,24 @@ struct CodexModelContextTests {
                         ]
                     ),
                     .init(
+                        id: "rollout-activity",
+                        state: .completed,
+                        itemsLoadState: .full,
+                        items: [
+                            .init(
+                                id: "call-after-exit",
+                                kind: .commandExecution,
+                                content: .command(.init(
+                                    command: "/bin/zsh -lc 'git diff --check'",
+                                    cwd: workspaceURL.path,
+                                    exitCode: 0,
+                                    status: .completed,
+                                    source: .agent
+                                ))
+                            ),
+                        ]
+                    ),
+                    .init(
                         id: "rollout-reviewer",
                         state: .interrupted,
                         itemsLoadState: .full,
@@ -11364,8 +11382,259 @@ struct CodexModelContextTests {
             preservesExistingTurnItems: true
         )
 
-        #expect(started.chat.turns.map(\.id) == ["turn-seed", "rollout-reviewer"])
+        #expect(
+            started.chat.turns.map(\.id)
+                == ["turn-seed", "rollout-activity", "rollout-reviewer"]
+        )
         #expect(started.chat.items(in: "rollout-reviewer").count == 3)
+        let reviewerMessage = try #require(
+            started.chat.items(in: "rollout-reviewer").first { $0.kind == .agentMessage }
+        )
+        #expect(reviewerMessage.origin == .reviewRolloutAssistant)
+        #expect(reviewerMessage.semanticRelation == .companionOf(.exitedReviewMode))
+    }
+
+    @Test("started review classifies a unique-id live assistant after exit activity")
+    func startedReviewClassifiesUniqueIDLiveAssistantAfterExitActivity() async throws {
+        let workspaceURL = temporaryDirectory()
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadStart(threadID: "thread-review", model: "gpt-5")
+        try await runtime.transport.enqueueReviewStart(
+            turnID: "turn-seed",
+            reviewThreadID: "thread-review"
+        )
+
+        let started = try await context.startReview(
+            in: workspaceURL,
+            input: CodexReviewInput(
+                target: .uncommittedChanges,
+                options: .init(model: "gpt-5", ephemeral: false)
+            )
+        )
+        _ = started.chat.apply(.turnStarted("turn-seed"))
+        _ = started.chat.apply(.itemCompleted(
+            .init(
+                id: "review-exit",
+                kind: .exitedReviewMode,
+                content: .log("No issues found.")
+            ),
+            turnID: "turn-seed"
+        ))
+        _ = started.chat.apply(.itemCompleted(
+            .init(
+                id: "review-command",
+                kind: .commandExecution,
+                content: .command(.init(command: "/bin/zsh -lc"))
+            ),
+            turnID: "turn-seed"
+        ))
+        _ = started.chat.apply(.itemCompleted(
+            .init(
+                id: "msg-unique",
+                kind: .agentMessage,
+                content: .message(.init(
+                    id: "msg-unique",
+                    role: .assistant,
+                    text: "No issues found."
+                ))
+            ),
+            turnID: "turn-seed"
+        ))
+
+        let reviewerMessage = try #require(
+            started.chat.items(in: "turn-seed").first { $0.itemID == "msg-unique" }
+        )
+        #expect(reviewerMessage.origin == .reviewRolloutAssistant)
+        #expect(reviewerMessage.semanticRelation == .companionOf(.exitedReviewMode))
+    }
+
+    @Test("ordinary chat does not classify a post-review duplicate prompt turn")
+    func ordinaryChatDoesNotClassifyPostReviewDuplicatePromptTurn() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let chat = CodexChat(id: "ordinary-chat", modelContext: context)
+
+        chat.apply(
+            .init(
+                id: chat.id,
+                sourceKind: .appServer,
+                turns: [
+                    .init(
+                        id: "prior-review",
+                        state: .completed,
+                        items: [
+                            .init(
+                                id: "prior-review-output",
+                                kind: .exitedReviewMode,
+                                content: .log("No issues found.")
+                            ),
+                        ]
+                    ),
+                    .init(
+                        id: "ordinary-turn",
+                        state: .completed,
+                        items: [
+                            .init(
+                                id: "ordinary-user-1",
+                                kind: .userMessage,
+                                content: .message(.init(
+                                    id: "ordinary-user-1",
+                                    role: .user,
+                                    text: "Repeat this prompt."
+                                ))
+                            ),
+                            .init(
+                                id: "ordinary-user-2",
+                                kind: .userMessage,
+                                content: .message(.init(
+                                    id: "ordinary-user-2",
+                                    role: .user,
+                                    text: "Repeat this prompt."
+                                ))
+                            ),
+                            .init(
+                                id: "ordinary-assistant",
+                                kind: .agentMessage,
+                                content: .message(.init(
+                                    id: "ordinary-assistant",
+                                    role: .assistant,
+                                    text: "This is an ordinary response."
+                                ))
+                            ),
+                        ]
+                    ),
+                ]
+            ),
+            workspace: nil
+        )
+
+        let response = try #require(
+            chat.items(in: "ordinary-turn").first { $0.itemID == "ordinary-assistant" }
+        )
+        #expect(response.origin == .currentV2Item)
+        #expect(response.semanticRelation == nil)
+    }
+
+    @Test("review snapshot classifies a same-turn assistant after exit activity")
+    func reviewSnapshotClassifiesSameTurnAssistantAfterExitActivity() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let chat = CodexChat(id: "review-chat", modelContext: context)
+
+        chat.apply(
+            .init(
+                id: chat.id,
+                sourceKind: .subAgentReview,
+                turns: [
+                    .init(
+                        id: "review-turn",
+                        state: .completed,
+                        items: [
+                            .init(
+                                id: "review-output",
+                                kind: .exitedReviewMode,
+                                content: .log("No issues found.")
+                            ),
+                            .init(
+                                id: "review-command",
+                                kind: .commandExecution,
+                                content: .command(.init(command: "/bin/zsh -lc"))
+                            ),
+                            .init(
+                                id: "review-assistant",
+                                kind: .agentMessage,
+                                content: .message(.init(
+                                    id: "review-assistant",
+                                    role: .assistant,
+                                    text: "No issues found."
+                                ))
+                            ),
+                        ]
+                    ),
+                ]
+            ),
+            workspace: nil
+        )
+
+        let response = try #require(
+            chat.items(in: "review-turn").first { $0.itemID == "review-assistant" }
+        )
+        #expect(response.origin == .reviewRolloutAssistant)
+        #expect(response.semanticRelation == .companionOf(.exitedReviewMode))
+    }
+
+    @Test("later review entry blocks a persisted companion from an earlier exit")
+    func laterReviewEntryBlocksPersistedCompanionFromEarlierExit() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let chat = CodexChat(id: "review-chat", modelContext: context)
+
+        chat.apply(
+            .init(
+                id: chat.id,
+                sourceKind: .subAgentReview,
+                turns: [
+                    .init(
+                        id: "review-boundaries",
+                        state: .completed,
+                        items: [
+                            .init(
+                                id: "prior-review-output",
+                                kind: .exitedReviewMode,
+                                content: .log("No issues found.")
+                            ),
+                            .init(
+                                id: "later-review-entry",
+                                kind: .enteredReviewMode,
+                                content: .log("current changes")
+                            ),
+                        ]
+                    ),
+                    .init(
+                        id: "candidate-turn",
+                        state: .completed,
+                        items: [
+                            .init(
+                                id: "candidate-user-1",
+                                kind: .userMessage,
+                                content: .message(.init(
+                                    id: "candidate-user-1",
+                                    role: .user,
+                                    text: "current changes"
+                                ))
+                            ),
+                            .init(
+                                id: "candidate-user-2",
+                                kind: .userMessage,
+                                content: .message(.init(
+                                    id: "candidate-user-2",
+                                    role: .user,
+                                    text: "current changes"
+                                ))
+                            ),
+                            .init(
+                                id: "candidate-assistant",
+                                kind: .agentMessage,
+                                content: .message(.init(
+                                    id: "candidate-assistant",
+                                    role: .assistant,
+                                    text: "Still running."
+                                ))
+                            ),
+                        ]
+                    ),
+                ]
+            ),
+            workspace: nil
+        )
+
+        let response = try #require(
+            chat.items(in: "candidate-turn").first { $0.itemID == "candidate-assistant" }
+        )
+        #expect(response.origin == .currentV2Item)
+        #expect(response.semanticRelation == nil)
     }
 
     @Test("started review coalesces multiple synthesized rollout records into the live turn")

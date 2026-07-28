@@ -64,6 +64,15 @@ private extension CodexThreadItem {
         kind == .exitedReviewMode
     }
 
+    var isReviewNarrativeBoundary: Bool {
+        switch kind {
+        case .userMessage, .agentMessage, .enteredReviewMode, .exitedReviewMode:
+            true
+        default:
+            false
+        }
+    }
+
     var command: CodexCommand? {
         guard case .command(let command) = content else {
             return nil
@@ -895,7 +904,114 @@ public final class CodexChat: CodexPersistentModel {
             }
             coalesced[index] = coalescing(coalesced[index], with: record)
         }
-        return coalesced.map(normalizingLifecycleFromItemOrder)
+        return normalizingReviewRolloutCompanions(
+            coalesced.map(normalizingLifecycleFromItemOrder)
+        )
+    }
+
+    private func normalizingReviewRolloutCompanions(
+        _ records: [CodexTurnSnapshot]
+    ) -> [CodexTurnSnapshot] {
+        guard sourceKind == .subAgentReview else {
+            return records
+        }
+        var normalized = records
+        for candidateIndex in normalized.indices {
+            if let agentIndex = sameTurnReviewCompanionAgentIndex(
+                in: normalized[candidateIndex]
+            ) {
+                normalized[candidateIndex].items[agentIndex] = reviewRolloutCompanion(
+                    normalized[candidateIndex].items[agentIndex]
+                )
+                continue
+            }
+            guard let agentIndex = persistedReviewCompanionAgentIndex(
+                in: normalized[candidateIndex]
+            ), hasPrecedingReviewExit(
+                before: candidateIndex,
+                in: normalized
+            ) else {
+                continue
+            }
+            normalized[candidateIndex].items[agentIndex] = reviewRolloutCompanion(
+                normalized[candidateIndex].items[agentIndex]
+            )
+        }
+        return normalized
+    }
+
+    private func sameTurnReviewCompanionAgentIndex(
+        in record: CodexTurnSnapshot
+    ) -> Int? {
+        for index in record.items.indices
+        where record.items[index].kind == .agentMessage
+            && record.items[index].semanticRelation == nil
+        {
+            let precedingNarrativeItem = record.items[..<index].last {
+                $0.isReviewNarrativeBoundary
+            }
+            if precedingNarrativeItem?.isExitedReviewModeMarker == true {
+                return index
+            }
+        }
+        return nil
+    }
+
+    private func persistedReviewCompanionAgentIndex(
+        in record: CodexTurnSnapshot
+    ) -> Int? {
+        guard record.status.isTerminal else {
+            return nil
+        }
+        let userMessages = record.items.filter { $0.kind == .userMessage }
+        let agentIndices = record.items.indices.filter {
+            record.items[$0].kind == .agentMessage
+        }
+        guard userMessages.count == 2,
+            agentIndices.count == 1,
+            userMessages.allSatisfy({ normalizedMessageText($0) != nil }),
+            Set(userMessages.compactMap(normalizedMessageText)).count == 1,
+            normalizedMessageText(record.items[agentIndices[0]]) != nil,
+            record.items.contains(where: \.isReviewModeMarker) == false
+        else {
+            return nil
+        }
+        return agentIndices[0]
+    }
+
+    private func hasPrecedingReviewExit(
+        before candidateIndex: Int,
+        in records: [CodexTurnSnapshot]
+    ) -> Bool {
+        guard candidateIndex > records.startIndex else {
+            return false
+        }
+        for record in records[..<candidateIndex].reversed() {
+            if let boundary = record.items.last(where: \.isReviewNarrativeBoundary) {
+                return boundary.isExitedReviewModeMarker
+            }
+        }
+        return false
+    }
+
+    private func normalizedMessageText(_ item: CodexThreadItem) -> String? {
+        guard let text = item.message?.text.trimmingCharacters(in: .whitespacesAndNewlines),
+            text.isEmpty == false
+        else {
+            return nil
+        }
+        return text
+    }
+
+    private func reviewRolloutCompanion(_ item: CodexThreadItem) -> CodexThreadItem {
+        CodexThreadItem(
+            id: item.id,
+            kind: item.kind,
+            content: item.content,
+            origin: .reviewRolloutAssistant,
+            semanticRelation: .companionOf(.exitedReviewMode),
+            rawPayload: item.rawPayload
+        )
     }
 
     private func normalizingLifecycleFromItemOrder(
@@ -1418,7 +1534,11 @@ public final class CodexChat: CodexPersistentModel {
             return []
         }
         var changes: [CodexChatMutation] = []
-        for incomingItem in incomingItems {
+        for rawIncomingItem in incomingItems {
+            let incomingItem = normalizingLiveReviewRolloutCompanion(
+                rawIncomingItem,
+                turnID: turnID
+            )
             if incomingItem.kind == .reasoning && incomingItem.id.contains(":summary:") == false
                 && incomingItem.id.contains(":content:") == false
             {
@@ -1513,6 +1633,64 @@ public final class CodexChat: CodexPersistentModel {
             }
         }
         return changes
+    }
+
+    private func normalizingLiveReviewRolloutCompanion(
+        _ item: CodexThreadItem,
+        turnID: CodexTurnID?
+    ) -> CodexThreadItem {
+        guard sourceKind == .subAgentReview,
+            item.kind == .agentMessage,
+            item.semanticRelation == nil,
+            let turnID
+        else {
+            return item
+        }
+        let currentTurnItems = (itemsByTurnID[turnID] ?? []).map(\.threadItem)
+        let precedingNarrativeItem = currentTurnItems.last {
+            ($0.kind != item.kind || $0.id != item.id)
+                && $0.isReviewNarrativeBoundary
+        }
+        if precedingNarrativeItem?.isExitedReviewModeMarker == true {
+            return reviewRolloutCompanion(item)
+        }
+
+        var candidateItems = currentTurnItems
+        if let existingIndex = candidateItems.firstIndex(where: {
+            $0.kind == item.kind && $0.id == item.id
+        }) {
+            candidateItems[existingIndex] = item
+        } else {
+            candidateItems.append(item)
+        }
+        let candidateRecord = CodexTurnSnapshot(
+            id: turnID,
+            state: turnsByID[turnID]?.state ?? .inProgress,
+            items: candidateItems
+        )
+        guard persistedReviewCompanionAgentIndex(in: candidateRecord) != nil,
+            hasPrecedingReviewExit(before: turnID)
+        else {
+            return item
+        }
+        return reviewRolloutCompanion(item)
+    }
+
+    private func hasPrecedingReviewExit(before turnID: CodexTurnID) -> Bool {
+        guard let candidateIndex = turns.firstIndex(where: { $0.id == turnID }),
+            candidateIndex > turns.startIndex
+        else {
+            return false
+        }
+        for turn in turns[..<candidateIndex].reversed() {
+            let boundary = (itemsByTurnID[turn.id] ?? []).last {
+                $0.threadItem.isReviewNarrativeBoundary
+            }
+            if let boundary {
+                return boundary.isExitedReviewModeMarker
+            }
+        }
+        return false
     }
 
     private func shouldPreserveExistingFullItem(
