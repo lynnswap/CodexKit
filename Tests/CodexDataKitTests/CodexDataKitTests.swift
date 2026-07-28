@@ -12019,6 +12019,73 @@ struct CodexModelContextTests {
         })
     }
 
+    @Test("summary record cannot establish a preceding review boundary")
+    func summaryRecordCannotEstablishPrecedingReviewBoundary() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let chat = CodexChat(id: "partial-review-boundary-chat", modelContext: context)
+
+        chat.apply(
+            .init(
+                id: chat.id,
+                turns: [
+                    .init(
+                        id: "partial-boundary",
+                        state: .completed,
+                        itemsLoadState: .summary,
+                        items: [
+                            .init(
+                                id: "review-exit",
+                                kind: .exitedReviewMode,
+                                content: .log("No issues found.")
+                            ),
+                        ]
+                    ),
+                    .init(
+                        id: "ordinary-turn",
+                        state: .completed,
+                        items: [
+                            .init(
+                                id: "user-1",
+                                kind: .userMessage,
+                                content: .message(.init(
+                                    id: "user-1",
+                                    role: .user,
+                                    text: "repeated prompt"
+                                ))
+                            ),
+                            .init(
+                                id: "user-2",
+                                kind: .userMessage,
+                                content: .message(.init(
+                                    id: "user-2",
+                                    role: .user,
+                                    text: "repeated prompt"
+                                ))
+                            ),
+                            .init(
+                                id: "assistant",
+                                kind: .agentMessage,
+                                content: .message(.init(
+                                    id: "assistant",
+                                    role: .assistant,
+                                    text: "Ordinary response"
+                                ))
+                            ),
+                        ]
+                    ),
+                ]
+            ),
+            workspace: nil
+        )
+
+        let assistant = try #require(
+            chat.items(in: "ordinary-turn").first { $0.itemID == "assistant" }
+        )
+        #expect(assistant.origin == .currentV2Item)
+        #expect(assistant.semanticRelation == nil)
+    }
+
     @Test("ordered update uses narrative evidence before the existing item")
     func orderedUpdateUsesNarrativeEvidenceBeforeExistingItem() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()

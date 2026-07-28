@@ -396,12 +396,12 @@ struct ThreadEventHubTests {
             itemsLoadState: .summary,
             items: [seededItem]
         )), for: "thread-1")
-        let observedItem = messageItem(id: "observed", text: "Observed live item")
+        let observedItem = messageItem(id: "observed", text: "Complete live item")
         try hub.route(
             .itemCompleted(observedItem, turnID: "turn-1"),
             for: "thread-1"
         )
-        let terminalItem = messageItem(id: "terminal", text: "Terminal summary")
+        let terminalItem = messageItem(id: "observed", text: "Terminal summary")
         let outcome = CodexTurnOutcome.completed(.init(
             turnID: "turn-1",
             transcript: .init(items: [terminalItem]),
@@ -417,7 +417,7 @@ struct ThreadEventHubTests {
             return
         }
         #expect(snapshot.itemsLoadState == .summary)
-        #expect(snapshot.items.map(\.id) == ["terminal", "seeded", "observed"])
+        #expect(snapshot.items == [observedItem, seededItem])
         #expect(try await iterator.next() == .terminal(outcome))
         events.cancel()
     }

@@ -1022,7 +1022,19 @@ public final class CodexChat: CodexPersistentModel {
     ) -> Bool {
         if candidateIndex > records.startIndex {
             for record in records[..<candidateIndex].reversed() {
-                if let boundary = record.items.last(where: \.isReviewNarrativeBoundary) {
+                let boundary: CodexThreadItem?
+                if record.itemsLoadState == .full {
+                    boundary = record.items.last(where: \.isReviewNarrativeBoundary)
+                } else if usesLoadedReviewHistory,
+                          turnsByID[record.id]?.itemsLoadState == .full
+                {
+                    boundary = (itemsByTurnID[record.id] ?? [])
+                        .map(\.threadItem)
+                        .last(where: \.isReviewNarrativeBoundary)
+                } else {
+                    return false
+                }
+                if let boundary {
                     return boundary.isExitedReviewModeMarker
                 }
             }
@@ -1829,6 +1841,9 @@ public final class CodexChat: CodexPersistentModel {
         }
         for turn in turns[..<candidateIndex].reversed()
         where excludedTurnIDs.contains(turn.id) == false {
+            guard turn.itemsLoadState == .full else {
+                return false
+            }
             let boundary = (itemsByTurnID[turn.id] ?? []).last {
                 $0.threadItem.isReviewNarrativeBoundary
             }

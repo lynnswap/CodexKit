@@ -799,6 +799,7 @@ private struct ThreadEventGeneration: Equatable, Sendable {
     private var postTerminalTail: [CodexThreadEvent] = []
     private var terminal: CodexTurnOutcome?
     private var provisionalResumeSnapshot: CodexTurnSnapshot?
+    private var observedItemIDs: Set<String> = []
     private(set) var isClosed = false
 
     init(expectedTurnID: CodexTurnID? = nil) {
@@ -1077,6 +1078,7 @@ private struct ThreadEventGeneration: Equatable, Sendable {
         guard var snapshot else {
             preconditionFailure("A compact item update requires a turn snapshot.")
         }
+        observedItemIDs.insert(item.id)
         if let index = snapshot.items.firstIndex(where: { $0.id == item.id }) {
             snapshot.items[index] = item
         } else {
@@ -1094,7 +1096,10 @@ private struct ThreadEventGeneration: Equatable, Sendable {
             var indexes = Dictionary(uniqueKeysWithValues: items.indices.map { (items[$0].id, $0) })
             for item in existing {
                 if let index = indexes[item.id] {
-                    if items[index].text?.isEmpty != false, item.text?.isEmpty == false {
+                    if snapshot?.itemsLoadState == .full
+                        || observedItemIDs.contains(item.id)
+                        || (items[index].text?.isEmpty != false && item.text?.isEmpty == false)
+                    {
                         items[index] = item
                     }
                 } else {
