@@ -319,7 +319,8 @@ extension CodexThread {
         let reviewThreadID = identity.activeTurnThreadID
         let initialTurn = initialTurn ?? CodexTurnSnapshot(
             id: identity.turnID,
-            state: .inProgress
+            state: .inProgress,
+            itemsLoadState: .notLoaded
         )
         let state: TurnGenerationHandleState
         if let proposedState {
@@ -415,6 +416,9 @@ extension CodexThread {
             includesTurns: includeTurns
         )
         await router.seedTurns(snapshot.turns, threadID: id)
+        if let currentTurn = snapshot.turns?.last {
+            await router.seedCurrentTurnSnapshot(currentTurn, threadID: id)
+        }
         return snapshot
     }
 
@@ -436,6 +440,18 @@ extension CodexThread {
             ))
         let turns = CodexAppServer.turnSnapshots(from: response.data)
         await router.seedTurns(turns, threadID: id)
+        let currentTurn: CodexTurnSnapshot?
+        switch query.sortDirection ?? .descending {
+        case .ascending where response.nextCursor == nil:
+            currentTurn = turns.last
+        case .descending where query.cursor == nil:
+            currentTurn = turns.first
+        default:
+            currentTurn = nil
+        }
+        if let currentTurn {
+            await router.seedCurrentTurnSnapshot(currentTurn, threadID: id)
+        }
         return .init(
             turns: turns,
             nextCursor: response.nextCursor,
@@ -853,7 +869,11 @@ private func interruptCodexTurnPreparingTarget(
                 let cancellation = CodexTurnCancellation(threadID: threadID, turnID: activeTurn)
                 let state = await store.restoreGeneration(
                     turnID: activeTurn,
-                    initialSnapshot: .init(id: activeTurn, state: .inProgress),
+                    initialSnapshot: .init(
+                        id: activeTurn,
+                        state: .inProgress,
+                        itemsLoadState: .notLoaded
+                    ),
                     connectionLease: connectionLease
                 )
                 await router.adoptThreadEventGeneration(threadID, including: activeTurn)

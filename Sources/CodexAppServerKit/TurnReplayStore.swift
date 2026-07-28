@@ -880,12 +880,16 @@ private final class WeakTurnGenerationHandleState {
 }
 
 private struct TurnReplayAccumulator {
-    private(set) var snapshot: CodexTurnSnapshot
+    private var snapshotReducer: CodexTurnSnapshotReducer
     private(set) var usage: CodexTokenUsage?
     private var hasRoutedEvent = false
 
     init(turnID: CodexTurnID) {
-        self.snapshot = .init(id: turnID, state: .inProgress)
+        snapshotReducer = .init(turnID: turnID)
+    }
+
+    var snapshot: CodexTurnSnapshot {
+        snapshotReducer.snapshot
     }
 
     var progress: CodexReviewProgress {
@@ -895,29 +899,10 @@ private struct TurnReplayAccumulator {
     mutating func seed(_ initialSnapshot: CodexTurnSnapshot) {
         precondition(initialSnapshot.id == snapshot.id)
         guard hasRoutedEvent else {
-            snapshot = initialSnapshot
+            snapshotReducer.replaceBindingSnapshot(with: initialSnapshot)
             return
         }
-
-        var items = initialSnapshot.items
-        var indexes = Dictionary(uniqueKeysWithValues: items.indices.map { (items[$0].id, $0) })
-        for item in snapshot.items {
-            if let index = indexes[item.id] {
-                items[index] = item
-            } else {
-                indexes[item.id] = items.count
-                items.append(item)
-            }
-        }
-        snapshot = .init(
-            id: snapshot.id,
-            state: snapshot.state,
-            itemsLoadState: initialSnapshot.itemsLoadState,
-            items: items,
-            startedAt: snapshot.startedAt ?? initialSnapshot.startedAt,
-            completedAt: snapshot.completedAt ?? initialSnapshot.completedAt,
-            duration: snapshot.duration ?? initialSnapshot.duration
-        )
+        snapshotReducer.merge(initialSnapshot)
     }
 
     mutating func apply(_ event: CodexTurnEvent) {
@@ -925,9 +910,10 @@ private struct TurnReplayAccumulator {
         switch event {
         case .started(let turnID):
             precondition(turnID == snapshot.id)
+            snapshotReducer.markStarted()
         case .snapshot(let newSnapshot):
             precondition(newSnapshot.id == snapshot.id)
-            snapshot = newSnapshot
+            snapshotReducer.replace(with: newSnapshot)
         case .itemStarted(let item), .itemUpdated(let item), .itemCompleted(let item):
             upsert(item)
         case .message(let message):
@@ -955,31 +941,8 @@ private struct TurnReplayAccumulator {
 
     func compact(_ outcome: CodexTurnOutcome) -> CompactTurnSnapshot {
         precondition(outcome.response.turnID == snapshot.id)
-        let finalizedOutcome = finalized(outcome)
-        let response = finalizedOutcome.response
-        let state: CodexTurnSnapshot.State
-        switch finalizedOutcome {
-        case .completed:
-            state = .completed
-        case .interrupted:
-            state = .interrupted
-        case .failed(let failedTurn):
-            state = .failed(failedTurn.error)
-        case .invalidTerminalStatus(let rawStatus, let error, _):
-            state = .unknown(rawValue: rawStatus, error: error)
-        }
-        return .init(
-            snapshot: .init(
-                id: response.turnID,
-                state: state,
-                itemsLoadState: .full,
-                items: response.transcript.items,
-                startedAt: response.startedAt,
-                completedAt: response.completedAt,
-                duration: response.duration
-            ),
-            outcome: finalizedOutcome
-        )
+        var reducer = snapshotReducer
+        return reducer.finish(finalized(outcome))
     }
 
     private func finalized(_ outcome: CodexTurnOutcome) -> CodexTurnOutcome {
@@ -1001,23 +964,6 @@ private struct TurnReplayAccumulator {
 
     private func finalized(_ response: CodexResponse) -> CodexResponse {
         var response = response
-        if response.transcript.items.isEmpty {
-            response.transcript = .init(items: snapshot.items)
-        } else if response.transcript.reviewOutputText == nil,
-                  let reviewOutput = snapshot.items.last(where: {
-                      $0.kind == .exitedReviewMode && $0.text?.isEmpty == false
-                  })
-        {
-            var items = response.transcript.items
-            if let index = items.firstIndex(where: { $0.id == reviewOutput.id }) {
-                if items[index].text?.isEmpty != false {
-                    items[index] = reviewOutput
-                }
-            } else {
-                items.append(reviewOutput)
-            }
-            response.transcript = .init(items: items)
-        }
         if response.usage == nil {
             response.usage = usage
         }
@@ -1025,11 +971,7 @@ private struct TurnReplayAccumulator {
     }
 
     private mutating func upsert(_ item: CodexThreadItem) {
-        if let index = snapshot.items.firstIndex(where: { $0.id == item.id }) {
-            snapshot.items[index] = item
-        } else {
-            snapshot.items.append(item)
-        }
+        snapshotReducer.observe(item)
     }
 
     private func requiredCurrentItem(

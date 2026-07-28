@@ -5,6 +5,114 @@ import Testing
 
 @Suite("Thread event hub")
 struct ThreadEventHubTests {
+    @Test func adoptedGenerationDoesNotClaimIdentityOnlySnapshotCompleteness() async throws {
+        let hub = ThreadEventHub()
+
+        hub.beginGeneration(for: "thread-1", including: "turn-1")
+
+        var iterator = hub.events(for: "thread-1").makeAsyncIterator()
+        #expect(try await iterator.next() == .snapshot(.init(
+            id: "turn-1",
+            state: .inProgress,
+            itemsLoadState: .notLoaded
+        )))
+    }
+
+    @Test func seededCurrentSnapshotKeepsLaterItemUpdatesAsLiveEvents() async throws {
+        let hub = ThreadEventHub()
+        let initial = messageItem(id: "message", text: "Initial")
+        let updated = messageItem(id: "message", text: "Updated")
+        let events = hub.events(for: "thread-1")
+        var iterator = events.makeAsyncIterator()
+
+        hub.seedCurrentTurnSnapshot(.init(
+            id: "turn-1",
+            state: .completed,
+            itemsLoadState: .full,
+            items: [initial]
+        ), for: "thread-1")
+        try hub.route(
+            .itemCompleted(updated, turnID: "turn-1"),
+            for: "thread-1"
+        )
+
+        #expect(try await iterator.next() == .snapshot(.init(
+            id: "turn-1",
+            state: .completed,
+            itemsLoadState: .full,
+            items: [initial]
+        )))
+        #expect(try await iterator.next() == .itemCompleted(updated, turnID: "turn-1"))
+        events.cancel()
+    }
+
+    @Test func historicalSnapshotYieldsToADifferentObservedTurn() async throws {
+        let hub = ThreadEventHub()
+        let historical = messageItem(id: "historical", text: "Historical")
+        let live = messageItem(id: "live", text: "Live")
+        let events = hub.events(for: "thread-1")
+        var iterator = events.makeAsyncIterator()
+
+        hub.seedCurrentTurnSnapshot(.init(
+            id: "turn-history",
+            state: .inProgress,
+            itemsLoadState: .full,
+            items: [historical]
+        ), for: "thread-1")
+        #expect(try await iterator.next() == .snapshot(.init(
+            id: "turn-history",
+            state: .inProgress,
+            itemsLoadState: .full,
+            items: [historical]
+        )))
+
+        try hub.route(.itemStarted(live, turnID: "turn-live"), for: "thread-1")
+
+        #expect(try await iterator.next() == .snapshot(.init(
+            id: "turn-live",
+            state: .inProgress,
+            itemsLoadState: .notLoaded,
+            items: [live]
+        )))
+        events.cancel()
+    }
+
+    @Test func newerHistoricalSnapshotReplacesThePriorHistoricalGeneration() async throws {
+        let hub = ThreadEventHub()
+        let first = messageItem(id: "first", text: "First")
+        let second = messageItem(id: "second", text: "Second")
+        let events = hub.events(for: "thread-1")
+        var iterator = events.makeAsyncIterator()
+
+        hub.seedCurrentTurnSnapshot(.init(
+            id: "turn-1",
+            state: .inProgress,
+            itemsLoadState: .full,
+            items: [first]
+        ), for: "thread-1")
+        #expect(try await iterator.next() == .snapshot(.init(
+            id: "turn-1",
+            state: .inProgress,
+            itemsLoadState: .full,
+            items: [first]
+        )))
+
+        hub.seedCurrentTurnSnapshot(.init(
+            id: "turn-2",
+            state: .inProgress,
+            itemsLoadState: .full,
+            items: [second]
+        ), for: "thread-1")
+
+        #expect(try await iterator.next() == .snapshot(.init(
+            id: "turn-2",
+            state: .inProgress,
+            itemsLoadState: .full,
+            items: [second]
+        )))
+        events.cancel()
+    }
+
     @Test func reviewStartDispositionKeepsDetachedSourceEventsOnTheirSource() throws {
         let hub = ThreadEventHub()
         let review = try hub.registerCheckpoint(
@@ -54,7 +162,8 @@ struct ThreadEventHubTests {
         #expect(review.pendingCheckpointCount == 0)
         #expect(try await sourceIterator.next() == .snapshot(.init(
             id: "turn-source",
-            state: .inProgress
+            state: .inProgress,
+            itemsLoadState: .notLoaded
         )))
         #expect(try await sourceIterator.next() == .statusChanged(
             .active(activeFlags: [.waitingOnApproval])
@@ -221,7 +330,8 @@ struct ThreadEventHubTests {
         var iterator = events.makeAsyncIterator()
         #expect(try await iterator.next() == .snapshot(.init(
             id: "turn-1",
-            state: .inProgress
+            state: .inProgress,
+            itemsLoadState: .notLoaded
         )))
         #expect(try await iterator.next() == existing)
         #expect(try await iterator.next() == concurrent)
@@ -286,7 +396,11 @@ struct ThreadEventHubTests {
         let events = hub.events(for: "thread-1")
         var iterator = events.makeAsyncIterator()
         #expect(try await iterator.next() == .snapshot(.init(id: "turn-1", state: .completed)))
-        #expect(try await iterator.next() == .terminal(outcome))
+        #expect(try await iterator.next() == .terminal(.completed(.init(
+            turnID: "turn-1",
+            transcript: .init(),
+            transcriptItemsLoadState: .full
+        ))))
         events.cancel()
     }
 
@@ -386,6 +500,100 @@ struct ThreadEventHubTests {
         events.cancel()
     }
 
+    @Test func sparseTerminalPreservesPartialSnapshotCompletenessForLateSubscribers() async throws {
+        let hub = ThreadEventHub()
+        hub.beginGeneration(for: "thread-1", including: "turn-1")
+        let seededItem = messageItem(id: "seeded", text: "Seeded summary")
+        try hub.route(.snapshot(.init(
+            id: "turn-1",
+            state: .inProgress,
+            itemsLoadState: .summary,
+            items: [seededItem]
+        )), for: "thread-1")
+        let observedItem = messageItem(id: "observed", text: "Complete live item")
+        try hub.route(
+            .itemCompleted(observedItem, turnID: "turn-1"),
+            for: "thread-1"
+        )
+        let terminalItem = messageItem(id: "observed", text: "Terminal summary")
+        let outcome = CodexTurnOutcome.completed(.init(
+            turnID: "turn-1",
+            transcript: .init(items: [terminalItem]),
+            transcriptItemsLoadState: .summary
+        ))
+        try hub.route(.terminal(outcome), for: "thread-1")
+
+        let events = hub.events(for: "thread-1")
+        var iterator = events.makeAsyncIterator()
+        let event = try #require(try await iterator.next())
+        guard case .snapshot(let snapshot) = event else {
+            Issue.record("Expected a compact terminal snapshot.")
+            return
+        }
+        #expect(snapshot.itemsLoadState == .summary)
+        #expect(snapshot.items == [seededItem, observedItem])
+        #expect(try await iterator.next() == .terminal(.completed(.init(
+            turnID: "turn-1",
+            transcript: .init(items: [seededItem, observedItem]),
+            transcriptItemsLoadState: .summary
+        ))))
+        events.cancel()
+    }
+
+    @Test func sparseTerminalReconcilesCompositeItemIdentityForLateSubscribers() async throws {
+        let hub = ThreadEventHub()
+        hub.beginGeneration(for: "thread-1", including: "turn-1")
+        let entered = CodexThreadItem(
+            id: "review-marker",
+            kind: .enteredReviewMode,
+            content: .log("Entered")
+        )
+        let staleExit = CodexThreadItem(
+            id: "review-marker",
+            kind: .exitedReviewMode,
+            content: .log("Stale")
+        )
+        try hub.route(.snapshot(.init(
+            id: "turn-1",
+            state: .inProgress,
+            itemsLoadState: .summary,
+            items: [entered, staleExit]
+        )), for: "thread-1")
+        let observedEntered = CodexThreadItem(
+            id: "review-marker",
+            kind: .enteredReviewMode,
+            content: .log("Entered live")
+        )
+        try hub.route(
+            .itemCompleted(observedEntered, turnID: "turn-1"),
+            for: "thread-1"
+        )
+        let terminalExit = CodexThreadItem(
+            id: "review-marker",
+            kind: .exitedReviewMode,
+            content: .log("Final review")
+        )
+
+        try hub.route(.terminal(.completed(.init(
+            turnID: "turn-1",
+            transcript: .init(items: [terminalExit]),
+            transcriptItemsLoadState: .summary
+        ))), for: "thread-1")
+
+        var iterator = hub.events(for: "thread-1").makeAsyncIterator()
+        #expect(try await iterator.next() == .snapshot(.init(
+            id: "turn-1",
+            state: .completed,
+            itemsLoadState: .summary,
+            items: [observedEntered, terminalExit]
+        )))
+        #expect(try await iterator.next() == .terminal(.completed(.init(
+            turnID: "turn-1",
+            transcript: .init(items: [observedEntered, terminalExit]),
+            transcriptItemsLoadState: .summary
+        ))))
+    }
+
     @Test func terminalIsExactlyOnceNonDroppableAndDoesNotFinishTheThread() async throws {
         let hub = ThreadEventHub()
         hub.beginGeneration(for: "thread-1", including: "turn-1")
@@ -395,14 +603,16 @@ struct ThreadEventHubTests {
 
         #expect(try await iterator.next() == .snapshot(.init(
             id: "turn-1",
-            state: .inProgress
+            state: .inProgress,
+            itemsLoadState: .notLoaded
         )))
         try hub.route(.terminal(outcome), for: "thread-1")
         #expect(try hub.route(.terminal(outcome), for: "thread-1") == 0)
 
         #expect(try await iterator.next() == .snapshot(.init(
             id: "turn-1",
-            state: .completed
+            state: .completed,
+            itemsLoadState: .notLoaded
         )))
         #expect(try await iterator.next() == .terminal(outcome))
 
@@ -434,7 +644,11 @@ struct ThreadEventHubTests {
         while let event = try await late.next() {
             lateEvents.append(event)
         }
-        #expect(lateEvents.first == .snapshot(.init(id: "turn-1", state: .completed)))
+        #expect(lateEvents.first == .snapshot(.init(
+            id: "turn-1",
+            state: .completed,
+            itemsLoadState: .notLoaded
+        )))
         #expect(lateEvents.filter { $0 == .terminal(outcome) }.count == 1)
         #expect(lateEvents.last == .closed)
     }
@@ -471,7 +685,11 @@ struct ThreadEventHubTests {
         try hub.route(.closed, for: "thread-1")
 
         let expected: [CodexThreadEvent] = [
-            .snapshot(.init(id: "turn-1", state: .completed)),
+            .snapshot(.init(
+                id: "turn-1",
+                state: .completed,
+                itemsLoadState: .notLoaded
+            )),
             .terminal(outcome),
             .statusChanged(postStatus),
             postUnknown,
@@ -503,7 +721,8 @@ struct ThreadEventHubTests {
         #expect(snapshot.overflowCount == 1)
         #expect(try await iterator.next() == .snapshot(.init(
             id: "turn-1",
-            state: .inProgress
+            state: .inProgress,
+            itemsLoadState: .notLoaded
         )))
 
         var methods: [String] = []
@@ -557,6 +776,7 @@ struct ThreadEventHubTests {
         #expect(try await iterator.next() == .snapshot(.init(
             id: "turn-1",
             state: .inProgress,
+            itemsLoadState: .notLoaded,
             items: [item]
         )))
         #expect(try await iterator.next() == .messageDelta(first, turnID: "turn-1"))
@@ -596,7 +816,8 @@ struct ThreadEventHubTests {
 
         #expect(try await fastIterator.next() == .snapshot(.init(
             id: "turn-1",
-            state: .inProgress
+            state: .inProgress,
+            itemsLoadState: .notLoaded
         )))
         for index in 0..<600 {
             if index == 300 {
@@ -647,7 +868,8 @@ struct ThreadEventHubTests {
         var iterator = hub.events(for: "thread-1").makeAsyncIterator()
         #expect(try await iterator.next() == .snapshot(.init(
             id: "turn-current",
-            state: .inProgress
+            state: .inProgress,
+            itemsLoadState: .notLoaded
         )))
     }
 
@@ -743,7 +965,8 @@ struct ThreadEventHubTests {
         var iterator = events.makeAsyncIterator()
         #expect(try await iterator.next() == .snapshot(.init(
             id: "turn-old",
-            state: .completed
+            state: .completed,
+            itemsLoadState: .notLoaded
         )))
         #expect(try await iterator.next() == .terminal(oldOutcome))
 

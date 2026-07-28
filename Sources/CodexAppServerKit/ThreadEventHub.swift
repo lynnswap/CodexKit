@@ -495,6 +495,60 @@ package final class ThreadEventHub: Sendable {
         _ = deliver(publication)
     }
 
+    package func seedCurrentTurnSnapshot(
+        _ snapshot: CodexTurnSnapshot,
+        for threadID: CodexThreadID
+    ) {
+        var publication: ThreadEventPublication?
+        state.withLock { state in
+            guard case .open = state.phase else {
+                return
+            }
+            var thread = state.threads[threadID] ?? .init()
+            guard thread.activeCheckpointID == nil else {
+                return
+            }
+            let resetsGeneration: Bool
+            var generation: ThreadEventGeneration
+            if let current = thread.current {
+                if current.turnID == nil, current.hasProvisionalResumeSnapshot == false {
+                    generation = current
+                    resetsGeneration = true
+                } else if current.turnID == snapshot.id {
+                    generation = current
+                    resetsGeneration = false
+                } else {
+                    guard current.isSupersededByHistoricalTurn(snapshot.id) else {
+                        return
+                    }
+                    generation = .init()
+                    resetsGeneration = true
+                }
+            } else {
+                generation = .init()
+                resetsGeneration = true
+            }
+            do {
+                try generation.mergeHistoricalSnapshot(snapshot)
+            } catch {
+                preconditionFailure(
+                    "A matching current turn snapshot must merge into its generation: \(error)"
+                )
+            }
+            thread.current = generation
+            thread.isClosed = generation.isClosed
+            let revision = nextPublicationRevision(for: &thread)
+            publication = .supersede(
+                Array(thread.subscribers.values),
+                generation.replayEvents,
+                revision,
+                resetsGeneration: resetsGeneration
+            )
+            state.threads[threadID] = thread
+        }
+        _ = deliver(publication)
+    }
+
     package func events(for threadID: CodexThreadID) -> CodexThreadEventSequence {
         events(for: threadID, beforePublication: {})
     }
@@ -582,6 +636,7 @@ package final class ThreadEventHub: Sendable {
 
             let eventTurnID = Self.turnID(of: event)
             let shouldRollGeneration = thread.isClosed
+                || thread.current?.isSupersededByObservedTurn(eventTurnID) == true
                 || (
                     thread.current?.hasTerminal == true
                         && eventTurnID != nil
@@ -791,26 +846,53 @@ private struct ThreadEventGeneration: Equatable, Sendable {
     private static let compactTailCapacity = compactCapacity - 3
     private static let postTerminalTailCapacity = compactCapacity - 1
 
-    private(set) var turnID: CodexTurnID?
-    private var snapshot: CodexTurnSnapshot?
+    private var snapshotReducer: CodexTurnSnapshotReducer?
     private var latestUsage: CodexTokenUsage?
     private var latestStatus: CodexThreadStatus?
     private var compactTail: [CodexThreadEvent] = []
     private var postTerminalTail: [CodexThreadEvent] = []
     private var terminal: CodexTurnOutcome?
     private var provisionalResumeSnapshot: CodexTurnSnapshot?
+    private var isHistoricalSnapshotOnly = false
     private(set) var isClosed = false
 
     init(expectedTurnID: CodexTurnID? = nil) {
-        turnID = expectedTurnID
         if let expectedTurnID {
-            snapshot = .init(id: expectedTurnID, state: .inProgress)
+            snapshotReducer = .init(turnID: expectedTurnID)
         }
     }
 
-    var hasTerminal: Bool { terminal != nil }
+    var turnID: CodexTurnID? {
+        snapshotReducer?.snapshot.id
+    }
+
+    private var snapshot: CodexTurnSnapshot? {
+        snapshotReducer?.snapshot
+    }
+
+    var hasTerminal: Bool {
+        if terminal != nil {
+            return true
+        }
+        switch snapshot?.state {
+        case .completed, .interrupted, .failed, .unknown:
+            return true
+        case .inProgress, nil:
+            return false
+        }
+    }
     var hasProvisionalResumeSnapshot: Bool {
         turnID == nil && provisionalResumeSnapshot != nil
+    }
+
+    func isSupersededByObservedTurn(_ observedTurnID: CodexTurnID?) -> Bool {
+        isHistoricalSnapshotOnly
+            && observedTurnID != nil
+            && observedTurnID != turnID
+    }
+
+    func isSupersededByHistoricalTurn(_ historicalTurnID: CodexTurnID) -> Bool {
+        turnID != historicalTurnID && (isHistoricalSnapshotOnly || hasTerminal)
     }
 
     var compactEvents: [CodexThreadEvent] {
@@ -854,6 +936,7 @@ private struct ThreadEventGeneration: Equatable, Sendable {
         case .turnStarted(let eventTurnID):
             try establishTurn(eventTurnID)
             try requireNonterminalTurnEvent("turn/started")
+            snapshotReducer?.markStarted()
 
         case .snapshot(let newSnapshot):
             try establishTurn(newSnapshot.id)
@@ -864,16 +947,20 @@ private struct ThreadEventGeneration: Equatable, Sendable {
         case .terminal(let outcome):
             let outcome = finalized(outcome)
             try establishTurn(outcome.response.turnID)
+            guard var candidateReducer = snapshotReducer else {
+                preconditionFailure("A terminal turn requires a snapshot reducer.")
+            }
+            let compactSnapshot = candidateReducer.finish(outcome)
             if let terminal {
-                guard terminal == outcome else {
+                guard terminal == compactSnapshot.outcome else {
                     throw CodexTransportFailure.contractViolation(
                         message: "Turn \(outcome.response.turnID.rawValue) reported conflicting terminal outcomes."
                     )
                 }
                 return .duplicate
             }
-            terminal = outcome
-            finalizeSnapshot(with: outcome)
+            snapshotReducer = candidateReducer
+            terminal = compactSnapshot.outcome
 
         case .itemStarted(let item, let eventTurnID),
              .itemUpdated(let item, let eventTurnID),
@@ -884,7 +971,6 @@ private struct ThreadEventGeneration: Equatable, Sendable {
                 appendCompactTail(event)
                 return .accepted
             }
-            ensureSnapshot()
             upsert(item)
 
         case .message(let message, let eventTurnID):
@@ -894,7 +980,6 @@ private struct ThreadEventGeneration: Equatable, Sendable {
                 appendCompactTail(event)
                 return .accepted
             }
-            ensureSnapshot()
             upsert(.init(
                 id: message.id,
                 kind: message.role == .user ? .userMessage : .agentMessage,
@@ -908,7 +993,6 @@ private struct ThreadEventGeneration: Equatable, Sendable {
                 appendCompactTail(event)
                 return .accepted
             }
-            ensureSnapshot()
             upsert(currentItem)
             appendCompactTail(event)
 
@@ -919,7 +1003,6 @@ private struct ThreadEventGeneration: Equatable, Sendable {
                 appendCompactTail(event)
                 return .accepted
             }
-            ensureSnapshot()
             upsert(currentItem)
             appendCompactTail(event)
 
@@ -930,7 +1013,6 @@ private struct ThreadEventGeneration: Equatable, Sendable {
                 appendCompactTail(event)
                 return .accepted
             }
-            ensureSnapshot()
             upsert(currentItem)
             appendCompactTail(event)
 
@@ -977,22 +1059,50 @@ private struct ThreadEventGeneration: Equatable, Sendable {
                     message: "One thread generation cannot contain turns \(turnID.rawValue) and \(eventTurnID.rawValue)."
                 )
             }
+            isHistoricalSnapshotOnly = false
             return
         }
         if hasProvisionalResumeSnapshot {
             adoptProvisionalResumeIdentity(eventTurnID)
         } else {
-            turnID = eventTurnID
-            snapshot = .init(id: eventTurnID, state: .inProgress)
+            snapshotReducer = .init(turnID: eventTurnID)
         }
+        isHistoricalSnapshotOnly = false
     }
 
     mutating func mergeResponseSnapshot(_ responseSnapshot: CodexTurnSnapshot) throws {
         try establishTurn(responseSnapshot.id)
         seed(responseSnapshot)
-        if let terminal {
-            finalizeSnapshot(with: terminal)
+        reconcileTerminalSnapshot()
+    }
+
+    mutating func mergeHistoricalSnapshot(_ historicalSnapshot: CodexTurnSnapshot) throws {
+        if let provisionalResumeSnapshot {
+            guard provisionalResumeSnapshot.id == historicalSnapshot.id else {
+                throw CodexTransportFailure.contractViolation(
+                    message: "A provisional resume snapshot cannot merge historical turn "
+                        + "\(historicalSnapshot.id.rawValue) into "
+                        + "\(provisionalResumeSnapshot.id.rawValue)."
+                )
+            }
+            var reducer = CodexTurnSnapshotReducer(snapshot: provisionalResumeSnapshot)
+            reducer.merge(historicalSnapshot)
+            self.provisionalResumeSnapshot = reducer.snapshot
+            return
         }
+        if let turnID {
+            guard turnID == historicalSnapshot.id else {
+                throw CodexTransportFailure.contractViolation(
+                    message: "One thread generation cannot contain turns "
+                        + "\(turnID.rawValue) and \(historicalSnapshot.id.rawValue)."
+                )
+            }
+            seed(historicalSnapshot)
+            reconcileTerminalSnapshot()
+            return
+        }
+        snapshotReducer = .init(snapshot: historicalSnapshot)
+        isHistoricalSnapshotOnly = true
     }
 
     mutating func mergeProvisionalResumeSnapshot(_ responseSnapshot: CodexTurnSnapshot) {
@@ -1013,9 +1123,7 @@ private struct ThreadEventGeneration: Equatable, Sendable {
         var adoptedSnapshot = responseSnapshot
         adoptedSnapshot.id = turnID
         seed(adoptedSnapshot)
-        if let terminal {
-            finalizeSnapshot(with: terminal)
-        }
+        reconcileTerminalSnapshot()
     }
 
     mutating func adoptProvisionalResumeIdentity(_ canonicalTurnID: CodexTurnID) {
@@ -1023,9 +1131,8 @@ private struct ThreadEventGeneration: Equatable, Sendable {
             hasProvisionalResumeSnapshot,
             "Only an identity-unbound resume snapshot can adopt a persisted live turn identity."
         )
-        turnID = canonicalTurnID
         provisionalResumeSnapshot?.id = canonicalTurnID
-        snapshot = provisionalResumeSnapshot
+        snapshotReducer = provisionalResumeSnapshot.map(CodexTurnSnapshotReducer.init(snapshot:))
         provisionalResumeSnapshot = nil
     }
 
@@ -1037,91 +1144,33 @@ private struct ThreadEventGeneration: Equatable, Sendable {
         }
     }
 
-    private mutating func ensureSnapshot() {
-        guard snapshot == nil else {
-            return
-        }
-        guard let turnID else {
-            preconditionFailure("A compact turn snapshot requires a turn identity.")
-        }
-        snapshot = .init(id: turnID, state: .inProgress)
-    }
-
     private mutating func seed(_ newSnapshot: CodexTurnSnapshot) {
-        guard let snapshot else {
-            self.snapshot = newSnapshot
+        guard var snapshotReducer else {
+            self.snapshotReducer = .init(snapshot: newSnapshot)
             return
         }
-        var items = newSnapshot.items
-        var indexes = Dictionary(uniqueKeysWithValues: items.indices.map { (items[$0].id, $0) })
-        for item in snapshot.items {
-            if let index = indexes[item.id] {
-                items[index] = item
-            } else {
-                indexes[item.id] = items.count
-                items.append(item)
-            }
-        }
-        self.snapshot = .init(
-            id: newSnapshot.id,
-            state: newSnapshot.state,
-            itemsLoadState: newSnapshot.itemsLoadState,
-            items: items,
-            startedAt: newSnapshot.startedAt ?? snapshot.startedAt,
-            completedAt: newSnapshot.completedAt ?? snapshot.completedAt,
-            duration: newSnapshot.duration ?? snapshot.duration
-        )
+        snapshotReducer.merge(newSnapshot)
+        self.snapshotReducer = snapshotReducer
     }
 
     private mutating func upsert(_ item: CodexThreadItem) {
-        guard var snapshot else {
+        guard var snapshotReducer else {
             preconditionFailure("A compact item update requires a turn snapshot.")
         }
-        if let index = snapshot.items.firstIndex(where: { $0.id == item.id }) {
-            snapshot.items[index] = item
-        } else {
-            snapshot.items.append(item)
-        }
-        self.snapshot = snapshot
+        snapshotReducer.observe(item)
+        self.snapshotReducer = snapshotReducer
     }
 
-    private mutating func finalizeSnapshot(with outcome: CodexTurnOutcome) {
-        let response = outcome.response
-        var items = response.transcript.items
-        if let existing = snapshot?.items {
-            var indexes = Dictionary(uniqueKeysWithValues: items.indices.map { (items[$0].id, $0) })
-            for item in existing {
-                if let index = indexes[item.id] {
-                    if items[index].text?.isEmpty != false, item.text?.isEmpty == false {
-                        items[index] = item
-                    }
-                } else {
-                    indexes[item.id] = items.count
-                    items.append(item)
-                }
-            }
+    private mutating func reconcileTerminalSnapshot() {
+        guard let terminal else {
+            return
         }
-        let state: CodexTurnSnapshot.State
-        switch outcome {
-        case .completed:
-            state = .completed
-        case .interrupted:
-            state = .interrupted
-        case .failed(let failed):
-            state = .failed(failed.error)
-        case .invalidTerminalStatus(let rawStatus, let error, _):
-            state = .unknown(rawValue: rawStatus, error: error)
+        guard var snapshotReducer else {
+            preconditionFailure("A terminal turn requires a snapshot reducer.")
         }
-        snapshot = .init(
-            id: response.turnID,
-            state: state,
-            itemsLoadState: .full,
-            items: items,
-            startedAt: response.startedAt ?? snapshot?.startedAt,
-            completedAt: response.completedAt ?? snapshot?.completedAt,
-            duration: response.duration ?? snapshot?.duration
-        )
-        latestUsage = response.usage ?? latestUsage
+        let compactSnapshot = snapshotReducer.finish(terminal)
+        self.snapshotReducer = snapshotReducer
+        self.terminal = compactSnapshot.outcome
     }
 
     private func finalized(_ outcome: CodexTurnOutcome) -> CodexTurnOutcome {

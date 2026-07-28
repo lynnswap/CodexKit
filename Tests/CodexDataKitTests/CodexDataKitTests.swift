@@ -11325,6 +11325,24 @@ struct CodexModelContextTests {
                         ]
                     ),
                     .init(
+                        id: "rollout-activity",
+                        state: .completed,
+                        itemsLoadState: .full,
+                        items: [
+                            .init(
+                                id: "call-after-exit",
+                                kind: .commandExecution,
+                                content: .command(.init(
+                                    command: "/bin/zsh -lc 'git diff --check'",
+                                    cwd: workspaceURL.path,
+                                    exitCode: 0,
+                                    status: .completed,
+                                    source: .agent
+                                ))
+                            ),
+                        ]
+                    ),
+                    .init(
                         id: "rollout-reviewer",
                         state: .interrupted,
                         itemsLoadState: .full,
@@ -11364,8 +11382,1401 @@ struct CodexModelContextTests {
             preservesExistingTurnItems: true
         )
 
-        #expect(started.chat.turns.map(\.id) == ["turn-seed", "rollout-reviewer"])
+        #expect(
+            started.chat.turns.map(\.id)
+                == ["turn-seed", "rollout-activity", "rollout-reviewer"]
+        )
         #expect(started.chat.items(in: "rollout-reviewer").count == 3)
+        let reviewerMessage = try #require(
+            started.chat.items(in: "rollout-reviewer").first { $0.kind == .agentMessage }
+        )
+        #expect(reviewerMessage.origin == .reviewRolloutAssistant)
+        #expect(reviewerMessage.semanticRelation == .companionOf(.exitedReviewMode))
+    }
+
+    @Test("started review classifies a unique-id live assistant after exit activity")
+    func startedReviewClassifiesUniqueIDLiveAssistantAfterExitActivity() async throws {
+        let workspaceURL = temporaryDirectory()
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        try await runtime.transport.enqueueThreadStart(threadID: "thread-review", model: "gpt-5")
+        try await runtime.transport.enqueueReviewStart(
+            turnID: "turn-seed",
+            reviewThreadID: "thread-review"
+        )
+
+        let started = try await context.startReview(
+            in: workspaceURL,
+            input: CodexReviewInput(
+                target: .uncommittedChanges,
+                options: .init(model: "gpt-5", ephemeral: false)
+            )
+        )
+        _ = started.chat.apply(.turnStarted("turn-seed"))
+        _ = started.chat.apply(.itemCompleted(
+            .init(
+                id: "review-exit",
+                kind: .exitedReviewMode,
+                content: .log("No issues found.")
+            ),
+            turnID: "turn-seed"
+        ))
+        _ = started.chat.apply(.itemCompleted(
+            .init(
+                id: "review-command",
+                kind: .commandExecution,
+                content: .command(.init(command: "/bin/zsh -lc"))
+            ),
+            turnID: "turn-seed"
+        ))
+        _ = started.chat.apply(.itemCompleted(
+            .init(
+                id: "msg-unique",
+                kind: .agentMessage,
+                content: .message(.init(
+                    id: "msg-unique",
+                    role: .assistant,
+                    text: "No issues found."
+                ))
+            ),
+            turnID: "turn-seed"
+        ))
+
+        let reviewerMessage = try #require(
+            started.chat.items(in: "turn-seed").first { $0.itemID == "msg-unique" }
+        )
+        #expect(reviewerMessage.origin == .reviewRolloutAssistant)
+        #expect(reviewerMessage.semanticRelation == .companionOf(.exitedReviewMode))
+    }
+
+    @Test("coalesced review companion waits for a full snapshot")
+    func coalescedReviewCompanionWaitsForFullSnapshot() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let chat = CodexChat(id: "review-chat", modelContext: context)
+        let items: [CodexThreadItem] = [
+            .init(
+                id: "review-entry",
+                kind: .enteredReviewMode,
+                content: .log("current changes")
+            ),
+            .init(
+                id: "review-exit",
+                kind: .exitedReviewMode,
+                content: .log("No issues found.")
+            ),
+            .init(
+                id: "reviewer-user-1",
+                kind: .userMessage,
+                content: .message(.init(
+                    id: "reviewer-user-1",
+                    role: .user,
+                    text: "current changes"
+                ))
+            ),
+            .init(
+                id: "reviewer-user-2",
+                kind: .userMessage,
+                content: .message(.init(
+                    id: "reviewer-user-2",
+                    role: .user,
+                    text: "current changes"
+                ))
+            ),
+            .init(
+                id: "review-command",
+                kind: .commandExecution,
+                content: .command(.init(command: "/bin/zsh -lc"))
+            ),
+            .init(
+                id: "reviewer-assistant",
+                kind: .agentMessage,
+                content: .message(.init(
+                    id: "reviewer-assistant",
+                    role: .assistant,
+                    text: "No issues found."
+                ))
+            ),
+        ]
+
+        let summaryChanges = chat.apply(.snapshot(.init(
+            id: "coalesced-review",
+            state: .inProgress,
+            itemsLoadState: .summary,
+            items: items
+        )))
+
+        let summaryMessage = try #require(
+            chat.items(in: "coalesced-review").first {
+                $0.itemID == "reviewer-assistant"
+            }
+        )
+        #expect(summaryMessage.itemsLoadState == .summary)
+        #expect(summaryMessage.origin == .currentV2Item)
+        #expect(summaryMessage.semanticRelation == nil)
+        let summaryUpdates = chat.observationUpdates(for: summaryChanges)
+        #expect(summaryUpdates.contains { update in
+            guard case .turnInserted(let turn, _) = update else {
+                return false
+            }
+            return turn.items.contains {
+                $0.id == "reviewer-assistant"
+                    && $0.semanticRelation == nil
+            }
+        })
+
+        let fullChanges = chat.apply(.snapshot(.init(
+            id: "coalesced-review",
+            state: .inProgress,
+            itemsLoadState: .full,
+            items: items
+        )))
+
+        let fullMessage = try #require(
+            chat.items(in: "coalesced-review").first {
+                $0.itemID == "reviewer-assistant"
+            }
+        )
+        #expect(fullMessage.itemsLoadState == .full)
+        #expect(fullMessage.origin == .reviewRolloutAssistant)
+        #expect(fullMessage.semanticRelation == .companionOf(.exitedReviewMode))
+        let fullUpdates = chat.observationUpdates(for: fullChanges)
+        #expect(fullUpdates.contains { update in
+            guard case .itemUpdated(let item, let turnID, _) = update else {
+                return false
+            }
+            return item.id == "reviewer-assistant"
+                && turnID == "coalesced-review"
+                && item.origin == .reviewRolloutAssistant
+                && item.semanticRelation == .companionOf(.exitedReviewMode)
+        })
+    }
+
+    @Test("adjacent review companion waits for a full snapshot")
+    func adjacentReviewCompanionWaitsForFullSnapshot() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let chat = CodexChat(id: "adjacent-review-chat", modelContext: context)
+        let items: [CodexThreadItem] = [
+            .init(
+                id: "review-exit",
+                kind: .exitedReviewMode,
+                content: .log("No issues found.")
+            ),
+            .init(
+                id: "reviewer-assistant",
+                kind: .agentMessage,
+                content: .message(.init(
+                    id: "reviewer-assistant",
+                    role: .assistant,
+                    text: "No issues found."
+                ))
+            ),
+        ]
+
+        _ = chat.apply(.snapshot(.init(
+            id: "adjacent-review",
+            state: .inProgress,
+            itemsLoadState: .summary,
+            items: items
+        )))
+
+        let summaryMessage = try #require(
+            chat.items(in: "adjacent-review").first {
+                $0.itemID == "reviewer-assistant"
+            }
+        )
+        #expect(summaryMessage.itemsLoadState == .summary)
+        #expect(summaryMessage.origin == .currentV2Item)
+        #expect(summaryMessage.semanticRelation == nil)
+
+        let fullChanges = chat.apply(.snapshot(.init(
+            id: "adjacent-review",
+            state: .inProgress,
+            itemsLoadState: .full,
+            items: items
+        )))
+
+        let fullMessage = try #require(
+            chat.items(in: "adjacent-review").first {
+                $0.itemID == "reviewer-assistant"
+            }
+        )
+        #expect(fullMessage.itemsLoadState == .full)
+        #expect(fullMessage.origin == .reviewRolloutAssistant)
+        #expect(fullMessage.semanticRelation == .companionOf(.exitedReviewMode))
+        let fullUpdates = chat.observationUpdates(for: fullChanges)
+        #expect(fullUpdates.contains { update in
+            guard case .itemUpdated(let item, let turnID, _) = update else {
+                return false
+            }
+            return item.id == "reviewer-assistant"
+                && turnID == "adjacent-review"
+                && item.origin == .reviewRolloutAssistant
+                && item.semanticRelation == .companionOf(.exitedReviewMode)
+        })
+    }
+
+    @Test("full snapshot normalization ignores stale omitted review items")
+    func fullSnapshotNormalizationIgnoresStaleOmittedReviewItems() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let chat = CodexChat(id: "corrected-review-chat", modelContext: context)
+        let assistant = CodexThreadItem(
+            id: "reviewer-assistant",
+            kind: .agentMessage,
+            content: .message(.init(
+                id: "reviewer-assistant",
+                role: .assistant,
+                text: "Ordinary assistant response"
+            ))
+        )
+
+        _ = chat.apply(.snapshot(.init(
+            id: "corrected-review",
+            state: .inProgress,
+            itemsLoadState: .full,
+            items: [
+                .init(
+                    id: "review-exit",
+                    kind: .exitedReviewMode,
+                    content: .log("No issues found.")
+                ),
+                assistant,
+            ]
+        )))
+
+        let classifiedMessage = try #require(
+            chat.items(in: "corrected-review").first {
+                $0.itemID == "reviewer-assistant"
+            }
+        )
+        #expect(classifiedMessage.origin == .reviewRolloutAssistant)
+        #expect(classifiedMessage.semanticRelation == .companionOf(.exitedReviewMode))
+
+        let correctedChanges = chat.apply(.snapshot(.init(
+            id: "corrected-review",
+            state: .inProgress,
+            itemsLoadState: .full,
+            items: [assistant]
+        )))
+
+        let correctedMessage = try #require(
+            chat.items(in: "corrected-review").first {
+                $0.itemID == "reviewer-assistant"
+            }
+        )
+        #expect(correctedMessage.origin == .currentV2Item)
+        #expect(correctedMessage.semanticRelation == nil)
+        #expect(chat.items(in: "corrected-review").contains {
+            $0.itemID == "review-exit"
+        } == false)
+        let correctedUpdates = chat.observationUpdates(for: correctedChanges)
+        #expect(correctedUpdates.contains { update in
+            guard case .itemRemoved(let locator) = update else {
+                return false
+            }
+            return locator.id == "review-exit"
+                && locator.turnID == "corrected-review"
+        })
+        #expect(correctedUpdates.contains { update in
+            guard case .itemUpdated(let item, let turnID, _) = update else {
+                return false
+            }
+            return item.id == "reviewer-assistant"
+                && turnID == "corrected-review"
+                && item.origin == .currentV2Item
+                && item.semanticRelation == nil
+        })
+
+        _ = chat.apply(.itemUpdated(
+            .init(
+                id: "reviewer-assistant",
+                kind: .agentMessage,
+                content: .message(.init(
+                    id: "reviewer-assistant",
+                    role: .assistant,
+                    text: "Updated ordinary assistant response"
+                ))
+            ),
+            turnID: "corrected-review"
+        ))
+
+        let liveUpdatedMessage = try #require(
+            chat.items(in: "corrected-review").first {
+                $0.itemID == "reviewer-assistant"
+            }
+        )
+        #expect(liveUpdatedMessage.origin == .currentV2Item)
+        #expect(liveUpdatedMessage.semanticRelation == nil)
+    }
+
+    @Test("first snapshot classifies a persisted companion after a review exit")
+    func firstSnapshotClassifiesPersistedCompanionAfterReviewExit() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let chat = CodexChat(id: "persisted-review-chat", modelContext: context)
+        chat.apply(
+            .init(
+                id: chat.id,
+                turns: [
+                    .init(
+                        id: "review-boundary",
+                        state: .completed,
+                        items: [
+                            .init(
+                                id: "review-exit",
+                                kind: .exitedReviewMode,
+                                content: .log("No issues found.")
+                            ),
+                        ]
+                    ),
+                ]
+            ),
+            workspace: nil
+        )
+
+        _ = chat.apply(.snapshot(.init(
+            id: "persisted-companion",
+            state: .completed,
+            itemsLoadState: .full,
+            items: [
+                .init(
+                    id: "reviewer-user-1",
+                    kind: .userMessage,
+                    content: .message(.init(
+                        id: "reviewer-user-1",
+                        role: .user,
+                        text: "current changes"
+                    ))
+                ),
+                .init(
+                    id: "reviewer-user-2",
+                    kind: .userMessage,
+                    content: .message(.init(
+                        id: "reviewer-user-2",
+                        role: .user,
+                        text: "current changes"
+                    ))
+                ),
+                .init(
+                    id: "reviewer-assistant",
+                    kind: .agentMessage,
+                    content: .message(.init(
+                        id: "reviewer-assistant",
+                        role: .assistant,
+                        text: "No issues found."
+                    ))
+                ),
+            ]
+        )))
+
+        let reviewerMessage = try #require(
+            chat.items(in: "persisted-companion").first {
+                $0.itemID == "reviewer-assistant"
+            }
+        )
+        #expect(reviewerMessage.origin == .reviewRolloutAssistant)
+        #expect(reviewerMessage.semanticRelation == .companionOf(.exitedReviewMode))
+    }
+
+    @Test("partial snapshot uses the loaded preceding review boundary")
+    func partialSnapshotUsesLoadedPrecedingReviewBoundary() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let chat = CodexChat(id: "partial-review-chat", modelContext: context)
+        chat.apply(
+            .init(
+                id: chat.id,
+                turns: [
+                    .init(
+                        id: "review-boundary",
+                        state: .completed,
+                        items: [
+                            .init(
+                                id: "review-exit",
+                                kind: .exitedReviewMode,
+                                content: .log("No issues found.")
+                            ),
+                        ]
+                    ),
+                ]
+            ),
+            workspace: nil
+        )
+
+        chat.apply(
+            .init(
+                id: chat.id,
+                turns: [
+                    .init(
+                        id: "persisted-companion",
+                        state: .completed,
+                        items: [
+                            .init(
+                                id: "reviewer-user-1",
+                                kind: .userMessage,
+                                content: .message(.init(
+                                    id: "reviewer-user-1",
+                                    role: .user,
+                                    text: "current changes"
+                                ))
+                            ),
+                            .init(
+                                id: "reviewer-user-2",
+                                kind: .userMessage,
+                                content: .message(.init(
+                                    id: "reviewer-user-2",
+                                    role: .user,
+                                    text: "current changes"
+                                ))
+                            ),
+                            .init(
+                                id: "reviewer-assistant",
+                                kind: .agentMessage,
+                                content: .message(.init(
+                                    id: "reviewer-assistant",
+                                    role: .assistant,
+                                    text: "No issues found."
+                                ))
+                            ),
+                        ]
+                    ),
+                ]
+            ),
+            workspace: nil,
+            preservesExistingTurnItems: true
+        )
+
+        let reviewerMessage = try #require(
+            chat.items(in: "persisted-companion").first {
+                $0.itemID == "reviewer-assistant"
+            }
+        )
+        #expect(reviewerMessage.origin == .reviewRolloutAssistant)
+        #expect(reviewerMessage.semanticRelation == .companionOf(.exitedReviewMode))
+    }
+
+    @Test("authoritative snapshot does not use omitted loaded review boundaries")
+    func authoritativeSnapshotDoesNotUseOmittedLoadedReviewBoundaries() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let chat = CodexChat(id: "authoritative-review-chat", modelContext: context)
+        chat.apply(
+            .init(
+                id: chat.id,
+                turns: [
+                    .init(
+                        id: "stale-review-boundary",
+                        state: .completed,
+                        items: [
+                            .init(
+                                id: "stale-review-exit",
+                                kind: .exitedReviewMode,
+                                content: .log("No issues found.")
+                            ),
+                        ]
+                    ),
+                ]
+            ),
+            workspace: nil
+        )
+
+        chat.apply(
+            .init(
+                id: chat.id,
+                turns: [
+                    .init(
+                        id: "ordinary-persisted-turn",
+                        state: .completed,
+                        items: [
+                            .init(
+                                id: "ordinary-user-1",
+                                kind: .userMessage,
+                                content: .message(.init(
+                                    id: "ordinary-user-1",
+                                    role: .user,
+                                    text: "repeated prompt"
+                                ))
+                            ),
+                            .init(
+                                id: "ordinary-user-2",
+                                kind: .userMessage,
+                                content: .message(.init(
+                                    id: "ordinary-user-2",
+                                    role: .user,
+                                    text: "repeated prompt"
+                                ))
+                            ),
+                            .init(
+                                id: "ordinary-assistant",
+                                kind: .agentMessage,
+                                content: .message(.init(
+                                    id: "ordinary-assistant",
+                                    role: .assistant,
+                                    text: "Ordinary response"
+                                ))
+                            ),
+                        ]
+                    ),
+                ]
+            ),
+            workspace: nil
+        )
+
+        let assistant = try #require(
+            chat.items(in: "ordinary-persisted-turn").first {
+                $0.itemID == "ordinary-assistant"
+            }
+        )
+        #expect(assistant.origin == .currentV2Item)
+        #expect(assistant.semanticRelation == nil)
+        #expect(chat.turns.map(\.id) == ["ordinary-persisted-turn"])
+    }
+
+    @Test("summary record preserves its loaded full review boundary")
+    func summaryRecordPreservesLoadedFullReviewBoundary() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let chat = CodexChat(id: "summarized-review-chat", modelContext: context)
+        chat.apply(
+            .init(
+                id: chat.id,
+                turns: [
+                    .init(
+                        id: "review-boundary",
+                        state: .completed,
+                        items: [
+                            .init(
+                                id: "review-exit",
+                                kind: .exitedReviewMode,
+                                content: .log("No issues found.")
+                            ),
+                        ]
+                    ),
+                ]
+            ),
+            workspace: nil
+        )
+
+        chat.apply(
+            .init(
+                id: chat.id,
+                turns: [
+                    .init(
+                        id: "review-boundary",
+                        state: .completed,
+                        itemsLoadState: .summary
+                    ),
+                    .init(
+                        id: "persisted-companion",
+                        state: .completed,
+                        items: [
+                            .init(
+                                id: "reviewer-user-1",
+                                kind: .userMessage,
+                                content: .message(.init(
+                                    id: "reviewer-user-1",
+                                    role: .user,
+                                    text: "current changes"
+                                ))
+                            ),
+                            .init(
+                                id: "reviewer-user-2",
+                                kind: .userMessage,
+                                content: .message(.init(
+                                    id: "reviewer-user-2",
+                                    role: .user,
+                                    text: "current changes"
+                                ))
+                            ),
+                            .init(
+                                id: "reviewer-assistant",
+                                kind: .agentMessage,
+                                content: .message(.init(
+                                    id: "reviewer-assistant",
+                                    role: .assistant,
+                                    text: "No issues found."
+                                ))
+                            ),
+                        ]
+                    ),
+                ]
+            ),
+            workspace: nil
+        )
+
+        let reviewerMessage = try #require(
+            chat.items(in: "persisted-companion").first {
+                $0.itemID == "reviewer-assistant"
+            }
+        )
+        #expect(reviewerMessage.origin == .reviewRolloutAssistant)
+        #expect(reviewerMessage.semanticRelation == .companionOf(.exitedReviewMode))
+        #expect(chat.items(in: "review-boundary").contains {
+            $0.itemID == "review-exit"
+        })
+    }
+
+    @Test("summary record cannot establish a preceding review boundary")
+    func summaryRecordCannotEstablishPrecedingReviewBoundary() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let chat = CodexChat(id: "partial-review-boundary-chat", modelContext: context)
+
+        chat.apply(
+            .init(
+                id: chat.id,
+                turns: [
+                    .init(
+                        id: "partial-boundary",
+                        state: .completed,
+                        itemsLoadState: .summary,
+                        items: [
+                            .init(
+                                id: "review-exit",
+                                kind: .exitedReviewMode,
+                                content: .log("No issues found.")
+                            ),
+                        ]
+                    ),
+                    .init(
+                        id: "ordinary-turn",
+                        state: .completed,
+                        items: [
+                            .init(
+                                id: "user-1",
+                                kind: .userMessage,
+                                content: .message(.init(
+                                    id: "user-1",
+                                    role: .user,
+                                    text: "repeated prompt"
+                                ))
+                            ),
+                            .init(
+                                id: "user-2",
+                                kind: .userMessage,
+                                content: .message(.init(
+                                    id: "user-2",
+                                    role: .user,
+                                    text: "repeated prompt"
+                                ))
+                            ),
+                            .init(
+                                id: "assistant",
+                                kind: .agentMessage,
+                                content: .message(.init(
+                                    id: "assistant",
+                                    role: .assistant,
+                                    text: "Ordinary response"
+                                ))
+                            ),
+                        ]
+                    ),
+                ]
+            ),
+            workspace: nil
+        )
+
+        let assistant = try #require(
+            chat.items(in: "ordinary-turn").first { $0.itemID == "assistant" }
+        )
+        #expect(assistant.origin == .currentV2Item)
+        #expect(assistant.semanticRelation == nil)
+    }
+
+    @Test("ordered update uses narrative evidence before the existing item")
+    func orderedUpdateUsesNarrativeEvidenceBeforeExistingItem() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let chat = CodexChat(id: "ordered-review-chat", modelContext: context)
+
+        _ = chat.apply(.itemCompleted(
+            .init(
+                id: "ordinary-assistant",
+                kind: .agentMessage,
+                content: .message(.init(
+                    id: "ordinary-assistant",
+                    role: .assistant,
+                    text: "Ordinary response"
+                ))
+            ),
+            turnID: "ordered-review"
+        ))
+        _ = chat.apply(.itemCompleted(
+            .init(
+                id: "later-review-exit",
+                kind: .exitedReviewMode,
+                content: .log("No issues found.")
+            ),
+            turnID: "ordered-review"
+        ))
+        _ = chat.apply(.itemUpdated(
+            .init(
+                id: "ordinary-assistant",
+                kind: .agentMessage,
+                content: .message(.init(
+                    id: "ordinary-assistant",
+                    role: .assistant,
+                    text: "Updated ordinary response"
+                ))
+            ),
+            turnID: "ordered-review"
+        ))
+
+        let assistant = try #require(
+            chat.items(in: "ordered-review").first {
+                $0.itemID == "ordinary-assistant"
+            }
+        )
+        #expect(assistant.origin == .currentV2Item)
+        #expect(assistant.semanticRelation == nil)
+    }
+
+    @Test("terminal transcript provides full review companion evidence")
+    func terminalTranscriptProvidesFullReviewCompanionEvidence() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let chat = CodexChat(id: "terminal-review-chat", modelContext: context)
+        _ = chat.apply(.turnStarted("terminal-review"))
+
+        let terminalChanges = chat.apply(.terminal(.completed(.init(
+            turnID: "terminal-review",
+            transcript: .init(items: [
+                .init(
+                    id: "review-exit",
+                    kind: .exitedReviewMode,
+                    content: .log("No issues found.")
+                ),
+                .init(
+                    id: "reviewer-user-1",
+                    kind: .userMessage,
+                    content: .message(.init(
+                        id: "reviewer-user-1",
+                        role: .user,
+                        text: "current changes"
+                    ))
+                ),
+                .init(
+                    id: "reviewer-user-2",
+                    kind: .userMessage,
+                    content: .message(.init(
+                        id: "reviewer-user-2",
+                        role: .user,
+                        text: "current changes"
+                    ))
+                ),
+                .init(
+                    id: "reviewer-assistant",
+                    kind: .agentMessage,
+                    content: .message(.init(
+                        id: "reviewer-assistant",
+                        role: .assistant,
+                        text: "No issues found."
+                    ))
+                ),
+            ]),
+            transcriptItemsLoadState: .full
+        ))))
+
+        let turn = try #require(chat.turn(id: "terminal-review"))
+        #expect(turn.itemsLoadState == .full)
+        let reviewerMessage = try #require(
+            chat.items(in: "terminal-review").first {
+                $0.itemID == "reviewer-assistant"
+            }
+        )
+        #expect(reviewerMessage.origin == .reviewRolloutAssistant)
+        #expect(reviewerMessage.semanticRelation == .companionOf(.exitedReviewMode))
+        let terminalUpdates = chat.observationUpdates(for: terminalChanges)
+        #expect(terminalUpdates.contains { update in
+            guard case .itemInserted(let item, let turnID, _) = update else {
+                return false
+            }
+            return item.id == "reviewer-assistant"
+                && turnID == "terminal-review"
+                && item.semanticRelation == .companionOf(.exitedReviewMode)
+        })
+    }
+
+    @Test("summary terminal transcript does not provide full companion evidence")
+    func summaryTerminalTranscriptDoesNotProvideFullCompanionEvidence() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let chat = CodexChat(id: "summary-terminal-review-chat", modelContext: context)
+        _ = chat.apply(.turnStarted("summary-terminal-review"))
+
+        _ = chat.apply(.terminal(.completed(.init(
+            turnID: "summary-terminal-review",
+            transcript: .init(items: [
+                .init(
+                    id: "review-exit",
+                    kind: .exitedReviewMode,
+                    content: .log("No issues found.")
+                ),
+                .init(
+                    id: "reviewer-user-1",
+                    kind: .userMessage,
+                    content: .message(.init(
+                        id: "reviewer-user-1",
+                        role: .user,
+                        text: "current changes"
+                    ))
+                ),
+                .init(
+                    id: "reviewer-user-2",
+                    kind: .userMessage,
+                    content: .message(.init(
+                        id: "reviewer-user-2",
+                        role: .user,
+                        text: "current changes"
+                    ))
+                ),
+                .init(
+                    id: "reviewer-assistant",
+                    kind: .agentMessage,
+                    content: .message(.init(
+                        id: "reviewer-assistant",
+                        role: .assistant,
+                        text: "No issues found."
+                    ))
+                ),
+            ]),
+            transcriptItemsLoadState: .summary
+        ))))
+
+        let turn = try #require(chat.turn(id: "summary-terminal-review"))
+        #expect(turn.itemsLoadState == .summary)
+        let reviewerMessage = try #require(
+            chat.items(in: "summary-terminal-review").first {
+                $0.itemID == "reviewer-assistant"
+            }
+        )
+        #expect(reviewerMessage.origin == .currentV2Item)
+        #expect(reviewerMessage.semanticRelation == nil)
+    }
+
+    @Test("summary terminal transcript preserves an existing full turn")
+    func summaryTerminalTranscriptPreservesExistingFullTurn() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let chat = CodexChat(id: "full-terminal-chat", modelContext: context)
+        let fullItem = CodexThreadItem(
+            id: "assistant",
+            kind: .agentMessage,
+            content: .message(.init(
+                id: "assistant",
+                role: .assistant,
+                text: "Complete response"
+            ))
+        )
+        _ = chat.apply(.snapshot(.init(
+            id: "turn",
+            state: .inProgress,
+            itemsLoadState: .full,
+            items: [fullItem]
+        )))
+
+        _ = chat.apply(.terminal(.completed(.init(
+            turnID: "turn",
+            transcript: .init(items: [
+                .init(
+                    id: "assistant",
+                    kind: .agentMessage,
+                    content: .message(.init(
+                        id: "assistant",
+                        role: .assistant,
+                        text: "Summary response"
+                    ))
+                ),
+            ]),
+            transcriptItemsLoadState: .summary
+        ))))
+
+        let turn = try #require(chat.turn(id: "turn"))
+        #expect(turn.itemsLoadState == .full)
+        let assistant = try #require(
+            chat.items(in: "turn").first { $0.itemID == "assistant" }
+        )
+        #expect(assistant.text == "Complete response")
+        #expect(assistant.itemsLoadState == .full)
+    }
+
+    @Test("full terminal transcript removes omitted live items")
+    func fullTerminalTranscriptRemovesOmittedLiveItems() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let chat = CodexChat(id: "authoritative-terminal-chat", modelContext: context)
+        _ = chat.apply(.itemCompleted(
+            .init(
+                id: "omitted",
+                kind: .agentMessage,
+                content: .message(.init(
+                    id: "omitted",
+                    role: .assistant,
+                    text: "Omitted live item"
+                ))
+            ),
+            turnID: "turn"
+        ))
+        let retainedItem = CodexThreadItem(
+            id: "retained",
+            kind: .agentMessage,
+            content: .message(.init(
+                id: "retained",
+                role: .assistant,
+                text: "Retained terminal item"
+            ))
+        )
+
+        let changes = chat.apply(.terminal(.completed(.init(
+            turnID: "turn",
+            transcript: .init(items: [retainedItem]),
+            transcriptItemsLoadState: .full
+        ))))
+
+        #expect(chat.items(in: "turn").map(\.itemID) == ["retained"])
+        let updates = chat.observationUpdates(for: changes)
+        #expect(updates.contains { update in
+            guard case .itemRemoved(let locator) = update else {
+                return false
+            }
+            return locator.id == "omitted" && locator.turnID == "turn"
+        })
+    }
+
+    @Test("live persisted review companion waits for a full completion snapshot")
+    func livePersistedReviewCompanionWaitsForFullCompletionSnapshot() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let chat = CodexChat(id: "review-chat", modelContext: context)
+
+        chat.apply(
+            .init(
+                id: chat.id,
+                sourceKind: .subAgentReview,
+                turns: [
+                    .init(
+                        id: "review-boundary",
+                        state: .completed,
+                        items: [
+                            .init(
+                                id: "review-output",
+                                kind: .exitedReviewMode,
+                                content: .log("No issues found.")
+                            ),
+                        ]
+                    ),
+                ]
+            ),
+            workspace: nil
+        )
+        _ = chat.apply(.turnStarted("reviewer-turn"))
+        for id in ["reviewer-user-1", "reviewer-user-2"] {
+            _ = chat.apply(.itemCompleted(
+                .init(
+                    id: id,
+                    kind: .userMessage,
+                    content: .message(.init(
+                        id: id,
+                        role: .user,
+                        text: "current changes"
+                    ))
+                ),
+                turnID: "reviewer-turn"
+            ))
+        }
+        _ = chat.apply(.itemCompleted(
+            .init(
+                id: "reviewer-assistant",
+                kind: .agentMessage,
+                content: .message(.init(
+                    id: "reviewer-assistant",
+                    role: .assistant,
+                    text: "No issues found."
+                ))
+            ),
+            turnID: "reviewer-turn"
+        ))
+
+        let liveMessage = try #require(
+            chat.items(in: "reviewer-turn").first {
+                $0.itemID == "reviewer-assistant"
+            }
+        )
+        #expect(liveMessage.origin == .currentV2Item)
+        #expect(liveMessage.semanticRelation == nil)
+
+        _ = chat.apply(.terminal(.completed(.init(turnID: "reviewer-turn"))))
+
+        let sparseCompletedMessage = try #require(
+            chat.items(in: "reviewer-turn").first {
+                $0.itemID == "reviewer-assistant"
+            }
+        )
+        #expect(sparseCompletedMessage.origin == .currentV2Item)
+        #expect(sparseCompletedMessage.semanticRelation == nil)
+
+        _ = chat.apply(.snapshot(.init(
+            id: "reviewer-turn",
+            state: .completed,
+            itemsLoadState: .full,
+            items: [
+                .init(
+                    id: "reviewer-user-1",
+                    kind: .userMessage,
+                    content: .message(.init(
+                        id: "reviewer-user-1",
+                        role: .user,
+                        text: "current changes"
+                    ))
+                ),
+                .init(
+                    id: "reviewer-user-2",
+                    kind: .userMessage,
+                    content: .message(.init(
+                        id: "reviewer-user-2",
+                        role: .user,
+                        text: "current changes"
+                    ))
+                ),
+                .init(
+                    id: "reviewer-assistant",
+                    kind: .agentMessage,
+                    content: .message(.init(
+                        id: "reviewer-assistant",
+                        role: .assistant,
+                        text: "No issues found."
+                    ))
+                ),
+            ]
+        )))
+
+        let completedMessage = try #require(
+            chat.items(in: "reviewer-turn").first {
+                $0.itemID == "reviewer-assistant"
+            }
+        )
+        #expect(completedMessage.origin == .reviewRolloutAssistant)
+        #expect(completedMessage.semanticRelation == .companionOf(.exitedReviewMode))
+    }
+
+    @Test("persisted review companion does not depend on the thread source")
+    func persistedReviewCompanionDoesNotDependOnThreadSource() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let chat = CodexChat(id: "legacy-review-chat", modelContext: context)
+
+        chat.apply(
+            .init(
+                id: chat.id,
+                sourceKind: .vscode,
+                turns: [
+                    .init(
+                        id: "prior-review",
+                        state: .completed,
+                        items: [
+                            .init(
+                                id: "prior-review-output",
+                                kind: .exitedReviewMode,
+                                content: .log("No issues found.")
+                            ),
+                        ]
+                    ),
+                    .init(
+                        id: "ordinary-turn",
+                        state: .completed,
+                        items: [
+                            .init(
+                                id: "ordinary-user-1",
+                                kind: .userMessage,
+                                content: .message(.init(
+                                    id: "ordinary-user-1",
+                                    role: .user,
+                                    text: "Repeat this prompt."
+                                ))
+                            ),
+                            .init(
+                                id: "ordinary-user-2",
+                                kind: .userMessage,
+                                content: .message(.init(
+                                    id: "ordinary-user-2",
+                                    role: .user,
+                                    text: "Repeat this prompt."
+                                ))
+                            ),
+                            .init(
+                                id: "ordinary-assistant",
+                                kind: .agentMessage,
+                                content: .message(.init(
+                                    id: "ordinary-assistant",
+                                    role: .assistant,
+                                    text: "This is an ordinary response."
+                                ))
+                            ),
+                        ]
+                    ),
+                ]
+            ),
+            workspace: nil
+        )
+
+        let response = try #require(
+            chat.items(in: "ordinary-turn").first { $0.itemID == "ordinary-assistant" }
+        )
+        #expect(response.origin == .reviewRolloutAssistant)
+        #expect(response.semanticRelation == .companionOf(.exitedReviewMode))
+    }
+
+    @Test("ordinary chat does not classify a duplicate prompt without a review exit")
+    func ordinaryChatDoesNotClassifyDuplicatePromptWithoutReviewExit() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let chat = CodexChat(id: "ordinary-chat", modelContext: context)
+
+        chat.apply(
+            .init(
+                id: chat.id,
+                sourceKind: .appServer,
+                turns: [
+                    .init(
+                        id: "ordinary-turn",
+                        state: .completed,
+                        items: [
+                            .init(
+                                id: "ordinary-user-1",
+                                kind: .userMessage,
+                                content: .message(.init(
+                                    id: "ordinary-user-1",
+                                    role: .user,
+                                    text: "Repeat this prompt."
+                                ))
+                            ),
+                            .init(
+                                id: "ordinary-user-2",
+                                kind: .userMessage,
+                                content: .message(.init(
+                                    id: "ordinary-user-2",
+                                    role: .user,
+                                    text: "Repeat this prompt."
+                                ))
+                            ),
+                            .init(
+                                id: "ordinary-assistant",
+                                kind: .agentMessage,
+                                content: .message(.init(
+                                    id: "ordinary-assistant",
+                                    role: .assistant,
+                                    text: "This is an ordinary response."
+                                ))
+                            ),
+                        ]
+                    ),
+                ]
+            ),
+            workspace: nil
+        )
+
+        let response = try #require(
+            chat.items(in: "ordinary-turn").first { $0.itemID == "ordinary-assistant" }
+        )
+        #expect(response.origin == .currentV2Item)
+        #expect(response.semanticRelation == nil)
+    }
+
+    @Test("live candidate does not infer a companion from summary items")
+    func liveCandidateDoesNotInferCompanionFromSummaryItems() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let chat = CodexChat(id: "summary-review-chat", modelContext: context)
+
+        chat.apply(
+            .init(
+                id: chat.id,
+                sourceKind: .vscode,
+                turns: [
+                    .init(
+                        id: "review-boundary",
+                        state: .completed,
+                        itemsLoadState: .full,
+                        items: [
+                            .init(
+                                id: "review-output",
+                                kind: .exitedReviewMode,
+                                content: .log("No issues found.")
+                            ),
+                        ]
+                    ),
+                    .init(
+                        id: "summary-turn",
+                        state: .completed,
+                        itemsLoadState: .summary,
+                        items: [
+                            .init(
+                                id: "summary-user-1",
+                                kind: .userMessage,
+                                content: .message(.init(
+                                    id: "summary-user-1",
+                                    role: .user,
+                                    text: "current changes"
+                                ))
+                            ),
+                            .init(
+                                id: "summary-user-2",
+                                kind: .userMessage,
+                                content: .message(.init(
+                                    id: "summary-user-2",
+                                    role: .user,
+                                    text: "current changes"
+                                ))
+                            ),
+                        ]
+                    ),
+                ]
+            ),
+            workspace: nil
+        )
+        _ = chat.apply(.itemCompleted(
+            .init(
+                id: "summary-assistant",
+                kind: .agentMessage,
+                content: .message(.init(
+                    id: "summary-assistant",
+                    role: .assistant,
+                    text: "This summary may omit narrative items."
+                ))
+            ),
+            turnID: "summary-turn"
+        ))
+
+        let response = try #require(
+            chat.items(in: "summary-turn").first {
+                $0.itemID == "summary-assistant"
+            }
+        )
+        #expect(response.origin == .currentV2Item)
+        #expect(response.semanticRelation == nil)
+    }
+
+    @Test("review snapshot classifies a same-turn assistant after exit activity")
+    func reviewSnapshotClassifiesSameTurnAssistantAfterExitActivity() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let chat = CodexChat(id: "review-chat", modelContext: context)
+
+        chat.apply(
+            .init(
+                id: chat.id,
+                sourceKind: .subAgentReview,
+                turns: [
+                    .init(
+                        id: "review-turn",
+                        state: .completed,
+                        items: [
+                            .init(
+                                id: "review-output",
+                                kind: .exitedReviewMode,
+                                content: .log("No issues found.")
+                            ),
+                            .init(
+                                id: "review-command",
+                                kind: .commandExecution,
+                                content: .command(.init(command: "/bin/zsh -lc"))
+                            ),
+                            .init(
+                                id: "review-assistant",
+                                kind: .agentMessage,
+                                content: .message(.init(
+                                    id: "review-assistant",
+                                    role: .assistant,
+                                    text: "No issues found."
+                                ))
+                            ),
+                        ]
+                    ),
+                ]
+            ),
+            workspace: nil
+        )
+
+        let response = try #require(
+            chat.items(in: "review-turn").first { $0.itemID == "review-assistant" }
+        )
+        #expect(response.origin == .reviewRolloutAssistant)
+        #expect(response.semanticRelation == .companionOf(.exitedReviewMode))
+    }
+
+    @Test("later review entry blocks a persisted companion from an earlier exit")
+    func laterReviewEntryBlocksPersistedCompanionFromEarlierExit() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let chat = CodexChat(id: "review-chat", modelContext: context)
+
+        chat.apply(
+            .init(
+                id: chat.id,
+                sourceKind: .subAgentReview,
+                turns: [
+                    .init(
+                        id: "review-boundaries",
+                        state: .completed,
+                        items: [
+                            .init(
+                                id: "prior-review-output",
+                                kind: .exitedReviewMode,
+                                content: .log("No issues found.")
+                            ),
+                            .init(
+                                id: "later-review-entry",
+                                kind: .enteredReviewMode,
+                                content: .log("current changes")
+                            ),
+                        ]
+                    ),
+                    .init(
+                        id: "candidate-turn",
+                        state: .completed,
+                        items: [
+                            .init(
+                                id: "candidate-user-1",
+                                kind: .userMessage,
+                                content: .message(.init(
+                                    id: "candidate-user-1",
+                                    role: .user,
+                                    text: "current changes"
+                                ))
+                            ),
+                            .init(
+                                id: "candidate-user-2",
+                                kind: .userMessage,
+                                content: .message(.init(
+                                    id: "candidate-user-2",
+                                    role: .user,
+                                    text: "current changes"
+                                ))
+                            ),
+                            .init(
+                                id: "candidate-assistant",
+                                kind: .agentMessage,
+                                content: .message(.init(
+                                    id: "candidate-assistant",
+                                    role: .assistant,
+                                    text: "Still running."
+                                ))
+                            ),
+                        ]
+                    ),
+                ]
+            ),
+            workspace: nil
+        )
+
+        let response = try #require(
+            chat.items(in: "candidate-turn").first { $0.itemID == "candidate-assistant" }
+        )
+        #expect(response.origin == .currentV2Item)
+        #expect(response.semanticRelation == nil)
     }
 
     @Test("started review coalesces multiple synthesized rollout records into the live turn")

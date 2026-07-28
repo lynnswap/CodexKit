@@ -147,6 +147,13 @@ package actor CodexAppServerNotificationRouter {
         }
     }
 
+    package func seedCurrentTurnSnapshot(
+        _ snapshot: CodexTurnSnapshot,
+        threadID: CodexThreadID
+    ) {
+        threadEventHub.seedCurrentTurnSnapshot(snapshot, for: threadID)
+    }
+
     package func accountEvents() async -> CodexAccountEvents {
         return await accountEventHub.events()
     }
@@ -832,9 +839,13 @@ package actor CodexAppServerNotificationRouter {
             ))
         }
         let snapshot = CodexAppServer.turnSnapshots(from: [turn])[0]
+        // A terminal notification may carry only a sparse summary; without
+        // itemsView, omissions cannot be treated as authoritative.
+        let transcriptItemsLoadState = turn.itemsLoadState ?? .notLoaded
         let response = CodexResponse(
             turnID: snapshot.id,
             transcript: .init(items: snapshot.items),
+            transcriptItemsLoadState: transcriptItemsLoadState,
             startedAt: snapshot.startedAt,
             completedAt: snapshot.completedAt,
             duration: snapshot.duration

@@ -603,7 +603,11 @@ struct CodexAppServerKitTests {
         )
 
         let events = try await collect(thread.events)
-        #expect(events.contains(.terminal(.completed(.init(turnID: "turn-resume-terminal")))))
+        #expect(events.contains(.terminal(.completed(.init(
+            turnID: "turn-resume-terminal",
+            transcript: .init(),
+            transcriptItemsLoadState: .full
+        )))))
     }
 
     @Test func resumedThreadTransfersNestedProtocolViolationAfterAssociation() async throws {
@@ -668,7 +672,11 @@ struct CodexAppServerKitTests {
         )
 
         let events = try await collect(thread.events)
-        #expect(events.contains(.terminal(.completed(.init(turnID: "turn-read-terminal")))))
+        #expect(events.contains(.terminal(.completed(.init(
+            turnID: "turn-read-terminal",
+            transcript: .init(),
+            transcriptItemsLoadState: .full
+        )))))
     }
 
     @Test func turnListSeedsNestedTerminalReceivedBeforeListResponse() async throws {
@@ -703,7 +711,11 @@ struct CodexAppServerKitTests {
         )
 
         let events = try await collect(thread.events)
-        #expect(events.contains(.terminal(.completed(.init(turnID: "turn-list-turns-terminal")))))
+        #expect(events.contains(.terminal(.completed(.init(
+            turnID: "turn-list-turns-terminal",
+            transcript: .init(),
+            transcriptItemsLoadState: .full
+        )))))
     }
 
     @Test func appServerStartReviewStartsThreadThenReview() async throws {
@@ -2061,6 +2073,17 @@ struct CodexAppServerKitTests {
         #expect(params.target == .baseBranch("main"))
         #expect(params.delivery == .detached)
 
+        var eventIterator = review.events.makeAsyncIterator()
+        let initialEvent = try #require(try await eventIterator.next())
+        #expect(initialEvent == .snapshot(review.initialTurn))
+        let eventsTask = Task {
+            var events = [initialEvent]
+            while let event = try await eventIterator.next() {
+                events.append(event)
+            }
+            return events
+        }
+
         try await transport.emitServerNotification(
             method: "item/completed",
             params: ThreadItemParams(
@@ -2133,7 +2156,7 @@ struct CodexAppServerKitTests {
             params: ThreadIDParams(threadID: "thread-review")
         )
 
-        let events = try await collect(review.events)
+        let events = try await eventsTask.value
         let completedItems = events.compactMap { event -> (item: CodexThreadItem, turnID: CodexTurnID?)? in
             guard case .itemCompleted(let item, let turnID) = event else {
                 return nil

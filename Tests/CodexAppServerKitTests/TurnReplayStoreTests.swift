@@ -264,6 +264,8 @@ struct TurnReplayStoreTests {
 
         let terminalState = try #require(await state.snapshot().terminalSnapshot)
         #expect(terminalState.snapshot.items == [item])
+        #expect(terminalState.snapshot.itemsLoadState == .full)
+        #expect(terminalState.outcome.response.transcriptItemsLoadState == .full)
         #expect(await store.snapshotForTesting().activeGenerationCount == 0)
         #expect(try await iterator.next() == .snapshot(terminalState.snapshot))
         #expect(try await iterator.next() == .terminal(terminalState.outcome))
@@ -276,6 +278,306 @@ struct TurnReplayStoreTests {
         #expect(try await lateIterator.next() == .snapshot(terminalState.snapshot))
         #expect(try await lateIterator.next() == .terminal(terminalState.outcome))
         #expect(try await lateIterator.next() == nil)
+    }
+
+    @Test func terminalReplayPreservesSummaryTranscriptCompleteness() async throws {
+        let store = TurnReplayStore()
+        let state = makeState()
+        let pending = await store.registerPendingOperation(
+            kind: .turn(threadID: "thread-1"),
+            state: state
+        )
+        pending.acceptWrite()
+        let summaryItem = makeItem(id: "summary-message")
+        await store.bind(
+            pending,
+            to: "turn-1",
+            initialSnapshot: .init(
+                id: "turn-1",
+                state: .inProgress,
+                itemsLoadState: .summary,
+                items: [summaryItem]
+            )
+        )
+
+        await store.finish(.completed(.init(
+            turnID: "turn-1",
+            transcript: .init(items: [summaryItem]),
+            transcriptItemsLoadState: .summary
+        )))
+
+        let terminalState = try #require(await state.snapshot().terminalSnapshot)
+        #expect(terminalState.snapshot.itemsLoadState == .summary)
+        #expect(terminalState.outcome.response.transcriptItemsLoadState == .summary)
+    }
+
+    @Test func startedReplayBuildsAFullTerminalTranscript() async throws {
+        let store = TurnReplayStore()
+        let state = makeState()
+        let pending = await store.registerPendingOperation(
+            kind: .turn(threadID: "thread-1"),
+            state: state
+        )
+        pending.acceptWrite()
+        let liveItem = makeItem(id: "live-message")
+        await store.bind(
+            pending,
+            to: "turn-1",
+            initialSnapshot: .init(
+                id: "turn-1",
+                state: .inProgress,
+                itemsLoadState: .notLoaded
+            )
+        )
+        _ = await store.yield(.started("turn-1"), for: "turn-1")
+        _ = await store.yield(.itemCompleted(liveItem), for: "turn-1")
+        let terminalItem = makeItem(id: "terminal-message")
+
+        await store.finish(.completed(.init(
+            turnID: "turn-1",
+            transcript: .init(items: [terminalItem]),
+            transcriptItemsLoadState: .summary
+        )))
+
+        let terminalState = try #require(await state.snapshot().terminalSnapshot)
+        #expect(terminalState.snapshot.itemsLoadState == .full)
+        #expect(terminalState.snapshot.items == [liveItem, terminalItem])
+        #expect(terminalState.outcome.response.transcriptItemsLoadState == .full)
+        #expect(terminalState.outcome.response.transcript.items == [liveItem, terminalItem])
+    }
+
+    @Test func summaryTerminalItemDoesNotReplaceAFullReplayItem() async throws {
+        let store = TurnReplayStore()
+        let state = makeState()
+        let pending = await store.registerPendingOperation(
+            kind: .turn(threadID: "thread-1"),
+            state: state
+        )
+        pending.acceptWrite()
+        await store.bind(
+            pending,
+            to: "turn-1",
+            initialSnapshot: .init(
+                id: "turn-1",
+                state: .inProgress,
+                itemsLoadState: .notLoaded
+            )
+        )
+        let fullItem = makeItem(id: "message", text: "Complete response")
+        _ = await store.yield(.started("turn-1"), for: "turn-1")
+        _ = await store.yield(.itemCompleted(fullItem), for: "turn-1")
+        let summaryItem = makeItem(id: "message", text: "Summary response")
+
+        await store.finish(.completed(.init(
+            turnID: "turn-1",
+            transcript: .init(items: [summaryItem]),
+            transcriptItemsLoadState: .summary
+        )))
+
+        let terminalState = try #require(await state.snapshot().terminalSnapshot)
+        #expect(terminalState.snapshot.itemsLoadState == .full)
+        #expect(terminalState.snapshot.items == [fullItem])
+        #expect(terminalState.outcome.response.transcript.items == [fullItem])
+    }
+
+    @Test func sparseTerminalPreservesItemsObservedAfterAPartialSeed() async throws {
+        let store = TurnReplayStore()
+        let state = makeState()
+        let pending = await store.registerPendingOperation(
+            kind: .turn(threadID: "thread-1"),
+            state: state
+        )
+        pending.acceptWrite()
+        let seededItem = makeItem(id: "seeded", text: "Seeded summary")
+        await store.bind(
+            pending,
+            to: "turn-1",
+            initialSnapshot: .init(
+                id: "turn-1",
+                state: .inProgress,
+                itemsLoadState: .summary,
+                items: [seededItem]
+            )
+        )
+        let observedItem = makeItem(id: "observed", text: "Complete live response")
+        _ = await store.yield(.itemCompleted(observedItem), for: "turn-1")
+        let terminalItem = makeItem(id: "seeded", text: "Terminal summary")
+
+        await store.finish(.completed(.init(
+            turnID: "turn-1",
+            transcript: .init(items: [terminalItem]),
+            transcriptItemsLoadState: .summary
+        )))
+
+        let terminalState = try #require(await state.snapshot().terminalSnapshot)
+        #expect(terminalState.snapshot.itemsLoadState == .summary)
+        #expect(terminalState.snapshot.items == [terminalItem, observedItem])
+        #expect(terminalState.outcome.response.transcript.items == [
+            terminalItem,
+            observedItem,
+        ])
+    }
+
+    @Test func sparseTerminalUpdatesAnUnobservedKindSharingAnObservedRawID() async throws {
+        let store = TurnReplayStore()
+        let state = makeState()
+        let pending = await store.registerPendingOperation(
+            kind: .turn(threadID: "thread-1"),
+            state: state
+        )
+        pending.acceptWrite()
+        let entered = CodexThreadItem(
+            id: "review-marker",
+            kind: .enteredReviewMode,
+            content: .log("Entered")
+        )
+        let staleExit = CodexThreadItem(
+            id: "review-marker",
+            kind: .exitedReviewMode,
+            content: .log("Stale")
+        )
+        await store.bind(
+            pending,
+            to: "turn-1",
+            initialSnapshot: .init(
+                id: "turn-1",
+                state: .inProgress,
+                itemsLoadState: .summary,
+                items: [entered, staleExit]
+            )
+        )
+        let observedEntered = CodexThreadItem(
+            id: "review-marker",
+            kind: .enteredReviewMode,
+            content: .log("Entered live")
+        )
+        _ = await store.yield(.itemCompleted(observedEntered), for: "turn-1")
+        let terminalExit = CodexThreadItem(
+            id: "review-marker",
+            kind: .exitedReviewMode,
+            content: .log("Final review")
+        )
+
+        await store.finish(.completed(.init(
+            turnID: "turn-1",
+            transcript: .init(items: [terminalExit]),
+            transcriptItemsLoadState: .summary
+        )))
+
+        let terminalState = try #require(await state.snapshot().terminalSnapshot)
+        #expect(terminalState.snapshot.items == [observedEntered, terminalExit])
+        #expect(terminalState.outcome.response.transcript.items == [
+            observedEntered,
+            terminalExit,
+        ])
+    }
+
+    @Test func fullTerminalTranscriptRemovesOmittedReplayItems() async throws {
+        let store = TurnReplayStore()
+        let state = makeState()
+        let pending = await store.registerPendingOperation(
+            kind: .turn(threadID: "thread-1"),
+            state: state
+        )
+        pending.acceptWrite()
+        let omittedItem = makeItem(id: "omitted")
+        await store.bind(
+            pending,
+            to: "turn-1",
+            initialSnapshot: .init(
+                id: "turn-1",
+                state: .inProgress,
+                itemsLoadState: .full,
+                items: [omittedItem]
+            )
+        )
+        let retainedItem = makeItem(id: "retained")
+
+        await store.finish(.completed(.init(
+            turnID: "turn-1",
+            transcript: .init(items: [retainedItem]),
+            transcriptItemsLoadState: .full
+        )))
+
+        let terminalState = try #require(await state.snapshot().terminalSnapshot)
+        #expect(terminalState.snapshot.itemsLoadState == .full)
+        #expect(terminalState.snapshot.items == [retainedItem])
+        #expect(terminalState.outcome.response.transcript.items == [retainedItem])
+    }
+
+    @Test func responseCollectionDoesNotRestoreItemsOmittedByAFullTerminal() async throws {
+        let store = TurnReplayStore()
+        let state = makeState()
+        let pending = await store.registerPendingOperation(
+            kind: .turn(threadID: "thread-1"),
+            state: state
+        )
+        pending.acceptWrite()
+        await store.bind(
+            pending,
+            to: "turn-1",
+            initialSnapshot: .init(
+                id: "turn-1",
+                state: .inProgress,
+                itemsLoadState: .notLoaded
+            )
+        )
+        let events = CodexTurnEventSequence(
+            turnID: "turn-1",
+            store: store,
+            state: state
+        )
+        let collection = Task {
+            try await CodexResponseCollector.collect(from: events)
+        }
+        _ = await store.yield(
+            .itemCompleted(makeItem(id: "omitted")),
+            for: "turn-1"
+        )
+        await store.finish(.completed(.init(
+            turnID: "turn-1",
+            transcript: .init(),
+            transcriptItemsLoadState: .full
+        )))
+
+        let outcome = try await collection.value
+        #expect(outcome.response.transcript.items.isEmpty)
+        #expect(outcome.response.transcriptItemsLoadState == .full)
+    }
+
+    @Test func diagnosticBeforeBindingDoesNotUpgradeTranscriptCompleteness() async throws {
+        let store = TurnReplayStore()
+        let state = makeState()
+        let pending = await store.registerPendingOperation(
+            kind: .turn(threadID: "thread-1"),
+            state: state
+        )
+        pending.acceptWrite()
+        _ = await store.routeIfTracked(
+            .unknown(.init(method: "early", params: Data(), turnID: "turn-1")),
+            for: "turn-1"
+        )
+        let summaryItem = makeItem(id: "summary-message")
+        await store.bind(
+            pending,
+            to: "turn-1",
+            initialSnapshot: .init(
+                id: "turn-1",
+                state: .inProgress,
+                itemsLoadState: .summary,
+                items: [summaryItem]
+            )
+        )
+
+        await store.finish(.completed(.init(
+            turnID: "turn-1",
+            transcript: .init(items: [summaryItem]),
+            transcriptItemsLoadState: .summary
+        )))
+
+        let terminalState = try #require(await state.snapshot().terminalSnapshot)
+        #expect(terminalState.snapshot.itemsLoadState == .summary)
+        #expect(terminalState.outcome.response.transcriptItemsLoadState == .summary)
     }
 
     @Test func lateTranscriptSubscriptionReplaysTerminalSnapshot() async throws {
@@ -565,11 +867,11 @@ struct TurnReplayStoreTests {
         )
     }
 
-    private func makeItem(id: String) -> CodexThreadItem {
+    private func makeItem(id: String, text: String? = nil) -> CodexThreadItem {
         .init(
             id: id,
             kind: .agentMessage,
-            content: .message(.init(id: id, role: .assistant, text: id))
+            content: .message(.init(id: id, role: .assistant, text: text ?? id))
         )
     }
 }

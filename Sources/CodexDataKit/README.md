@@ -228,6 +228,13 @@ When a consumer needs the canonical transcript for one loaded turn, use
 context's current items; consumers do not reconstruct `CodexThreadItem` values
 or invent a separate output cache.
 
+CodexDataKit preserves every raw review rollout item while normalizing
+the app-server's live and persisted companion assistant representations to
+`CodexThreadItem.SemanticRelation.companionOf(.exitedReviewMode)`. Renderers use
+that relation instead of inferring review identity from item text, turn
+adjacency, or the top-level thread source. Persisted review rollouts may retain
+the client source that initiated them.
+
 ## Live Chat Observation
 
 Use `CodexChat.observe()` or `CodexModelContext.observe(_:)` when a detail view needs an immutable transcript projection followed by live app-server updates.
