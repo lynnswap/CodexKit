@@ -1340,6 +1340,9 @@ public final class CodexChat: CodexPersistentModel {
             preservesExistingUsage: true
         ))
         changes.append(contentsOf: mergeItems(response.transcript.items, turnID: response.turnID))
+        changes.append(contentsOf: normalizeCompletedReviewRolloutCompanion(
+            in: response.turnID
+        ))
         if let terminalStatus = turnsByID[response.turnID]?.status {
             changes.append(contentsOf: terminalizeActiveItems(
                 in: response.turnID,
@@ -1377,6 +1380,9 @@ public final class CodexChat: CodexPersistentModel {
                 preservesExistingUsage: true
             ))
             changes.append(contentsOf: mergeItems(snapshot.items, turnID: snapshot.id))
+            changes.append(contentsOf: normalizeCompletedReviewRolloutCompanion(
+                in: snapshot.id
+            ))
             switch snapshot.state {
             case .inProgress:
                 changes.appendIfPresent(markRunningIfNeeded(turnID: snapshot.id))
@@ -1674,6 +1680,36 @@ public final class CodexChat: CodexPersistentModel {
             return item
         }
         return reviewRolloutCompanion(item)
+    }
+
+    private func normalizeCompletedReviewRolloutCompanion(
+        in turnID: CodexTurnID
+    ) -> [CodexChatMutation] {
+        guard sourceKind == .subAgentReview,
+            let turn = turnsByID[turnID],
+            let state = turn.state,
+            turn.status?.isTerminal == true,
+            let turnItems = itemsByTurnID[turnID]
+        else {
+            return []
+        }
+        let record = CodexTurnSnapshot(
+            id: turnID,
+            state: state,
+            itemsLoadState: turn.itemsLoadState,
+            items: turnItems.map(\.threadItem)
+        )
+        guard let agentIndex = persistedReviewCompanionAgentIndex(in: record),
+            hasPrecedingReviewExit(before: turnID),
+            turnItems[agentIndex].semanticRelation == nil
+        else {
+            return []
+        }
+        return mergeItems(
+            [turnItems[agentIndex].threadItem],
+            turnID: turnID,
+            itemsLoadState: turnItems[agentIndex].itemsLoadState
+        )
     }
 
     private func hasPrecedingReviewExit(before turnID: CodexTurnID) -> Bool {

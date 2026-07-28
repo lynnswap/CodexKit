@@ -11450,6 +11450,79 @@ struct CodexModelContextTests {
         #expect(reviewerMessage.semanticRelation == .companionOf(.exitedReviewMode))
     }
 
+    @Test("live persisted review companion is classified when its turn completes")
+    func livePersistedReviewCompanionIsClassifiedWhenItsTurnCompletes() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let chat = CodexChat(id: "review-chat", modelContext: context)
+
+        chat.apply(
+            .init(
+                id: chat.id,
+                sourceKind: .subAgentReview,
+                turns: [
+                    .init(
+                        id: "review-boundary",
+                        state: .completed,
+                        items: [
+                            .init(
+                                id: "review-output",
+                                kind: .exitedReviewMode,
+                                content: .log("No issues found.")
+                            ),
+                        ]
+                    ),
+                ]
+            ),
+            workspace: nil
+        )
+        _ = chat.apply(.turnStarted("reviewer-turn"))
+        for id in ["reviewer-user-1", "reviewer-user-2"] {
+            _ = chat.apply(.itemCompleted(
+                .init(
+                    id: id,
+                    kind: .userMessage,
+                    content: .message(.init(
+                        id: id,
+                        role: .user,
+                        text: "current changes"
+                    ))
+                ),
+                turnID: "reviewer-turn"
+            ))
+        }
+        _ = chat.apply(.itemCompleted(
+            .init(
+                id: "reviewer-assistant",
+                kind: .agentMessage,
+                content: .message(.init(
+                    id: "reviewer-assistant",
+                    role: .assistant,
+                    text: "No issues found."
+                ))
+            ),
+            turnID: "reviewer-turn"
+        ))
+
+        let liveMessage = try #require(
+            chat.items(in: "reviewer-turn").first {
+                $0.itemID == "reviewer-assistant"
+            }
+        )
+        #expect(liveMessage.origin == .currentV2Item)
+        #expect(liveMessage.semanticRelation == nil)
+
+        _ = chat.apply(.terminal(.completed(.init(turnID: "reviewer-turn"))))
+
+        let completedMessage = try #require(
+            chat.items(in: "reviewer-turn").first {
+                $0.itemID == "reviewer-assistant"
+            }
+        )
+        #expect(completedMessage.origin == .reviewRolloutAssistant)
+        #expect(completedMessage.semanticRelation == .companionOf(.exitedReviewMode))
+    }
+
     @Test("ordinary chat does not classify a post-review duplicate prompt turn")
     func ordinaryChatDoesNotClassifyPostReviewDuplicatePromptTurn() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
