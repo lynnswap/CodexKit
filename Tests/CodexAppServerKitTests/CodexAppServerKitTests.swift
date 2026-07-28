@@ -2061,6 +2061,10 @@ struct CodexAppServerKitTests {
         #expect(params.target == .baseBranch("main"))
         #expect(params.delivery == .detached)
 
+        var eventIterator = review.events.makeAsyncIterator()
+        let initialEvent = try #require(try await eventIterator.next())
+        #expect(initialEvent == .snapshot(review.initialTurn))
+
         try await transport.emitServerNotification(
             method: "item/completed",
             params: ThreadItemParams(
@@ -2133,7 +2137,10 @@ struct CodexAppServerKitTests {
             params: ThreadIDParams(threadID: "thread-review")
         )
 
-        let events = try await collect(review.events)
+        var events = [initialEvent]
+        while let event = try await eventIterator.next() {
+            events.append(event)
+        }
         let completedItems = events.compactMap { event -> (item: CodexThreadItem, turnID: CodexTurnID?)? in
             guard case .itemCompleted(let item, let turnID) = event else {
                 return nil
