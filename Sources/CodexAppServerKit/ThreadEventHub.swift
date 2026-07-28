@@ -1088,7 +1088,9 @@ private struct ThreadEventGeneration: Equatable, Sendable {
     private mutating func finalizeSnapshot(with outcome: CodexTurnOutcome) {
         let response = outcome.response
         var items = response.transcript.items
-        if let existing = snapshot?.items {
+        if response.transcriptItemsLoadState != .full,
+           let existing = snapshot?.items
+        {
             var indexes = Dictionary(uniqueKeysWithValues: items.indices.map { (items[$0].id, $0) })
             for item in existing {
                 if let index = indexes[item.id] {
@@ -1115,13 +1117,29 @@ private struct ThreadEventGeneration: Equatable, Sendable {
         snapshot = .init(
             id: response.turnID,
             state: state,
-            itemsLoadState: .full,
+            itemsLoadState: moreCompleteItemsLoadState(
+                snapshot?.itemsLoadState ?? .notLoaded,
+                response.transcriptItemsLoadState
+            ),
             items: items,
             startedAt: response.startedAt ?? snapshot?.startedAt,
             completedAt: response.completedAt ?? snapshot?.completedAt,
             duration: response.duration ?? snapshot?.duration
         )
         latestUsage = response.usage ?? latestUsage
+    }
+
+    private func moreCompleteItemsLoadState(
+        _ lhs: CodexTurnItemsLoadState,
+        _ rhs: CodexTurnItemsLoadState
+    ) -> CodexTurnItemsLoadState {
+        if lhs == .full || rhs == .full {
+            return .full
+        }
+        if lhs == .summary || rhs == .summary {
+            return .summary
+        }
+        return .notLoaded
     }
 
     private func finalized(_ outcome: CodexTurnOutcome) -> CodexTurnOutcome {

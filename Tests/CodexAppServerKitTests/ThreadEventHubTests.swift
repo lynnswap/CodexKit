@@ -386,6 +386,42 @@ struct ThreadEventHubTests {
         events.cancel()
     }
 
+    @Test func sparseTerminalPreservesPartialSnapshotCompletenessForLateSubscribers() async throws {
+        let hub = ThreadEventHub()
+        hub.beginGeneration(for: "thread-1", including: "turn-1")
+        let seededItem = messageItem(id: "seeded", text: "Seeded summary")
+        try hub.route(.snapshot(.init(
+            id: "turn-1",
+            state: .inProgress,
+            itemsLoadState: .summary,
+            items: [seededItem]
+        )), for: "thread-1")
+        let observedItem = messageItem(id: "observed", text: "Observed live item")
+        try hub.route(
+            .itemCompleted(observedItem, turnID: "turn-1"),
+            for: "thread-1"
+        )
+        let terminalItem = messageItem(id: "terminal", text: "Terminal summary")
+        let outcome = CodexTurnOutcome.completed(.init(
+            turnID: "turn-1",
+            transcript: .init(items: [terminalItem]),
+            transcriptItemsLoadState: .summary
+        ))
+        try hub.route(.terminal(outcome), for: "thread-1")
+
+        let events = hub.events(for: "thread-1")
+        var iterator = events.makeAsyncIterator()
+        let event = try #require(try await iterator.next())
+        guard case .snapshot(let snapshot) = event else {
+            Issue.record("Expected a compact terminal snapshot.")
+            return
+        }
+        #expect(snapshot.itemsLoadState == .summary)
+        #expect(snapshot.items.map(\.id) == ["terminal", "seeded", "observed"])
+        #expect(try await iterator.next() == .terminal(outcome))
+        events.cancel()
+    }
+
     @Test func terminalIsExactlyOnceNonDroppableAndDoesNotFinishTheThread() async throws {
         let hub = ThreadEventHub()
         hub.beginGeneration(for: "thread-1", including: "turn-1")
