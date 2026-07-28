@@ -11669,7 +11669,17 @@ struct CodexModelContextTests {
         )
         #expect(correctedMessage.origin == .currentV2Item)
         #expect(correctedMessage.semanticRelation == nil)
+        #expect(chat.items(in: "corrected-review").contains {
+            $0.itemID == "review-exit"
+        } == false)
         let correctedUpdates = chat.observationUpdates(for: correctedChanges)
+        #expect(correctedUpdates.contains { update in
+            guard case .itemRemoved(let locator) = update else {
+                return false
+            }
+            return locator.id == "review-exit"
+                && locator.turnID == "corrected-review"
+        })
         #expect(correctedUpdates.contains { update in
             guard case .itemUpdated(let item, let turnID, _) = update else {
                 return false
@@ -11679,6 +11689,27 @@ struct CodexModelContextTests {
                 && item.origin == .currentV2Item
                 && item.semanticRelation == nil
         })
+
+        _ = chat.apply(.itemUpdated(
+            .init(
+                id: "reviewer-assistant",
+                kind: .agentMessage,
+                content: .message(.init(
+                    id: "reviewer-assistant",
+                    role: .assistant,
+                    text: "Updated ordinary assistant response"
+                ))
+            ),
+            turnID: "corrected-review"
+        ))
+
+        let liveUpdatedMessage = try #require(
+            chat.items(in: "corrected-review").first {
+                $0.itemID == "reviewer-assistant"
+            }
+        )
+        #expect(liveUpdatedMessage.origin == .currentV2Item)
+        #expect(liveUpdatedMessage.semanticRelation == nil)
     }
 
     @Test("first snapshot classifies a persisted companion after a review exit")

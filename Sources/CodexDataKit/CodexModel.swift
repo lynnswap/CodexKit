@@ -1414,6 +1414,12 @@ public final class CodexChat: CodexPersistentModel {
                     before: incomingSnapshot.id
                 )
             )
+            if snapshot.itemsAreAuthoritative {
+                changes.append(contentsOf: removeItemsOmittedFromAuthoritativeSnapshot(
+                    snapshot.items,
+                    turnID: snapshot.id
+                ))
+            }
             changes.append(contentsOf: mergeItems(
                 snapshot.items,
                 turnID: snapshot.id,
