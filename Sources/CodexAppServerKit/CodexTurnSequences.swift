@@ -765,7 +765,10 @@ private struct CodexResponseAccumulator {
 
     func finalized(_ response: CodexResponse) -> CodexResponse {
         var response = response
-        let finalizedTranscript = finalizedTranscript(for: response.transcript)
+        let finalizedTranscript = finalizedTranscript(
+            for: response.transcript,
+            itemsLoadState: response.transcriptItemsLoadState
+        )
         response.transcript = finalizedTranscript
         if response.usage == nil {
             response.usage = usage
@@ -790,7 +793,13 @@ private struct CodexResponseAccumulator {
         }
     }
 
-    private func finalizedTranscript(for terminalTranscript: CodexTranscript) -> CodexTranscript {
+    private func finalizedTranscript(
+        for terminalTranscript: CodexTranscript,
+        itemsLoadState: CodexTurnItemsLoadState
+    ) -> CodexTranscript {
+        guard itemsLoadState != .full else {
+            return terminalTranscript
+        }
         let liveTranscript = transcript
         guard terminalTranscript.items.isEmpty == false else {
             return liveTranscript

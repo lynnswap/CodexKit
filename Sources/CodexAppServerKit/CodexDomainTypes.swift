@@ -2019,6 +2019,8 @@ public enum CodexTurnStatus: Equatable, Sendable {
 public struct CodexResponse: Identifiable, Equatable, Sendable {
     public var turnID: CodexTurnID
     public var transcript: CodexTranscript
+    /// Completeness of the transcript items carried by this response.
+    public var transcriptItemsLoadState: CodexTurnItemsLoadState
     public var usage: CodexTokenUsage?
     public var startedAt: Date?
     public var completedAt: Date?
@@ -2030,7 +2032,26 @@ public struct CodexResponse: Identifiable, Equatable, Sendable {
 
     public init(
         turnID: CodexTurnID,
-        transcript: CodexTranscript = .init(),
+        usage: CodexTokenUsage? = nil,
+        startedAt: Date? = nil,
+        completedAt: Date? = nil,
+        duration: Duration? = nil
+    ) {
+        self.init(
+            turnID: turnID,
+            transcript: .init(),
+            transcriptItemsLoadState: .notLoaded,
+            usage: usage,
+            startedAt: startedAt,
+            completedAt: completedAt,
+            duration: duration
+        )
+    }
+
+    public init(
+        turnID: CodexTurnID,
+        transcript: CodexTranscript,
+        transcriptItemsLoadState: CodexTurnItemsLoadState = .full,
         usage: CodexTokenUsage? = nil,
         startedAt: Date? = nil,
         completedAt: Date? = nil,
@@ -2038,6 +2059,7 @@ public struct CodexResponse: Identifiable, Equatable, Sendable {
     ) {
         self.turnID = turnID
         self.transcript = transcript
+        self.transcriptItemsLoadState = transcriptItemsLoadState
         self.usage = usage
         self.startedAt = startedAt
         self.completedAt = completedAt
@@ -2277,7 +2299,11 @@ package struct CodexResponseStream: AsyncSequence, Sendable {
             let connectionLease = try await turn.state.connectionLeaseForSiblingGeneration()
             state = await turn.turnReplayStore.restoreGeneration(
                 turnID: cancelledTurnID,
-                initialSnapshot: .init(id: cancelledTurnID, state: .inProgress),
+                initialSnapshot: .init(
+                    id: cancelledTurnID,
+                    state: .inProgress,
+                    itemsLoadState: .notLoaded
+                ),
                 connectionLease: connectionLease
             )
         }

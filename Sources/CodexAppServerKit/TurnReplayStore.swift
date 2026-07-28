@@ -885,7 +885,11 @@ private struct TurnReplayAccumulator {
     private var hasRoutedEvent = false
 
     init(turnID: CodexTurnID) {
-        self.snapshot = .init(id: turnID, state: .inProgress)
+        self.snapshot = .init(
+            id: turnID,
+            state: .inProgress,
+            itemsLoadState: .notLoaded
+        )
     }
 
     var progress: CodexReviewProgress {
@@ -912,7 +916,10 @@ private struct TurnReplayAccumulator {
         snapshot = .init(
             id: snapshot.id,
             state: snapshot.state,
-            itemsLoadState: initialSnapshot.itemsLoadState,
+            itemsLoadState: moreCompleteItemsLoadState(
+                snapshot.itemsLoadState,
+                initialSnapshot.itemsLoadState
+            ),
             items: items,
             startedAt: snapshot.startedAt ?? initialSnapshot.startedAt,
             completedAt: snapshot.completedAt ?? initialSnapshot.completedAt,
@@ -925,6 +932,7 @@ private struct TurnReplayAccumulator {
         switch event {
         case .started(let turnID):
             precondition(turnID == snapshot.id)
+            snapshot.itemsLoadState = .full
         case .snapshot(let newSnapshot):
             precondition(newSnapshot.id == snapshot.id)
             snapshot = newSnapshot
@@ -972,7 +980,7 @@ private struct TurnReplayAccumulator {
             snapshot: .init(
                 id: response.turnID,
                 state: state,
-                itemsLoadState: .full,
+                itemsLoadState: response.transcriptItemsLoadState,
                 items: response.transcript.items,
                 startedAt: response.startedAt,
                 completedAt: response.completedAt,
@@ -1001,9 +1009,30 @@ private struct TurnReplayAccumulator {
 
     private func finalized(_ response: CodexResponse) -> CodexResponse {
         var response = response
-        if response.transcript.items.isEmpty {
+        let finalizedItemsLoadState = moreCompleteItemsLoadState(
+            snapshot.itemsLoadState,
+            response.transcriptItemsLoadState
+        )
+        if response.transcriptItemsLoadState != .full,
+           snapshot.itemsLoadState == .full
+        {
+            var items = snapshot.items
+            for terminalItem in response.transcript.items {
+                if items.contains(where: {
+                    $0.id == terminalItem.id && $0.kind == terminalItem.kind
+                }) {
+                    continue
+                } else {
+                    items.append(terminalItem)
+                }
+            }
+            response.transcript = .init(items: items)
+        } else if response.transcriptItemsLoadState != .full,
+                  response.transcript.items.isEmpty
+        {
             response.transcript = .init(items: snapshot.items)
-        } else if response.transcript.reviewOutputText == nil,
+        } else if response.transcriptItemsLoadState != .full,
+                  response.transcript.reviewOutputText == nil,
                   let reviewOutput = snapshot.items.last(where: {
                       $0.kind == .exitedReviewMode && $0.text?.isEmpty == false
                   })
@@ -1021,6 +1050,7 @@ private struct TurnReplayAccumulator {
         if response.usage == nil {
             response.usage = usage
         }
+        response.transcriptItemsLoadState = finalizedItemsLoadState
         return response
     }
 
@@ -1041,4 +1071,17 @@ private struct TurnReplayAccumulator {
         }
         return item
     }
+}
+
+private func moreCompleteItemsLoadState(
+    _ lhs: CodexTurnItemsLoadState,
+    _ rhs: CodexTurnItemsLoadState
+) -> CodexTurnItemsLoadState {
+    if lhs == .full || rhs == .full {
+        return .full
+    }
+    if lhs == .summary || rhs == .summary {
+        return .summary
+    }
+    return .notLoaded
 }

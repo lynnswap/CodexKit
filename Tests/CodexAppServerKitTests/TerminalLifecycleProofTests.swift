@@ -232,7 +232,11 @@ struct TerminalLifecycleProofTests {
     ) async -> CodexReviewSession {
         await thread.reviewSession(
             .init(threadID: thread.id, turnID: turnID),
-            initialTurn: .init(id: turnID, state: .inProgress)
+            initialTurn: .init(
+                id: turnID,
+                state: .inProgress,
+                itemsLoadState: .notLoaded
+            )
         )
     }
 }

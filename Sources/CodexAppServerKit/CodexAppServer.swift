@@ -554,7 +554,11 @@ public actor CodexAppServer {
             threadOptions.model = identity.model
         }
         let activeTurnThreadID = identity.activeTurnThreadID
-        let initialTurn = CodexTurnSnapshot(id: identity.turnID, state: .inProgress)
+        let initialTurn = CodexTurnSnapshot(
+            id: identity.turnID,
+            state: .inProgress,
+            itemsLoadState: .notLoaded
+        )
         let reservation = await turnReplayStore.reserveRestoredGeneration(
             turnID: identity.turnID,
             initialSnapshot: initialTurn,

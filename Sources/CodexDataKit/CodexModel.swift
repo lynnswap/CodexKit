@@ -1376,16 +1376,28 @@ public final class CodexChat: CodexPersistentModel {
         {
             updatedAt = completedAt
         }
+        let terminalItemsLoadState = mostCompleteItemsLoadState(
+            turnsByID[response.turnID]?.itemsLoadState ?? .notLoaded,
+            response.transcriptItemsLoadState
+        )
         changes.appendIfPresent(upsertTurn(
             id: response.turnID,
             state: state,
+            itemsLoadState: terminalItemsLoadState,
             usage: response.usage,
             preservesExistingUsage: true
         ))
+        if response.transcriptItemsLoadState == .full {
+            changes.append(contentsOf: removeItemsOmittedFromAuthoritativeSnapshot(
+                response.transcript.items,
+                turnID: response.turnID
+            ))
+        }
         changes.append(contentsOf: mergeItems(
             response.transcript.items,
             turnID: response.turnID,
-            reviewCompanionEvidence: .orderedItems
+            reviewCompanionEvidence: .orderedItems,
+            itemsLoadState: response.transcriptItemsLoadState
         ))
         changes.append(contentsOf: normalizeReviewRolloutCompanion(
             in: response.turnID

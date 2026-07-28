@@ -12067,6 +12067,218 @@ struct CodexModelContextTests {
         #expect(assistant.semanticRelation == nil)
     }
 
+    @Test("terminal transcript provides full review companion evidence")
+    func terminalTranscriptProvidesFullReviewCompanionEvidence() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let chat = CodexChat(id: "terminal-review-chat", modelContext: context)
+        _ = chat.apply(.turnStarted("terminal-review"))
+
+        let terminalChanges = chat.apply(.terminal(.completed(.init(
+            turnID: "terminal-review",
+            transcript: .init(items: [
+                .init(
+                    id: "review-exit",
+                    kind: .exitedReviewMode,
+                    content: .log("No issues found.")
+                ),
+                .init(
+                    id: "reviewer-user-1",
+                    kind: .userMessage,
+                    content: .message(.init(
+                        id: "reviewer-user-1",
+                        role: .user,
+                        text: "current changes"
+                    ))
+                ),
+                .init(
+                    id: "reviewer-user-2",
+                    kind: .userMessage,
+                    content: .message(.init(
+                        id: "reviewer-user-2",
+                        role: .user,
+                        text: "current changes"
+                    ))
+                ),
+                .init(
+                    id: "reviewer-assistant",
+                    kind: .agentMessage,
+                    content: .message(.init(
+                        id: "reviewer-assistant",
+                        role: .assistant,
+                        text: "No issues found."
+                    ))
+                ),
+            ]),
+            transcriptItemsLoadState: .full
+        ))))
+
+        let turn = try #require(chat.turn(id: "terminal-review"))
+        #expect(turn.itemsLoadState == .full)
+        let reviewerMessage = try #require(
+            chat.items(in: "terminal-review").first {
+                $0.itemID == "reviewer-assistant"
+            }
+        )
+        #expect(reviewerMessage.origin == .reviewRolloutAssistant)
+        #expect(reviewerMessage.semanticRelation == .companionOf(.exitedReviewMode))
+        let terminalUpdates = chat.observationUpdates(for: terminalChanges)
+        #expect(terminalUpdates.contains { update in
+            guard case .itemInserted(let item, let turnID, _) = update else {
+                return false
+            }
+            return item.id == "reviewer-assistant"
+                && turnID == "terminal-review"
+                && item.semanticRelation == .companionOf(.exitedReviewMode)
+        })
+    }
+
+    @Test("summary terminal transcript does not provide full companion evidence")
+    func summaryTerminalTranscriptDoesNotProvideFullCompanionEvidence() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let chat = CodexChat(id: "summary-terminal-review-chat", modelContext: context)
+        _ = chat.apply(.turnStarted("summary-terminal-review"))
+
+        _ = chat.apply(.terminal(.completed(.init(
+            turnID: "summary-terminal-review",
+            transcript: .init(items: [
+                .init(
+                    id: "review-exit",
+                    kind: .exitedReviewMode,
+                    content: .log("No issues found.")
+                ),
+                .init(
+                    id: "reviewer-user-1",
+                    kind: .userMessage,
+                    content: .message(.init(
+                        id: "reviewer-user-1",
+                        role: .user,
+                        text: "current changes"
+                    ))
+                ),
+                .init(
+                    id: "reviewer-user-2",
+                    kind: .userMessage,
+                    content: .message(.init(
+                        id: "reviewer-user-2",
+                        role: .user,
+                        text: "current changes"
+                    ))
+                ),
+                .init(
+                    id: "reviewer-assistant",
+                    kind: .agentMessage,
+                    content: .message(.init(
+                        id: "reviewer-assistant",
+                        role: .assistant,
+                        text: "No issues found."
+                    ))
+                ),
+            ]),
+            transcriptItemsLoadState: .summary
+        ))))
+
+        let turn = try #require(chat.turn(id: "summary-terminal-review"))
+        #expect(turn.itemsLoadState == .summary)
+        let reviewerMessage = try #require(
+            chat.items(in: "summary-terminal-review").first {
+                $0.itemID == "reviewer-assistant"
+            }
+        )
+        #expect(reviewerMessage.origin == .currentV2Item)
+        #expect(reviewerMessage.semanticRelation == nil)
+    }
+
+    @Test("summary terminal transcript preserves an existing full turn")
+    func summaryTerminalTranscriptPreservesExistingFullTurn() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let chat = CodexChat(id: "full-terminal-chat", modelContext: context)
+        let fullItem = CodexThreadItem(
+            id: "assistant",
+            kind: .agentMessage,
+            content: .message(.init(
+                id: "assistant",
+                role: .assistant,
+                text: "Complete response"
+            ))
+        )
+        _ = chat.apply(.snapshot(.init(
+            id: "turn",
+            state: .inProgress,
+            itemsLoadState: .full,
+            items: [fullItem]
+        )))
+
+        _ = chat.apply(.terminal(.completed(.init(
+            turnID: "turn",
+            transcript: .init(items: [
+                .init(
+                    id: "assistant",
+                    kind: .agentMessage,
+                    content: .message(.init(
+                        id: "assistant",
+                        role: .assistant,
+                        text: "Summary response"
+                    ))
+                ),
+            ]),
+            transcriptItemsLoadState: .summary
+        ))))
+
+        let turn = try #require(chat.turn(id: "turn"))
+        #expect(turn.itemsLoadState == .full)
+        let assistant = try #require(
+            chat.items(in: "turn").first { $0.itemID == "assistant" }
+        )
+        #expect(assistant.text == "Complete response")
+        #expect(assistant.itemsLoadState == .full)
+    }
+
+    @Test("full terminal transcript removes omitted live items")
+    func fullTerminalTranscriptRemovesOmittedLiveItems() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let chat = CodexChat(id: "authoritative-terminal-chat", modelContext: context)
+        _ = chat.apply(.itemCompleted(
+            .init(
+                id: "omitted",
+                kind: .agentMessage,
+                content: .message(.init(
+                    id: "omitted",
+                    role: .assistant,
+                    text: "Omitted live item"
+                ))
+            ),
+            turnID: "turn"
+        ))
+        let retainedItem = CodexThreadItem(
+            id: "retained",
+            kind: .agentMessage,
+            content: .message(.init(
+                id: "retained",
+                role: .assistant,
+                text: "Retained terminal item"
+            ))
+        )
+
+        let changes = chat.apply(.terminal(.completed(.init(
+            turnID: "turn",
+            transcript: .init(items: [retainedItem]),
+            transcriptItemsLoadState: .full
+        ))))
+
+        #expect(chat.items(in: "turn").map(\.itemID) == ["retained"])
+        let updates = chat.observationUpdates(for: changes)
+        #expect(updates.contains { update in
+            guard case .itemRemoved(let locator) = update else {
+                return false
+            }
+            return locator.id == "omitted" && locator.turnID == "turn"
+        })
+    }
+
     @Test("live persisted review companion waits for a full completion snapshot")
     func livePersistedReviewCompanionWaitsForFullCompletionSnapshot() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()

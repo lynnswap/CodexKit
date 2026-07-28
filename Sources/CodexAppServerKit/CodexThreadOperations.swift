@@ -319,7 +319,8 @@ extension CodexThread {
         let reviewThreadID = identity.activeTurnThreadID
         let initialTurn = initialTurn ?? CodexTurnSnapshot(
             id: identity.turnID,
-            state: .inProgress
+            state: .inProgress,
+            itemsLoadState: .notLoaded
         )
         let state: TurnGenerationHandleState
         if let proposedState {
@@ -853,7 +854,11 @@ private func interruptCodexTurnPreparingTarget(
                 let cancellation = CodexTurnCancellation(threadID: threadID, turnID: activeTurn)
                 let state = await store.restoreGeneration(
                     turnID: activeTurn,
-                    initialSnapshot: .init(id: activeTurn, state: .inProgress),
+                    initialSnapshot: .init(
+                        id: activeTurn,
+                        state: .inProgress,
+                        itemsLoadState: .notLoaded
+                    ),
                     connectionLease: connectionLease
                 )
                 await router.adoptThreadEventGeneration(threadID, including: activeTurn)
