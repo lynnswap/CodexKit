@@ -940,6 +940,9 @@ public final class CodexChat: CodexPersistentModel {
     private func sameTurnReviewCompanionAgentIndex(
         in record: CodexTurnSnapshot
     ) -> Int? {
+        guard record.itemsLoadState == .full else {
+            return nil
+        }
         for index in record.items.indices
         where record.items[index].kind == .agentMessage
             && record.items[index].semanticRelation == nil
@@ -957,8 +960,7 @@ public final class CodexChat: CodexPersistentModel {
             if trailingNarrativeItems.isEmpty {
                 return index
             }
-            guard record.itemsLoadState == .full,
-                trailingNarrativeItems.count == 2,
+            guard trailingNarrativeItems.count == 2,
                 trailingNarrativeItems.allSatisfy({ $0.kind == .userMessage }),
                 trailingNarrativeItems.allSatisfy({ normalizedMessageText($0) != nil }),
                 Set(trailingNarrativeItems.compactMap(normalizedMessageText)).count == 1
@@ -1270,6 +1272,7 @@ public final class CodexChat: CodexPersistentModel {
             mergeItems(
                 record.items,
                 turnID: record.id,
+                reviewCompanionEvidence: .snapshotBatch,
                 itemsLoadState: record.itemsLoadState
             )
         }
@@ -1354,7 +1357,11 @@ public final class CodexChat: CodexPersistentModel {
             usage: response.usage,
             preservesExistingUsage: true
         ))
-        changes.append(contentsOf: mergeItems(response.transcript.items, turnID: response.turnID))
+        changes.append(contentsOf: mergeItems(
+            response.transcript.items,
+            turnID: response.turnID,
+            reviewCompanionEvidence: .orderedItems
+        ))
         changes.append(contentsOf: normalizeReviewRolloutCompanion(
             in: response.turnID
         ))
@@ -1397,6 +1404,7 @@ public final class CodexChat: CodexPersistentModel {
             changes.append(contentsOf: mergeItems(
                 snapshot.items,
                 turnID: snapshot.id,
+                reviewCompanionEvidence: .snapshotBatch,
                 itemsLoadState: snapshot.itemsLoadState
             ))
             changes.append(contentsOf: normalizeReviewRolloutCompanion(
@@ -1432,7 +1440,7 @@ public final class CodexChat: CodexPersistentModel {
             ))
             changes.append(contentsOf: mergeItems([
                 itemByApplyingLifecycleStatus(.inProgress, to: item),
-            ], turnID: turnID))
+            ], turnID: turnID, reviewCompanionEvidence: .orderedItems))
             changes.appendIfPresent(markRunningIfNeeded(turnID: turnID))
         case .itemCompleted(let item, let turnID):
             insertRunningTurnIfMissing(turnID, into: &changes)
@@ -1442,7 +1450,7 @@ public final class CodexChat: CodexPersistentModel {
             ))
             changes.append(contentsOf: mergeItems([
                 itemByApplyingLifecycleStatus(.completed, to: item),
-            ], turnID: turnID))
+            ], turnID: turnID, reviewCompanionEvidence: .orderedItems))
         case .itemUpdated(let item, let turnID):
             insertRunningTurnIfMissing(turnID, into: &changes)
             changes.append(contentsOf: terminalizeActiveItemsBeforeAppending(
@@ -1452,6 +1460,7 @@ public final class CodexChat: CodexPersistentModel {
             changes.append(contentsOf: mergeItems(
                 [item],
                 turnID: turnID,
+                reviewCompanionEvidence: .orderedItems,
                 accumulatesOutputDeltas: isOutputDeltaUpdate(item)
             ))
             changes.appendIfPresent(markRunningIfNeeded(turnID: turnID))
@@ -1466,7 +1475,11 @@ public final class CodexChat: CodexPersistentModel {
                 item,
                 turnID: turnID
             ))
-            changes.append(contentsOf: mergeItems([item], turnID: turnID))
+            changes.append(contentsOf: mergeItems(
+                [item],
+                turnID: turnID,
+                reviewCompanionEvidence: .orderedItems
+            ))
             changes.appendIfPresent(markRunningIfNeeded(turnID: turnID))
         case .messageDelta(let delta, let turnID):
             insertRunningTurnIfMissing(turnID, into: &changes)
@@ -1548,10 +1561,16 @@ public final class CodexChat: CodexPersistentModel {
         hasAppliedLiveTurnItemUpdates = true
     }
 
+    private enum ReviewCompanionEvidence {
+        case snapshotBatch
+        case orderedItems
+    }
+
     @discardableResult
     private func mergeItems(
         _ incomingItems: [CodexThreadItem],
         turnID: CodexTurnID?,
+        reviewCompanionEvidence: ReviewCompanionEvidence,
         itemsLoadState: CodexTurnItemsLoadState = .full,
         accumulatesOutputDeltas: Bool = false
     ) -> [CodexChatMutation] {
@@ -1560,9 +1579,10 @@ public final class CodexChat: CodexPersistentModel {
         }
         var changes: [CodexChatMutation] = []
         for rawIncomingItem in incomingItems {
-            let incomingItem = normalizingLiveReviewRolloutCompanion(
+            let incomingItem = normalizingReviewRolloutCompanion(
                 rawIncomingItem,
-                turnID: turnID
+                turnID: turnID,
+                evidence: reviewCompanionEvidence
             )
             if incomingItem.kind == .reasoning && incomingItem.id.contains(":summary:") == false
                 && incomingItem.id.contains(":content:") == false
@@ -1660,9 +1680,10 @@ public final class CodexChat: CodexPersistentModel {
         return changes
     }
 
-    private func normalizingLiveReviewRolloutCompanion(
+    private func normalizingReviewRolloutCompanion(
         _ item: CodexThreadItem,
-        turnID: CodexTurnID?
+        turnID: CodexTurnID?,
+        evidence: ReviewCompanionEvidence
     ) -> CodexThreadItem {
         guard item.kind == .agentMessage,
             item.semanticRelation == nil,
@@ -1675,7 +1696,9 @@ public final class CodexChat: CodexPersistentModel {
             ($0.kind != item.kind || $0.id != item.id)
                 && $0.isReviewNarrativeBoundary
         }
-        if precedingNarrativeItem?.isExitedReviewModeMarker == true {
+        if case .orderedItems = evidence,
+            precedingNarrativeItem?.isExitedReviewModeMarker == true
+        {
             return reviewRolloutCompanion(item)
         }
 
@@ -1738,6 +1761,7 @@ public final class CodexChat: CodexPersistentModel {
         return mergeItems(
             [reviewRolloutCompanion(turnItems[agentIndex].threadItem)],
             turnID: turnID,
+            reviewCompanionEvidence: .snapshotBatch,
             itemsLoadState: turnItems[agentIndex].itemsLoadState
         )
     }
@@ -2197,7 +2221,11 @@ public final class CodexChat: CodexPersistentModel {
             text: merge.text
         )
         let item = CodexThreadItem(id: itemID, kind: .agentMessage, content: .message(message))
-        return mergeItems([item], turnID: turnID)
+        return mergeItems(
+            [item],
+            turnID: turnID,
+            reviewCompanionEvidence: .orderedItems
+        )
     }
 
     private func start(_ part: CodexReasoningPart, turnID: CodexTurnID?) -> [CodexChatMutation] {
@@ -2207,13 +2235,17 @@ public final class CodexChat: CodexPersistentModel {
         }
         return mergeItems([
             .init(id: part.id, kind: .reasoning, content: .reasoning(.empty)),
-        ], turnID: turnID)
+        ], turnID: turnID, reviewCompanionEvidence: .orderedItems)
     }
 
     private func merge(_ delta: CodexReasoningDelta, turnID: CodexTurnID?) -> [CodexChatMutation] {
         let key = reasoningMergeKey(for: delta, turnID: turnID)
         if let currentItem = delta.currentItem {
-            return mergeItems([currentItem], turnID: turnID)
+            return mergeItems(
+                [currentItem],
+                turnID: turnID,
+                reviewCompanionEvidence: .orderedItems
+            )
         }
         let previousAccumulatedText = liveMergeState.reasoningDeltaTextByItemKey[key] ?? ""
         let accumulatedText = previousAccumulatedText + delta.delta
@@ -2242,7 +2274,7 @@ public final class CodexChat: CodexPersistentModel {
         }
         return mergeItems([
             .init(id: key.id, kind: .reasoning, content: .reasoning(reasoning)),
-        ], turnID: turnID)
+        ], turnID: turnID, reviewCompanionEvidence: .orderedItems)
     }
 
     private func reasoningMergeKey(

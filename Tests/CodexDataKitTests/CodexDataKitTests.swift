@@ -11553,6 +11553,71 @@ struct CodexModelContextTests {
         })
     }
 
+    @Test("adjacent review companion waits for a full snapshot")
+    func adjacentReviewCompanionWaitsForFullSnapshot() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let chat = CodexChat(id: "adjacent-review-chat", modelContext: context)
+        let items: [CodexThreadItem] = [
+            .init(
+                id: "review-exit",
+                kind: .exitedReviewMode,
+                content: .log("No issues found.")
+            ),
+            .init(
+                id: "reviewer-assistant",
+                kind: .agentMessage,
+                content: .message(.init(
+                    id: "reviewer-assistant",
+                    role: .assistant,
+                    text: "No issues found."
+                ))
+            ),
+        ]
+
+        _ = chat.apply(.snapshot(.init(
+            id: "adjacent-review",
+            state: .inProgress,
+            itemsLoadState: .summary,
+            items: items
+        )))
+
+        let summaryMessage = try #require(
+            chat.items(in: "adjacent-review").first {
+                $0.itemID == "reviewer-assistant"
+            }
+        )
+        #expect(summaryMessage.itemsLoadState == .summary)
+        #expect(summaryMessage.origin == .currentV2Item)
+        #expect(summaryMessage.semanticRelation == nil)
+
+        let fullChanges = chat.apply(.snapshot(.init(
+            id: "adjacent-review",
+            state: .inProgress,
+            itemsLoadState: .full,
+            items: items
+        )))
+
+        let fullMessage = try #require(
+            chat.items(in: "adjacent-review").first {
+                $0.itemID == "reviewer-assistant"
+            }
+        )
+        #expect(fullMessage.itemsLoadState == .full)
+        #expect(fullMessage.origin == .reviewRolloutAssistant)
+        #expect(fullMessage.semanticRelation == .companionOf(.exitedReviewMode))
+        let fullUpdates = chat.observationUpdates(for: fullChanges)
+        #expect(fullUpdates.contains { update in
+            guard case .itemUpdated(let item, let turnID, _) = update else {
+                return false
+            }
+            return item.id == "reviewer-assistant"
+                && turnID == "adjacent-review"
+                && item.origin == .reviewRolloutAssistant
+                && item.semanticRelation == .companionOf(.exitedReviewMode)
+        })
+    }
+
     @Test("live persisted review companion waits for a full completion snapshot")
     func livePersistedReviewCompanionWaitsForFullCompletionSnapshot() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
