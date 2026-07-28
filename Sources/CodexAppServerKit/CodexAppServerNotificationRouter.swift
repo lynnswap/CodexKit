@@ -147,6 +147,13 @@ package actor CodexAppServerNotificationRouter {
         }
     }
 
+    package func seedCurrentTurnSnapshot(
+        _ snapshot: CodexTurnSnapshot,
+        threadID: CodexThreadID
+    ) {
+        threadEventHub.seedCurrentTurnSnapshot(snapshot, for: threadID)
+    }
+
     package func accountEvents() async -> CodexAccountEvents {
         return await accountEventHub.events()
     }

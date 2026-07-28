@@ -603,7 +603,11 @@ struct CodexAppServerKitTests {
         )
 
         let events = try await collect(thread.events)
-        #expect(events.contains(.terminal(.completed(.init(turnID: "turn-resume-terminal")))))
+        #expect(events.contains(.terminal(.completed(.init(
+            turnID: "turn-resume-terminal",
+            transcript: .init(),
+            transcriptItemsLoadState: .full
+        )))))
     }
 
     @Test func resumedThreadTransfersNestedProtocolViolationAfterAssociation() async throws {
@@ -668,7 +672,11 @@ struct CodexAppServerKitTests {
         )
 
         let events = try await collect(thread.events)
-        #expect(events.contains(.terminal(.completed(.init(turnID: "turn-read-terminal")))))
+        #expect(events.contains(.terminal(.completed(.init(
+            turnID: "turn-read-terminal",
+            transcript: .init(),
+            transcriptItemsLoadState: .full
+        )))))
     }
 
     @Test func turnListSeedsNestedTerminalReceivedBeforeListResponse() async throws {

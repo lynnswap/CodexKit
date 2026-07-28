@@ -880,17 +880,16 @@ private final class WeakTurnGenerationHandleState {
 }
 
 private struct TurnReplayAccumulator {
-    private(set) var snapshot: CodexTurnSnapshot
+    private var snapshotReducer: CodexTurnSnapshotReducer
     private(set) var usage: CodexTokenUsage?
     private var hasRoutedEvent = false
-    private var observedItemIDs: Set<String> = []
 
     init(turnID: CodexTurnID) {
-        self.snapshot = .init(
-            id: turnID,
-            state: .inProgress,
-            itemsLoadState: .notLoaded
-        )
+        snapshotReducer = .init(turnID: turnID)
+    }
+
+    var snapshot: CodexTurnSnapshot {
+        snapshotReducer.snapshot
     }
 
     var progress: CodexReviewProgress {
@@ -900,32 +899,10 @@ private struct TurnReplayAccumulator {
     mutating func seed(_ initialSnapshot: CodexTurnSnapshot) {
         precondition(initialSnapshot.id == snapshot.id)
         guard hasRoutedEvent else {
-            snapshot = initialSnapshot
+            snapshotReducer.replace(with: initialSnapshot)
             return
         }
-
-        var items = initialSnapshot.items
-        var indexes = Dictionary(uniqueKeysWithValues: items.indices.map { (items[$0].id, $0) })
-        for item in snapshot.items {
-            if let index = indexes[item.id] {
-                items[index] = item
-            } else {
-                indexes[item.id] = items.count
-                items.append(item)
-            }
-        }
-        snapshot = .init(
-            id: snapshot.id,
-            state: snapshot.state,
-            itemsLoadState: moreCompleteItemsLoadState(
-                snapshot.itemsLoadState,
-                initialSnapshot.itemsLoadState
-            ),
-            items: items,
-            startedAt: snapshot.startedAt ?? initialSnapshot.startedAt,
-            completedAt: snapshot.completedAt ?? initialSnapshot.completedAt,
-            duration: snapshot.duration ?? initialSnapshot.duration
-        )
+        snapshotReducer.merge(initialSnapshot)
     }
 
     mutating func apply(_ event: CodexTurnEvent) {
@@ -933,11 +910,10 @@ private struct TurnReplayAccumulator {
         switch event {
         case .started(let turnID):
             precondition(turnID == snapshot.id)
-            snapshot.itemsLoadState = .full
+            snapshotReducer.markStarted()
         case .snapshot(let newSnapshot):
             precondition(newSnapshot.id == snapshot.id)
-            snapshot = newSnapshot
-            observedItemIDs.removeAll(keepingCapacity: true)
+            snapshotReducer.replace(with: newSnapshot)
         case .itemStarted(let item), .itemUpdated(let item), .itemCompleted(let item):
             upsert(item)
         case .message(let message):
@@ -965,31 +941,8 @@ private struct TurnReplayAccumulator {
 
     func compact(_ outcome: CodexTurnOutcome) -> CompactTurnSnapshot {
         precondition(outcome.response.turnID == snapshot.id)
-        let finalizedOutcome = finalized(outcome)
-        let response = finalizedOutcome.response
-        let state: CodexTurnSnapshot.State
-        switch finalizedOutcome {
-        case .completed:
-            state = .completed
-        case .interrupted:
-            state = .interrupted
-        case .failed(let failedTurn):
-            state = .failed(failedTurn.error)
-        case .invalidTerminalStatus(let rawStatus, let error, _):
-            state = .unknown(rawValue: rawStatus, error: error)
-        }
-        return .init(
-            snapshot: .init(
-                id: response.turnID,
-                state: state,
-                itemsLoadState: response.transcriptItemsLoadState,
-                items: response.transcript.items,
-                startedAt: response.startedAt,
-                completedAt: response.completedAt,
-                duration: response.duration
-            ),
-            outcome: finalizedOutcome
-        )
+        var reducer = snapshotReducer
+        return reducer.finish(finalized(outcome))
     }
 
     private func finalized(_ outcome: CodexTurnOutcome) -> CodexTurnOutcome {
@@ -1011,41 +964,14 @@ private struct TurnReplayAccumulator {
 
     private func finalized(_ response: CodexResponse) -> CodexResponse {
         var response = response
-        let finalizedItemsLoadState = moreCompleteItemsLoadState(
-            snapshot.itemsLoadState,
-            response.transcriptItemsLoadState
-        )
-        if response.transcriptItemsLoadState != .full {
-            var items = snapshot.items
-            for terminalItem in response.transcript.items {
-                if let index = items.firstIndex(where: {
-                    $0.id == terminalItem.id && $0.kind == terminalItem.kind
-                }) {
-                    if snapshot.itemsLoadState != .full,
-                       observedItemIDs.contains(terminalItem.id) == false
-                    {
-                        items[index] = terminalItem
-                    }
-                } else {
-                    items.append(terminalItem)
-                }
-            }
-            response.transcript = .init(items: items)
-        }
         if response.usage == nil {
             response.usage = usage
         }
-        response.transcriptItemsLoadState = finalizedItemsLoadState
         return response
     }
 
     private mutating func upsert(_ item: CodexThreadItem) {
-        observedItemIDs.insert(item.id)
-        if let index = snapshot.items.firstIndex(where: { $0.id == item.id }) {
-            snapshot.items[index] = item
-        } else {
-            snapshot.items.append(item)
-        }
+        snapshotReducer.observe(item)
     }
 
     private func requiredCurrentItem(
@@ -1057,17 +983,4 @@ private struct TurnReplayAccumulator {
         }
         return item
     }
-}
-
-private func moreCompleteItemsLoadState(
-    _ lhs: CodexTurnItemsLoadState,
-    _ rhs: CodexTurnItemsLoadState
-) -> CodexTurnItemsLoadState {
-    if lhs == .full || rhs == .full {
-        return .full
-    }
-    if lhs == .summary || rhs == .summary {
-        return .summary
-    }
-    return .notLoaded
 }

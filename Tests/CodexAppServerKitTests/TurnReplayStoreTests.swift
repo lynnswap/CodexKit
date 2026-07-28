@@ -418,6 +418,60 @@ struct TurnReplayStoreTests {
         ])
     }
 
+    @Test func sparseTerminalUpdatesAnUnobservedKindSharingAnObservedRawID() async throws {
+        let store = TurnReplayStore()
+        let state = makeState()
+        let pending = await store.registerPendingOperation(
+            kind: .turn(threadID: "thread-1"),
+            state: state
+        )
+        pending.acceptWrite()
+        let entered = CodexThreadItem(
+            id: "review-marker",
+            kind: .enteredReviewMode,
+            content: .log("Entered")
+        )
+        let staleExit = CodexThreadItem(
+            id: "review-marker",
+            kind: .exitedReviewMode,
+            content: .log("Stale")
+        )
+        await store.bind(
+            pending,
+            to: "turn-1",
+            initialSnapshot: .init(
+                id: "turn-1",
+                state: .inProgress,
+                itemsLoadState: .summary,
+                items: [entered, staleExit]
+            )
+        )
+        let observedEntered = CodexThreadItem(
+            id: "review-marker",
+            kind: .enteredReviewMode,
+            content: .log("Entered live")
+        )
+        _ = await store.yield(.itemCompleted(observedEntered), for: "turn-1")
+        let terminalExit = CodexThreadItem(
+            id: "review-marker",
+            kind: .exitedReviewMode,
+            content: .log("Final review")
+        )
+
+        await store.finish(.completed(.init(
+            turnID: "turn-1",
+            transcript: .init(items: [terminalExit]),
+            transcriptItemsLoadState: .summary
+        )))
+
+        let terminalState = try #require(await state.snapshot().terminalSnapshot)
+        #expect(terminalState.snapshot.items == [observedEntered, terminalExit])
+        #expect(terminalState.outcome.response.transcript.items == [
+            observedEntered,
+            terminalExit,
+        ])
+    }
+
     @Test func fullTerminalTranscriptRemovesOmittedReplayItems() async throws {
         let store = TurnReplayStore()
         let state = makeState()

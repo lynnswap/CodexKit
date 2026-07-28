@@ -416,6 +416,9 @@ extension CodexThread {
             includesTurns: includeTurns
         )
         await router.seedTurns(snapshot.turns, threadID: id)
+        if let currentTurn = snapshot.turns?.last {
+            await router.seedCurrentTurnSnapshot(currentTurn, threadID: id)
+        }
         return snapshot
     }
 
@@ -437,6 +440,18 @@ extension CodexThread {
             ))
         let turns = CodexAppServer.turnSnapshots(from: response.data)
         await router.seedTurns(turns, threadID: id)
+        let currentTurn: CodexTurnSnapshot?
+        switch query.sortDirection {
+        case .ascending where response.nextCursor == nil:
+            currentTurn = turns.last
+        case .descending where query.cursor == nil:
+            currentTurn = turns.first
+        default:
+            currentTurn = nil
+        }
+        if let currentTurn {
+            await router.seedCurrentTurnSnapshot(currentTurn, threadID: id)
+        }
         return .init(
             turns: turns,
             nextCursor: response.nextCursor,
