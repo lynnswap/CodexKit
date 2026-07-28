@@ -711,7 +711,11 @@ struct CodexAppServerKitTests {
         )
 
         let events = try await collect(thread.events)
-        #expect(events.contains(.terminal(.completed(.init(turnID: "turn-list-turns-terminal")))))
+        #expect(events.contains(.terminal(.completed(.init(
+            turnID: "turn-list-turns-terminal",
+            transcript: .init(),
+            transcriptItemsLoadState: .full
+        )))))
     }
 
     @Test func appServerStartReviewStartsThreadThenReview() async throws {

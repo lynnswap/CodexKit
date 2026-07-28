@@ -441,7 +441,7 @@ extension CodexThread {
         let turns = CodexAppServer.turnSnapshots(from: response.data)
         await router.seedTurns(turns, threadID: id)
         let currentTurn: CodexTurnSnapshot?
-        switch query.sortDirection {
+        switch query.sortDirection ?? .descending {
         case .ascending where response.nextCursor == nil:
             currentTurn = turns.last
         case .descending where query.cursor == nil:

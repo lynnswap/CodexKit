@@ -14,6 +14,52 @@ struct CodexTurnSnapshotReducerTests {
         #expect(reducer.snapshot.itemsLoadState == .full)
     }
 
+    @Test func delayedStartDoesNotPromoteSummarySnapshotCompleteness() {
+        let summary = item(id: "summary", kind: .agentMessage, text: "Summary")
+        let terminal = item(id: "terminal", kind: .agentMessage, text: "Terminal")
+        var reducer = CodexTurnSnapshotReducer(snapshot: .init(
+            id: "turn-1",
+            state: .inProgress,
+            itemsLoadState: .summary,
+            items: [summary]
+        ))
+
+        reducer.markStarted()
+        let compact = reducer.finish(.completed(.init(
+            turnID: "turn-1",
+            transcript: .init(items: [terminal]),
+            transcriptItemsLoadState: .summary
+        )))
+
+        #expect(compact.snapshot.itemsLoadState == .summary)
+        #expect(compact.snapshot.items == [summary, terminal])
+    }
+
+    @Test func delayedStartDoesNotPromoteNotLoadedHistorySnapshot() {
+        var reducer = CodexTurnSnapshotReducer(snapshot: .init(
+            id: "turn-1",
+            state: .inProgress,
+            itemsLoadState: .notLoaded
+        ))
+
+        reducer.markStarted()
+
+        #expect(reducer.snapshot.itemsLoadState == .notLoaded)
+    }
+
+    @Test func delayedStartPromotesIdentityOnlyBindingSnapshot() {
+        var reducer = CodexTurnSnapshotReducer(turnID: "turn-1")
+        reducer.replaceBindingSnapshot(with: .init(
+            id: "turn-1",
+            state: .inProgress,
+            itemsLoadState: .notLoaded
+        ))
+
+        reducer.markStarted()
+
+        #expect(reducer.snapshot.itemsLoadState == .full)
+    }
+
     @Test func sparseTerminalUpdatesAnUnobservedItemWithTheSameRawIDAsAnotherKind() {
         let entered = item(
             id: "review-marker",

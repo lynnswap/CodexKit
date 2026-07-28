@@ -899,7 +899,7 @@ private struct TurnReplayAccumulator {
     mutating func seed(_ initialSnapshot: CodexTurnSnapshot) {
         precondition(initialSnapshot.id == snapshot.id)
         guard hasRoutedEvent else {
-            snapshotReducer.replace(with: initialSnapshot)
+            snapshotReducer.replaceBindingSnapshot(with: initialSnapshot)
             return
         }
         snapshotReducer.merge(initialSnapshot)

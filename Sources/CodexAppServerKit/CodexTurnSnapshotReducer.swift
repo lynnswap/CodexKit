@@ -19,6 +19,7 @@ struct CodexTurnSnapshotReducer: Equatable, Sendable {
 
     private(set) var snapshot: CodexTurnSnapshot
     private var evidenceByIdentity: [CodexTurnItemIdentity: ItemEvidence]
+    private var hasSnapshotEvidence: Bool
 
     init(turnID: CodexTurnID) {
         snapshot = .init(
@@ -27,28 +28,47 @@ struct CodexTurnSnapshotReducer: Equatable, Sendable {
             itemsLoadState: .notLoaded
         )
         evidenceByIdentity = [:]
+        hasSnapshotEvidence = false
     }
 
     init(snapshot: CodexTurnSnapshot) {
         self.snapshot = snapshot
         evidenceByIdentity = Self.snapshotEvidence(for: snapshot)
+        hasSnapshotEvidence = true
     }
 
     mutating func markStarted() {
-        snapshot.itemsLoadState = .full
-        for item in snapshot.items {
-            evidenceByIdentity[.init(item)] = .completeSnapshot
+        guard hasSnapshotEvidence == false else {
+            return
         }
+        snapshot.itemsLoadState = .full
     }
 
     mutating func replace(with newSnapshot: CodexTurnSnapshot) {
+        replace(with: newSnapshot, hasSnapshotEvidence: true)
+    }
+
+    mutating func replaceBindingSnapshot(with newSnapshot: CodexTurnSnapshot) {
+        replace(
+            with: newSnapshot,
+            hasSnapshotEvidence: newSnapshot.itemsLoadState != .notLoaded
+                || newSnapshot.items.isEmpty == false
+        )
+    }
+
+    private mutating func replace(
+        with newSnapshot: CodexTurnSnapshot,
+        hasSnapshotEvidence: Bool
+    ) {
         precondition(newSnapshot.id == snapshot.id)
         snapshot = newSnapshot
         evidenceByIdentity = Self.snapshotEvidence(for: newSnapshot)
+        self.hasSnapshotEvidence = hasSnapshotEvidence
     }
 
     mutating func merge(_ newSnapshot: CodexTurnSnapshot) {
         precondition(newSnapshot.id == snapshot.id)
+        hasSnapshotEvidence = true
         if snapshot.itemsLoadState == .full, newSnapshot.itemsLoadState != .full {
             mergePartialSnapshotIntoCompleteState(newSnapshot)
             return
