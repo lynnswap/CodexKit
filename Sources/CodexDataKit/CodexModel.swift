@@ -1355,7 +1355,7 @@ public final class CodexChat: CodexPersistentModel {
             preservesExistingUsage: true
         ))
         changes.append(contentsOf: mergeItems(response.transcript.items, turnID: response.turnID))
-        changes.append(contentsOf: normalizeCompletedReviewRolloutCompanion(
+        changes.append(contentsOf: normalizeReviewRolloutCompanion(
             in: response.turnID
         ))
         if let terminalStatus = turnsByID[response.turnID]?.status {
@@ -1394,8 +1394,12 @@ public final class CodexChat: CodexPersistentModel {
                 itemsLoadState: snapshot.itemsLoadState,
                 preservesExistingUsage: true
             ))
-            changes.append(contentsOf: mergeItems(snapshot.items, turnID: snapshot.id))
-            changes.append(contentsOf: normalizeCompletedReviewRolloutCompanion(
+            changes.append(contentsOf: mergeItems(
+                snapshot.items,
+                turnID: snapshot.id,
+                itemsLoadState: snapshot.itemsLoadState
+            ))
+            changes.append(contentsOf: normalizeReviewRolloutCompanion(
                 in: snapshot.id
             ))
             switch snapshot.state {
@@ -1689,6 +1693,12 @@ public final class CodexChat: CodexPersistentModel {
             itemsLoadState: turnsByID[turnID]?.itemsLoadState ?? .notLoaded,
             items: candidateItems
         )
+        if let agentIndex = sameTurnReviewCompanionAgentIndex(in: candidateRecord),
+            candidateItems[agentIndex].id == item.id,
+            candidateItems[agentIndex].kind == item.kind
+        {
+            return reviewRolloutCompanion(item)
+        }
         guard persistedReviewCompanionAgentIndex(in: candidateRecord) != nil,
             hasPrecedingReviewExit(before: turnID)
         else {
@@ -1697,12 +1707,11 @@ public final class CodexChat: CodexPersistentModel {
         return reviewRolloutCompanion(item)
     }
 
-    private func normalizeCompletedReviewRolloutCompanion(
+    private func normalizeReviewRolloutCompanion(
         in turnID: CodexTurnID
     ) -> [CodexChatMutation] {
         guard let turn = turnsByID[turnID],
             let state = turn.state,
-            turn.status?.isTerminal == true,
             let turnItems = itemsByTurnID[turnID]
         else {
             return []
@@ -1713,14 +1722,21 @@ public final class CodexChat: CodexPersistentModel {
             itemsLoadState: turn.itemsLoadState,
             items: turnItems.map(\.threadItem)
         )
-        guard let agentIndex = persistedReviewCompanionAgentIndex(in: record),
-            hasPrecedingReviewExit(before: turnID),
-            turnItems[agentIndex].semanticRelation == nil
-        else {
+        let agentIndex: Int
+        if let sameTurnAgentIndex = sameTurnReviewCompanionAgentIndex(in: record) {
+            agentIndex = sameTurnAgentIndex
+        } else if let persistedAgentIndex = persistedReviewCompanionAgentIndex(in: record),
+            hasPrecedingReviewExit(before: turnID)
+        {
+            agentIndex = persistedAgentIndex
+        } else {
+            return []
+        }
+        guard turnItems[agentIndex].semanticRelation == nil else {
             return []
         }
         return mergeItems(
-            [turnItems[agentIndex].threadItem],
+            [reviewRolloutCompanion(turnItems[agentIndex].threadItem)],
             turnID: turnID,
             itemsLoadState: turnItems[agentIndex].itemsLoadState
         )

@@ -11500,53 +11500,57 @@ struct CodexModelContextTests {
             ),
         ]
 
-        chat.apply(
-            .init(
-                id: chat.id,
-                sourceKind: .vscode,
-                turns: [
-                    .init(
-                        id: "coalesced-review",
-                        state: .inProgress,
-                        itemsLoadState: .summary,
-                        items: items
-                    ),
-                ]
-            ),
-            workspace: nil
-        )
+        let summaryChanges = chat.apply(.snapshot(.init(
+            id: "coalesced-review",
+            state: .inProgress,
+            itemsLoadState: .summary,
+            items: items
+        )))
 
         let summaryMessage = try #require(
             chat.items(in: "coalesced-review").first {
                 $0.itemID == "reviewer-assistant"
             }
         )
+        #expect(summaryMessage.itemsLoadState == .summary)
         #expect(summaryMessage.origin == .currentV2Item)
         #expect(summaryMessage.semanticRelation == nil)
+        let summaryUpdates = chat.observationUpdates(for: summaryChanges)
+        #expect(summaryUpdates.contains { update in
+            guard case .turnInserted(let turn, _) = update else {
+                return false
+            }
+            return turn.items.contains {
+                $0.id == "reviewer-assistant"
+                    && $0.semanticRelation == nil
+            }
+        })
 
-        chat.apply(
-            .init(
-                id: chat.id,
-                sourceKind: .vscode,
-                turns: [
-                    .init(
-                        id: "coalesced-review",
-                        state: .inProgress,
-                        itemsLoadState: .full,
-                        items: items
-                    ),
-                ]
-            ),
-            workspace: nil
-        )
+        let fullChanges = chat.apply(.snapshot(.init(
+            id: "coalesced-review",
+            state: .inProgress,
+            itemsLoadState: .full,
+            items: items
+        )))
 
         let fullMessage = try #require(
             chat.items(in: "coalesced-review").first {
                 $0.itemID == "reviewer-assistant"
             }
         )
+        #expect(fullMessage.itemsLoadState == .full)
         #expect(fullMessage.origin == .reviewRolloutAssistant)
         #expect(fullMessage.semanticRelation == .companionOf(.exitedReviewMode))
+        let fullUpdates = chat.observationUpdates(for: fullChanges)
+        #expect(fullUpdates.contains { update in
+            guard case .itemUpdated(let item, let turnID, _) = update else {
+                return false
+            }
+            return item.id == "reviewer-assistant"
+                && turnID == "coalesced-review"
+                && item.origin == .reviewRolloutAssistant
+                && item.semanticRelation == .companionOf(.exitedReviewMode)
+        })
     }
 
     @Test("live persisted review companion waits for a full completion snapshot")
