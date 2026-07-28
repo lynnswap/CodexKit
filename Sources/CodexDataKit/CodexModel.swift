@@ -912,9 +912,6 @@ public final class CodexChat: CodexPersistentModel {
     private func normalizingReviewRolloutCompanions(
         _ records: [CodexTurnSnapshot]
     ) -> [CodexTurnSnapshot] {
-        guard sourceKind == .subAgentReview else {
-            return records
-        }
         var normalized = records
         for candidateIndex in normalized.indices {
             if let agentIndex = sameTurnReviewCompanionAgentIndex(
@@ -960,7 +957,9 @@ public final class CodexChat: CodexPersistentModel {
     private func persistedReviewCompanionAgentIndex(
         in record: CodexTurnSnapshot
     ) -> Int? {
-        guard record.status.isTerminal else {
+        guard record.status.isTerminal,
+            record.itemsLoadState == .full
+        else {
             return nil
         }
         let userMessages = record.items.filter { $0.kind == .userMessage }
@@ -1645,8 +1644,7 @@ public final class CodexChat: CodexPersistentModel {
         _ item: CodexThreadItem,
         turnID: CodexTurnID?
     ) -> CodexThreadItem {
-        guard sourceKind == .subAgentReview,
-            item.kind == .agentMessage,
+        guard item.kind == .agentMessage,
             item.semanticRelation == nil,
             let turnID
         else {
@@ -1672,6 +1670,7 @@ public final class CodexChat: CodexPersistentModel {
         let candidateRecord = CodexTurnSnapshot(
             id: turnID,
             state: turnsByID[turnID]?.state ?? .inProgress,
+            itemsLoadState: turnsByID[turnID]?.itemsLoadState ?? .notLoaded,
             items: candidateItems
         )
         guard persistedReviewCompanionAgentIndex(in: candidateRecord) != nil,
@@ -1685,8 +1684,7 @@ public final class CodexChat: CodexPersistentModel {
     private func normalizeCompletedReviewRolloutCompanion(
         in turnID: CodexTurnID
     ) -> [CodexChatMutation] {
-        guard sourceKind == .subAgentReview,
-            let turn = turnsByID[turnID],
+        guard let turn = turnsByID[turnID],
             let state = turn.state,
             turn.status?.isTerminal == true,
             let turnItems = itemsByTurnID[turnID]

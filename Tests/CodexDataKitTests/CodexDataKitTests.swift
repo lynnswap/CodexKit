@@ -11450,8 +11450,8 @@ struct CodexModelContextTests {
         #expect(reviewerMessage.semanticRelation == .companionOf(.exitedReviewMode))
     }
 
-    @Test("live persisted review companion is classified when its turn completes")
-    func livePersistedReviewCompanionIsClassifiedWhenItsTurnCompletes() async throws {
+    @Test("live persisted review companion waits for a full completion snapshot")
+    func livePersistedReviewCompanionWaitsForFullCompletionSnapshot() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         let context = CodexModelContainer(appServer: runtime.server).mainContext
         let chat = CodexChat(id: "review-chat", modelContext: context)
@@ -11514,6 +11514,49 @@ struct CodexModelContextTests {
 
         _ = chat.apply(.terminal(.completed(.init(turnID: "reviewer-turn"))))
 
+        let sparseCompletedMessage = try #require(
+            chat.items(in: "reviewer-turn").first {
+                $0.itemID == "reviewer-assistant"
+            }
+        )
+        #expect(sparseCompletedMessage.origin == .currentV2Item)
+        #expect(sparseCompletedMessage.semanticRelation == nil)
+
+        _ = chat.apply(.snapshot(.init(
+            id: "reviewer-turn",
+            state: .completed,
+            itemsLoadState: .full,
+            items: [
+                .init(
+                    id: "reviewer-user-1",
+                    kind: .userMessage,
+                    content: .message(.init(
+                        id: "reviewer-user-1",
+                        role: .user,
+                        text: "current changes"
+                    ))
+                ),
+                .init(
+                    id: "reviewer-user-2",
+                    kind: .userMessage,
+                    content: .message(.init(
+                        id: "reviewer-user-2",
+                        role: .user,
+                        text: "current changes"
+                    ))
+                ),
+                .init(
+                    id: "reviewer-assistant",
+                    kind: .agentMessage,
+                    content: .message(.init(
+                        id: "reviewer-assistant",
+                        role: .assistant,
+                        text: "No issues found."
+                    ))
+                ),
+            ]
+        )))
+
         let completedMessage = try #require(
             chat.items(in: "reviewer-turn").first {
                 $0.itemID == "reviewer-assistant"
@@ -11523,16 +11566,16 @@ struct CodexModelContextTests {
         #expect(completedMessage.semanticRelation == .companionOf(.exitedReviewMode))
     }
 
-    @Test("ordinary chat does not classify a post-review duplicate prompt turn")
-    func ordinaryChatDoesNotClassifyPostReviewDuplicatePromptTurn() async throws {
+    @Test("persisted review companion does not depend on the thread source")
+    func persistedReviewCompanionDoesNotDependOnThreadSource() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
         let context = CodexModelContainer(appServer: runtime.server).mainContext
-        let chat = CodexChat(id: "ordinary-chat", modelContext: context)
+        let chat = CodexChat(id: "legacy-review-chat", modelContext: context)
 
         chat.apply(
             .init(
                 id: chat.id,
-                sourceKind: .appServer,
+                sourceKind: .vscode,
                 turns: [
                     .init(
                         id: "prior-review",
@@ -11585,6 +11628,136 @@ struct CodexModelContextTests {
 
         let response = try #require(
             chat.items(in: "ordinary-turn").first { $0.itemID == "ordinary-assistant" }
+        )
+        #expect(response.origin == .reviewRolloutAssistant)
+        #expect(response.semanticRelation == .companionOf(.exitedReviewMode))
+    }
+
+    @Test("ordinary chat does not classify a duplicate prompt without a review exit")
+    func ordinaryChatDoesNotClassifyDuplicatePromptWithoutReviewExit() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let chat = CodexChat(id: "ordinary-chat", modelContext: context)
+
+        chat.apply(
+            .init(
+                id: chat.id,
+                sourceKind: .appServer,
+                turns: [
+                    .init(
+                        id: "ordinary-turn",
+                        state: .completed,
+                        items: [
+                            .init(
+                                id: "ordinary-user-1",
+                                kind: .userMessage,
+                                content: .message(.init(
+                                    id: "ordinary-user-1",
+                                    role: .user,
+                                    text: "Repeat this prompt."
+                                ))
+                            ),
+                            .init(
+                                id: "ordinary-user-2",
+                                kind: .userMessage,
+                                content: .message(.init(
+                                    id: "ordinary-user-2",
+                                    role: .user,
+                                    text: "Repeat this prompt."
+                                ))
+                            ),
+                            .init(
+                                id: "ordinary-assistant",
+                                kind: .agentMessage,
+                                content: .message(.init(
+                                    id: "ordinary-assistant",
+                                    role: .assistant,
+                                    text: "This is an ordinary response."
+                                ))
+                            ),
+                        ]
+                    ),
+                ]
+            ),
+            workspace: nil
+        )
+
+        let response = try #require(
+            chat.items(in: "ordinary-turn").first { $0.itemID == "ordinary-assistant" }
+        )
+        #expect(response.origin == .currentV2Item)
+        #expect(response.semanticRelation == nil)
+    }
+
+    @Test("live candidate does not infer a companion from summary items")
+    func liveCandidateDoesNotInferCompanionFromSummaryItems() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let chat = CodexChat(id: "summary-review-chat", modelContext: context)
+
+        chat.apply(
+            .init(
+                id: chat.id,
+                sourceKind: .vscode,
+                turns: [
+                    .init(
+                        id: "review-boundary",
+                        state: .completed,
+                        itemsLoadState: .full,
+                        items: [
+                            .init(
+                                id: "review-output",
+                                kind: .exitedReviewMode,
+                                content: .log("No issues found.")
+                            ),
+                        ]
+                    ),
+                    .init(
+                        id: "summary-turn",
+                        state: .completed,
+                        itemsLoadState: .summary,
+                        items: [
+                            .init(
+                                id: "summary-user-1",
+                                kind: .userMessage,
+                                content: .message(.init(
+                                    id: "summary-user-1",
+                                    role: .user,
+                                    text: "current changes"
+                                ))
+                            ),
+                            .init(
+                                id: "summary-user-2",
+                                kind: .userMessage,
+                                content: .message(.init(
+                                    id: "summary-user-2",
+                                    role: .user,
+                                    text: "current changes"
+                                ))
+                            ),
+                        ]
+                    ),
+                ]
+            ),
+            workspace: nil
+        )
+        _ = chat.apply(.itemCompleted(
+            .init(
+                id: "summary-assistant",
+                kind: .agentMessage,
+                content: .message(.init(
+                    id: "summary-assistant",
+                    role: .assistant,
+                    text: "This summary may omit narrative items."
+                ))
+            ),
+            turnID: "summary-turn"
+        ))
+
+        let response = try #require(
+            chat.items(in: "summary-turn").first {
+                $0.itemID == "summary-assistant"
+            }
         )
         #expect(response.origin == .currentV2Item)
         #expect(response.semanticRelation == nil)
