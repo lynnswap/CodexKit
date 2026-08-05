@@ -154,6 +154,9 @@ package actor AppServerClient {
         onWriteAccepted: @escaping @Sendable () -> Void = {},
         onResponseRejected: @escaping @Sendable () async throws -> Void = {},
         onResponseAccepted: @escaping @Sendable () -> Void = {},
+        retriesOverloadResponses: Bool = true,
+        postWriteCallerCancellationPolicy: RequestOperationState
+            .PostWriteCallerCancellationPolicy = .performCleanup,
         onPostWriteCancellation: @escaping @Sendable (Request.Response) async throws -> Void = { _ in }
     ) async throws -> Request.Response {
         try await send(
@@ -167,6 +170,8 @@ package actor AppServerClient {
             onWriteAccepted: onWriteAccepted,
             onResponseRejected: onResponseRejected,
             onResponseAccepted: onResponseAccepted,
+            retriesOverloadResponses: retriesOverloadResponses,
+            postWriteCallerCancellationPolicy: postWriteCallerCancellationPolicy,
             onPostWriteCancellation: onPostWriteCancellation
         )
     }
@@ -200,6 +205,9 @@ package actor AppServerClient {
         onWriteAccepted: @escaping @Sendable () -> Void = {},
         onResponseRejected: @escaping @Sendable () async throws -> Void = {},
         onResponseAccepted: @escaping @Sendable () -> Void = {},
+        retriesOverloadResponses: Bool = true,
+        postWriteCallerCancellationPolicy: RequestOperationState
+            .PostWriteCallerCancellationPolicy = .performCleanup,
         onPostWriteCancellation: @escaping @Sendable (Response) async throws -> Void = { _ in }
     ) async throws -> Response {
         try await serializer.run(scope: scope) { [encoder, self] laneToken in
@@ -232,10 +240,13 @@ package actor AppServerClient {
                     onWriteAccepted: onWriteAccepted,
                     onResponseRejected: onResponseRejected,
                     onResponseAccepted: onResponseAccepted,
+                    retriesOverloadResponses: retriesOverloadResponses,
                     operationState: state
                 )
                 state.markResponseBound()
-                switch state.resolveResponse() {
+                switch state.resolveResponse(
+                    postWriteCallerCancellationPolicy: postWriteCallerCancellationPolicy
+                ) {
                 case .returnResponse:
                     return response
                 case .performCleanup(let abandonment):
@@ -295,6 +306,7 @@ package actor AppServerClient {
         onWriteAccepted: @escaping @Sendable () -> Void,
         onResponseRejected: @escaping @Sendable () async throws -> Void,
         onResponseAccepted: @escaping @Sendable () -> Void,
+        retriesOverloadResponses: Bool,
         operationState: RequestOperationState
     ) async throws -> Response {
         var requestID = initialRequestID
@@ -406,7 +418,8 @@ package actor AppServerClient {
                     try await reconcileRejectedResponse(using: onResponseRejected)
                 }
                 if case .responseError(let serverError) = error,
-                   serverError.code == Self.appServerOverloadedErrorCode {
+                   serverError.code == Self.appServerOverloadedErrorCode,
+                   retriesOverloadResponses {
                     guard let delay = overloadRetryDelay(retryAttempt) else {
                         throw CodexAppServerError.request(.init(
                             requestID: attemptRequestID,

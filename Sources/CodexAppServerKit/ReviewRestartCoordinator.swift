@@ -828,7 +828,8 @@ package actor ReviewRestartCoordinator {
             case .connectionTerminated:
                 return .invalidate
             case .launch, .turnDeadlineExceeded, .malformedNotification,
-                 .reviewRestartUnavailable, .loginAlreadyInProgress:
+                 .reviewRestartUnavailable, .loginAlreadyInProgress,
+                 .invalidAPIKey, .authenticationOutcomeUnknown:
                 return .invalidate
             }
         }

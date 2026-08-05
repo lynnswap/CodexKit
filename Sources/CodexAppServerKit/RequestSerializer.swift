@@ -2,6 +2,11 @@ import Foundation
 import Synchronization
 
 package final class RequestOperationState: Sendable {
+    package enum PostWriteCallerCancellationPolicy: Equatable, Sendable {
+        case performCleanup
+        case returnResponse
+    }
+
     package enum ResponseDisposition: Sendable {
         case returnResponse
         case performCleanup(RequestOperationAbandonment)
@@ -160,10 +165,17 @@ package final class RequestOperationState: Sendable {
         }
     }
 
-    package func resolveResponse() -> ResponseDisposition {
+    package func resolveResponse(
+        postWriteCallerCancellationPolicy: PostWriteCallerCancellationPolicy
+    ) -> ResponseDisposition {
         state.withLock { state in
             precondition(state.phase == .responseBound, "A request response must be bound before resolution.")
             if let abandonment = state.abandonment {
+                if abandonment == .callerCancellation,
+                   postWriteCallerCancellationPolicy == .returnResponse {
+                    state.phase = .returned
+                    return .returnResponse
+                }
                 return .performCleanup(abandonment)
             }
             state.phase = .returned

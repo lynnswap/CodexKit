@@ -445,13 +445,35 @@ patch.setServiceTier(nil)
 try await appServer.updateConfiguration(patch)
 ```
 
-Login flows return typed handles:
+ChatGPT browser login returns a typed handle:
 
 ```swift
 let handle = try await appServer.loginChatGPT()
 openInBrowser(handle.authenticationURL)
 let outcome = try await handle.result()
 ```
+
+API-key login is an immediate credential replacement owned by the app-server:
+
+```swift
+func configureAuthentication(
+    on appServer: CodexAppServer,
+    apiKey: String
+) async throws {
+    try await appServer.login(apiKey: apiKey)
+}
+```
+
+A successful return means the app-server stored and reloaded the key in its
+configured Codex home. Login does not make a remote API request, so it does not
+prove that the key will be accepted by the API. Empty keys and keys with leading
+or trailing whitespace fail before a request is sent.
+
+Caller cancellation before write acceptance sends nothing. Once the request is
+written, cancellation is deferred until its correlated response is known. A
+connection loss, deadline, or malformed response after write acceptance throws
+`CodexAppServerError.authenticationOutcomeUnknown`; reconcile the authoritative
+account state before retrying.
 
 ## Testing
 
@@ -546,6 +568,8 @@ The public boundary is:
 - `CodexModel`
 - `CodexAccount`
 - `CodexAccountEvent`
+- `CodexAPIKeyValidationFailure`
+- `CodexAuthenticationOutcomeUnknownReason`
 - `CodexLoginHandle`
 
 Unknown notifications and unknown item kinds are preserved so clients can keep

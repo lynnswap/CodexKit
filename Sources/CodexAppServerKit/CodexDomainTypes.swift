@@ -3032,6 +3032,33 @@ public struct CodexLoginHandle: Identifiable, Equatable, Sendable {
     }
 }
 
+/// Why an API key was rejected before an authentication request was sent.
+public enum CodexAPIKeyValidationFailure: Equatable, Sendable {
+    /// The key is empty or contains only whitespace.
+    case empty
+
+    /// The key has leading or trailing whitespace.
+    case surroundingWhitespace
+}
+
+/// Why the result of a written authentication request could not be confirmed.
+public enum CodexAuthenticationOutcomeUnknownReason: Equatable, Sendable {
+    /// The app-server connection terminated before a correlated response was accepted.
+    case connectionTerminated
+
+    /// The authentication request exceeded its configured deadline after being written.
+    case deadlineExceeded(Duration)
+
+    /// The transport ended after the request was written but before its result was confirmed.
+    case transportEnded
+
+    /// The app-server returned bytes that were not a valid login response.
+    case invalidResponse
+
+    /// The app-server returned a valid response for a different login method.
+    case unexpectedResponse
+}
+
 public enum CodexAppServerError: Error, Equatable, LocalizedError, Sendable {
     case launch(CodexLaunchFailure)
     case request(CodexRequestFailure)
@@ -3040,6 +3067,8 @@ public enum CodexAppServerError: Error, Equatable, LocalizedError, Sendable {
     case malformedNotification(CodexMalformedNotification)
     case reviewRestartUnavailable(CodexReviewRestartToken.ID)
     case loginAlreadyInProgress
+    case invalidAPIKey(CodexAPIKeyValidationFailure)
+    case authenticationOutcomeUnknown(CodexAuthenticationOutcomeUnknownReason)
 
     public var errorDescription: String? {
         switch self {
@@ -3057,6 +3086,20 @@ public enum CodexAppServerError: Error, Equatable, LocalizedError, Sendable {
             "Prepared review restart is no longer available for token \(tokenID)."
         case .loginAlreadyInProgress:
             "A ChatGPT login is already in progress."
+        case .invalidAPIKey(.empty):
+            "The API key must not be empty."
+        case .invalidAPIKey(.surroundingWhitespace):
+            "The API key must not contain leading or trailing whitespace."
+        case .authenticationOutcomeUnknown(.connectionTerminated):
+            "The app-server connection terminated before the API-key login result was confirmed. Reconcile account state before retrying."
+        case .authenticationOutcomeUnknown(.deadlineExceeded(let duration)):
+            "The written API-key login request exceeded its deadline of \(duration) before its result was confirmed. Reconcile account state before retrying."
+        case .authenticationOutcomeUnknown(.transportEnded):
+            "The transport ended before the written API-key login result was confirmed. Reconcile account state before retrying."
+        case .authenticationOutcomeUnknown(.invalidResponse):
+            "The app-server returned an invalid API-key login response. Reconcile account state before retrying."
+        case .authenticationOutcomeUnknown(.unexpectedResponse):
+            "The app-server returned an unexpected login response. Reconcile account state before retrying."
         }
     }
 }
