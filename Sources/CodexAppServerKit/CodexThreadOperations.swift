@@ -802,6 +802,7 @@ extension CodexTurn {
     }
 
     package func interruptAndAwaitTerminalAcknowledgement(
+        adoptsRedirectedTurnAsThreadEventOwner: Bool = true,
         willCancelActiveTurn: (@Sendable (CodexTurnCancellation) async -> Void)? = nil
     ) async throws -> CodexTurnInterruptionAcknowledgement {
         if let outcome = try await state.cachedOutcome() {
@@ -820,6 +821,7 @@ extension CodexTurn {
             originalState: state,
             store: turnReplayStore,
             connectionLease: connectionLease,
+            adoptsRedirectedTurnAsThreadEventOwner: adoptsRedirectedTurnAsThreadEventOwner,
             willCancelActiveTurn: willCancelActiveTurn
         )
         let outcome = try await CodexResponseStream(turn: self).waitForCancelledResponse(
@@ -848,6 +850,7 @@ private func interruptCodexTurnPreparingTarget(
     originalState: TurnGenerationHandleState,
     store: TurnReplayStore,
     connectionLease: AppServerConnectionLease,
+    adoptsRedirectedTurnAsThreadEventOwner: Bool,
     willCancelActiveTurn: (@Sendable (CodexTurnCancellation) async -> Void)?
 ) async throws -> PreparedTurnInterruption {
     var resolver = InterruptRaceResolver(expectedTurnID: turnID)
@@ -876,7 +879,9 @@ private func interruptCodexTurnPreparingTarget(
                     ),
                     connectionLease: connectionLease
                 )
-                await router.adoptThreadEventGeneration(threadID, including: activeTurn)
+                if adoptsRedirectedTurnAsThreadEventOwner {
+                    await router.adoptThreadEventGeneration(threadID, including: activeTurn)
+                }
                 if let willCancelActiveTurn {
                     await willCancelActiveTurn(cancellation)
                 }

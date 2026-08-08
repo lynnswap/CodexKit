@@ -617,12 +617,18 @@ public actor CodexAppServer {
         try await reviewRestartCoordinator.prepare(
             identity,
             operations: .init { [self] identities in
+                identities.record(identity)
                 let review = try await resumeReview(
                     identity,
                     threadOptions: threadOptions
                 )
+                // Inline reviews interrupt an internal reviewer child turn, while
+                // source-thread events continue under the outer review turn.
                 let acknowledgement = try await review.response.turn
-                    .interruptAndAwaitTerminalAcknowledgement {
+                    .interruptAndAwaitTerminalAcknowledgement(
+                        adoptsRedirectedTurnAsThreadEventOwner:
+                            identity.activeTurnThreadID != identity.sourceThreadID
+                    ) {
                     retryCancellation in
                     if retryCancellation.turnID != Optional(identity.turnID) {
                         identities.record(Self.reviewCleanupIdentity(
@@ -638,7 +644,6 @@ public actor CodexAppServer {
                     )
                 }
                 let cancellation = acknowledgement.cancellation
-                identities.record(identity)
                 identities.record(Self.reviewCleanupIdentity(
                     for: cancellation,
                     sourceIdentity: identity,
