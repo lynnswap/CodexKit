@@ -8428,13 +8428,18 @@ private func prepareRestartToken(
 ) async throws -> CodexReviewRestartToken {
     try await runtime.transport.enqueueThreadResume(.init(id: identity.activeTurnThreadID))
     try await runtime.transport.enqueueEmpty(for: "turn/interrupt")
+    let expectedInterruptRequestCount = await runtime.transport
+        .recordedRequests(method: "turn/interrupt").count + 1
     let prepareTask = Task {
         try await runtime.server.prepareReviewRestart(identity)
     }
     defer {
         prepareTask.cancel()
     }
-    await runtime.transport.waitForRequest(method: "turn/interrupt")
+    await runtime.transport.waitForRequest(
+        method: "turn/interrupt",
+        count: expectedInterruptRequestCount
+    )
     try await runtime.transport.emitServerNotification(
         method: "turn/completed",
         params: TurnCompletedParams(
