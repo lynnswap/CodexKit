@@ -2523,19 +2523,83 @@ extension AppServerAPI.Account {
 }
 
 extension AppServerAPI.Account.Login {
-    package struct Params: Codable, Equatable, Sendable {
-        package var type: String
-        package var apiKey: String?
-        package var codexStreamlinedLogin: Bool
+    package enum Params: Codable, Equatable, Sendable {
+        case chatGPT(codexStreamlinedLogin: Bool = true)
+        case apiKey(String)
 
-        package init(
-            type: String = "chatgpt",
-            apiKey: String? = nil,
-            codexStreamlinedLogin: Bool = true
-        ) {
-            self.type = type
-            self.apiKey = apiKey
-            self.codexStreamlinedLogin = codexStreamlinedLogin
+        private enum Kind: String, Codable {
+            case apiKey
+            case chatGPT = "chatgpt"
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case type
+            case apiKey
+            case codexStreamlinedLogin
+        }
+
+        package var type: String {
+            switch self {
+            case .chatGPT:
+                "chatgpt"
+            case .apiKey:
+                "apiKey"
+            }
+        }
+
+        package var apiKey: String? {
+            guard case .apiKey(let apiKey) = self else {
+                return nil
+            }
+            return apiKey
+        }
+
+        package var codexStreamlinedLogin: Bool? {
+            guard case .chatGPT(let codexStreamlinedLogin) = self else {
+                return nil
+            }
+            return codexStreamlinedLogin
+        }
+
+        package init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            switch try container.decode(Kind.self, forKey: .type) {
+            case .chatGPT:
+                guard container.contains(.apiKey) == false else {
+                    throw DecodingError.dataCorruptedError(
+                        forKey: .apiKey,
+                        in: container,
+                        debugDescription: "ChatGPT login parameters cannot contain an API key."
+                    )
+                }
+                self = .chatGPT(
+                    codexStreamlinedLogin: try container.decode(
+                        Bool.self,
+                        forKey: .codexStreamlinedLogin
+                    )
+                )
+            case .apiKey:
+                guard container.contains(.codexStreamlinedLogin) == false else {
+                    throw DecodingError.dataCorruptedError(
+                        forKey: .codexStreamlinedLogin,
+                        in: container,
+                        debugDescription: "API-key login parameters cannot contain ChatGPT options."
+                    )
+                }
+                self = .apiKey(try container.decode(String.self, forKey: .apiKey))
+            }
+        }
+
+        package func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            switch self {
+            case .chatGPT(let codexStreamlinedLogin):
+                try container.encode(Kind.chatGPT, forKey: .type)
+                try container.encode(codexStreamlinedLogin, forKey: .codexStreamlinedLogin)
+            case .apiKey(let apiKey):
+                try container.encode(Kind.apiKey, forKey: .type)
+                try container.encode(apiKey, forKey: .apiKey)
+            }
         }
     }
 }

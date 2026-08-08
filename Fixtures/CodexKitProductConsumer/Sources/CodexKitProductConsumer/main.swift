@@ -89,6 +89,11 @@ struct CodexKitProductConsumer {
 
         do {
             precondition(runtime.deadlineClock === deadlineClock)
+            try await runtime.transport.enqueueAPIKeyLogin()
+            try await runtime.server.login(apiKey: "fixture-api-key")
+            let loginRequests = await runtime.transport.recordedRequests(for: .accountLoginStart)
+            precondition(loginRequests.count == 1)
+
             let configURL = workspace.appendingPathComponent("config.toml")
             let configLayer = try CodexAppServerTestConfigurationLayerMetadata(
                 source: .user(file: configURL, profile: nil),

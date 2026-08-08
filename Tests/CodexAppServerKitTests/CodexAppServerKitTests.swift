@@ -6151,6 +6151,13 @@ struct CodexAppServerKitTests {
         let client = harness.client
         let router = harness.router
         await transport.waitForNotificationStreamCount(1)
+        let thread = CodexThread(
+            id: "thread-1",
+            client: client,
+            router: router,
+            connectionLease: harness.lease
+        )
+        let logEntries = thread.logEntries
 
         try await emitItemStarted(
             on: transport,
@@ -6224,8 +6231,7 @@ struct CodexAppServerKitTests {
             params: ThreadIDParams(threadID: "thread-1")
         )
 
-        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
-        let logs = try await collect(thread.logEntries)
+        let logs = try await collect(logEntries)
         let updates = logs.filter { $0.phase == .updated }
 
         #expect(updates.count == 3)
@@ -6645,6 +6651,337 @@ struct CodexAppServerKitTests {
             "account/login/start",
             "account/login/cancel",
         ])
+    }
+
+    @Test func apiKeyLoginUsesAnExclusiveWireShapeWithoutExposingTheSecretSemantically() async throws {
+        let apiKey = "sk-test-api-key-secret-sentinel"
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueAPIKeyLogin()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+
+        try await harness.server.login(apiKey: apiKey)
+
+        let request = try #require(
+            await transport.recordedRequests(method: "account/login/start").first
+        )
+        guard case .apiKey(let encodedAPIKey) = try request.decodeParams(
+            AppServerAPI.Account.Login.Params.self
+        ) else {
+            Issue.record("Expected API-key login parameters.")
+            return
+        }
+        #expect(encodedAPIKey == apiKey)
+
+        let object = try #require(
+            JSONSerialization.jsonObject(with: request.params) as? [String: Any]
+        )
+        #expect(Set(object.keys) == Set(["type", "apiKey"]))
+        #expect(object["type"] as? String == "apiKey")
+        #expect(object["apiKey"] as? String == apiKey)
+
+        let semanticRequest = try #require(await transport.recordedRequests().first?.request)
+        #expect(semanticRequest == .accountLoginStart)
+        #expect(String(reflecting: semanticRequest).contains(apiKey) == false)
+        await harness.close()
+    }
+
+    @Test func loginParameterDecoderRejectsMixedProviderStates() throws {
+        #expect(throws: DecodingError.self) {
+            try JSONDecoder().decode(
+                AppServerAPI.Account.Login.Params.self,
+                from: Data(
+                    #"{"type":"apiKey","apiKey":"placeholder","codexStreamlinedLogin":true}"#.utf8
+                )
+            )
+        }
+        #expect(throws: DecodingError.self) {
+            try JSONDecoder().decode(
+                AppServerAPI.Account.Login.Params.self,
+                from: Data(
+                    #"{"type":"chatgpt","apiKey":"placeholder","codexStreamlinedLogin":true}"#.utf8
+                )
+            )
+        }
+    }
+
+    @Test func apiKeyLoginRejectsInvalidInputBeforeSendingARequest() async throws {
+        let transport = CodexAppServerTestTransport()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let invalidInputs: [(String, CodexAPIKeyValidationFailure)] = [
+            ("", .empty),
+            (" \n\t", .empty),
+            (" sk-test-validation-leading", .surroundingWhitespace),
+            ("sk-test-validation-trailing\n", .surroundingWhitespace),
+        ]
+
+        for (apiKey, expectedFailure) in invalidInputs {
+            do {
+                try await harness.server.login(apiKey: apiKey)
+                Issue.record("Expected invalid API-key input to fail.")
+            } catch let error as CodexAppServerError {
+                #expect(error == .invalidAPIKey(expectedFailure))
+                let sensitiveValue = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+                if sensitiveValue.hasPrefix("sk-") {
+                    #expect(error.localizedDescription.contains(sensitiveValue) == false)
+                }
+            }
+        }
+
+        #expect(await transport.recordedRequests(method: "account/login/start").isEmpty)
+        await harness.close()
+    }
+
+    @Test func apiKeyLoginRejectsAnUnexpectedProviderResponseWithoutExposingTheSecret() async throws {
+        let apiKey = "sk-test-unexpected-response-secret"
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueChatGPTLogin(
+            loginID: "unexpected-login",
+            authenticationURL: URL(string: "https://example.test/\(apiKey)")!
+        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+
+        do {
+            try await harness.server.login(apiKey: apiKey)
+            Issue.record("Expected the provider mismatch to require reconciliation.")
+        } catch let error as CodexAppServerError {
+            #expect(error == .authenticationOutcomeUnknown(.unexpectedResponse))
+            #expect(error.localizedDescription.contains(apiKey) == false)
+            #expect(String(reflecting: error).contains(apiKey) == false)
+        }
+        await harness.close()
+    }
+
+    @Test func apiKeyLoginSanitizesAnInvalidResponseThatEchoesTheSecret() async throws {
+        let apiKey = "sk-test-invalid-response-secret"
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueJSON(
+            #"{"type":42,"echo":"\#(apiKey)"}"#,
+            for: "account/login/start"
+        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+
+        do {
+            try await harness.server.login(apiKey: apiKey)
+            Issue.record("Expected the invalid response to require reconciliation.")
+        } catch let error as CodexAppServerError {
+            #expect(error == .authenticationOutcomeUnknown(.invalidResponse))
+            #expect(error.localizedDescription.contains(apiKey) == false)
+            #expect(String(reflecting: error).contains(apiKey) == false)
+        }
+        await harness.close()
+    }
+
+    @Test func apiKeyLoginKeepsExplicitServerRejectionKnownAndSecretFree() async throws {
+        let apiKey = "sk-test-server-rejection-secret"
+        let transport = CodexAppServerTestTransport()
+        await transport.enqueueFailure(
+            code: -32_000,
+            message: "rejected \(apiKey)",
+            for: "account/login/start"
+        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+
+        do {
+            try await harness.server.login(apiKey: apiKey)
+            Issue.record("Expected an explicit server rejection.")
+        } catch let error as CodexAppServerError {
+            guard case .request(let failure) = error,
+                  case .server(let serverError) = failure.kind else {
+                Issue.record("Expected a known server rejection, got \(error).")
+                return
+            }
+            #expect(serverError.code == -32_000)
+            #expect(serverError.message == "API-key login was rejected by the app-server.")
+            #expect(error.localizedDescription.contains(apiKey) == false)
+            #expect(String(reflecting: error).contains(apiKey) == false)
+        }
+        await harness.close()
+    }
+
+    @Test func apiKeyLoginPostWriteCancellationDoesNotHideAServerRejection() async throws {
+        let apiKey = "sk-test-cancelled-server-rejection-secret"
+        let transport = CodexAppServerTestTransport()
+        let responseGate = CodexAppServerTestGate()
+        await transport.enqueueFailure(
+            code: -32_000,
+            message: "rejected \(apiKey)",
+            for: "account/login/start"
+        )
+        await transport.holdNextIgnoringCancellation(
+            method: "account/login/start",
+            gate: responseGate
+        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let task = Task {
+            try await harness.server.login(apiKey: apiKey)
+        }
+        await transport.waitForRequest(method: "account/login/start")
+
+        task.cancel()
+        await responseGate.open()
+
+        do {
+            try await task.value
+            Issue.record("Expected the correlated server rejection.")
+        } catch let error as CodexAppServerError {
+            guard case .request(let failure) = error,
+                  case .server(let serverError) = failure.kind else {
+                Issue.record("Expected a known server rejection, got \(error).")
+                return
+            }
+            #expect(serverError.code == -32_000)
+            #expect(error.localizedDescription.contains(apiKey) == false)
+        }
+        await harness.close()
+    }
+
+    @Test func apiKeyLoginDoesNotRetryOrPublishAnOverloadResponseContainingTheSecret() async throws {
+        let apiKey = "sk-test-overload-secret"
+        let transport = CodexAppServerTestTransport()
+        await transport.enqueueFailure(
+            code: -32_001,
+            message: "overloaded \(apiKey)",
+            for: "account/login/start"
+        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+
+        do {
+            try await harness.server.login(apiKey: apiKey)
+            Issue.record("Expected an explicit overload rejection.")
+        } catch let error as CodexAppServerError {
+            guard case .request(let failure) = error,
+                  case .server(let serverError) = failure.kind else {
+                Issue.record("Expected a known overload rejection, got \(error).")
+                return
+            }
+            #expect(serverError.code == -32_001)
+            #expect(error.localizedDescription.contains(apiKey) == false)
+            #expect(String(reflecting: error).contains(apiKey) == false)
+        }
+        #expect(await transport.recordedRequests(method: "account/login/start").count == 1)
+        await harness.close()
+    }
+
+    @Test func apiKeyLoginCancellationBeforeWriteHasNoWireEffect() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueAPIKeyLogin()
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let startGate = CodexAppServerTestGate()
+        let task = Task {
+            await startGate.waitIgnoringCancellation()
+            try await harness.server.login(apiKey: "sk-test-pre-write-cancellation")
+        }
+        await startGate.waitUntilBlocked()
+
+        task.cancel()
+        await startGate.open()
+
+        await #expect(throws: CancellationError.self) {
+            try await task.value
+        }
+        #expect(await transport.recordedRequests(method: "account/login/start").isEmpty)
+        await harness.close()
+    }
+
+    @Test func apiKeyLoginDefersPostWriteCancellationUntilTheResponseIsKnown() async throws {
+        let transport = CodexAppServerTestTransport()
+        let responseGate = CodexAppServerTestGate()
+        try await transport.enqueueAPIKeyLogin()
+        await transport.holdNextIgnoringCancellation(
+            method: "account/login/start",
+            gate: responseGate
+        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let task = Task {
+            try await harness.server.login(apiKey: "sk-test-post-write-cancellation")
+        }
+        await transport.waitForRequest(method: "account/login/start")
+
+        task.cancel()
+        await responseGate.open()
+
+        try await task.value
+        #expect(await transport.recordedRequests(method: "account/login/start").count == 1)
+        #expect(await transport.recordedRequests(method: "account/login/cancel").isEmpty)
+        await harness.close()
+    }
+
+    @Test func apiKeyLoginDeadlineAfterWriteRequiresReconciliation() async throws {
+        let transport = CodexAppServerTestTransport()
+        let responseGate = CodexAppServerTestGate()
+        let deadlineClock = CodexAppServerTestDeadlineClock()
+        try await transport.enqueueAPIKeyLogin()
+        await transport.holdNextIgnoringCancellation(
+            method: "account/login/start",
+            gate: responseGate
+        )
+        let runtime = try await CodexAppServerTestRuntime.start(
+            transport: transport,
+            configuration: .init(deadlines: .init(request: .seconds(5))),
+            deadlineClock: deadlineClock
+        )
+        let task = Task {
+            try await runtime.server.login(apiKey: "sk-test-deadline")
+        }
+        await transport.waitForRequest(method: "account/login/start")
+        try await deadlineClock.waitForSleeperCount(1)
+
+        deadlineClock.advance(by: .seconds(5))
+
+        do {
+            try await task.value
+            Issue.record("Expected an unknown authentication outcome after the deadline.")
+        } catch let error as CodexAppServerError {
+            #expect(error == .authenticationOutcomeUnknown(.deadlineExceeded(.seconds(5))))
+        }
+        #expect(await transport.isClosedForTesting())
+        await runtime.close()
+    }
+
+    @Test func apiKeyLoginWriteFailureAfterAcceptanceRequiresReconciliation() async throws {
+        let apiKey = "sk-test-post-write-transport-secret"
+        let transport = TestOutboundWriteFailureTransport(
+            failure: .contractViolation(message: "failed after writing \(apiKey)")
+        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+
+        do {
+            try await harness.server.login(apiKey: apiKey)
+            Issue.record("Expected transport reconciliation after write acceptance.")
+        } catch let error as CodexAppServerError {
+            #expect(error == .authenticationOutcomeUnknown(.transportEnded))
+            #expect(error.localizedDescription.contains(apiKey) == false)
+            #expect(String(reflecting: error).contains(apiKey) == false)
+        }
+        await harness.close()
+    }
+
+    @Test func apiKeyLoginConnectionTerminationAfterWriteRequiresReconciliation() async throws {
+        let apiKey = "sk-test-connection-secret"
+        let transport = CodexAppServerTestTransport()
+        let responseGate = CodexAppServerTestGate()
+        try await transport.enqueueAPIKeyLogin()
+        await transport.holdNextIgnoringCancellation(
+            method: "account/login/start",
+            gate: responseGate
+        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+        let task = Task {
+            try await harness.server.login(apiKey: apiKey)
+        }
+        await transport.waitForRequest(method: "account/login/start")
+
+        await transport.failConnection(.closed)
+        await responseGate.open()
+
+        do {
+            try await task.value
+            Issue.record("Expected connection reconciliation.")
+        } catch let error as CodexAppServerError {
+            #expect(error == .authenticationOutcomeUnknown(.connectionTerminated))
+            #expect(error.localizedDescription.contains(apiKey) == false)
+        }
+        await harness.close()
     }
 
     @Test func stockChatGPTLoginResolvesAfterPostSuccessAccountUpdate() async throws {
@@ -7801,6 +8138,7 @@ private final class TestPreWriteSuspendingTransport: JSONRPC.Transport, Sendable
 private final class TestOutboundWriteFailureTransport: JSONRPC.Transport, Sendable {
     let connectionEventHub = ConnectionEventHub()
     private let failure: CodexTransportFailure
+    private let inboundGate = CodexAppServerTestGate()
 
     init(failure: CodexTransportFailure) {
         self.failure = failure
@@ -7815,12 +8153,18 @@ private final class TestOutboundWriteFailureTransport: JSONRPC.Transport, Sendab
     }
 
     func notify(_ notification: JSONRPC.Notification) async throws {}
-    func nextInboundEvent() async throws -> JSONRPC.InboundEvent? { nil }
+    func nextInboundEvent() async throws -> JSONRPC.InboundEvent? {
+        await inboundGate.waitIgnoringCancellation()
+        return nil
+    }
     func respond(
         to requestID: CodexServerRequestID,
         with response: CodexServerRequestResponse
     ) async throws {}
-    func beginClose() async -> JSONRPC.ProcessExitObservation? { nil }
+    func beginClose() async -> JSONRPC.ProcessExitObservation? {
+        await inboundGate.open()
+        return nil
+    }
     func finishPendingResponsesAfterInboundDrain(_ failure: CodexTransportFailure) async {}
     func waitForProcessExit() async -> JSONRPC.ProcessExitObservation { .unavailable }
     func waitUntilClosed() async {}

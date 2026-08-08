@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 
 /// A live connection to a Codex app-server process.
 ///
@@ -1041,7 +1042,7 @@ public actor CodexAppServer {
         )
         do {
             let response = try await client.send(
-                AppServerAPI.Account.Login.Start.Request(params: .init(type: "chatgpt")),
+                AppServerAPI.Account.Login.Start.Request(params: .chatGPT()),
                 onPostWriteCancellation: { [loginRegistry] response in
                     let (id, url) = try Self.chatGPTLoginIdentity(from: response)
                     let handle = try await loginRegistry.bind(
@@ -1057,6 +1058,45 @@ public actor CodexAppServer {
         } catch {
             await loginRegistry.abandon(state)
             throw error
+        }
+    }
+
+    /// Replaces the active credentials with an API key.
+    ///
+    /// A successful return means the app-server stored and reloaded the key in
+    /// its configured Codex home. It does not prove that a remote API request
+    /// will accept the key.
+    ///
+    /// - Parameter apiKey: A nonempty API key without leading or trailing whitespace.
+    /// - Throws: An input, transport, JSON-RPC, or app-server authentication error.
+    public func login(apiKey: String) async throws {
+        try Self.validate(apiKey: apiKey)
+
+        let acceptedWriteHasUnknownOutcome = Mutex(false)
+        let response: AppServerAPI.Account.Login.Response
+        do {
+            response = try await client.send(
+                AppServerAPI.Account.Login.Start.Request(params: .apiKey(apiKey)),
+                onWriteAccepted: {
+                    acceptedWriteHasUnknownOutcome.withLock { $0 = true }
+                },
+                retriesOverloadResponses: false,
+                postWriteCallerCancellationPolicy: .returnResponse
+            )
+        } catch is CancellationError {
+            guard acceptedWriteHasUnknownOutcome.withLock({ $0 }) else {
+                throw CancellationError()
+            }
+            throw CodexAppServerError.authenticationOutcomeUnknown(.transportEnded)
+        } catch let error as CodexAppServerError {
+            throw Self.apiKeyLoginError(
+                from: error,
+                acceptedWriteHasUnknownOutcome: acceptedWriteHasUnknownOutcome.withLock { $0 }
+            )
+        }
+
+        guard response == .apiKey else {
+            throw CodexAppServerError.authenticationOutcomeUnknown(.unexpectedResponse)
         }
     }
 
@@ -1333,6 +1373,117 @@ public actor CodexAppServer {
             ))
         }
         return (.init(rawValue: loginID), url)
+    }
+
+    private nonisolated static func validate(apiKey: String) throws {
+        let trimmed = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.isEmpty == false else {
+            throw CodexAppServerError.invalidAPIKey(.empty)
+        }
+        guard trimmed == apiKey else {
+            throw CodexAppServerError.invalidAPIKey(.surroundingWhitespace)
+        }
+    }
+
+    private nonisolated static func apiKeyLoginError(
+        from error: CodexAppServerError,
+        acceptedWriteHasUnknownOutcome: Bool
+    ) -> CodexAppServerError {
+        if case .request(let failure) = error {
+            switch failure.kind {
+            case .server, .overloadRetryExhausted:
+                return .request(sanitizedAPIKeyLoginRequestFailure(failure))
+            case .deadlineExceeded(let duration) where acceptedWriteHasUnknownOutcome:
+                return .authenticationOutcomeUnknown(.deadlineExceeded(duration))
+            case .invalidResponse where acceptedWriteHasUnknownOutcome:
+                return .authenticationOutcomeUnknown(.invalidResponse)
+            case .write where acceptedWriteHasUnknownOutcome,
+                 .transport where acceptedWriteHasUnknownOutcome:
+                return .authenticationOutcomeUnknown(.transportEnded)
+            case .encode, .write, .transport, .invalidResponse, .deadlineExceeded:
+                return .request(sanitizedAPIKeyLoginRequestFailure(failure))
+            }
+        }
+        if case .connectionTerminated = error, acceptedWriteHasUnknownOutcome {
+            return .authenticationOutcomeUnknown(.connectionTerminated)
+        }
+        if case .connectionTerminated(let termination) = error {
+            return .connectionTerminated(sanitizedAPIKeyLoginTermination(termination))
+        }
+        return error
+    }
+
+    private nonisolated static func sanitizedAPIKeyLoginRequestFailure(
+        _ failure: CodexRequestFailure
+    ) -> CodexRequestFailure {
+        let kind: CodexRequestFailure.Kind = switch failure.kind {
+        case .encode:
+            .encode(message: "API-key login request encoding failed.")
+        case .write(let transportFailure):
+            .write(sanitizedAPIKeyLoginTransportFailure(transportFailure))
+        case .transport(let transportFailure):
+            .transport(sanitizedAPIKeyLoginTransportFailure(transportFailure))
+        case .server(let serverError):
+            .server(.init(
+                code: serverError.code,
+                message: "API-key login was rejected by the app-server."
+            ))
+        case .invalidResponse(let expectedType, _, _):
+            .invalidResponse(
+                expectedType: expectedType,
+                message: "The app-server returned an invalid API-key login response.",
+                rawData: nil
+            )
+        case .deadlineExceeded(let duration):
+            .deadlineExceeded(duration)
+        case .overloadRetryExhausted(let serverError, let attempts):
+            .overloadRetryExhausted(
+                last: .init(
+                    code: serverError.code,
+                    message: "The app-server remained overloaded."
+                ),
+                attempts: attempts
+            )
+        }
+        return .init(
+            requestID: failure.requestID,
+            method: failure.method,
+            purpose: failure.purpose,
+            kind: kind
+        )
+    }
+
+    private nonisolated static func sanitizedAPIKeyLoginTermination(
+        _ termination: CodexConnectionTermination
+    ) -> CodexConnectionTermination {
+        switch termination {
+        case .closedByCaller:
+            .closedByCaller
+        case .processExited(let status):
+            .processExited(status: status)
+        case .transportFailure(let failure):
+            .transportFailure(sanitizedAPIKeyLoginTransportFailure(failure))
+        }
+    }
+
+    private nonisolated static func sanitizedAPIKeyLoginTransportFailure(
+        _ failure: CodexTransportFailure
+    ) -> CodexTransportFailure {
+        switch failure {
+        case .closed:
+            .closed
+        case .io(let errno, _):
+            .io(errno: errno, message: "The API-key login transport failed.")
+        case .framing:
+            .framing(message: "The API-key login transport returned an invalid frame.", rawData: nil)
+        case .protocolViolation:
+            .protocolViolation(
+                message: "The API-key login transport violated the app-server protocol.",
+                rawData: nil
+            )
+        case .contractViolation:
+            .contractViolation(message: "The API-key login transport contract was violated.")
+        }
     }
 
 }
