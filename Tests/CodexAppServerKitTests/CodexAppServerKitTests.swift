@@ -6151,6 +6151,13 @@ struct CodexAppServerKitTests {
         let client = harness.client
         let router = harness.router
         await transport.waitForNotificationStreamCount(1)
+        let thread = CodexThread(
+            id: "thread-1",
+            client: client,
+            router: router,
+            connectionLease: harness.lease
+        )
+        let logEntries = thread.logEntries
 
         try await emitItemStarted(
             on: transport,
@@ -6224,8 +6231,7 @@ struct CodexAppServerKitTests {
             params: ThreadIDParams(threadID: "thread-1")
         )
 
-        let thread = CodexThread(id: "thread-1", client: client, router: router, connectionLease: harness.lease)
-        let logs = try await collect(thread.logEntries)
+        let logs = try await collect(logEntries)
         let updates = logs.filter { $0.phase == .updated }
 
         #expect(updates.count == 3)
