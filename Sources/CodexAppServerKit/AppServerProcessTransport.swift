@@ -1762,8 +1762,19 @@ package enum CodexAppServerExecutable {
         let environmentDirectories = (environment["PATH"] ?? "")
             .split(separator: ":", omittingEmptySubsequences: true)
             .map(String.init)
-        var directories: [String] = []
-        for directory in environmentDirectories + [
+        var knownDirectories: [String] = []
+        if let homeDirectory = environment["HOME"]?.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        ),
+           homeDirectory.isEmpty == false {
+            // The standalone Codex installer defaults here even when a GUI app's PATH omits it.
+            knownDirectories.append(
+                URL(fileURLWithPath: homeDirectory, isDirectory: true)
+                    .appendingPathComponent(".local/bin", isDirectory: true)
+                    .path
+            )
+        }
+        knownDirectories += [
             "/Applications/Codex.app/Contents/Resources",
             "/opt/homebrew/bin",
             "/usr/local/bin",
@@ -1771,7 +1782,10 @@ package enum CodexAppServerExecutable {
             "/bin",
             "/usr/sbin",
             "/sbin",
-        ] where directories.contains(directory) == false {
+        ]
+        var directories: [String] = []
+        for directory in environmentDirectories + knownDirectories
+        where directories.contains(directory) == false {
             directories.append(directory)
         }
         return directories
