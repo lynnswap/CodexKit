@@ -617,11 +617,12 @@ public actor CodexAppServer {
         try await reviewRestartCoordinator.prepare(
             identity,
             operations: .init { [self] identities in
+                identities.record(identity)
                 let review = try await resumeReview(
                     identity,
                     threadOptions: threadOptions
                 )
-                let acknowledgement = try await review.response.turn
+                let acknowledgement = try await review
                     .interruptAndAwaitTerminalAcknowledgement {
                     retryCancellation in
                     if retryCancellation.turnID != Optional(identity.turnID) {
@@ -638,7 +639,6 @@ public actor CodexAppServer {
                     )
                 }
                 let cancellation = acknowledgement.cancellation
-                identities.record(identity)
                 identities.record(Self.reviewCleanupIdentity(
                     for: cancellation,
                     sourceIdentity: identity,
@@ -1172,7 +1172,7 @@ public actor CodexAppServer {
     private nonisolated static func interruptLateReviewSession(
         _ review: CodexReviewSession
     ) async throws {
-        _ = try await interruptAndAwaitTerminal(review.response)
+        _ = try await review.interruptAndAwaitTerminalAcknowledgement()
     }
 
     private nonisolated static func orderedReviewCleanupThreadIDs(

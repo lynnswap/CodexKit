@@ -299,7 +299,7 @@ extension CodexThread {
     private func cleanupCancelledReviewSession(
         _ review: CodexReviewSession
     ) async throws {
-        _ = try await interruptAndAwaitTerminal(review.response)
+        _ = try await review.interruptAndAwaitTerminalAcknowledgement()
         guard review.reviewThreadID != id else {
             return
         }
@@ -683,6 +683,34 @@ private func finishPendingTurnOperation(
     }
 }
 
+extension CodexReviewSession {
+    package func interruptAndAwaitTerminalAcknowledgement(
+        willCancelActiveTurn: (@Sendable (CodexTurnCancellation) async -> Void)? = nil
+    ) async throws -> CodexTurnInterruptionAcknowledgement {
+        let acknowledgement = try await response.turn.interruptAndAwaitTerminalAcknowledgement(
+            adoptsRedirectedTurnAsThreadEventOwner:
+                activeTurnThreadID != sourceThreadID,
+            willCancelActiveTurn: willCancelActiveTurn
+        )
+        guard activeTurnThreadID == sourceThreadID,
+              acknowledgement.cancellation.turnID != Optional(turnID) else {
+            return acknowledgement
+        }
+
+        // An inline review's redirected child is a TurnReplay generation only.
+        // The source thread remains on the outer review turn, whose terminal is
+        // emitted after the child acknowledges interruption.
+        let outerOutcome = try await response.waitForCancelledResponse(.init(
+            threadID: activeTurnThreadID,
+            turnID: turnID
+        ))
+        return .init(
+            cancellation: acknowledgement.cancellation,
+            outcome: outerOutcome
+        )
+    }
+}
+
 package func withThreadEventGeneration<Response: Sendable>(
     _ threadID: CodexThreadID,
     router: CodexAppServerNotificationRouter,
@@ -804,6 +832,16 @@ extension CodexTurn {
     package func interruptAndAwaitTerminalAcknowledgement(
         willCancelActiveTurn: (@Sendable (CodexTurnCancellation) async -> Void)? = nil
     ) async throws -> CodexTurnInterruptionAcknowledgement {
+        try await interruptAndAwaitTerminalAcknowledgement(
+            adoptsRedirectedTurnAsThreadEventOwner: true,
+            willCancelActiveTurn: willCancelActiveTurn
+        )
+    }
+
+    fileprivate func interruptAndAwaitTerminalAcknowledgement(
+        adoptsRedirectedTurnAsThreadEventOwner: Bool,
+        willCancelActiveTurn: (@Sendable (CodexTurnCancellation) async -> Void)?
+    ) async throws -> CodexTurnInterruptionAcknowledgement {
         if let outcome = try await state.cachedOutcome() {
             let cancellation = CodexTurnCancellation(threadID: threadID, turnID: id)
             return .init(
@@ -820,6 +858,7 @@ extension CodexTurn {
             originalState: state,
             store: turnReplayStore,
             connectionLease: connectionLease,
+            adoptsRedirectedTurnAsThreadEventOwner: adoptsRedirectedTurnAsThreadEventOwner,
             willCancelActiveTurn: willCancelActiveTurn
         )
         let outcome = try await CodexResponseStream(turn: self).waitForCancelledResponse(
@@ -848,6 +887,7 @@ private func interruptCodexTurnPreparingTarget(
     originalState: TurnGenerationHandleState,
     store: TurnReplayStore,
     connectionLease: AppServerConnectionLease,
+    adoptsRedirectedTurnAsThreadEventOwner: Bool,
     willCancelActiveTurn: (@Sendable (CodexTurnCancellation) async -> Void)?
 ) async throws -> PreparedTurnInterruption {
     var resolver = InterruptRaceResolver(expectedTurnID: turnID)
@@ -876,7 +916,9 @@ private func interruptCodexTurnPreparingTarget(
                     ),
                     connectionLease: connectionLease
                 )
-                await router.adoptThreadEventGeneration(threadID, including: activeTurn)
+                if adoptsRedirectedTurnAsThreadEventOwner {
+                    await router.adoptThreadEventGeneration(threadID, including: activeTurn)
+                }
                 if let willCancelActiveTurn {
                     await willCancelActiveTurn(cancellation)
                 }
