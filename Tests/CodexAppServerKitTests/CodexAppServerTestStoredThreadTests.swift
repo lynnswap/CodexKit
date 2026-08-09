@@ -130,6 +130,37 @@ struct CodexAppServerTestStoredThreadTests {
         #expect(stored.snapshot.sourceKind == .subAgentReview)
     }
 
+    @Test func threadStoreListUsesProductionSourceFilterSemantics() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start(threads: [
+            makeRuntimeStoredThreadFixture(id: "cli", source: .cli),
+            makeRuntimeStoredThreadFixture(id: "vscode", source: .vscode),
+            makeRuntimeStoredThreadFixture(id: "atlas", source: .custom("atlas")),
+            makeRuntimeStoredThreadFixture(id: "chatgpt", source: .custom("chatgpt")),
+            makeRuntimeStoredThreadFixture(id: "custom", source: .custom("other")),
+            makeRuntimeStoredThreadFixture(id: "exec", source: .exec),
+            makeRuntimeStoredThreadFixture(id: "app-server", source: .appServer),
+            makeRuntimeStoredThreadFixture(id: "review", source: .subAgentReview),
+            makeRuntimeStoredThreadFixture(id: "compact", source: .subAgentCompact),
+        ])
+
+        let interactiveIDs = ["cli", "vscode", "atlas", "chatgpt"]
+        #expect(try await runtime.server.listThreads().threads.map(\.id.rawValue) == interactiveIDs)
+        #expect(try await runtime.server.listThreads(.init(
+            sourceKinds: []
+        )).threads.map(\.id.rawValue) == interactiveIDs)
+        #expect(try await runtime.server.listThreads(.init(
+            sourceKinds: [.appServer]
+        )).threads.map(\.id.rawValue) == ["app-server"])
+        #expect(try await runtime.server.listThreads(.init(
+            sourceKinds: [.subAgentReview]
+        )).threads.map(\.id.rawValue) == ["review"])
+        #expect(try await runtime.server.listThreads(.init(
+            sourceKinds: [.subAgent]
+        )).threads.map(\.id.rawValue) == ["review", "compact"])
+
+        await runtime.close()
+    }
+
     @Test func replacingTurnsRevalidatesProjectionAndPreservesHiddenMetadata() throws {
         let fixture = try makeStoredThreadFixture()
         let replacementItem = try CodexAppServerTestItem.plan(
@@ -274,6 +305,87 @@ struct CodexAppServerTestStoredThreadTests {
                 snapshot: mismatchedSource,
                 turns: [fixture.turn],
                 metadata: fixture.metadata,
+                runtimeMetadata: fixture.runtimeMetadata,
+                isArchived: false
+            )
+        }
+
+        var explicitNullSession = fixture.snapshot
+        explicitNullSession.sessionID = nil
+        #expect(
+            throws: CodexAppServerTestError.invalidFixture(
+                "thread snapshot session id must match the Testing thread metadata"
+            )
+        ) {
+            _ = try CodexAppServerTestStoredThread(
+                snapshot: explicitNullSession,
+                turns: [fixture.turn],
+                metadata: fixture.metadata,
+                runtimeMetadata: fixture.runtimeMetadata,
+                isArchived: false
+            )
+        }
+
+        var explicitNullSource = fixture.snapshot
+        explicitNullSource.source = nil
+        #expect(
+            throws: CodexAppServerTestError.invalidFixture(
+                "thread snapshot source must match the Testing thread metadata"
+            )
+        ) {
+            _ = try CodexAppServerTestStoredThread(
+                snapshot: explicitNullSource,
+                turns: [fixture.turn],
+                metadata: fixture.metadata,
+                runtimeMetadata: fixture.runtimeMetadata,
+                isArchived: false
+            )
+        }
+
+        var spawnMetadata = fixture.metadata
+        spawnMetadata.source = .subAgentThreadSpawn(
+            parentThreadID: "source-parent",
+            depth: 1,
+            agentPath: nil,
+            agentNickname: nil,
+            agentRole: nil
+        )
+        #expect(
+            throws: CodexAppServerTestError.invalidFixture(
+                "thread-spawn source parent must match the Testing thread metadata parent"
+            )
+        ) {
+            _ = try CodexAppServerTestStoredThread(
+                snapshot: fixture.snapshot,
+                turns: [fixture.turn],
+                metadata: spawnMetadata,
+                runtimeMetadata: fixture.runtimeMetadata,
+                isArchived: false
+            )
+        }
+
+        var gitMetadata = fixture.metadata
+        gitMetadata.gitInfo = .init(sha: "abc123")
+        var gitSnapshot = fixture.snapshot
+        gitSnapshot.presentFields.remove(.gitInfo)
+        let gitFixture = try CodexAppServerTestStoredThread(
+            snapshot: gitSnapshot,
+            turns: [fixture.turn],
+            metadata: gitMetadata,
+            runtimeMetadata: fixture.runtimeMetadata,
+            isArchived: false
+        )
+        var explicitNullGitInfo = gitFixture.snapshot
+        explicitNullGitInfo.gitInfo = nil
+        #expect(
+            throws: CodexAppServerTestError.invalidFixture(
+                "thread snapshot Git metadata must match the Testing thread metadata"
+            )
+        ) {
+            _ = try CodexAppServerTestStoredThread(
+                snapshot: explicitNullGitInfo,
+                turns: [fixture.turn],
+                metadata: gitFixture.metadata,
                 runtimeMetadata: fixture.runtimeMetadata,
                 isArchived: false
             )
@@ -508,7 +620,7 @@ func makeRuntimeStoredThreadFixture(
     preview: String? = nil,
     model: String = "gpt-5",
     modelProvider: String = "openai",
-    source: CodexAppServerTestSessionSource = .appServer,
+    source: CodexAppServerTestSessionSource = .cli,
     createdAt: Date = Date(timeIntervalSince1970: 10),
     updatedAt: Date = Date(timeIntervalSince1970: 20),
     recencyAt: Date? = nil,

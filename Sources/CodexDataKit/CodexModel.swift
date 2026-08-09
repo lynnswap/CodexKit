@@ -544,7 +544,23 @@ public final class CodexChat: CodexPersistentModel {
     public private(set) var name: String?
     public private(set) var preview: String?
     public private(set) var modelProvider: String?
-    public private(set) var sourceKind: CodexThreadSourceKind?
+    /// The app-server session identifier, when present in the latest snapshot.
+    public private(set) var sessionID: String?
+    /// The direct parent thread identifier reported by the app-server.
+    public private(set) var parentThreadID: CodexThreadID?
+    /// The exact thread session origin reported by the app-server.
+    public private(set) var source: CodexThreadSessionSource?
+    private var sourceKindFallback: CodexThreadSourceKind?
+    /// A coarse source projection retained for source-kind filtering compatibility.
+    ///
+    /// Exact custom sources project to `nil`. Fetch predicates must narrow this
+    /// property to a finite set of non-`nil` kinds; an unbounded `nil` or non-`nil`
+    /// comparison cannot be represented by the app-server and fails validation.
+    public var sourceKind: CodexThreadSourceKind? {
+        source?.sourceKind ?? sourceKindFallback
+    }
+    /// Git repository metadata captured for this thread by the app-server.
+    public private(set) var gitInfo: CodexThreadGitInfo?
     public private(set) var isArchived: Bool
     public private(set) var createdAt: Date?
     public private(set) var updatedAt: Date?
@@ -642,7 +658,8 @@ public final class CodexChat: CodexPersistentModel {
         self.id = id
         self.turns = []
         self.items = []
-        self.sourceKind = .appServer
+        self.source = nil
+        self.sourceKindFallback = nil
         self.isArchived = false
         self.modelContext = modelContext
     }
@@ -669,8 +686,24 @@ public final class CodexChat: CodexPersistentModel {
         {
             modelProvider = snapshot.modelProvider
         }
-        if snapshot.hasField(.sourceKind) {
-            sourceKind = snapshot.sourceKind
+        if snapshot.hasField(.sessionID) {
+            sessionID = snapshot.sessionID
+        }
+        if snapshot.hasField(.parentThreadID) {
+            parentThreadID = snapshot.parentThreadID
+        }
+        if snapshot.hasField(.source) {
+            source = snapshot.source
+            sourceKindFallback = nil
+        } else if snapshot.hasField(.sourceKind) {
+            let sourceKind = snapshot.sourceKind
+            if source == nil || source?.sourceKind != sourceKind {
+                source = nil
+                sourceKindFallback = sourceKind
+            }
+        }
+        if snapshot.hasField(.gitInfo) {
+            gitInfo = snapshot.gitInfo
         }
         if receivedAuthoritativeTitleMetadata {
             preservesSeededMetadataUntilAuthoritativeSnapshot = false
@@ -2795,7 +2828,11 @@ public final class CodexChat: CodexPersistentModel {
             name: name,
             preview: preview,
             modelProvider: modelProvider,
-            sourceKind: sourceKind,
+            sessionID: sessionID,
+            parentThreadID: parentThreadID,
+            source: source,
+            sourceKind: sourceKindFallback,
+            gitInfo: gitInfo,
             createdAt: createdAt,
             updatedAt: updatedAt,
             recencyAt: recencyAt,

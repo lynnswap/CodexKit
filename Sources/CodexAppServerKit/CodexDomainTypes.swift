@@ -1001,13 +1001,120 @@ package struct CodexTurn: Identifiable, Sendable {
     }
 }
 
+/// Git repository metadata captured for a thread by the app-server.
+public struct CodexThreadGitInfo: Equatable, Sendable {
+    /// The captured commit SHA, when the thread store recorded one.
+    public var sha: String?
+    /// The captured branch name, when the thread store recorded one.
+    public var branch: String?
+    /// The raw origin remote value. Git remotes are not required to use URL syntax.
+    public var originURL: String?
+
+    public init(
+        sha: String? = nil,
+        branch: String? = nil,
+        originURL: String? = nil
+    ) {
+        self.sha = sha
+        self.branch = branch
+        self.originURL = originURL
+    }
+}
+
+/// The exact session origin reported by the app-server for a thread.
+///
+/// This differs from ``CodexThreadSource``, which is a client-supplied analytics
+/// classification used when starting a thread.
+public enum CodexThreadSessionSource: Hashable, Sendable {
+    public enum SubAgent: Hashable, Sendable {
+        public struct ThreadSpawn: Hashable, Sendable {
+            public var parentThreadID: CodexThreadID
+            public var depth: Int
+            public var agentPath: String?
+            public var agentNickname: String?
+            public var agentRole: String?
+
+            public init(
+                parentThreadID: CodexThreadID,
+                depth: Int,
+                agentPath: String? = nil,
+                agentNickname: String? = nil,
+                agentRole: String? = nil
+            ) {
+                self.parentThreadID = parentThreadID
+                self.depth = depth
+                self.agentPath = agentPath
+                self.agentNickname = agentNickname
+                self.agentRole = agentRole
+            }
+        }
+
+        case review
+        case compact
+        case threadSpawn(ThreadSpawn)
+        case memoryConsolidation
+        case other(String)
+    }
+
+    case cli
+    case vscode
+    case exec
+    case appServer
+    case custom(String)
+    case subAgent(SubAgent)
+    case unknown
+
+    /// A coarse compatibility projection suitable for source-kind filtering.
+    ///
+    /// Custom sources return `nil` because the app-server does not include them
+    /// in any source-kind filter.
+    public var sourceKind: CodexThreadSourceKind? {
+        switch self {
+        case .cli:
+            .cli
+        case .vscode:
+            .vscode
+        case .exec:
+            .exec
+        case .appServer:
+            .appServer
+        case .custom:
+            nil
+        case .unknown:
+            .unknown
+        case .subAgent(.review):
+            .subAgentReview
+        case .subAgent(.compact):
+            .subAgentCompact
+        case .subAgent(.threadSpawn):
+            .subAgentThreadSpawn
+        case .subAgent(.memoryConsolidation):
+            .subAgent
+        case .subAgent(.other):
+            .subAgentOther
+        }
+    }
+
+    /// Returns whether this exact source is included by an app-server source-kind filter.
+    public func matches(sourceKind: CodexThreadSourceKind) -> Bool {
+        if sourceKind == .subAgent, case .subAgent = self {
+            return true
+        }
+        return self.sourceKind == sourceKind
+    }
+}
+
 public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
     package enum Field: String, Hashable, Sendable {
+        case sessionID
+        case parentThreadID
         case workspace
         case name
         case preview
         case modelProvider
+        case source
         case sourceKind
+        case gitInfo
         case createdAt
         case updatedAt
         case recencyAt
@@ -1017,11 +1124,49 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
     }
 
     public var id: CodexThreadID
+    /// The app-server session identifier, when present in the snapshot.
+    public var sessionID: String? {
+        didSet { presentFields.insert(.sessionID) }
+    }
+    /// The direct parent thread identifier reported by the app-server.
+    public var parentThreadID: CodexThreadID? {
+        didSet { presentFields.insert(.parentThreadID) }
+    }
     public var workspace: URL?
     public var name: String?
     public var preview: String?
     public var modelProvider: String?
-    public var sourceKind: CodexThreadSourceKind?
+    private var sourceStorage: CodexThreadSessionSource?
+    private var sourceKindFallback: CodexThreadSourceKind?
+    /// The exact thread session origin reported by the app-server.
+    public var source: CodexThreadSessionSource? {
+        get { sourceStorage }
+        set {
+            sourceStorage = newValue
+            sourceKindFallback = nil
+            presentFields.remove(.sourceKind)
+            presentFields.insert(.source)
+        }
+    }
+    /// A coarse source projection retained for source-kind filtering compatibility.
+    public var sourceKind: CodexThreadSourceKind? {
+        get { sourceStorage?.sourceKind ?? sourceKindFallback }
+        set {
+            if let sourceStorage, newValue == sourceStorage.sourceKind {
+                presentFields.remove(.sourceKind)
+                presentFields.insert(.source)
+                return
+            }
+            sourceStorage = nil
+            sourceKindFallback = newValue
+            presentFields.remove(.source)
+            presentFields.insert(.sourceKind)
+        }
+    }
+    /// Git repository metadata captured for this thread by the app-server.
+    public var gitInfo: CodexThreadGitInfo? {
+        didSet { presentFields.insert(.gitInfo) }
+    }
     public var createdAt: Date?
     public var updatedAt: Date?
     public var recencyAt: Date?
@@ -1036,11 +1181,15 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
 
     public static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.id == rhs.id
+            && lhs.sessionID == rhs.sessionID
+            && lhs.parentThreadID == rhs.parentThreadID
             && lhs.workspace == rhs.workspace
             && lhs.name == rhs.name
             && lhs.preview == rhs.preview
             && lhs.modelProvider == rhs.modelProvider
+            && lhs.source == rhs.source
             && lhs.sourceKind == rhs.sourceKind
+            && lhs.gitInfo == rhs.gitInfo
             && lhs.createdAt == rhs.createdAt
             && lhs.updatedAt == rhs.updatedAt
             && lhs.recencyAt == rhs.recencyAt
@@ -1055,7 +1204,11 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
         name: String? = nil,
         preview: String? = nil,
         modelProvider: String? = nil,
+        sessionID: String? = nil,
+        parentThreadID: CodexThreadID? = nil,
+        source: CodexThreadSessionSource? = nil,
         sourceKind: CodexThreadSourceKind? = nil,
+        gitInfo: CodexThreadGitInfo? = nil,
         createdAt: Date? = nil,
         updatedAt: Date? = nil,
         recencyAt: Date? = nil,
@@ -1069,7 +1222,11 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
             name: name,
             preview: preview,
             modelProvider: modelProvider,
+            sessionID: sessionID,
+            parentThreadID: parentThreadID,
+            source: source,
             sourceKind: sourceKind,
+            gitInfo: gitInfo,
             createdAt: createdAt,
             updatedAt: updatedAt,
             recencyAt: recencyAt,
@@ -1078,11 +1235,15 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
             turns: turns,
             turnItemsAreAuthoritative: true,
             presentFields: Self.presentFields(
+                sessionID: sessionID,
+                parentThreadID: parentThreadID,
                 workspace: workspace,
                 name: name,
                 preview: preview,
                 modelProvider: modelProvider,
+                source: source,
                 sourceKind: sourceKind,
+                gitInfo: gitInfo,
                 createdAt: createdAt,
                 updatedAt: updatedAt,
                 recencyAt: recencyAt,
@@ -1099,7 +1260,11 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
         name: String? = nil,
         preview: String? = nil,
         modelProvider: String? = nil,
+        sessionID: String? = nil,
+        parentThreadID: CodexThreadID? = nil,
+        source: CodexThreadSessionSource? = nil,
         sourceKind: CodexThreadSourceKind? = nil,
+        gitInfo: CodexThreadGitInfo? = nil,
         createdAt: Date? = nil,
         updatedAt: Date? = nil,
         recencyAt: Date? = nil,
@@ -1109,12 +1274,20 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
         turnItemsAreAuthoritative: Bool,
         presentFields: Set<Field>? = nil
     ) {
+        precondition(
+            source == nil || sourceKind == nil || source?.sourceKind == sourceKind,
+            "An exact thread source and its compatibility kind must agree."
+        )
         self.id = id
+        self.sessionID = sessionID
+        self.parentThreadID = parentThreadID
         self.workspace = workspace
         self.name = name
         self.preview = preview
         self.modelProvider = modelProvider
-        self.sourceKind = sourceKind
+        self.sourceStorage = source
+        self.sourceKindFallback = source == nil ? sourceKind : nil
+        self.gitInfo = gitInfo
         self.createdAt = createdAt
         self.updatedAt = updatedAt
         self.recencyAt = recencyAt
@@ -1124,11 +1297,15 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
         self.turnItemsAreAuthoritative = turnItemsAreAuthoritative
             && (turns?.allSatisfy(\.itemsAreAuthoritative) ?? false)
         self.presentFields = presentFields ?? Self.presentFields(
+            sessionID: sessionID,
+            parentThreadID: parentThreadID,
             workspace: workspace,
             name: name,
             preview: preview,
             modelProvider: modelProvider,
+            source: source,
             sourceKind: sourceKind,
+            gitInfo: gitInfo,
             createdAt: createdAt,
             updatedAt: updatedAt,
             recencyAt: recencyAt,
@@ -1143,11 +1320,15 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
     }
 
     private static func presentFields(
+        sessionID: String?,
+        parentThreadID: CodexThreadID?,
         workspace: URL?,
         name: String?,
         preview: String?,
         modelProvider: String?,
+        source: CodexThreadSessionSource?,
         sourceKind: CodexThreadSourceKind?,
+        gitInfo: CodexThreadGitInfo?,
         createdAt: Date?,
         updatedAt: Date?,
         recencyAt: Date?,
@@ -1156,6 +1337,12 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
         turns: [CodexTurnSnapshot]?
     ) -> Set<Field> {
         var fields: Set<Field> = []
+        if sessionID != nil {
+            fields.insert(.sessionID)
+        }
+        if parentThreadID != nil {
+            fields.insert(.parentThreadID)
+        }
         if workspace != nil {
             fields.insert(.workspace)
         }
@@ -1168,8 +1355,13 @@ public struct CodexThreadSnapshot: Identifiable, Equatable, Sendable {
         if modelProvider != nil {
             fields.insert(.modelProvider)
         }
-        if sourceKind != nil {
+        if source != nil {
+            fields.insert(.source)
+        } else if sourceKind != nil {
             fields.insert(.sourceKind)
+        }
+        if gitInfo != nil {
+            fields.insert(.gitInfo)
         }
         if createdAt != nil {
             fields.insert(.createdAt)

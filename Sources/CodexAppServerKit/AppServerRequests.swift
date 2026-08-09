@@ -531,7 +531,7 @@ extension AppServerAPI.Thread {
         case subAgent(SubAgent)
         case unknown
 
-        package var sourceKind: CodexThreadSourceKind {
+        package var sourceKind: CodexThreadSourceKind? {
             switch self {
             case .cli:
                 .cli
@@ -541,7 +541,9 @@ extension AppServerAPI.Thread {
                 .exec
             case .appServer:
                 .appServer
-            case .custom, .unknown:
+            case .custom:
+                nil
+            case .unknown:
                 .unknown
             case .subAgent(.review):
                 .subAgentReview
@@ -559,11 +561,14 @@ extension AppServerAPI.Thread {
 
     package struct Snapshot: Codable, Equatable, Sendable {
         package enum Field: String, Hashable, Sendable {
+            case sessionID
+            case parentThreadID
             case cwd
             case name
             case preview
             case modelProvider
-            case sourceKind
+            case source
+            case gitInfo
             case createdAt
             case updatedAt
             case recencyAt
@@ -582,12 +587,37 @@ extension AppServerAPI.Thread {
             }
         }
 
+        package struct GitInfo: Codable, Equatable, Sendable {
+            package var sha: String?
+            package var branch: String?
+            package var originURL: String?
+
+            enum CodingKeys: String, CodingKey {
+                case sha
+                case branch
+                case originURL = "originUrl"
+            }
+
+            package init(
+                sha: String? = nil,
+                branch: String? = nil,
+                originURL: String? = nil
+            ) {
+                self.sha = sha
+                self.branch = branch
+                self.originURL = originURL
+            }
+        }
+
         package var id: String
+        package var sessionID: String?
+        package var parentThreadID: String?
         package var cwd: String?
         package var name: String?
         package var preview: String?
         package var modelProvider: String?
         package var source: AppServerAPI.Thread.SessionSource?
+        package var gitInfo: GitInfo?
         package var createdAt: Int?
         package var updatedAt: Int?
         package var recencyAt: Int?
@@ -602,11 +632,14 @@ extension AppServerAPI.Thread {
 
         enum CodingKeys: String, CodingKey {
             case id
+            case sessionID = "sessionId"
+            case parentThreadID = "parentThreadId"
             case cwd
             case name
             case preview
             case modelProvider
             case source
+            case gitInfo
             case createdAt
             case updatedAt
             case recencyAt
@@ -617,11 +650,14 @@ extension AppServerAPI.Thread {
 
         package init(
             id: String,
+            sessionID: String? = nil,
+            parentThreadID: String? = nil,
             cwd: String? = nil,
             name: String? = nil,
             preview: String? = nil,
             modelProvider: String? = nil,
             source: AppServerAPI.Thread.SessionSource? = nil,
+            gitInfo: GitInfo? = nil,
             createdAt: Int? = nil,
             updatedAt: Int? = nil,
             recencyAt: Int? = nil,
@@ -631,11 +667,14 @@ extension AppServerAPI.Thread {
             presentFields: Set<Field>? = nil
         ) {
             self.id = id
+            self.sessionID = sessionID
+            self.parentThreadID = parentThreadID
             self.cwd = cwd
             self.name = name
             self.preview = preview
             self.modelProvider = modelProvider
             self.source = source
+            self.gitInfo = gitInfo
             self.createdAt = createdAt
             self.updatedAt = updatedAt
             self.recencyAt = recencyAt
@@ -643,11 +682,14 @@ extension AppServerAPI.Thread {
             self.ephemeral = ephemeral
             self.turns = turns
             self.presentFields = presentFields ?? Self.presentFields(
+                sessionID: sessionID,
+                parentThreadID: parentThreadID,
                 cwd: cwd,
                 name: name,
                 preview: preview,
                 modelProvider: modelProvider,
                 source: source,
+                gitInfo: gitInfo,
                 createdAt: createdAt,
                 updatedAt: updatedAt,
                 recencyAt: recencyAt,
@@ -660,6 +702,8 @@ extension AppServerAPI.Thread {
         package init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             id = try container.decode(String.self, forKey: .id)
+            sessionID = try container.decodeIfPresent(String.self, forKey: .sessionID)
+            parentThreadID = try container.decodeIfPresent(String.self, forKey: .parentThreadID)
             cwd = try container.decodeIfPresent(String.self, forKey: .cwd)
             name = try container.decodeIfPresent(String.self, forKey: .name)
             preview = try container.decodeIfPresent(String.self, forKey: .preview)
@@ -668,6 +712,7 @@ extension AppServerAPI.Thread {
                 AppServerAPI.Thread.SessionSource.self,
                 forKey: .source
             )
+            gitInfo = try container.decodeIfPresent(GitInfo.self, forKey: .gitInfo)
             createdAt = try container.decodeIfPresent(Int.self, forKey: .createdAt)
             updatedAt = try container.decodeIfPresent(Int.self, forKey: .updatedAt)
             recencyAt = try container.decodeIfPresent(Int.self, forKey: .recencyAt)
@@ -680,11 +725,14 @@ extension AppServerAPI.Thread {
         package func encode(to encoder: Encoder) throws {
             var container = encoder.container(keyedBy: CodingKeys.self)
             try container.encode(id, forKey: .id)
+            try encode(sessionID, forKey: .sessionID, into: &container)
+            try encode(parentThreadID, forKey: .parentThreadID, into: &container)
             try encode(cwd, forKey: .cwd, into: &container)
             try encode(name, forKey: .name, into: &container)
             try encode(preview, forKey: .preview, into: &container)
             try encode(modelProvider, forKey: .modelProvider, into: &container)
             try encode(source, forKey: .source, into: &container)
+            try encode(gitInfo, forKey: .gitInfo, into: &container)
             try encode(createdAt, forKey: .createdAt, into: &container)
             try encode(updatedAt, forKey: .updatedAt, into: &container)
             try encode(recencyAt, forKey: .recencyAt, into: &container)
@@ -709,11 +757,14 @@ extension AppServerAPI.Thread {
         }
 
         private static func presentFields(
+            sessionID: String?,
+            parentThreadID: String?,
             cwd: String?,
             name: String?,
             preview: String?,
             modelProvider: String?,
             source: AppServerAPI.Thread.SessionSource?,
+            gitInfo: GitInfo?,
             createdAt: Int?,
             updatedAt: Int?,
             recencyAt: Int?,
@@ -722,6 +773,12 @@ extension AppServerAPI.Thread {
             turns: [AppServerAPI.Turn.Payload]?
         ) -> Set<Field> {
             var fields: Set<Field> = []
+            if sessionID != nil {
+                fields.insert(.sessionID)
+            }
+            if parentThreadID != nil {
+                fields.insert(.parentThreadID)
+            }
             if cwd != nil {
                 fields.insert(.cwd)
             }
@@ -735,7 +792,10 @@ extension AppServerAPI.Thread {
                 fields.insert(.modelProvider)
             }
             if source != nil {
-                fields.insert(.sourceKind)
+                fields.insert(.source)
+            }
+            if gitInfo != nil {
+                fields.insert(.gitInfo)
             }
             if createdAt != nil {
                 fields.insert(.createdAt)
@@ -910,6 +970,10 @@ private extension AppServerAPI.Thread.Snapshot.Field {
         switch key {
         case .id:
             return nil
+        case .sessionID:
+            self = .sessionID
+        case .parentThreadID:
+            self = .parentThreadID
         case .cwd:
             self = .cwd
         case .name:
@@ -919,7 +983,9 @@ private extension AppServerAPI.Thread.Snapshot.Field {
         case .modelProvider:
             self = .modelProvider
         case .source:
-            self = .sourceKind
+            self = .source
+        case .gitInfo:
+            self = .gitInfo
         case .createdAt:
             self = .createdAt
         case .updatedAt:

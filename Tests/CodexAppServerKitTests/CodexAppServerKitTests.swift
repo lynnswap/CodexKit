@@ -1623,10 +1623,37 @@ struct CodexAppServerKitTests {
             .subAgent(.other("custom-agent")),
             .unknown,
         ]
+        let expectedDomainSources: [CodexThreadSessionSource] = [
+            .cli,
+            .vscode,
+            .exec,
+            .appServer,
+            .custom("automation"),
+            .subAgent(.review),
+            .subAgent(.compact),
+            .subAgent(.threadSpawn(.init(
+                parentThreadID: "parent-thread",
+                depth: 2,
+                agentPath: "reviewer/worker",
+                agentNickname: "Scout",
+                agentRole: "reviewer"
+            ))),
+            .subAgent(.memoryConsolidation),
+            .subAgent(.other("custom-agent")),
+            .unknown,
+        ]
 
-        for source in sources {
+        for (source, expectedDomainSource) in zip(sources, expectedDomainSources) {
             let data = try JSONEncoder().encode(source)
             #expect(try JSONDecoder().decode(AppServerAPI.Thread.SessionSource.self, from: data) == source)
+            let snapshot = CodexAppServer.threadSnapshot(
+                from: .init(id: "thread-source", source: source),
+                includesTurns: false
+            )
+            #expect(snapshot.source == expectedDomainSource)
+            #expect(snapshot.sourceKind == expectedDomainSource.sourceKind)
+            #expect(snapshot.hasField(.source))
+            #expect(snapshot.hasField(.sourceKind) == false)
         }
     }
 
@@ -1640,8 +1667,67 @@ struct CodexAppServerKitTests {
 
         let snapshot = try #require(try await harness.server.listThreads().threads.first)
 
+        #expect(snapshot.source == .subAgent(.review))
         #expect(snapshot.sourceKind == .subAgentReview)
-        #expect(snapshot.hasField(.sourceKind))
+        #expect(snapshot.hasField(.source))
+        #expect(snapshot.hasField(.sourceKind) == false)
+    }
+
+    @Test func threadListProjectsThreadProvenanceMetadata() async throws {
+        let transport = CodexAppServerTestTransport()
+        try await transport.enqueueJSON(
+            """
+            {
+              "data": [
+                {
+                  "id": "thread-worker",
+                  "sessionId": "session-review",
+                  "parentThreadId": "thread-parent",
+                  "source": {
+                    "subAgent": {
+                      "thread_spawn": {
+                        "parent_thread_id": "thread-parent",
+                        "depth": 2,
+                        "agent_path": "reviewer/worker",
+                        "agent_nickname": "Scout",
+                        "agent_role": "reviewer"
+                      }
+                    }
+                  },
+                  "gitInfo": {
+                    "sha": "0123456789abcdef",
+                    "branch": "agent/review-sidebar",
+                    "originUrl": "git@github.com:lynnswap/CodexKit.git"
+                  }
+                }
+              ]
+            }
+            """,
+            for: "thread/list"
+        )
+        let harness = await CodexAppServerTestConnectionHarness.start(transport: transport)
+
+        let snapshot = try #require(try await harness.server.listThreads().threads.first)
+
+        #expect(snapshot.sessionID == "session-review")
+        #expect(snapshot.parentThreadID == "thread-parent")
+        #expect(snapshot.source == .subAgent(.threadSpawn(.init(
+            parentThreadID: "thread-parent",
+            depth: 2,
+            agentPath: "reviewer/worker",
+            agentNickname: "Scout",
+            agentRole: "reviewer"
+        ))))
+        #expect(snapshot.sourceKind == .subAgentThreadSpawn)
+        #expect(snapshot.gitInfo == .init(
+            sha: "0123456789abcdef",
+            branch: "agent/review-sidebar",
+            originURL: "git@github.com:lynnswap/CodexKit.git"
+        ))
+        #expect(snapshot.hasField(.sessionID))
+        #expect(snapshot.hasField(.parentThreadID))
+        #expect(snapshot.hasField(.source))
+        #expect(snapshot.hasField(.gitInfo))
     }
 
     @Test func threadListDoesNotUseLegacySourceKindFallback() async throws {
@@ -1655,6 +1741,8 @@ struct CodexAppServerKitTests {
         let snapshot = try #require(try await harness.server.listThreads().threads.first)
 
         #expect(snapshot.sourceKind == nil)
+        #expect(snapshot.source == nil)
+        #expect(snapshot.hasField(.source) == false)
         #expect(snapshot.hasField(.sourceKind) == false)
     }
 
@@ -1666,7 +1754,11 @@ struct CodexAppServerKitTests {
               "data": [
                 {
                   "id": "thread-partial",
+                  "sessionId": null,
+                  "parentThreadId": null,
                   "name": null,
+                  "source": null,
+                  "gitInfo": null,
                   "updatedAt": 1000
                 }
               ]
@@ -1682,6 +1774,15 @@ struct CodexAppServerKitTests {
 
         #expect(snapshot.hasField(.name))
         #expect(snapshot.name == nil)
+        #expect(snapshot.hasField(.sessionID))
+        #expect(snapshot.sessionID == nil)
+        #expect(snapshot.hasField(.parentThreadID))
+        #expect(snapshot.parentThreadID == nil)
+        #expect(snapshot.hasField(.source))
+        #expect(snapshot.source == nil)
+        #expect(snapshot.sourceKind == nil)
+        #expect(snapshot.hasField(.gitInfo))
+        #expect(snapshot.gitInfo == nil)
         #expect(snapshot.hasField(.updatedAt))
         #expect(snapshot.updatedAt == Date(timeIntervalSince1970: 1000))
         #expect(!snapshot.hasField(.workspace))
@@ -1693,16 +1794,84 @@ struct CodexAppServerKitTests {
             id: "thread-partial",
             name: nil,
             updatedAt: nil,
-            presentFields: [.name, .updatedAt]
+            presentFields: [
+                .sessionID,
+                .parentThreadID,
+                .name,
+                .source,
+                .gitInfo,
+                .updatedAt,
+            ]
         )
 
         let data = try JSONEncoder().encode(snapshot)
         let object = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
 
         #expect(object["id"] as? String == "thread-partial")
+        #expect(object["sessionId"] is NSNull)
+        #expect(object["parentThreadId"] is NSNull)
         #expect(object["name"] is NSNull)
+        #expect(object["source"] is NSNull)
+        #expect(object["gitInfo"] is NSNull)
         #expect(object["updatedAt"] is NSNull)
         #expect(object["cwd"] == nil)
+    }
+
+    @Test func threadSnapshotEncodingPreservesThreadProvenanceMetadata() throws {
+        let snapshot = AppServerAPI.Thread.Snapshot(
+            id: "thread-worker",
+            sessionID: "session-review",
+            parentThreadID: "thread-parent",
+            source: .subAgent(.review),
+            gitInfo: .init(
+                sha: "0123456789abcdef",
+                branch: "agent/review-sidebar",
+                originURL: "git@github.com:lynnswap/CodexKit.git"
+            )
+        )
+
+        let data = try JSONEncoder().encode(snapshot)
+        let decoded = try JSONDecoder().decode(AppServerAPI.Thread.Snapshot.self, from: data)
+        let object = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let gitInfo = try #require(object["gitInfo"] as? [String: Any])
+
+        #expect(decoded == snapshot)
+        #expect(object["sessionId"] as? String == "session-review")
+        #expect(object["parentThreadId"] as? String == "thread-parent")
+        #expect(gitInfo["originUrl"] as? String == "git@github.com:lynnswap/CodexKit.git")
+    }
+
+    @Test func exactThreadSourceOwnsCompatibilityProjection() {
+        var snapshot = CodexThreadSnapshot(
+            id: "thread-source-owner",
+            source: .subAgent(.review)
+        )
+
+        #expect(snapshot.source == .subAgent(.review))
+        #expect(snapshot.sourceKind == .subAgentReview)
+        #expect(snapshot.hasField(.source))
+        #expect(snapshot.hasField(.sourceKind) == false)
+
+        snapshot.sourceKind = .subAgentReview
+        #expect(snapshot.source == .subAgent(.review))
+        #expect(snapshot.hasField(.source))
+        #expect(snapshot.hasField(.sourceKind) == false)
+
+        snapshot.sourceKind = .appServer
+        #expect(snapshot.source == nil)
+        #expect(snapshot.sourceKind == .appServer)
+        #expect(snapshot.hasField(.source) == false)
+        #expect(snapshot.hasField(.sourceKind))
+
+        snapshot.source = .custom("automation")
+        #expect(snapshot.source == .custom("automation"))
+        #expect(snapshot.sourceKind == nil)
+        #expect(snapshot.hasField(.source))
+        #expect(snapshot.hasField(.sourceKind) == false)
+
+        snapshot.source = nil
+        #expect(snapshot.source == nil)
+        #expect(snapshot.hasField(.source))
     }
 
     @Test func threadReadUsesIncludeTurnsToInterpretEmptyTurns() async throws {

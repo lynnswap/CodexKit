@@ -347,8 +347,14 @@ private struct CodexThreadServerFilter: Hashable, Sendable {
     init() {}
 
     init(signature: CodexChatPredicateSignature) throws {
+        let derivedFilter = Self.filter(from: signature)
+        if signature.referencesSourceKind, derivedFilter?.sourceKinds == nil {
+            throw CodexFetchValidationError.unsupportedPredicate(
+                String(describing: signature)
+            )
+        }
         let archiveScope = Self.archiveScope(from: signature)
-        guard var filter = Self.filter(from: signature) else {
+        guard var filter = derivedFilter else {
             switch archiveScope {
             case .scoped(let archived):
                 self = Self(isComplete: false)
@@ -674,6 +680,7 @@ private struct CodexThreadServerFilter: Hashable, Sendable {
             (.sourceKind(let sourceKind), .key(.sourceKind)):
             var filter = Self()
             filter.sourceKinds = [sourceKind]
+            filter.isComplete = sourceKind != .subAgent
             return filter
         default:
             return nilCheckFilter(lhs, rhs)
@@ -741,6 +748,7 @@ private struct CodexThreadServerFilter: Hashable, Sendable {
             }
             var filter = Self()
             filter.sourceKinds = values
+            filter.isComplete = values.contains(.subAgent) == false
             return filter
         case (.workspaceIDArray(let values), .key(.workspaceID)):
             guard values.isEmpty == false else {
@@ -835,6 +843,22 @@ private extension CodexChatPredicateSignature {
             return nil
         }
         return value
+    }
+
+    var referencesSourceKind: Bool {
+        switch self {
+        case .bool(let value):
+            value == .key(.sourceKind)
+        case .equal(let lhs, let rhs),
+            .notEqual(let lhs, let rhs),
+            .localizedStandardContains(let lhs, let rhs),
+            .contains(let lhs, let rhs):
+            lhs == .key(.sourceKind) || rhs == .key(.sourceKind)
+        case .conjunction(let lhs, let rhs), .disjunction(let lhs, let rhs):
+            lhs.referencesSourceKind || rhs.referencesSourceKind
+        case .negation(let predicate):
+            predicate.referencesSourceKind
+        }
     }
 }
 

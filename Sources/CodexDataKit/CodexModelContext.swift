@@ -132,7 +132,11 @@ public final class CodexModelContext: Equatable, SendableMetatype {
         var name: String?
         var preview: String?
         var modelProvider: String?
+        var sessionID: String?
+        var parentThreadID: CodexThreadID?
+        var source: CodexThreadSessionSource?
         var sourceKind: CodexThreadSourceKind?
+        var gitInfo: CodexThreadGitInfo?
         var isArchived: Bool
         var createdAt: Date?
         var updatedAt: Date?
@@ -983,7 +987,11 @@ public final class CodexModelContext: Equatable, SendableMetatype {
                     name: metadata.name,
                     preview: metadata.preview,
                     modelProvider: metadata.modelProvider,
-                    sourceKind: metadata.sourceKind,
+                    sessionID: metadata.sessionID,
+                    parentThreadID: metadata.parentThreadID,
+                    source: metadata.source,
+                    sourceKind: metadata.source == nil ? metadata.sourceKind : nil,
+                    gitInfo: metadata.gitInfo,
                     createdAt: metadata.createdAt,
                     updatedAt: metadata.updatedAt,
                     recencyAt: metadata.recencyAt,
@@ -1557,7 +1565,7 @@ public final class CodexModelContext: Equatable, SendableMetatype {
             id: thread.id,
             workspace: thread.workspace,
             modelProvider: input.options.modelProvider,
-            sourceKind: .appServer,
+            source: .appServer,
             createdAt: now,
             updatedAt: now,
             ephemeral: input.options.ephemeral
@@ -1616,7 +1624,7 @@ public final class CodexModelContext: Equatable, SendableMetatype {
                 workspace: eventThread.workspace ?? workspaceURL,
                 preview: input.target.dataKitPreview,
                 modelProvider: input.options.modelProvider,
-                sourceKind: .subAgentReview,
+                source: .subAgent(.review),
                 createdAt: now,
                 updatedAt: now,
                 recencyAt: now,
@@ -2182,7 +2190,11 @@ public final class CodexModelContext: Equatable, SendableMetatype {
             name: snapshot.name,
             preview: snapshot.preview,
             modelProvider: snapshot.modelProvider,
-            sourceKind: snapshot.sourceKind,
+            sessionID: snapshot.sessionID,
+            parentThreadID: snapshot.parentThreadID,
+            source: snapshot.source,
+            sourceKind: snapshot.source == nil ? snapshot.sourceKind : nil,
+            gitInfo: snapshot.gitInfo,
             createdAt: snapshot.createdAt,
             updatedAt: snapshot.updatedAt,
             recencyAt: snapshot.recencyAt,
@@ -2199,7 +2211,11 @@ public final class CodexModelContext: Equatable, SendableMetatype {
             name: chat.name,
             preview: chat.preview,
             modelProvider: chat.modelProvider,
+            sessionID: chat.sessionID,
+            parentThreadID: chat.parentThreadID,
+            source: chat.source,
             sourceKind: chat.sourceKind,
+            gitInfo: chat.gitInfo,
             isArchived: chat.isArchived,
             createdAt: chat.createdAt,
             updatedAt: chat.updatedAt,

@@ -78,6 +78,18 @@ private func nonNilModelProviderChatPredicate() -> Predicate<CodexChat> {
     }
 }
 
+private func nilSourceKindChatPredicate() -> Predicate<CodexChat> {
+    #Predicate<CodexChat> { chat in
+        chat.isArchived == false && chat.sourceKind == nil
+    }
+}
+
+private func nonNilSourceKindChatPredicate() -> Predicate<CodexChat> {
+    #Predicate<CodexChat> { chat in
+        chat.isArchived == false && chat.sourceKind != nil
+    }
+}
+
 private func archivedNilModelProviderChatPredicate() -> Predicate<CodexChat> {
     #Predicate<CodexChat> { chat in
         chat.isArchived && chat.modelProvider == nil
@@ -198,7 +210,11 @@ private extension CodexThreadSnapshot {
             name: name,
             preview: preview,
             modelProvider: modelProvider,
+            sessionID: sessionID,
+            parentThreadID: parentThreadID,
+            source: source,
             sourceKind: sourceKind,
+            gitInfo: gitInfo,
             createdAt: createdAt,
             updatedAt: updatedAt,
             recencyAt: recencyAt,
@@ -645,6 +661,220 @@ struct CodexModelContextTests {
         #expect(await runtime.transport.recordedRequests(method: "thread/list").count == 2)
     }
 
+    @Test("thread provenance mutates in place, preserves omissions, and clears explicit nulls")
+    func threadProvenanceUsesSnapshotPresenceSemantics() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let chatID = CodexThreadID("thread-provenance")
+        let parentThreadID = CodexThreadID("thread-parent")
+        let source = CodexThreadSessionSource.subAgent(.threadSpawn(.init(
+            parentThreadID: parentThreadID,
+            depth: 2,
+            agentPath: "research/metadata",
+            agentNickname: "Ada",
+            agentRole: "explorer"
+        )))
+        let gitInfo = CodexThreadGitInfo(
+            sha: "0123456789abcdef",
+            branch: "feature/provenance",
+            originURL: "git@github.com:lynnswap/CodexKit.git"
+        )
+        let chat = context.model(for: chatID)
+
+        chat.apply(
+            .init(
+                id: chatID,
+                sessionID: "session-provenance",
+                parentThreadID: parentThreadID,
+                source: source,
+                gitInfo: gitInfo
+            ),
+            workspace: nil
+        )
+
+        #expect(chat.sessionID == "session-provenance")
+        #expect(chat.parentThreadID == parentThreadID)
+        #expect(chat.source == source)
+        #expect(chat.sourceKind == .subAgentThreadSpawn)
+        #expect(chat.gitInfo == gitInfo)
+
+        chat.apply(.init(id: chatID), workspace: nil)
+
+        #expect(context.model(for: chatID) === chat)
+        #expect(chat.sessionID == "session-provenance")
+        #expect(chat.parentThreadID == parentThreadID)
+        #expect(chat.source == source)
+        #expect(chat.sourceKind == .subAgentThreadSpawn)
+        #expect(chat.gitInfo == gitInfo)
+        #expect(chat.observationSnapshot().sessionID == "session-provenance")
+        #expect(chat.observationSnapshot().source == source)
+        #expect(chat.observationSnapshot().gitInfo == gitInfo)
+
+        chat.apply(
+            .init(
+                id: chatID,
+                turnItemsAreAuthoritative: false,
+                presentFields: [.sessionID, .parentThreadID, .source, .gitInfo]
+            ),
+            workspace: nil
+        )
+
+        #expect(context.model(for: chatID) === chat)
+        #expect(chat.sessionID == nil)
+        #expect(chat.parentThreadID == nil)
+        #expect(chat.source == nil)
+        #expect(chat.sourceKind == nil)
+        #expect(chat.gitInfo == nil)
+    }
+
+    @Test("legacy source-kind snapshots preserve matching exact source metadata")
+    func legacySourceKindSnapshotsStaySynchronizedWithExactSource() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let chat = context.model(for: CodexThreadID("thread-source-compatibility"))
+        let exactSource = CodexThreadSessionSource.subAgent(.threadSpawn(.init(
+            parentThreadID: "thread-parent",
+            depth: 1,
+            agentPath: nil,
+            agentNickname: nil,
+            agentRole: nil
+        )))
+
+        chat.apply(.init(id: chat.id, source: exactSource), workspace: nil)
+        chat.apply(.init(id: chat.id, sourceKind: .subAgentThreadSpawn), workspace: nil)
+
+        #expect(chat.source == exactSource)
+        #expect(chat.sourceKind == .subAgentThreadSpawn)
+
+        chat.apply(.init(id: chat.id, sourceKind: .appServer), workspace: nil)
+
+        #expect(chat.source == nil)
+        #expect(chat.sourceKind == .appServer)
+
+        chat.apply(
+            .init(
+                id: chat.id,
+                turnItemsAreAuthoritative: false,
+                presentFields: [.sourceKind]
+            ),
+            workspace: nil
+        )
+
+        #expect(chat.source == nil)
+        #expect(chat.sourceKind == nil)
+    }
+
+    @Test("exact provenance-only list changes revalidate registered fetched results")
+    func exactProvenanceChangesRevalidateFetchedResults() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        try await runtime.transport.enqueueJSON(
+            """
+            {
+              "data": [{
+                "id": "thread-provenance-revalidation",
+                "sessionId": "session-provenance-revalidation",
+                "parentThreadId": "thread-parent-revalidation",
+                "source": {"custom": "first"},
+                "gitInfo": {
+                  "sha": "1111111111111111",
+                  "branch": "feature/first",
+                  "originUrl": "git@github.com:lynnswap/CodexKit.git"
+                }
+              }],
+              "nextCursor": null
+            }
+            """,
+            for: "thread/list"
+        )
+        let results = context.fetchedResults(for: CodexFetchDescriptor<CodexChat>.recentChats)
+        let recorder = FetchedResultsTransactionRecorder(stream: results.transactions)
+        try await results.performFetch()
+        #expect(await eventually { recorder.transactions.count == 1 })
+        let chat = try #require(results.items.first)
+        #expect(chat.sessionID == "session-provenance-revalidation")
+        #expect(chat.parentThreadID == "thread-parent-revalidation")
+        #expect(chat.source == .custom("first"))
+        #expect(chat.sourceKind == nil)
+        #expect(chat.gitInfo?.branch == "feature/first")
+
+        try await runtime.transport.enqueueJSON(
+            """
+            {
+              "data": [{
+                "id": "thread-provenance-revalidation",
+                "sessionId": "session-provenance-revalidation",
+                "parentThreadId": "thread-parent-revalidation",
+                "source": {"custom": "second"},
+                "gitInfo": {
+                  "sha": "2222222222222222",
+                  "branch": "feature/second",
+                  "originUrl": "git@github.com:lynnswap/CodexKit.git"
+                }
+              }],
+              "nextCursor": null
+            }
+            """,
+            for: "thread/list"
+        )
+        _ = try await context.fetch(CodexFetchDescriptor<CodexChat>.recentChats)
+
+        #expect(await eventually { recorder.transactions.count >= 2 })
+        let transaction = try #require(recorder.transactions.first { transaction in
+            transaction.reason == .revalidate
+                && transaction.itemChanges.contains(
+                    .update(itemID: chat.id, indexPath: .init(section: 0, item: 0))
+                )
+        })
+        #expect(transaction.reason == .revalidate)
+        #expect(results.items.first === chat)
+        #expect(chat.source == .custom("second"))
+        #expect(chat.sourceKind == nil)
+        #expect(chat.gitInfo?.sha == "2222222222222222")
+        #expect(chat.gitInfo?.branch == "feature/second")
+
+        try await runtime.transport.enqueueJSON(
+            """
+            {
+              "data": [{"id": "thread-provenance-revalidation"}],
+              "nextCursor": null
+            }
+            """,
+            for: "thread/list"
+        )
+        _ = try await context.fetch(CodexFetchDescriptor<CodexChat>.recentChats)
+
+        #expect(results.items.first === chat)
+        #expect(chat.sessionID == "session-provenance-revalidation")
+        #expect(chat.parentThreadID == "thread-parent-revalidation")
+        #expect(chat.source == .custom("second"))
+        #expect(chat.gitInfo?.branch == "feature/second")
+
+        try await runtime.transport.enqueueJSON(
+            """
+            {
+              "data": [{
+                "id": "thread-provenance-revalidation",
+                "sessionId": null,
+                "parentThreadId": null,
+                "source": null,
+                "gitInfo": null
+              }],
+              "nextCursor": null
+            }
+            """,
+            for: "thread/list"
+        )
+        _ = try await context.fetch(CodexFetchDescriptor<CodexChat>.recentChats)
+
+        #expect(results.items.first === chat)
+        #expect(chat.sessionID == nil)
+        #expect(chat.parentThreadID == nil)
+        #expect(chat.source == nil)
+        #expect(chat.sourceKind == nil)
+        #expect(chat.gitInfo == nil)
+    }
+
     @Test("registered chat lookup does not create placeholders")
     func registeredChatLookupDoesNotCreatePlaceholders() async throws {
         let runtime = try await CodexAppServerTestRuntime.start()
@@ -659,6 +889,8 @@ struct CodexModelContextTests {
         let placeholder = context.model(for: threadID)
 
         #expect(placeholder.id == threadID)
+        #expect(placeholder.source == nil)
+        #expect(placeholder.sourceKind == nil)
         #expect(context.registeredModel(for: threadID) === placeholder)
         #expect(await runtime.transport.recordedRequests(method: "thread/list").isEmpty)
         #expect(await runtime.transport.recordedRequests(method: "thread/resume").isEmpty)
@@ -1150,6 +1382,16 @@ struct CodexModelContextTests {
         } catch CodexFetchFailure.validation(.negativeFetchLimit(-1)) {
         }
 
+        for predicate in [nilSourceKindChatPredicate(), nonNilSourceKindChatPredicate()] {
+            do {
+                _ = try await context.fetch(CodexFetchDescriptor<CodexChat>(
+                    predicate: predicate
+                ))
+                Issue.record("Expected unsupported source-kind predicate validation failure")
+            } catch CodexFetchFailure.validation(.unsupportedPredicate) {
+            }
+        }
+
         #expect(await runtime.transport.recordedRequests(method: "thread/list").isEmpty)
     }
 
@@ -1390,7 +1632,7 @@ struct CodexModelContextTests {
         let context = CodexModelContainer(appServer: runtime.server).mainContext
 
         try await runtime.transport.enqueueThreadList(.init(profile: .currentV2, threads: [
-            .init(id: "thread-legacy", name: "Legacy")
+            .init(id: "thread-legacy", name: "Legacy", sourceKind: .appServer)
         ]))
 
         let results = try await context.fetch(CodexFetchDescriptor<CodexChat>(
@@ -1398,6 +1640,7 @@ struct CodexModelContextTests {
         ))
 
         #expect(results.map(\.id.rawValue) == ["thread-legacy"])
+        #expect(results.first?.source == .appServer)
         #expect(results.first?.sourceKind == .appServer)
         let recorded = try #require(
             await runtime.transport.recordedRequests(method: "thread/list").first)
@@ -1423,11 +1666,59 @@ struct CodexModelContextTests {
         ))
 
         #expect(results.map(\.id.rawValue) == ["thread-review"])
+        #expect(results.first?.source == .subAgent(.review))
         #expect(results.first?.sourceKind == .subAgentReview)
         let recorded = try #require(
             await runtime.transport.recordedRequests(method: "thread/list").first)
         let params = try recorded.decodeParams(ThreadListParams.self)
         #expect(params.sourceKinds == ["subAgentReview"])
+    }
+
+    @Test("unknown source filters exclude custom session sources")
+    func unknownSourceFiltersExcludeCustomSessionSources() async throws {
+        let workspace = temporaryDirectory()
+        let runtime = try await CodexAppServerTestRuntime.start(threads: [
+            try makeDataKitStoredThreadFixture(
+                id: "thread-custom-source",
+                workspace: workspace,
+                source: .custom("automation")
+            ),
+            try makeDataKitStoredThreadFixture(
+                id: "thread-unknown-source",
+                workspace: workspace,
+                source: .unknown
+            ),
+        ])
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+
+        let results = try await context.fetch(CodexFetchDescriptor<CodexChat>(
+            predicate: sourceKindChatPredicate([.unknown])
+        ))
+
+        #expect(results.map(\.id.rawValue) == ["thread-unknown-source"])
+        #expect(results.first?.source == .unknown)
+        #expect(results.first?.sourceKind == .unknown)
+    }
+
+    @Test("broad server sub-agent filters preserve leaf predicate semantics")
+    func broadServerSubAgentFiltersPreserveLeafPredicateSemantics() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        try await runtime.transport.enqueueThreadList(.init(profile: .currentV2, threads: [
+            .init(id: "thread-review", sourceKind: .subAgentReview),
+            .init(id: "thread-compact", sourceKind: .subAgentCompact),
+            .init(id: "thread-memory", sourceKind: .subAgent),
+        ]))
+
+        let results = try await context.fetch(CodexFetchDescriptor<CodexChat>(
+            predicate: sourceKindChatPredicate([.subAgent])
+        ))
+
+        #expect(results.map(\.id.rawValue) == ["thread-memory"])
+        let recorded = try #require(
+            await runtime.transport.recordedRequests(method: "thread/list").first)
+        let params = try recorded.decodeParams(ThreadListParams.self)
+        #expect(params.sourceKinds == ["subAgent"])
     }
 
     @Test("query descriptors accept key path sorts and section aliases")
@@ -2818,6 +3109,8 @@ struct CodexModelContextTests {
         )
         let chat = started.chat
         #expect(chat.workspace != nil)
+        #expect(chat.source == .subAgent(.review))
+        #expect(chat.sourceKind == .subAgentReview)
 
         try await runtime.transport.enqueueThreadRead(.init(
             id: "thread-review",
@@ -3116,7 +3409,11 @@ struct CodexModelContextTests {
             name: "Source"
         ))
         try await runtime.transport.enqueueThreadList(.init(profile: .currentV2, threads: [
-            .init(id: "thread-source", workspace: workspaceURL, name: "Source")
+            DataKitTestThreadFixture(
+                id: "thread-source",
+                workspace: workspaceURL,
+                name: "Source"
+            ).withSourceKind(.appServer)
         ]))
         try await context.refresh(chat, includeTurns: false)
 
@@ -3151,7 +3448,11 @@ struct CodexModelContextTests {
             name: "Source"
         ))
         try await runtime.transport.enqueueThreadList(.init(profile: .currentV2, threads: [
-            .init(id: "thread-source", workspace: newWorkspaceURL, name: "Source")
+            DataKitTestThreadFixture(
+                id: "thread-source",
+                workspace: newWorkspaceURL,
+                name: "Source"
+            ).withSourceKind(.appServer)
         ]))
         try await context.refresh(chat, includeTurns: false)
 
@@ -5021,6 +5322,8 @@ struct CodexModelContextTests {
 
         #expect(results.items.first === chat)
         #expect(results.sections.first?.items.first === chat)
+        #expect(chat.source == .appServer)
+        #expect(chat.sourceKind == .appServer)
     }
 
     @Test("starting a chat excludes it from fetched results when pending changes are disabled")
@@ -5145,7 +5448,11 @@ struct CodexModelContextTests {
 
         try await runtime.transport.enqueueThreadStart(threadID: "thread-new")
         try await runtime.transport.enqueueThreadList(.init(profile: .currentV2, threads: [
-            .init(id: "thread-new", workspace: workspaceURL, name: "New")
+            DataKitTestThreadFixture(
+                id: "thread-new",
+                workspace: workspaceURL,
+                name: "New"
+            ).withSourceKind(.appServer)
         ]))
         let chat = try await workspace.startChat()
 
@@ -5888,8 +6195,10 @@ struct CodexModelContextTests {
         try await runtime.transport.enqueueThreadResume(.init(id: "thread-beta"))
         try await runtime.transport.enqueueThreadRead(.init(id: "thread-beta", name: "Aardvark"))
         try await runtime.transport.enqueueThreadList(.init(profile: .currentV2, threads: [
-            .init(id: "thread-beta", name: "Aardvark"),
-            .init(id: "thread-alpha", name: "Alpha"),
+            DataKitTestThreadFixture(id: "thread-beta", name: "Aardvark")
+                .withSourceKind(.appServer),
+            DataKitTestThreadFixture(id: "thread-alpha", name: "Alpha")
+                .withSourceKind(.appServer),
         ]))
         try await context.refresh(beta, includeTurns: false)
 
@@ -13095,6 +13404,7 @@ private func makeDataKitStoredThreadFixture(
     preview: String? = nil,
     model: String = "gpt-5",
     modelProvider: String = "openai",
+    source: CodexAppServerTestSessionSource = .cli,
     createdAt: Date = Date(timeIntervalSince1970: 10),
     updatedAt: Date = Date(timeIntervalSince1970: 20),
     ephemeral: Bool = false,
@@ -13108,7 +13418,7 @@ private func makeDataKitStoredThreadFixture(
             name: name,
             preview: preview ?? id.rawValue,
             modelProvider: modelProvider,
-            sourceKind: .appServer,
+            sourceKind: source.sourceKind,
             createdAt: createdAt,
             updatedAt: updatedAt,
             status: .idle,
@@ -13119,7 +13429,7 @@ private func makeDataKitStoredThreadFixture(
         metadata: .init(
             sessionID: "session-\(id.rawValue)",
             cliVersion: "codex-cli-test",
-            source: .appServer
+            source: source
         ),
         runtimeMetadata: .init(
             model: model,
@@ -13149,7 +13459,7 @@ enum DataKitTestFixtureProfile {
 
     var model: String { "gpt-5" }
     var modelProvider: String { "openai" }
-    var source: CodexThreadSourceKind { .appServer }
+    var source: CodexThreadSourceKind { .cli }
     var referenceDate: Date { Date(timeIntervalSince1970: 0) }
 }
 
@@ -13437,7 +13747,7 @@ private extension DataKitTestThreadFixture {
     func dto(
         profile: DataKitTestFixtureProfile
     ) throws -> AppServerAPI.Thread.Snapshot {
-        try .init(
+        .init(
             id: id.rawValue,
             cwd: workspace?.path,
             name: name,

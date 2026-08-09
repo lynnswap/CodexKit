@@ -115,7 +115,10 @@ let results = context.fetchedResults(
 try await results.performFetch()
 
 for chat in results.items {
-    print(chat.title)
+    let revision = [chat.gitInfo?.branch, chat.gitInfo?.sha]
+        .compactMap { $0 }
+        .joined(separator: " @ ")
+    print(revision.isEmpty ? chat.title : revision)
 }
 
 let workspace = try await context.fetch(CodexFetchDescriptor<CodexWorkspace>.workspaces).first

@@ -30,7 +30,7 @@ struct CodexKitProductConsumer {
                 name: "External product fixture",
                 preview: "No findings.",
                 modelProvider: "openai",
-                sourceKind: .appServer,
+                source: .subAgent(.review),
                 createdAt: Date(timeIntervalSince1970: 1),
                 updatedAt: Date(timeIntervalSince1970: 2),
                 status: .idle,
@@ -40,8 +40,14 @@ struct CodexKitProductConsumer {
             turns: [turn],
             metadata: .init(
                 sessionID: "fixture-session",
+                parentThreadID: "fixture-parent-thread",
                 cliVersion: "fixture-cli",
-                source: .appServer
+                source: .subAgentReview,
+                gitInfo: .init(
+                    sha: "0123456789abcdef",
+                    branch: "feature/thread-provenance",
+                    originURL: "git@github.com:lynnswap/CodexKit.git"
+                )
             ),
             runtimeMetadata: .init(
                 model: "gpt-5-codex",
@@ -113,10 +119,22 @@ struct CodexKitProductConsumer {
 
             let container = CodexModelContainer(appServer: runtime.server)
             let context = container.mainContext
-            let chats = try await context.fetch(CodexFetchDescriptor<CodexChat>.recentChats)
+            let reviewSourceKind: CodexThreadSourceKind? = .subAgentReview
+            let chats = try await context.fetch(CodexFetchDescriptor<CodexChat>(
+                predicate: #Predicate { chat in
+                    chat.isArchived == false && chat.sourceKind == reviewSourceKind
+                }
+            ))
             precondition(chats.map(\.id) == [CodexThreadID(rawValue: "thread-fixture")])
 
             let chat = chats[0]
+            precondition(chat.sessionID == "fixture-session")
+            precondition(chat.parentThreadID == "fixture-parent-thread")
+            precondition(chat.source == .subAgent(.review))
+            precondition(chat.sourceKind == .subAgentReview)
+            precondition(chat.gitInfo?.branch == "feature/thread-provenance")
+            precondition(chat.gitInfo?.sha == "0123456789abcdef")
+            precondition(chat.gitInfo?.originURL == "git@github.com:lynnswap/CodexKit.git")
             try await context.refresh(chat, includeTurns: true)
             let item = chat.items(in: "turn-fixture")[0]
             precondition(item.origin == .reviewRolloutAssistant)

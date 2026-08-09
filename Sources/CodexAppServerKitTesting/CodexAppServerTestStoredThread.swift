@@ -20,8 +20,55 @@ public enum CodexAppServerTestSessionSource: Equatable, Sendable {
     case subAgentOther(String)
     case unknown
 
+    /// The legacy single source-kind projection used by snapshot fixtures.
+    /// Custom sources project to `.unknown`; use ``filterSourceKind`` when
+    /// constructing app-server source-kind filters.
     public var sourceKind: CodexThreadSourceKind {
-        appServerValue.sourceKind
+        filterSourceKind ?? .unknown
+    }
+
+    /// The exact source-kind filter leaf, or `nil` when no filter includes this source.
+    public var filterSourceKind: CodexThreadSourceKind? {
+        domainProjection.sourceKind
+    }
+
+    package var domainProjection: CodexThreadSessionSource {
+        switch self {
+        case .cli:
+            .cli
+        case .vscode:
+            .vscode
+        case .exec:
+            .exec
+        case .appServer:
+            .appServer
+        case .custom(let value):
+            .custom(value)
+        case .subAgentReview:
+            .subAgent(.review)
+        case .subAgentCompact:
+            .subAgent(.compact)
+        case .subAgentThreadSpawn(
+            let parentThreadID,
+            let depth,
+            let agentPath,
+            let agentNickname,
+            let agentRole
+        ):
+            .subAgent(.threadSpawn(.init(
+                parentThreadID: parentThreadID,
+                depth: depth,
+                agentPath: agentPath,
+                agentNickname: agentNickname,
+                agentRole: agentRole
+            )))
+        case .subAgentMemoryConsolidation:
+            .subAgent(.memoryConsolidation)
+        case .subAgentOther(let value):
+            .subAgent(.other(value))
+        case .unknown:
+            .unknown
+        }
     }
 
     package var wireValue: CodexJSONValue {
@@ -132,6 +179,7 @@ public struct CodexAppServerTestThreadMetadata: Equatable, Sendable {
     public var parentThreadID: CodexThreadID?
     public var cliVersion: String
     public var source: CodexAppServerTestSessionSource
+    public var gitInfo: CodexThreadGitInfo?
     public var historyMode: HistoryMode
 
     public init(
@@ -140,6 +188,7 @@ public struct CodexAppServerTestThreadMetadata: Equatable, Sendable {
         parentThreadID: CodexThreadID? = nil,
         cliVersion: String,
         source: CodexAppServerTestSessionSource,
+        gitInfo: CodexThreadGitInfo? = nil,
         historyMode: HistoryMode = .legacy
     ) {
         self.sessionID = sessionID
@@ -147,6 +196,7 @@ public struct CodexAppServerTestThreadMetadata: Equatable, Sendable {
         self.parentThreadID = parentThreadID
         self.cliVersion = cliVersion
         self.source = source
+        self.gitInfo = gitInfo
         self.historyMode = historyMode
     }
 }
@@ -378,6 +428,7 @@ public struct CodexAppServerTestStoredThread: Equatable, Sendable {
             metadata: metadata,
             runtimeMetadata: runtimeMetadata
         )
+        let snapshot = Self.canonicalSnapshot(snapshot, metadata: metadata)
         self.snapshot = snapshot
         self.turns = turns
         self.metadata = metadata
@@ -400,7 +451,10 @@ public struct CodexAppServerTestStoredThread: Equatable, Sendable {
             name: snapshot.name,
             preview: snapshot.preview,
             modelProvider: snapshot.modelProvider,
-            sourceKind: snapshot.sourceKind,
+            sessionID: snapshot.sessionID,
+            parentThreadID: snapshot.parentThreadID,
+            source: snapshot.source,
+            gitInfo: snapshot.gitInfo,
             createdAt: snapshot.createdAt,
             updatedAt: snapshot.updatedAt,
             recencyAt: snapshot.recencyAt,
@@ -442,6 +496,25 @@ public struct CodexAppServerTestStoredThread: Equatable, Sendable {
         return .object(fields)
     }
 
+    private static func canonicalSnapshot(
+        _ snapshot: CodexThreadSnapshot,
+        metadata: CodexAppServerTestThreadMetadata
+    ) -> CodexThreadSnapshot {
+        var snapshot = snapshot
+        snapshot.sessionID = metadata.sessionID
+        snapshot.parentThreadID = metadata.parentThreadID
+        snapshot.source = metadata.source.domainProjection
+        snapshot.gitInfo = metadata.gitInfo
+        snapshot.presentFields.remove(.sourceKind)
+        snapshot.presentFields.formUnion([
+            .sessionID,
+            .parentThreadID,
+            .source,
+            .gitInfo,
+        ])
+        return snapshot
+    }
+
     private struct ValidatedSnapshot {
         var workspace: URL
         var preview: String
@@ -467,6 +540,11 @@ public struct CodexAppServerTestStoredThread: Equatable, Sendable {
             metadata.sessionID,
             field: "thread session id"
         )
+        if snapshot.hasField(.sessionID), snapshot.sessionID != metadata.sessionID {
+            throw CodexAppServerTestError.invalidFixture(
+                "thread snapshot session id must match the Testing thread metadata"
+            )
+        }
         try CodexAppServerTestThreadFixtureValidation.requireNonempty(
             metadata.cliVersion,
             field: "CLI version"
@@ -481,6 +559,20 @@ public struct CodexAppServerTestStoredThread: Equatable, Sendable {
             try CodexAppServerTestThreadFixtureValidation.requireNonempty(
                 parentThreadID.rawValue,
                 field: "parent thread id"
+            )
+        }
+        if case .subAgentThreadSpawn(let sourceParentThreadID, _, _, _, _) = metadata.source,
+            metadata.parentThreadID != sourceParentThreadID
+        {
+            throw CodexAppServerTestError.invalidFixture(
+                "thread-spawn source parent must match the Testing thread metadata parent"
+            )
+        }
+        if snapshot.hasField(.parentThreadID),
+            snapshot.parentThreadID != metadata.parentThreadID
+        {
+            throw CodexAppServerTestError.invalidFixture(
+                "thread snapshot parent id must match the Testing thread metadata"
             )
         }
         try metadata.source.validateFixture()
@@ -501,9 +593,22 @@ public struct CodexAppServerTestStoredThread: Equatable, Sendable {
             modelProvider,
             field: "thread model provider"
         )
-        guard let source = snapshot.sourceKind, source == metadata.source.sourceKind else {
+        if snapshot.hasField(.source) {
+            guard snapshot.source == metadata.source.domainProjection else {
+                throw CodexAppServerTestError.invalidFixture(
+                    "thread snapshot source must match the Testing thread metadata"
+                )
+            }
+        } else if snapshot.hasField(.sourceKind) {
+            guard snapshot.sourceKind == metadata.source.sourceKind else {
+                throw CodexAppServerTestError.invalidFixture(
+                    "thread snapshot source must match the Testing thread metadata"
+                )
+            }
+        }
+        if snapshot.hasField(.gitInfo), snapshot.gitInfo != metadata.gitInfo {
             throw CodexAppServerTestError.invalidFixture(
-                "thread snapshot source must match the Testing thread metadata"
+                "thread snapshot Git metadata must match the Testing thread metadata"
             )
         }
         guard let createdAt = snapshot.createdAt else {
@@ -603,7 +708,7 @@ public struct CodexAppServerTestStoredThread: Equatable, Sendable {
             "threadSource": .null,
             "agentNickname": .null,
             "agentRole": .null,
-            "gitInfo": .null,
+            "gitInfo": metadata.gitInfo.map(\.testWireValue) ?? .null,
             "name": snapshot.name.map(CodexJSONValue.string) ?? .null,
             "turns": .array(turns.map(\.wireValue)),
         ])
@@ -613,6 +718,16 @@ public struct CodexAppServerTestStoredThread: Equatable, Sendable {
         .waitingOnApproval,
         .waitingOnUserInput,
     ]
+}
+
+private extension CodexThreadGitInfo {
+    var testWireValue: CodexJSONValue {
+        .object([
+            "sha": sha.map(CodexJSONValue.string) ?? .null,
+            "branch": branch.map(CodexJSONValue.string) ?? .null,
+            "originUrl": originURL.map(CodexJSONValue.string) ?? .null,
+        ])
+    }
 }
 
 public struct CodexAppServerTestThreadPage: Equatable, Sendable {

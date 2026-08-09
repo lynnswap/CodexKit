@@ -1704,6 +1704,33 @@ public actor CodexAppServerTestTransport {
         _ snapshots: [CodexThreadSnapshot],
         for request: AppServerAPI.Thread.List.Params
     ) -> [CodexThreadSnapshot] {
+        enum SourceFilter {
+            case interactiveDefaults
+            case explicit([CodexThreadSourceKind])
+
+            init(_ rawKinds: [String]?) {
+                guard let rawKinds, rawKinds.isEmpty == false else {
+                    self = .interactiveDefaults
+                    return
+                }
+                self = .explicit(rawKinds.map(CodexThreadSourceKind.init(rawValue:)))
+            }
+
+            func includes(_ source: CodexThreadSessionSource) -> Bool {
+                switch self {
+                case .interactiveDefaults:
+                    switch source {
+                    case .cli, .vscode, .custom("atlas"), .custom("chatgpt"):
+                        true
+                    case .exec, .appServer, .custom, .subAgent, .unknown:
+                        false
+                    }
+                case .explicit(let kinds):
+                    kinds.contains(where: source.matches(sourceKind:))
+                }
+            }
+        }
+
         let workspacePaths: Set<String>?
         switch request.cwd {
         case .paths(let paths):
@@ -1711,6 +1738,7 @@ public actor CodexAppServerTestTransport {
         case nil:
             workspacePaths = nil
         }
+        let sourceFilter = SourceFilter(request.sourceKinds)
 
         return snapshots.filter { snapshot in
             if let workspacePaths {
@@ -1726,15 +1754,11 @@ public actor CodexAppServerTestTransport {
             {
                 return false
             }
-            if let sourceKinds = request.sourceKinds,
-                sourceKinds.isEmpty == false
-            {
-                guard let sourceKind = snapshot.sourceKind else {
-                    preconditionFailure("A stored-thread fixture must have a source kind.")
-                }
-                guard sourceKinds.contains(sourceKind.rawValue) else {
-                    return false
-                }
+            guard let source = snapshot.source else {
+                preconditionFailure("A stored-thread fixture must have an exact session source.")
+            }
+            guard sourceFilter.includes(source) else {
+                return false
             }
             if let searchTerm = request.searchTerm?.lowercased(),
                 searchTerm.isEmpty == false

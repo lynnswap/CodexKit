@@ -1203,7 +1203,16 @@ public actor CodexAppServer {
             name: snapshot.name,
             preview: snapshot.preview,
             modelProvider: snapshot.modelProvider,
-            sourceKind: snapshot.sourceKind,
+            sessionID: snapshot.sessionID,
+            parentThreadID: snapshot.parentThreadID.map { .init(rawValue: $0) },
+            source: snapshot.source.map(threadSessionSource(from:)),
+            gitInfo: snapshot.gitInfo.map {
+                CodexThreadGitInfo(
+                    sha: $0.sha,
+                    branch: $0.branch,
+                    originURL: $0.originURL
+                )
+            },
             createdAt: snapshot.createdAt.map { Date(timeIntervalSince1970: TimeInterval($0)) },
             updatedAt: snapshot.updatedAt.map { Date(timeIntervalSince1970: TimeInterval($0)) },
             recencyAt: snapshot.recencyAt.map { Date(timeIntervalSince1970: TimeInterval($0)) },
@@ -1224,6 +1233,10 @@ public actor CodexAppServer {
         var fields: Set<CodexThreadSnapshot.Field> = []
         for field in snapshot.presentFields {
             switch field {
+            case .sessionID:
+                fields.insert(.sessionID)
+            case .parentThreadID:
+                fields.insert(.parentThreadID)
             case .cwd:
                 fields.insert(.workspace)
             case .name:
@@ -1232,8 +1245,10 @@ public actor CodexAppServer {
                 fields.insert(.preview)
             case .modelProvider:
                 fields.insert(.modelProvider)
-            case .sourceKind:
-                fields.insert(.sourceKind)
+            case .source:
+                fields.insert(.source)
+            case .gitInfo:
+                fields.insert(.gitInfo)
             case .createdAt:
                 fields.insert(.createdAt)
             case .updatedAt:
@@ -1254,6 +1269,50 @@ public actor CodexAppServer {
             fields.insert(.turns)
         }
         return fields
+    }
+
+    private nonisolated static func threadSessionSource(
+        from source: AppServerAPI.Thread.SessionSource
+    ) -> CodexThreadSessionSource {
+        switch source {
+        case .cli:
+            .cli
+        case .vscode:
+            .vscode
+        case .exec:
+            .exec
+        case .appServer:
+            .appServer
+        case .custom(let value):
+            .custom(value)
+        case .subAgent(let source):
+            .subAgent(threadSubAgentSource(from: source))
+        case .unknown:
+            .unknown
+        }
+    }
+
+    private nonisolated static func threadSubAgentSource(
+        from source: AppServerAPI.Thread.SessionSource.SubAgent
+    ) -> CodexThreadSessionSource.SubAgent {
+        switch source {
+        case .review:
+            .review
+        case .compact:
+            .compact
+        case .threadSpawn(let spawn):
+            .threadSpawn(.init(
+                parentThreadID: .init(rawValue: spawn.parentThreadID),
+                depth: spawn.depth,
+                agentPath: spawn.agentPath,
+                agentNickname: spawn.agentNickname,
+                agentRole: spawn.agentRole
+            ))
+        case .memoryConsolidation:
+            .memoryConsolidation
+        case .other(let value):
+            .other(value)
+        }
     }
 
     package nonisolated static func turnSnapshots(
