@@ -396,7 +396,6 @@ private struct CodexThreadServerFilter: Hashable, Sendable {
     var requiresServerRefreshForMembership: Bool {
         searchTerm?.isEmpty == false
             || modelProviders?.isEmpty == false
-            || sourceKinds?.isEmpty == false
             || isComplete == false
     }
 

@@ -128,6 +128,15 @@ private func sourceKindChatPredicate(_ sourceKinds: [CodexThreadSourceKind]) -> 
     }
 }
 
+private func sourceKindEqualityChatPredicate(
+    _ sourceKind: CodexThreadSourceKind
+) -> Predicate<CodexChat> {
+    let optionalSourceKind: CodexThreadSourceKind? = sourceKind
+    return #Predicate<CodexChat> { chat in
+        chat.isArchived == false && chat.sourceKind == optionalSourceKind
+    }
+}
+
 private func workspaceChatPredicate(_ workspace: URL) -> Predicate<CodexChat> {
     let workspaceID: CodexWorkspaceID? = testWorkspaceID(for: workspace)
     return #Predicate<CodexChat> { chat in
@@ -1415,6 +1424,12 @@ struct CodexModelContextTests {
         #expect(localPlan.mutationStrategy(
             for: .remove(hasNextPage: false)
         ) == .removeLocally)
+
+        let sourcePlan = try CodexThreadQueryPlan(descriptor: CodexFetchDescriptor<CodexChat>(
+            predicate: sourceKindEqualityChatPredicate(.appServer),
+            sortBy: [CodexSortDescriptor(\.title)]
+        ))
+        #expect(sourcePlan.mutationStrategy(for: .insert) == .applyLocally)
         #expect(localPlan.mutationStrategy(
             for: .revalidate(affectsMembership: true, hasNextPage: true)
         ) == .refreshLoadedWindow)
@@ -3416,6 +3431,37 @@ struct CodexModelContextTests {
             ).withSourceKind(.appServer)
         ]))
         try await context.refresh(chat, includeTurns: false)
+
+        #expect(results.items.first === chat)
+    }
+
+    @Test("source-filtered results preserve matching live chats omitted from thread list")
+    func sourceFilteredResultsPreserveMatchingLiveChatsOmittedFromThreadList() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start()
+        let context = CodexModelContainer(appServer: runtime.server).mainContext
+        let workspaceURL = temporaryDirectory()
+
+        try await runtime.transport.enqueueThreadList(.init(profile: .currentV2, threads: [
+            DataKitTestThreadFixture(
+                id: "thread-live-source",
+                workspace: workspaceURL,
+                name: "Live source",
+                status: .active(activeFlags: [])
+            ).withSourceKind(.appServer)
+        ]))
+        let descriptor = CodexFetchDescriptor<CodexChat>(
+            predicate: sourceKindEqualityChatPredicate(.appServer)
+        )
+        let results = context.fetchedResults(for: descriptor)
+        try await results.performFetch()
+        let chat = try #require(results.items.first)
+        #expect(context.preservedLiveChats(
+            omittedFrom: [CodexChat](),
+            descriptor: descriptor
+        ).first === chat)
+
+        try await runtime.transport.enqueueThreadList(.init(profile: .currentV2, threads: []))
+        try await results.refresh()
 
         #expect(results.items.first === chat)
     }
