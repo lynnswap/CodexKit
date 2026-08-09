@@ -98,6 +98,38 @@ struct CodexAppServerKitTests {
         ])
     }
 
+    @Test func localProcessConfigurationResolvesStandaloneInstallerExecutableOutsidePATH() throws {
+        let rootURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let homeURL = rootURL.appendingPathComponent("home", isDirectory: true)
+        let binURL = homeURL.appendingPathComponent(".local/bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: binURL, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: rootURL)
+        }
+
+        let executableURL = binURL.appendingPathComponent("codex")
+        try """
+            #!/bin/sh
+            exit 0
+            """
+            .write(to: executableURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: executableURL.path
+        )
+
+        let configuration = AppServerProcessTransport.Configuration(
+            environment: [
+                "HOME": homeURL.path,
+                "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            ],
+            codexHomeURL: rootURL.appendingPathComponent("codex-home", isDirectory: true)
+        )
+
+        #expect(configuration.executable == executableURL.path)
+    }
+
     @Test func processTransportAnswersServerInitiatedRequestsThroughConfiguredHandler() async throws {
         let rootURL = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -8635,13 +8667,18 @@ private func prepareRestartToken(
 ) async throws -> CodexReviewRestartToken {
     try await runtime.transport.enqueueThreadResume(.init(id: identity.activeTurnThreadID))
     try await runtime.transport.enqueueEmpty(for: "turn/interrupt")
+    let expectedInterruptRequestCount = await runtime.transport
+        .recordedRequests(method: "turn/interrupt").count + 1
     let prepareTask = Task {
         try await runtime.server.prepareReviewRestart(identity)
     }
     defer {
         prepareTask.cancel()
     }
-    await runtime.transport.waitForRequest(method: "turn/interrupt")
+    await runtime.transport.waitForRequest(
+        method: "turn/interrupt",
+        count: expectedInterruptRequestCount
+    )
     try await runtime.transport.emitServerNotification(
         method: "turn/completed",
         params: TurnCompletedParams(
