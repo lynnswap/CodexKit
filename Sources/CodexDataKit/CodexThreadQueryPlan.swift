@@ -11,7 +11,9 @@ package struct CodexChatRecord: Hashable, Sendable {
     package var workspaceID: CodexWorkspaceID?
     package var workspaceURL: URL?
     package var workspaceGroupID: CodexWorkspaceGroupID?
+    package var source: CodexThreadSessionSource?
     package var sourceKind: CodexThreadSourceKind?
+    package var sourceProvenance: CodexThreadListSourceProvenance?
     package var searchableText: String
     package var createdAt: Date?
     package var updatedAt: Date?
@@ -27,11 +29,135 @@ package struct CodexChatRecord: Hashable, Sendable {
         workspaceID = chat.workspaceID
         workspaceURL = chat.workspace?.url
         workspaceGroupID = chat.workspaceGroupID
+        source = chat.source
         sourceKind = chat.sourceKind
+        sourceProvenance = chat.threadListSourceProvenance
         searchableText = chat.searchableText
         createdAt = chat.createdAt
         updatedAt = chat.updatedAt
         recencyAt = chat.recencyAt
+    }
+}
+
+package enum CodexThreadCandidateSourceScope: Hashable, Sendable {
+    case defaultUserVisible
+    case explicit([CodexThreadSourceKind])
+
+    package static let userVisibleNoninteractiveKinds: [CodexThreadSourceKind] = [
+        .exec,
+        .appServer,
+        .subAgentReview,
+        .subAgentCompact,
+        .subAgentThreadSpawn,
+        .subAgentOther,
+        .unknown,
+    ]
+
+    package var sourceKindFilters: [[CodexThreadSourceKind]?] {
+        switch self {
+        case .defaultUserVisible:
+            // The app-server's nil filter is the only way to include its supported custom
+            // interactive sources. A second disjoint query adds user-visible noninteractive
+            // sources without admitting internal memory-consolidation sessions.
+            [nil, Self.userVisibleNoninteractiveKinds]
+        case .explicit(let sourceKinds):
+            [sourceKinds]
+        }
+    }
+
+    package var requiresCompositeFetch: Bool {
+        switch self {
+        case .defaultUserVisible:
+            true
+        case .explicit:
+            false
+        }
+    }
+
+    package func matches(_ record: CodexChatRecord) -> Bool {
+        if record.source != nil || record.sourceKind != nil {
+            return matches(source: record.source, sourceKind: record.sourceKind)
+        }
+        guard let provenance = record.sourceProvenance else {
+            return false
+        }
+        return provenance.possibilities.allSatisfy(contains)
+    }
+
+    package func matches(_ resolution: CodexThreadSourceResolution) -> Bool {
+        switch resolution {
+        case .exact(let source):
+            matches(source: source, sourceKind: source.sourceKind)
+        case .kindOnly(let sourceKind):
+            matches(source: nil, sourceKind: sourceKind)
+        case .partitionProven(let provenance):
+            provenance.possibilities.allSatisfy(contains)
+        case .unresolved, .knownNull:
+            false
+        }
+    }
+
+    package func contains(_ possibility: CodexThreadListSourcePossibility) -> Bool {
+        switch possibility {
+        case .kind(let sourceKind):
+            matches(source: nil, sourceKind: sourceKind)
+        case .supportedCustomInteractive:
+            if case .defaultUserVisible = self {
+                true
+            } else {
+                false
+            }
+        }
+    }
+
+    package func matches(
+        source: CodexThreadSessionSource?,
+        sourceKind: CodexThreadSourceKind?
+    ) -> Bool {
+        if let source {
+            switch self {
+            case .defaultUserVisible:
+                return Self.matchesDefaultUserVisibleSource(source)
+            case .explicit(let sourceKinds):
+                return sourceKinds.contains { source.matches(sourceKind: $0) }
+            }
+        }
+        guard let sourceKind else {
+            return false
+        }
+        switch self {
+        case .defaultUserVisible:
+            return sourceKind == .cli
+                || sourceKind == .vscode
+                || Self.userVisibleNoninteractiveKinds.contains(sourceKind)
+        case .explicit(let sourceKinds):
+            return sourceKinds.contains { filterKind in
+                if filterKind == .subAgent {
+                    return sourceKind == .subAgent
+                        || sourceKind == .subAgentReview
+                        || sourceKind == .subAgentCompact
+                        || sourceKind == .subAgentThreadSpawn
+                        || sourceKind == .subAgentOther
+                }
+                return sourceKind == filterKind
+            }
+        }
+    }
+
+    private static func matchesDefaultUserVisibleSource(
+        _ source: CodexThreadSessionSource
+    ) -> Bool {
+        switch source {
+        case .cli, .vscode, .exec, .appServer, .unknown:
+            return true
+        case .custom(let value):
+            return value == "atlas" || value == "chatgpt"
+        case .subAgent(.review), .subAgent(.compact), .subAgent(.threadSpawn),
+            .subAgent(.other):
+            return true
+        case .subAgent(.memoryConsolidation):
+            return false
+        }
     }
 }
 
@@ -106,6 +232,10 @@ package struct CodexThreadQueryPlan: Sendable {
         serverFilter.sourceKinds
     }
 
+    package var candidateSourceScope: CodexThreadCandidateSourceScope {
+        sourceKinds.map(CodexThreadCandidateSourceScope.explicit) ?? .defaultUserVisible
+    }
+
     package var serverPredicateIsComplete: Bool {
         serverFilter.isComplete
     }
@@ -138,12 +268,37 @@ package struct CodexThreadQueryPlan: Sendable {
         }
     }
 
-    package func matches(_ chat: CodexChat) -> Bool {
-        matches(CodexChatRecord(chat: chat))
+    package func matchesLocalCandidate(_ chat: CodexChat) -> Bool {
+        matchesLocalCandidate(CodexChatRecord(chat: chat))
     }
 
-    package func matches(_ record: CodexChatRecord) -> Bool {
-        serverFilter.matchesArchiveScope(record) && (predicate?(record) ?? true)
+    package func matchesLocalCandidate(_ record: CodexChatRecord) -> Bool {
+        guard serverFilter.matchesArchiveScope(record) else {
+            return false
+        }
+        if record.source != nil || record.sourceKind != nil {
+            return candidateSourceScope.matches(record)
+                && (predicate?(record) ?? true)
+        }
+        guard let provenance = record.sourceProvenance else {
+            return false
+        }
+        return provenance.possibilities.allSatisfy { possibility in
+            guard candidateSourceScope.contains(possibility) else {
+                return false
+            }
+            var projectedRecord = record
+            projectedRecord.sourceKind = possibility.projectedSourceKind
+            return predicate?(projectedRecord) ?? true
+        }
+    }
+
+    package func matchesServerResponse(_ chat: CodexChat) -> Bool {
+        let record = CodexChatRecord(chat: chat)
+        guard candidateSourceScope.matches(record) else {
+            return false
+        }
+        return serverFilter.isComplete || matchesLocalCandidate(record)
     }
 
     package func matchesArchiveScope(_ archived: Bool) -> Bool {

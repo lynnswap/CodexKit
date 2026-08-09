@@ -792,7 +792,11 @@ public final class CodexFetchedResults<Model: CodexPersistentModel> {
                 targetWindowCount: targetWindowCount
             )
             try Task.checkCancellation()
-            let newItems = loadedItems(from: page, appending: appending)
+            let newItems = loadedItems(
+                from: page,
+                appending: appending,
+                cursor: cursor
+            )
             let relationshipDescriptor = appending ? fetchDescriptor : descriptor
             await modelContext.syncLoadedRelationships(
                 from: page,
@@ -884,7 +888,8 @@ public final class CodexFetchedResults<Model: CodexPersistentModel> {
 
     private func loadedItems(
         from page: CodexFetchPage<Model>,
-        appending: Bool
+        appending: Bool,
+        cursor: String?
     ) -> [Model] {
         guard appending else {
             return replacingItems(from: page)
@@ -908,7 +913,11 @@ public final class CodexFetchedResults<Model: CodexPersistentModel> {
                 existingItems: items
             )
         }
-        return append(page.items, to: items)
+        let appendedItems = append(page.items, to: items)
+        guard modelContext.localCursorOffset(from: cursor) > 0 else {
+            return appendedItems
+        }
+        return modelContext.sortedItems(appendedItems, for: fetchDescriptor)
     }
 
     private func replacingItems(from page: CodexFetchPage<Model>) -> [Model] {
@@ -1338,7 +1347,7 @@ extension CodexFetchedResults: CodexFetchedResultsRegistration {
         }
         var record = CodexChatRecord(chat: chat)
         record.isArchived = archived
-        return chatQueryPlan.matches(record)
+        return chatQueryPlan.matchesLocalCandidate(record)
     }
 
     private func shouldKeep(

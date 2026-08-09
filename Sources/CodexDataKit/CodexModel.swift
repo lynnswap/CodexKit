@@ -538,6 +538,132 @@ package struct CodexChatItemKey: Hashable {
     }
 }
 
+package enum CodexThreadListSourcePossibility: Hashable, Sendable {
+    case kind(CodexThreadSourceKind)
+    case supportedCustomInteractive
+
+    package var projectedSourceKind: CodexThreadSourceKind? {
+        switch self {
+        case .kind(let sourceKind):
+            sourceKind
+        case .supportedCustomInteractive:
+            nil
+        }
+    }
+}
+
+package struct CodexThreadListSourceProvenance: Hashable, Sendable {
+    package let possibilities: Set<CodexThreadListSourcePossibility>
+
+    package init(sourceKinds: [CodexThreadSourceKind]?) {
+        let possibilities: Set<CodexThreadListSourcePossibility>
+        if let sourceKinds, sourceKinds.isEmpty == false {
+            possibilities = Set(sourceKinds.flatMap { sourceKind -> [CodexThreadListSourcePossibility] in
+                if sourceKind == .subAgent {
+                    return [
+                        .kind(.subAgent),
+                        .kind(.subAgentReview),
+                        .kind(.subAgentCompact),
+                        .kind(.subAgentThreadSpawn),
+                        .kind(.subAgentOther),
+                    ]
+                }
+                return [.kind(sourceKind)]
+            })
+        } else {
+            possibilities = [
+                .kind(.cli),
+                .kind(.vscode),
+                .supportedCustomInteractive,
+            ]
+        }
+        precondition(
+            possibilities.isEmpty == false,
+            "A thread-list source provenance must contain at least one possibility."
+        )
+        self.possibilities = possibilities
+    }
+
+    package func intersecting(_ other: Self) -> Self {
+        let intersection = possibilities.intersection(other.possibilities)
+        precondition(
+            intersection.isEmpty == false,
+            "A thread cannot belong to disjoint thread-list source partitions."
+        )
+        return Self(possibilities: intersection)
+    }
+
+    private init(possibilities: Set<CodexThreadListSourcePossibility>) {
+        precondition(
+            possibilities.isEmpty == false,
+            "A thread-list source provenance must contain at least one possibility."
+        )
+        self.possibilities = possibilities
+    }
+}
+
+package enum CodexThreadSourceResolution: Hashable, Sendable {
+    case unresolved
+    case partitionProven(CodexThreadListSourceProvenance)
+    case exact(CodexThreadSessionSource)
+    case kindOnly(CodexThreadSourceKind)
+    case knownNull
+
+    package var source: CodexThreadSessionSource? {
+        guard case .exact(let source) = self else {
+            return nil
+        }
+        return source
+    }
+
+    package var sourceKind: CodexThreadSourceKind? {
+        switch self {
+        case .exact(let source):
+            source.sourceKind
+        case .kindOnly(let sourceKind):
+            sourceKind
+        case .unresolved, .partitionProven, .knownNull:
+            nil
+        }
+    }
+
+    package var partitionProvenance: CodexThreadListSourceProvenance? {
+        guard case .partitionProven(let provenance) = self else {
+            return nil
+        }
+        return provenance
+    }
+
+    package mutating func apply(
+        _ snapshot: CodexThreadSnapshot,
+        partitionProvenance: CodexThreadListSourceProvenance?
+    ) {
+        if snapshot.hasField(.source) {
+            self = snapshot.source.map(Self.exact) ?? .knownNull
+            return
+        }
+        if snapshot.hasField(.sourceKind) {
+            let sourceKind = snapshot.sourceKind
+            if case .exact(let source) = self, source.sourceKind == sourceKind {
+                return
+            }
+            self = sourceKind.map(Self.kindOnly) ?? .knownNull
+            return
+        }
+        guard let partitionProvenance else {
+            return
+        }
+        switch self {
+        case .unresolved:
+            self = .partitionProven(partitionProvenance)
+        case .partitionProven(let existing):
+            self = .partitionProven(existing.intersecting(partitionProvenance))
+        case .exact, .kindOnly, .knownNull:
+            break
+        }
+    }
+}
+
 @Observable
 public final class CodexChat: CodexPersistentModel {
     public let id: CodexThreadID
@@ -548,16 +674,24 @@ public final class CodexChat: CodexPersistentModel {
     public private(set) var sessionID: String?
     /// The direct parent thread identifier reported by the app-server.
     public private(set) var parentThreadID: CodexThreadID?
+    private var sourceResolution: CodexThreadSourceResolution
     /// The exact thread session origin reported by the app-server.
-    public private(set) var source: CodexThreadSessionSource?
-    private var sourceKindFallback: CodexThreadSourceKind?
+    public var source: CodexThreadSessionSource? {
+        sourceResolution.source
+    }
     /// A coarse source projection retained for source-kind filtering compatibility.
     ///
     /// Exact custom sources project to `nil`. Fetch predicates must narrow this
     /// property to a finite set of non-`nil` kinds; an unbounded `nil` or non-`nil`
     /// comparison cannot be represented by the app-server and fails validation.
     public var sourceKind: CodexThreadSourceKind? {
-        source?.sourceKind ?? sourceKindFallback
+        sourceResolution.sourceKind
+    }
+    package var threadListSourceProvenance: CodexThreadListSourceProvenance? {
+        sourceResolution.partitionProvenance
+    }
+    package var threadSourceResolution: CodexThreadSourceResolution {
+        sourceResolution
     }
     /// Git repository metadata captured for this thread by the app-server.
     public private(set) var gitInfo: CodexThreadGitInfo?
@@ -658,8 +792,7 @@ public final class CodexChat: CodexPersistentModel {
         self.id = id
         self.turns = []
         self.items = []
-        self.source = nil
-        self.sourceKindFallback = nil
+        self.sourceResolution = .unresolved
         self.isArchived = false
         self.modelContext = modelContext
     }
@@ -667,6 +800,7 @@ public final class CodexChat: CodexPersistentModel {
     package func apply(
         _ snapshot: CodexThreadSnapshot,
         workspace: CodexWorkspace?,
+        sourceProvenance: CodexThreadListSourceProvenance? = nil,
         preservesExistingTurnItems: Bool = false
     ) {
         if snapshot.hasField(.workspace) {
@@ -692,16 +826,7 @@ public final class CodexChat: CodexPersistentModel {
         if snapshot.hasField(.parentThreadID) {
             parentThreadID = snapshot.parentThreadID
         }
-        if snapshot.hasField(.source) {
-            source = snapshot.source
-            sourceKindFallback = nil
-        } else if snapshot.hasField(.sourceKind) {
-            let sourceKind = snapshot.sourceKind
-            if source == nil || source?.sourceKind != sourceKind {
-                source = nil
-                sourceKindFallback = sourceKind
-            }
-        }
+        sourceResolution.apply(snapshot, partitionProvenance: sourceProvenance)
         if snapshot.hasField(.gitInfo) {
             gitInfo = snapshot.gitInfo
         }
@@ -2831,7 +2956,7 @@ public final class CodexChat: CodexPersistentModel {
             sessionID: sessionID,
             parentThreadID: parentThreadID,
             source: source,
-            sourceKind: sourceKindFallback,
+            sourceKind: source == nil ? sourceKind : nil,
             gitInfo: gitInfo,
             createdAt: createdAt,
             updatedAt: updatedAt,

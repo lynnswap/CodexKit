@@ -419,7 +419,7 @@ struct CodexChatObservationMulticastTests {
         let threadID = CodexThreadID(rawValue: "thread-revalidation-order")
         let storedThread = try observationStoredThread(id: threadID)
 
-        try await runtime.transport.enqueueThreadList(.init(threads: [storedThread]))
+        try await runtime.transport.enqueueUserVisibleThreadList(.init(threads: [storedThread]))
         let results = context.fetchedResults(for: CodexFetchDescriptor<CodexChat>())
         try await results.performFetch()
         let chat = try #require(results.items.first)
@@ -432,7 +432,7 @@ struct CodexChatObservationMulticastTests {
         await recorder.waitUntilStarted()
 
         let revalidationGate = CodexAppServerTestGate()
-        try await runtime.transport.enqueueThreadList(.init(threads: [storedThread]))
+        try await runtime.transport.enqueueUserVisibleThreadList(.init(threads: [storedThread]))
         await runtime.transport.holdNext(.threadList, gate: revalidationGate)
 
         try await runtime.notificationEmitter.emitItemStarted(

@@ -88,9 +88,18 @@ when a fetch should report only the server-owned page membership.
 Every effective local ordering ends with the model's typed ID in the primary sort
 direction. The pinned app-server's `createdAt` and `updatedAt` cursors do not include
 that tie-breaker, so those sorts enumerate the server through its stable `recencyAt`
-cursor and then sort/page locally. An empty `sortBy` preserves the app-server's
-default ordering. Empty sorting and a single primary `recencyAt` sort use direct
-server paging.
+cursor and then sort/page locally. A source-unconstrained fetch composes the
+app-server's interactive-default listing with explicit user-visible noninteractive
+source kinds; internal memory-consolidation sessions are not part of that default
+membership. Because those partitions have no single server order, an empty `sortBy`
+reconstructs the app-server default as `createdAt` descending with an ID tie-breaker
+and pages locally after the merge. A complete query with one archived scope, one
+primary `recencyAt` sort, and a positive fetch limit reads bounded prefixes from both
+partitions before merging the requested page. Other composite orderings and
+unbounded or incomplete queries enumerate the required partitions before local
+sorting and paging. An explicit source predicate remains one source partition; it
+uses direct server paging only when the predicate is complete, has one archived
+scope, and uses empty sorting or one primary `recencyAt` sort.
 
 Fetches preserve object identity. If the same app-server thread appears in a later refresh, CodexDataKit mutates the existing `CodexChat` instance instead of replacing it.
 

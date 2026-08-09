@@ -22,6 +22,8 @@ public actor CodexAppServerTestThreadStore {
     private var plannedStarts: [PlannedStart]
     private var plannedForks: [PlannedFork] = []
     private static let cursorPrefix = "test-thread-store:"
+    private static let threadListDefaultLimit = 25
+    private static let threadListMaximumLimit = 100
 
     /// Creates an in-memory store from validated opaque thread fixtures.
     public init(
@@ -241,22 +243,12 @@ public actor CodexAppServerTestThreadStore {
         limit: Int?
     ) throws -> CodexAppServerTestThreadPage {
         let start = min(try offset(from: cursor), threads.count)
-        guard let limit else {
-            return CodexAppServerTestThreadPage(
-                threads: Array(threads[start..<threads.endIndex]),
-                backwardsCursor: start > 0 ? Self.cursor(for: 0) : nil
-            )
-        }
-        guard limit > 0 else {
-            return CodexAppServerTestThreadPage(
-                threads: [],
-                nextCursor: nil,
-                backwardsCursor: nil
-            )
-        }
-
-        let end = min(start + limit, threads.count)
-        let previousStart = max(0, start - limit)
+        let pageSize = min(
+            max(limit ?? Self.threadListDefaultLimit, 1),
+            Self.threadListMaximumLimit
+        )
+        let end = min(start + pageSize, threads.count)
+        let previousStart = max(0, start - pageSize)
         return CodexAppServerTestThreadPage(
             threads: Array(threads[start..<end]),
             nextCursor: end < threads.count ? Self.cursor(for: end) : nil,
@@ -1783,18 +1775,18 @@ public actor CodexAppServerTestTransport {
         sortKey: String?,
         sortDirection: String?
     ) throws -> [CodexThreadSnapshot] {
-        let key = sortKey ?? CodexThreadSortKey.createdAt.rawValue
-        guard CodexThreadSortKey(rawValue: key) != nil else {
+        let rawKey = sortKey ?? CodexThreadSortKey.createdAt.rawValue
+        guard let key = CodexThreadSortKey(rawValue: rawKey) else {
             throw JSONRPC.Error.responseError(.init(
                 code: -32602,
-                message: "Unsupported test thread sort key \(key)."
+                message: "Unsupported test thread sort key \(rawKey)."
             ))
         }
-        let direction = sortDirection ?? CodexSortDirection.descending.rawValue
-        guard CodexSortDirection(rawValue: direction) != nil else {
+        let rawDirection = sortDirection ?? CodexSortDirection.descending.rawValue
+        guard let direction = CodexSortDirection(rawValue: rawDirection) else {
             throw JSONRPC.Error.responseError(.init(
                 code: -32602,
-                message: "Unsupported test thread sort direction \(direction)."
+                message: "Unsupported test thread sort direction \(rawDirection)."
             ))
         }
         let indexed = snapshots.enumerated().map { (offset: $0.offset, snapshot: $0.element) }
@@ -1802,32 +1794,36 @@ public actor CodexAppServerTestTransport {
             let lhsDate = threadSortDate(lhs.snapshot, key: key)
             let rhsDate = threadSortDate(rhs.snapshot, key: key)
             if lhsDate == rhsDate {
+                if key == .recencyAt {
+                    switch direction {
+                    case .ascending:
+                        return lhs.snapshot.id.rawValue < rhs.snapshot.id.rawValue
+                    case .descending:
+                        return lhs.snapshot.id.rawValue > rhs.snapshot.id.rawValue
+                    }
+                }
                 return lhs.offset < rhs.offset
             }
             switch direction {
-            case CodexSortDirection.ascending.rawValue:
+            case .ascending:
                 return compareOptionalDate(lhsDate, rhsDate, ascending: true)
-            case CodexSortDirection.descending.rawValue:
+            case .descending:
                 return compareOptionalDate(lhsDate, rhsDate, ascending: false)
-            default:
-                preconditionFailure("Unsupported test thread sort direction \(direction).")
             }
         }.map(\.snapshot)
     }
 
     private static func threadSortDate(
         _ snapshot: CodexThreadSnapshot,
-        key: String
+        key: CodexThreadSortKey
     ) -> Date? {
         switch key {
-        case CodexThreadSortKey.createdAt.rawValue:
+        case .createdAt:
             snapshot.createdAt
-        case CodexThreadSortKey.updatedAt.rawValue:
+        case .updatedAt:
             snapshot.updatedAt
-        case CodexThreadSortKey.recencyAt.rawValue:
+        case .recencyAt:
             snapshot.recencyAt
-        default:
-            preconditionFailure("Unsupported test thread sort key \(key).")
         }
     }
 

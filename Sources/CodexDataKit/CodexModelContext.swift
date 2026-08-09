@@ -134,8 +134,7 @@ public final class CodexModelContext: Equatable, SendableMetatype {
         var modelProvider: String?
         var sessionID: String?
         var parentThreadID: CodexThreadID?
-        var source: CodexThreadSessionSource?
-        var sourceKind: CodexThreadSourceKind?
+        var sourceResolution: CodexThreadSourceResolution
         var gitInfo: CodexThreadGitInfo?
         var isArchived: Bool
         var createdAt: Date?
@@ -145,6 +144,66 @@ public final class CodexModelContext: Equatable, SendableMetatype {
         var ephemeral: Bool?
         var workspaceID: CodexWorkspaceID?
         var workspaceGroupID: CodexWorkspaceGroupID?
+    }
+
+    private struct FetchedThreadOccurrence: Sendable {
+        var snapshot: CodexThreadSnapshot
+        var sourceProvenance: CodexThreadListSourceProvenance
+    }
+
+    private struct FetchedThreadCandidate: Sendable {
+        var firstOccurrence: FetchedThreadOccurrence
+        var additionalOccurrences: [FetchedThreadOccurrence] = []
+
+        init(snapshot: CodexThreadSnapshot, sourceKinds: [CodexThreadSourceKind]?) {
+            firstOccurrence = FetchedThreadOccurrence(
+                snapshot: snapshot,
+                sourceProvenance: CodexThreadListSourceProvenance(sourceKinds: sourceKinds)
+            )
+        }
+
+        var id: CodexThreadID {
+            firstOccurrence.snapshot.id
+        }
+
+        var latestSnapshot: CodexThreadSnapshot {
+            additionalOccurrences.last?.snapshot ?? firstOccurrence.snapshot
+        }
+
+        var hasMultipleOccurrences: Bool {
+            additionalOccurrences.isEmpty == false
+        }
+
+        func sourceResolution(
+            startingAt initialResolution: CodexThreadSourceResolution
+        ) -> CodexThreadSourceResolution {
+            var resolution = initialResolution
+            resolution.apply(
+                firstOccurrence.snapshot,
+                partitionProvenance: firstOccurrence.sourceProvenance
+            )
+            for occurrence in additionalOccurrences {
+                resolution.apply(
+                    occurrence.snapshot,
+                    partitionProvenance: occurrence.sourceProvenance
+                )
+            }
+            return resolution
+        }
+
+        mutating func append(
+            snapshot: CodexThreadSnapshot,
+            sourceKinds: [CodexThreadSourceKind]?
+        ) {
+            precondition(
+                snapshot.id == id,
+                "Only snapshots for the same thread can be combined."
+            )
+            additionalOccurrences.append(FetchedThreadOccurrence(
+                snapshot: snapshot,
+                sourceProvenance: CodexThreadListSourceProvenance(sourceKinds: sourceKinds)
+            ))
+        }
     }
 
     private struct RefreshedThreadSnapshot: Sendable {
@@ -728,12 +787,11 @@ public final class CodexModelContext: Equatable, SendableMetatype {
         )
         let previousWorkspaces = group.workspaces
         let previousChats = group.workspaces.flatMap(\.chats)
-        let snapshots = try await fetchAllThreadSnapshots(matching: descriptor)
-        let fetchedChats = await applyFetchedSnapshots(
-            snapshots,
-            archived: archivedScope(for: descriptor) == true,
+        let fetchedChats = defaultUserVisibleChats(from: try await fetchAndApplyAllThreadSnapshots(
+            matching: descriptor,
+            appliedArchived: archivedScope(for: descriptor) == true,
             scopedWorkspaceURL: singleWorkspaceScope(for: descriptor)
-        )
+        ))
         let fetchedChatIDs = Set(fetchedChats.map(\.id))
         let chats = fetchedChats.filter { $0.workspace?.workspaceGroup?.id == group.id }
         let workspaces = unique(chats.compactMap(\.workspace))
@@ -783,12 +841,11 @@ public final class CodexModelContext: Equatable, SendableMetatype {
 
         let descriptor = CodexFetchDescriptor<CodexChat>.chats(in: workspace)
         let previousChats = workspace.chats
-        let snapshots = try await fetchAllThreadSnapshots(matching: descriptor)
-        let fetchedChats = await applyFetchedSnapshots(
-            snapshots,
-            archived: archivedScope(for: descriptor) == true,
+        let fetchedChats = defaultUserVisibleChats(from: try await fetchAndApplyAllThreadSnapshots(
+            matching: descriptor,
+            appliedArchived: archivedScope(for: descriptor) == true,
             scopedWorkspaceURL: singleWorkspaceScope(for: descriptor)
-        )
+        ))
         let chats = sort(
             fetchedChats,
             using: descriptor.sortBy
@@ -1870,7 +1927,10 @@ public final class CodexModelContext: Equatable, SendableMetatype {
     ) -> [Model] {
         if Model.self == CodexChat.self {
             let descriptor = descriptor as! CodexFetchDescriptor<CodexChat>
-            return sort(items as! [CodexChat], using: descriptor.sortBy).map { $0 as! Model }
+            return sortLocallyFetchedChats(
+                items as! [CodexChat],
+                using: descriptor
+            ).map { $0 as! Model }
         }
         if Model.self == CodexWorkspace.self {
             let descriptor = descriptor as! CodexFetchDescriptor<CodexWorkspace>
@@ -1948,7 +2008,7 @@ public final class CodexModelContext: Equatable, SendableMetatype {
             )
             result.insert(chat, at: insertionIndex)
         }
-        return result
+        return sortLocallyFetchedChats(result, using: descriptor)
     }
 
     private func liveChatInsertionIndex(
@@ -1996,19 +2056,27 @@ public final class CodexModelContext: Equatable, SendableMetatype {
         -> CodexFetchPage<CodexChat>
     {
         let plan = try CodexThreadQueryPlan(descriptor: descriptor)
+        if canUseBoundedCompositeRecencyPage(
+            for: descriptor,
+            plan: plan,
+            cursor: cursor
+        ) {
+            if let page = try await fetchBoundedCompositeRecencyPage(
+                matching: descriptor,
+                plan: plan,
+                cursor: cursor,
+                excluding: excludedRegistration
+            ) {
+                return page
+            }
+        }
         if canUseServerOrderedPages(for: descriptor, cursor: cursor) == false {
-            let fetchedChats = filter(
-                try await fetchAllChats(
-                    matching: descriptor,
-                    plan: plan,
-                    excluding: excludedRegistration
-                ),
-                using: plan
+            let fetchedChats = try await fetchAllChats(
+                matching: descriptor,
+                plan: plan,
+                excluding: excludedRegistration
             )
-            let chats = sort(
-                fetchedChats,
-                using: descriptor.sortBy
-            )
+            let chats = sortLocallyFetchedChats(fetchedChats, using: descriptor)
             let page = localPage(chats, for: descriptor, cursor: cursor)
             return CodexFetchPage(
                 items: page.items,
@@ -2019,16 +2087,15 @@ public final class CodexModelContext: Equatable, SendableMetatype {
             )
         }
 
-        let page = try await appServer.listThreads(plan.threadQuery(cursor: cursor, includePaging: true))
-        let fetchedChats = filter(
-            await applyFetchedSnapshots(
-                page.threads,
-                archived: plan.archived == true,
-                scopedWorkspaceURL: plan.singleWorkspace,
-                excluding: excludedRegistration
-            ),
-            using: plan
-        )
+        let query = plan.threadQuery(cursor: cursor, includePaging: true)
+        let page = try await appServer.listThreads(query)
+        try Task.checkCancellation()
+        let fetchedChats = await applyFetchedSnapshots(
+            coalescedThreadCandidates(page.threads, sourceKinds: query.sourceKinds),
+            archived: plan.archived == true,
+            scopedWorkspaceURL: plan.singleWorkspace,
+            excluding: excludedRegistration
+        ).filter { plan.matchesServerResponse($0) }
         let chats = sort(
             fetchedChats,
             using: descriptor.sortBy
@@ -2040,6 +2107,177 @@ public final class CodexModelContext: Equatable, SendableMetatype {
         )
     }
 
+    private func coalescedThreadCandidates(
+        _ snapshots: [CodexThreadSnapshot],
+        sourceKinds: [CodexThreadSourceKind]?
+    ) -> [FetchedThreadCandidate] {
+        var candidates: [FetchedThreadCandidate] = []
+        var indexesByID: [CodexThreadID: Int] = [:]
+        for snapshot in snapshots {
+            if let index = indexesByID[snapshot.id] {
+                candidates[index].append(snapshot: snapshot, sourceKinds: sourceKinds)
+            } else {
+                indexesByID[snapshot.id] = candidates.count
+                candidates.append(FetchedThreadCandidate(
+                    snapshot: snapshot,
+                    sourceKinds: sourceKinds
+                ))
+            }
+        }
+        return candidates
+    }
+
+    private func fetchBoundedCompositeRecencyPage(
+        matching descriptor: CodexFetchDescriptor<CodexChat>,
+        plan: CodexThreadQueryPlan,
+        cursor: String?,
+        excluding excludedRegistration: (any CodexFetchedResultsRegistration)?
+    ) async throws -> CodexFetchPage<CodexChat>? {
+        guard let limit = descriptor.fetchLimit, limit > 0 else {
+            preconditionFailure("A bounded composite page requires a positive fetch limit.")
+        }
+        let requestedOffset = cursor == nil
+            ? descriptor.normalizedFetchOffset
+            : localCursorOffset(from: cursor)
+        let (candidateLimit, overflow) = requestedOffset.addingReportingOverflow(limit)
+        precondition(overflow == false, "The composite page offset and limit must fit in Int.")
+
+        var candidates: [FetchedThreadCandidate] = []
+        var indexesByID: [CodexThreadID: Int] = [:]
+        var hasUnfetchedCandidates = false
+        let baseQuery = plan.threadQuery(cursor: nil, includePaging: true)
+        for sourceKinds in plan.candidateSourceScope.sourceKindFilters {
+            var query = baseQuery
+            query.sourceKinds = sourceKinds
+            let partition = try await fetchBoundedThreadSnapshots(
+                query: query,
+                limit: candidateLimit
+            )
+            for snapshot in partition.snapshots {
+                if let index = indexesByID[snapshot.id] {
+                    candidates[index].append(snapshot: snapshot, sourceKinds: sourceKinds)
+                } else {
+                    indexesByID[snapshot.id] = candidates.count
+                    candidates.append(FetchedThreadCandidate(
+                        snapshot: snapshot,
+                        sourceKinds: sourceKinds
+                    ))
+                }
+            }
+            hasUnfetchedCandidates = hasUnfetchedCandidates || partition.hasMore
+        }
+
+        let requiresExhaustiveFallback = candidates.contains { candidate in
+            let initialResolution = chatsByID[candidate.id]?.threadSourceResolution ?? .unresolved
+            return candidate.hasMultipleOccurrences
+                || plan.candidateSourceScope.matches(
+                    candidate.sourceResolution(startingAt: initialResolution)
+                ) == false
+        }
+        guard requiresExhaustiveFallback == false else {
+            return nil
+        }
+
+        let sortOrder = plan.sortPlans[0].order
+        candidates.sort { lhs, rhs in
+            threadSnapshot(
+                lhs.latestSnapshot,
+                sortsBefore: rhs.latestSnapshot,
+                byRecencyIn: sortOrder
+            )
+        }
+
+        let start = min(requestedOffset, candidates.count)
+        let end = min(start + limit, candidates.count)
+        let pageCandidates = Array(candidates[start..<end])
+        let hasNextPage = end < candidates.count || hasUnfetchedCandidates
+        precondition(
+            pageCandidates.isEmpty == false || hasNextPage == false,
+            "A composite page cursor must advance while more candidates remain."
+        )
+
+        try Task.checkCancellation()
+        let chats = await applyFetchedSnapshots(
+            pageCandidates,
+            archived: plan.archived == true,
+            scopedWorkspaceURL: plan.singleWorkspace,
+            excluding: excludedRegistration
+        )
+        let relationshipIsComplete = hasNextPage == false
+            && descriptor.normalizedFetchOffset == 0
+        let previousStart = max(0, start - limit)
+        return CodexFetchPage(
+            items: chats,
+            nextCursor: hasNextPage ? localCursor(for: end) : nil,
+            backwardsCursor: start > 0 ? localCursor(for: previousStart) : nil,
+            relationshipItems: relationshipIsComplete && start == 0 ? chats : nil,
+            relationshipIsComplete: relationshipIsComplete
+        )
+    }
+
+    private func fetchBoundedThreadSnapshots(
+        query baseQuery: CodexThreadQuery,
+        limit: Int
+    ) async throws -> (snapshots: [CodexThreadSnapshot], hasMore: Bool) {
+        var snapshots: [CodexThreadSnapshot] = []
+        var cursor: String?
+        var seenCursors: Set<String> = []
+
+        while snapshots.count < limit {
+            try Task.checkCancellation()
+            var query = baseQuery
+            query.cursor = cursor
+            query.limit = limit - snapshots.count
+            let page = try await appServer.listThreads(query)
+            let remainingCount = limit - snapshots.count
+            snapshots.append(contentsOf: page.threads.prefix(remainingCount))
+
+            if let nextCursor = page.nextCursor {
+                precondition(
+                    nextCursor != cursor && seenCursors.insert(nextCursor).inserted,
+                    "The app-server returned a repeated thread-list cursor."
+                )
+                precondition(
+                    page.threads.isEmpty == false,
+                    "The app-server returned a non-advancing empty thread-list page."
+                )
+            }
+
+            if page.threads.count > remainingCount {
+                return (snapshots, true)
+            }
+            guard snapshots.count < limit else {
+                return (snapshots, page.nextCursor != nil)
+            }
+            guard let nextCursor = page.nextCursor else {
+                return (snapshots, false)
+            }
+            cursor = nextCursor
+        }
+
+        return (snapshots, false)
+    }
+
+    private func threadSnapshot(
+        _ lhs: CodexThreadSnapshot,
+        sortsBefore rhs: CodexThreadSnapshot,
+        byRecencyIn order: SortOrder
+    ) -> Bool {
+        switch (lhs.recencyAt, rhs.recencyAt) {
+        case (.some(let lhsDate), .some(let rhsDate)) where lhsDate != rhsDate:
+            return order == .forward ? lhsDate < rhsDate : lhsDate > rhsDate
+        case (.none, .some):
+            return order == .forward
+        case (.some, .none):
+            return order == .reverse
+        case (.some, .some), (.none, .none):
+            break
+        }
+        return order == .forward
+            ? lhs.id.rawValue < rhs.id.rawValue
+            : lhs.id.rawValue > rhs.id.rawValue
+    }
+
     private func fetchAllChats(
         matching descriptor: CodexFetchDescriptor<CodexChat>,
         plan: CodexThreadQueryPlan,
@@ -2047,15 +2285,14 @@ public final class CodexModelContext: Equatable, SendableMetatype {
     ) async throws -> [CodexChat] {
         var chats: [CodexChat] = []
         for archived in plan.archiveScopes {
-            chats.append(contentsOf: await applyFetchedSnapshots(
-                try await fetchAllThreadSnapshots(
-                    matching: descriptor,
-                    archived: archived
-                ),
-                archived: archived,
+            let fetchedChats = try await fetchAndApplyAllThreadSnapshots(
+                matching: descriptor,
+                archiveScope: archived,
+                appliedArchived: archived,
                 scopedWorkspaceURL: plan.singleWorkspace,
                 excluding: excludedRegistration
-            ))
+            )
+            chats.append(contentsOf: fetchedChats.filter { plan.matchesServerResponse($0) })
         }
         return unique(chats)
     }
@@ -2065,12 +2302,12 @@ public final class CodexModelContext: Equatable, SendableMetatype {
         cursor: String?,
         excluding excludedRegistration: (any CodexFetchedResultsRegistration)? = nil
     ) async throws -> CodexFetchPage<CodexWorkspace> {
-        let chats = await applyFetchedSnapshots(
-            try await fetchAllThreadSnapshots(matching: descriptor),
-            archived: archivedScope(for: descriptor) == true,
+        let chats = defaultUserVisibleChats(from: try await fetchAndApplyAllThreadSnapshots(
+            matching: descriptor,
+            appliedArchived: archivedScope(for: descriptor) == true,
             scopedWorkspaceURL: singleWorkspaceScope(for: descriptor),
             excluding: excludedRegistration
-        )
+        ))
         let relationshipChats = chats + preservedLiveChatsForFetchedRelationships(
             omittedFrom: chats,
             descriptor: descriptor,
@@ -2103,12 +2340,12 @@ public final class CodexModelContext: Equatable, SendableMetatype {
         cursor: String?,
         excluding excludedRegistration: (any CodexFetchedResultsRegistration)? = nil
     ) async throws -> CodexFetchPage<CodexWorkspaceGroup> {
-        let chats = await applyFetchedSnapshots(
-            try await fetchAllThreadSnapshots(matching: descriptor),
-            archived: archivedScope(for: descriptor) == true,
+        let chats = defaultUserVisibleChats(from: try await fetchAndApplyAllThreadSnapshots(
+            matching: descriptor,
+            appliedArchived: archivedScope(for: descriptor) == true,
             scopedWorkspaceURL: singleWorkspaceScope(for: descriptor),
             excluding: excludedRegistration
-        )
+        ))
         let relationshipChats = chats + preservedLiveChatsForFetchedRelationships(
             omittedFrom: chats,
             descriptor: descriptor,
@@ -2148,19 +2385,39 @@ public final class CodexModelContext: Equatable, SendableMetatype {
     }
 
     private func applyFetchedSnapshots(
-        _ snapshots: [CodexThreadSnapshot],
+        _ candidates: [FetchedThreadCandidate],
         archived: Bool,
         scopedWorkspaceURL: URL? = nil,
         excluding excludedRegistration: (any CodexFetchedResultsRegistration)? = nil
     ) async -> [CodexChat] {
         var revalidations: [CodexFetchedChatRevalidation] = []
-        let chats = snapshots.map { snapshot in
-            let snapshot = snapshotForApply(snapshot, scopedWorkspaceURL: scopedWorkspaceURL)
-            let existingChat = chatsByID[snapshot.id]
+        var appliedChats: [CodexChat] = []
+        for candidate in candidates {
+            let existingChat = chatsByID[candidate.id]
             let previousState = existingChat.map(fetchedResultState(for:))
             let previousWorkspace = existingChat?.workspace
             let previousGroup = previousWorkspace?.workspaceGroup
-            let chat = apply(snapshot, archived: archived)
+            let firstOccurrence = candidate.firstOccurrence
+            let firstSnapshot = snapshotForApply(
+                firstOccurrence.snapshot,
+                scopedWorkspaceURL: scopedWorkspaceURL
+            )
+            var chat = apply(
+                firstSnapshot,
+                archived: archived,
+                sourceProvenance: firstOccurrence.sourceProvenance
+            )
+            for occurrence in candidate.additionalOccurrences {
+                let snapshot = snapshotForApply(
+                    occurrence.snapshot,
+                    scopedWorkspaceURL: scopedWorkspaceURL
+                )
+                chat = apply(
+                    snapshot,
+                    archived: archived,
+                    sourceProvenance: occurrence.sourceProvenance
+                )
+            }
             if previousState == nil || previousState != fetchedResultState(for: chat) {
                 revalidations.append(CodexFetchedChatRevalidation(
                     chat: chat,
@@ -2169,10 +2426,18 @@ public final class CodexModelContext: Equatable, SendableMetatype {
                     archived: chat.isArchived
                 ))
             }
-            return chat
+            appliedChats.append(chat)
         }
         await revalidateChatsInRegisteredResults(revalidations, excluding: excludedRegistration)
-        return chats
+        return appliedChats
+    }
+
+    private func defaultUserVisibleChats(from chats: [CodexChat]) -> [CodexChat] {
+        chats.filter {
+            CodexThreadCandidateSourceScope.defaultUserVisible.matches(
+                CodexChatRecord(chat: $0)
+            )
+        }
     }
 
     private func snapshotForApply(
@@ -2213,8 +2478,7 @@ public final class CodexModelContext: Equatable, SendableMetatype {
             modelProvider: chat.modelProvider,
             sessionID: chat.sessionID,
             parentThreadID: chat.parentThreadID,
-            source: chat.source,
-            sourceKind: chat.sourceKind,
+            sourceResolution: chat.threadSourceResolution,
             gitInfo: chat.gitInfo,
             isArchived: chat.isArchived,
             createdAt: chat.createdAt,
@@ -2231,6 +2495,7 @@ public final class CodexModelContext: Equatable, SendableMetatype {
     private func apply(
         _ snapshot: CodexThreadSnapshot,
         archived: Bool? = nil,
+        sourceProvenance: CodexThreadListSourceProvenance? = nil,
         preservesExistingTurnItems: Bool = false
     ) -> CodexChat {
         let chat = chat(for: snapshot.id)
@@ -2249,6 +2514,7 @@ public final class CodexModelContext: Equatable, SendableMetatype {
         chat.apply(
             snapshot,
             workspace: workspace,
+            sourceProvenance: sourceProvenance,
             preservesExistingTurnItems: preservesExistingTurnItems
         )
         if let archived {
@@ -2453,7 +2719,8 @@ public final class CodexModelContext: Equatable, SendableMetatype {
     }
 
     private func shouldPreserveMissingRefreshChat(_ chat: CodexChat, archivedScope: Bool?) -> Bool {
-        shouldPreserve(chat, outside: archivedScope) || shouldPreserveLiveFetchedChat(chat)
+        CodexThreadCandidateSourceScope.defaultUserVisible.matches(CodexChatRecord(chat: chat))
+            && (shouldPreserve(chat, outside: archivedScope) || shouldPreserveLiveFetchedChat(chat))
     }
 
     private func containsPreservedMissingRefreshChat(
@@ -2630,8 +2897,11 @@ public final class CodexModelContext: Equatable, SendableMetatype {
     ) -> Bool {
         guard let plan = chatQueryPlan(for: descriptor) else {
             return chat.isArchived == false
+                && CodexThreadCandidateSourceScope.defaultUserVisible.matches(
+                    CodexChatRecord(chat: chat)
+                )
         }
-        return plan.matches(chat)
+        return plan.matchesLocalCandidate(chat)
     }
 
     private func workspaceIfLoaded(for url: URL) -> CodexWorkspace? {
@@ -2761,27 +3031,69 @@ public final class CodexModelContext: Equatable, SendableMetatype {
         }
     }
 
+    private func fetchAndApplyAllThreadSnapshots<Model: CodexPersistentModel>(
+        matching descriptor: CodexFetchDescriptor<Model>,
+        archiveScope: Bool? = nil,
+        appliedArchived: Bool,
+        scopedWorkspaceURL: URL? = nil,
+        excluding excludedRegistration: (any CodexFetchedResultsRegistration)? = nil
+    ) async throws -> [CodexChat] {
+        let candidates = try await fetchAllThreadSnapshots(
+            matching: descriptor,
+            archived: archiveScope
+        )
+        try Task.checkCancellation()
+        return await applyFetchedSnapshots(
+            candidates,
+            archived: appliedArchived,
+            scopedWorkspaceURL: scopedWorkspaceURL,
+            excluding: excludedRegistration
+        )
+    }
+
     private func fetchAllThreadSnapshots<Model: CodexPersistentModel>(
         matching descriptor: CodexFetchDescriptor<Model>,
         archived archiveScope: Bool? = nil
-    ) async throws -> [CodexThreadSnapshot] {
-        var query = threadQuery(from: descriptor, includePaging: false, archived: archiveScope)
-        // Created/updated cursors in the pinned app-server do not contain a thread-ID
-        // tie-breaker. Enumerate with its stable recency cursor, then apply the requested
-        // effective ordering locally.
-        query.sortDirection = .descending
-        query.sortKey = .recencyAt
-        var threads: [CodexThreadSnapshot] = []
-        var cursor: String?
+    ) async throws -> [FetchedThreadCandidate] {
+        var candidates: [FetchedThreadCandidate] = []
+        var indexesByID: [CodexThreadID: Int] = [:]
 
-        repeat {
-            query.cursor = cursor
-            let page = try await appServer.listThreads(query)
-            threads.append(contentsOf: page.threads)
-            cursor = page.nextCursor
-        } while cursor != nil
+        for var query in threadQueries(
+            from: descriptor,
+            includePaging: false,
+            archived: archiveScope
+        ) {
+            let sourceKinds = query.sourceKinds
+            // Created/updated cursors in the pinned app-server do not contain a thread-ID
+            // tie-breaker. Enumerate with its stable recency cursor, then apply the requested
+            // effective ordering locally.
+            query.sortDirection = .descending
+            query.sortKey = .recencyAt
+            var cursor: String?
 
-        return threads
+            repeat {
+                try Task.checkCancellation()
+                query.cursor = cursor
+                let page = try await appServer.listThreads(query)
+                for thread in page.threads {
+                    if let index = indexesByID[thread.id] {
+                        candidates[index].append(
+                            snapshot: thread,
+                            sourceKinds: sourceKinds
+                        )
+                    } else {
+                        indexesByID[thread.id] = candidates.count
+                        candidates.append(FetchedThreadCandidate(
+                            snapshot: thread,
+                            sourceKinds: sourceKinds
+                        ))
+                    }
+                }
+                cursor = page.nextCursor
+            } while cursor != nil
+        }
+
+        return candidates
     }
 
     private func chatQueryPlan<Model: CodexPersistentModel>(
@@ -2811,10 +3123,6 @@ public final class CodexModelContext: Equatable, SendableMetatype {
         for descriptor: CodexFetchDescriptor<Model>
     ) -> URL? {
         chatQueryPlan(for: descriptor)?.singleWorkspace
-    }
-
-    private func filter(_ chats: [CodexChat], using plan: CodexThreadQueryPlan) -> [CodexChat] {
-        chats.filter { plan.matches($0) }
     }
 
     private func localPage<Model: CodexPersistentModel>(
@@ -2866,8 +3174,32 @@ public final class CodexModelContext: Equatable, SendableMetatype {
         guard plan.serverPredicateIsComplete else {
             return false
         }
+        guard plan.candidateSourceScope.requiresCompositeFetch == false else {
+            return false
+        }
         return plan.sortPlans.isEmpty
             || (plan.sortPlans.count == 1 && plan.sortPlans[0].key == .recencyAt)
+    }
+
+    private func canUseBoundedCompositeRecencyPage(
+        for descriptor: CodexFetchDescriptor<CodexChat>,
+        plan: CodexThreadQueryPlan,
+        cursor: String?
+    ) -> Bool {
+        guard cursor == nil || cursor?.hasPrefix(Self.localCursorPrefix) == true else {
+            return false
+        }
+        guard plan.candidateSourceScope == .defaultUserVisible,
+            plan.archived != nil,
+            plan.serverPredicateIsComplete,
+            plan.sortPlans.count == 1,
+            plan.sortPlans[0].key == .recencyAt,
+            let fetchLimit = descriptor.fetchLimit,
+            fetchLimit > 0
+        else {
+            return false
+        }
+        return true
     }
 
     package func localCursor(for offset: Int) -> String {
@@ -2917,6 +3249,42 @@ public final class CodexModelContext: Equatable, SendableMetatype {
             limit: includePaging ? descriptor.fetchLimit : nil,
             sortDirection: serverSort?.threadSortDirection,
             sortKey: serverSort?.threadSortKey
+        )
+    }
+
+    private func threadQueries<Model: CodexPersistentModel>(
+        from descriptor: CodexFetchDescriptor<Model>,
+        cursor: String? = nil,
+        includePaging: Bool = true,
+        archived archiveScope: Bool? = nil
+    ) -> [CodexThreadQuery] {
+        let candidateSourceScope = chatQueryPlan(for: descriptor)?.candidateSourceScope
+            ?? .defaultUserVisible
+        let baseQuery = threadQuery(
+            from: descriptor,
+            cursor: cursor,
+            includePaging: includePaging,
+            archived: archiveScope
+        )
+        return candidateSourceScope.sourceKindFilters.map { sourceKinds in
+            var query = baseQuery
+            query.sourceKinds = sourceKinds
+            return query
+        }
+    }
+
+    private func sortLocallyFetchedChats(
+        _ chats: [CodexChat],
+        using descriptor: CodexFetchDescriptor<CodexChat>
+    ) -> [CodexChat] {
+        guard descriptor.sortBy.isEmpty,
+            chatQueryPlan(for: descriptor)?.candidateSourceScope.requiresCompositeFetch == true
+        else {
+            return sort(chats, using: descriptor.sortBy)
+        }
+        return sort(
+            chats,
+            using: [CodexSortDescriptor(\CodexChat.createdAt, order: .reverse)]
         )
     }
 

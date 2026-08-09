@@ -161,6 +161,70 @@ struct CodexAppServerTestStoredThreadTests {
         await runtime.close()
     }
 
+    @Test func threadStoreRecencySortUsesThreadIDTieBreakerAcrossPages() async throws {
+        let recencyAt = Date(timeIntervalSince1970: 100)
+        let firstID = CodexThreadID("00000000-0000-0000-0000-000000000001")
+        let secondID = CodexThreadID("00000000-0000-0000-0000-000000000002")
+        let thirdID = CodexThreadID("00000000-0000-0000-0000-000000000003")
+        let runtime = try await CodexAppServerTestRuntime.start(threads: [
+            makeRuntimeStoredThreadFixture(id: secondID, recencyAt: recencyAt),
+            makeRuntimeStoredThreadFixture(id: firstID, recencyAt: recencyAt),
+            makeRuntimeStoredThreadFixture(id: thirdID, recencyAt: recencyAt),
+        ])
+
+        for (direction, expectedIDs) in [
+            (CodexSortDirection.ascending, [firstID, secondID, thirdID]),
+            (CodexSortDirection.descending, [thirdID, secondID, firstID]),
+        ] {
+            let firstPage = try await runtime.server.listThreads(.init(
+                limit: 2,
+                sortDirection: direction,
+                sortKey: .recencyAt
+            ))
+            #expect(firstPage.threads.map(\.id) == Array(expectedIDs.prefix(2)))
+            let nextCursor = try #require(firstPage.nextCursor)
+
+            let secondPage = try await runtime.server.listThreads(.init(
+                cursor: nextCursor,
+                limit: 2,
+                sortDirection: direction,
+                sortKey: .recencyAt
+            ))
+            #expect(secondPage.threads.map(\.id) == Array(expectedIDs.dropFirst(2)))
+            #expect(secondPage.nextCursor == nil)
+            #expect(secondPage.backwardsCursor != nil)
+        }
+
+        await runtime.close()
+    }
+
+    @Test func threadStoreListClampsProductionPageSize() async throws {
+        let runtime = try await CodexAppServerTestRuntime.start(threads: (0..<102).map { index in
+            try makeRuntimeStoredThreadFixture(id: CodexThreadID(rawValue: "thread-\(index)"))
+        })
+
+        let defaultPage = try await runtime.server.listThreads()
+        #expect(defaultPage.threads.count == 25)
+        #expect(defaultPage.nextCursor != nil)
+
+        let minimumPage = try await runtime.server.listThreads(.init(limit: 0))
+        #expect(minimumPage.threads.count == 1)
+        #expect(minimumPage.nextCursor != nil)
+
+        let maximumPage = try await runtime.server.listThreads(.init(limit: 101))
+        #expect(maximumPage.threads.count == 100)
+        let maximumNextCursor = try #require(maximumPage.nextCursor)
+
+        let maximumSecondPage = try await runtime.server.listThreads(.init(
+            cursor: maximumNextCursor,
+            limit: 101
+        ))
+        #expect(maximumSecondPage.threads.count == 2)
+        #expect(maximumSecondPage.nextCursor == nil)
+
+        await runtime.close()
+    }
+
     @Test func replacingTurnsRevalidatesProjectionAndPreservesHiddenMetadata() throws {
         let fixture = try makeStoredThreadFixture()
         let replacementItem = try CodexAppServerTestItem.plan(
