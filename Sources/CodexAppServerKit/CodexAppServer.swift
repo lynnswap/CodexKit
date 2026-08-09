@@ -622,13 +622,8 @@ public actor CodexAppServer {
                     identity,
                     threadOptions: threadOptions
                 )
-                // Inline reviews interrupt an internal reviewer child turn, while
-                // source-thread events continue under the outer review turn.
-                let acknowledgement = try await review.response.turn
-                    .interruptAndAwaitTerminalAcknowledgement(
-                        adoptsRedirectedTurnAsThreadEventOwner:
-                            identity.activeTurnThreadID != identity.sourceThreadID
-                    ) {
+                let acknowledgement = try await review
+                    .interruptAndAwaitTerminalAcknowledgement {
                     retryCancellation in
                     if retryCancellation.turnID != Optional(identity.turnID) {
                         identities.record(Self.reviewCleanupIdentity(
@@ -1177,7 +1172,7 @@ public actor CodexAppServer {
     private nonisolated static func interruptLateReviewSession(
         _ review: CodexReviewSession
     ) async throws {
-        _ = try await interruptAndAwaitTerminal(review.response)
+        _ = try await review.interruptAndAwaitTerminalAcknowledgement()
     }
 
     private nonisolated static func orderedReviewCleanupThreadIDs(
